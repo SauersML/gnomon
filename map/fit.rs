@@ -5558,6 +5558,85 @@ where
         .reset()
         .map_err(|err| HwePcaError::Source(Box::new(err)))?;
 
+    // A packed hard-call view already holds what this pass needs: the planes
+    // the pair kernels count, and integer moments the allele statistics are
+    // finalized from. Decoding it to f64 dosages, summing them and packing them
+    // again was most of the pass at biobank cohort sizes. The integers are the
+    // same either way, so both routes finalize to the same bits. Row-subset
+    // views keep the decoding path.
+    if let Some(packed) = source
+        .hard_call_packed()
+        .filter(|packed| packed.sample_selection().is_none())
+    {
+        let processed = packed.n_variants();
+        if n_variants_hint > 0 && processed > n_variants_hint {
+            return Err(HwePcaError::InvalidInput(
+                "VariantBlockSource returned more variants than reported hint",
+            ));
+        }
+        if processed != config.range_count() {
+            return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
+        }
+        if processed == 0 {
+            stats_progress.finish();
+            ld_progress.finish();
+            return Err(HwePcaError::InvalidInput(
+                "VariantBlockSource yielded no variants",
+            ));
+        }
+
+        let parallel = par.degree() > 1;
+        let mut moments = Vec::with_capacity(processed);
+        let mut chunk_start = 0usize;
+        while chunk_start < processed {
+            let chunk_end = (chunk_start + LD_PUSH_CHUNK).min(processed);
+            let mut entries = stream.take_slots(chunk_end - chunk_start)?;
+            let encode = |(entry, variant): (&mut LdVariantCodes, usize)| {
+                let bytes = packed.slice(variant, 1).ok_or(HwePcaError::InvalidInput(
+                    "packed hard-call source contains an invalid variant selection",
+                ))?;
+                let swapped = packed.match_kind(variant) == MatchKind::Swap;
+                Ok::<_, HwePcaError>(entry.fill_packed(bytes, n_samples, swapped))
+            };
+            let chunk_moments: Vec<(f64, f64, usize)> = if parallel {
+                entries
+                    .par_iter_mut()
+                    .zip(chunk_start..chunk_end)
+                    .map(encode)
+                    .collect::<Result<_, _>>()?
+            } else {
+                entries
+                    .iter_mut()
+                    .zip(chunk_start..chunk_end)
+                    .map(encode)
+                    .collect::<Result<_, _>>()?
+            };
+            moments.extend(chunk_moments);
+            stream.push_encoded(entries, &ld_progress, parallel)?;
+            stats_progress.advance(chunk_end);
+            chunk_start = chunk_end;
+        }
+
+        let weights = stream.finish()?;
+        let PrecomputedVariantStatistics {
+            scaler,
+            standardized_sums_sq,
+            ..
+        } = PrecomputedVariantStatistics::from_moments(n_samples, &moments);
+        stats_progress.set_total(processed);
+        stats_progress.finish();
+        ld_progress.set_total(processed);
+        ld_progress.finish();
+
+        let weights = LdWeights {
+            weights,
+            window: config.window_capacity().max(1),
+            bp_window: config.bp_window(),
+            ridge: config.ridge,
+        };
+        return Ok((scaler, standardized_sums_sq, processed, weights));
+    }
+
     let mut processed = 0usize;
     let mut used_source_progress = false;
 
@@ -5811,12 +5890,65 @@ impl LdBitplanes {
         if !self.fill_planes(column) {
             return false;
         }
+        self.count_planes();
+        true
+    }
+
+    /// Packs one variant straight from its PLINK 2-bit codes, planes exactly
+    /// as [`Self::fill`] packs the decoded column.
+    ///
+    /// A code's low bit is set for a missing call and for the dosage-2
+    /// homozygote, its high bit for the heterozygote and the dosage-2
+    /// homozygote, so each plane is bit arithmetic on the even and odd bits of
+    /// the bytes. `swapped` exchanges the two homozygotes, as a swapped allele
+    /// match does; heterozygotes and missing calls stay where they are.
+    fn fill_packed(&mut self, bytes: &[u8], n_samples: usize, swapped: bool) {
+        let words = n_samples.div_ceil(64);
+        self.present.clear();
+        self.het.clear();
+        self.alt.clear();
+        for word in 0..words {
+            // Sixteen codes to a byte pair of words: bytes `16w..16w + 16`
+            // hold samples `64w..64w + 64`, the last pair zero-padded.
+            let start = word * 16;
+            let chunk = &bytes[start..(start + 16).min(bytes.len())];
+            let mut buffer = [0u8; 16];
+            buffer[..chunk.len()].copy_from_slice(chunk);
+            let first = u64::from_le_bytes(buffer[..8].try_into().expect("eight bytes"));
+            let second = u64::from_le_bytes(buffer[8..].try_into().expect("eight bytes"));
+            let low = even_bits(first) | (even_bits(second) << 32);
+            let high = even_bits(first >> 1) | (even_bits(second >> 1) << 32);
+            let samples = (n_samples - word * 64).min(64);
+            let valid = if samples == 64 {
+                u64::MAX
+            } else {
+                (1u64 << samples) - 1
+            };
+            let dosage_two = if swapped { !(low | high) } else { low & high };
+            self.present.push((high | !low) & valid);
+            self.het.push(high & !low & valid);
+            self.alt.push(dosage_two & valid);
+        }
+        self.count_planes();
+    }
+
+    fn count_planes(&mut self) {
         let count =
             |plane: &[u64]| -> u64 { plane.iter().map(|word| word.count_ones() as u64).sum() };
         self.observed = count(&self.present);
         self.het_count = count(&self.het);
         self.alt_count = count(&self.alt);
-        true
+    }
+
+    /// `(sum, sum of squares, calls)` of the dosages: the integer moments the
+    /// allele statistics are finalized from, in the form every decoding pass
+    /// accumulates them.
+    fn moments(&self) -> (f64, f64, usize) {
+        (
+            (self.het_count + 2 * self.alt_count) as f64,
+            (self.het_count + 4 * self.alt_count) as f64,
+            self.observed as usize,
+        )
     }
 
     /// Every sample observed, so restricting a partner to this marker's
@@ -5875,7 +6007,31 @@ impl LdBitplanes {
     }
 }
 
+/// Gathers bits 0, 2, 4, … 62 of `word` into bits 0 … 31.
+#[inline(always)]
+fn even_bits(word: u64) -> u64 {
+    let mut bits = word & 0x5555_5555_5555_5555;
+    bits = (bits | (bits >> 1)) & 0x3333_3333_3333_3333;
+    bits = (bits | (bits >> 2)) & 0x0f0f_0f0f_0f0f_0f0f;
+    bits = (bits | (bits >> 4)) & 0x00ff_00ff_00ff_00ff;
+    bits = (bits | (bits >> 8)) & 0x0000_ffff_0000_ffff;
+    (bits | (bits >> 16)) & 0x0000_0000_ffff_ffff
+}
+
 impl LdVariantCodes {
+    /// Re-encodes one variant's PLINK 2-bit codes in place and returns its
+    /// moments; see [`LdBitplanes::fill_packed`].
+    fn fill_packed(&mut self, bytes: &[u8], n_samples: usize, swapped: bool) -> (f64, f64, usize) {
+        let mut planes = match std::mem::replace(self, LdVariantCodes::Empty) {
+            LdVariantCodes::HardCall(planes) => planes,
+            LdVariantCodes::Dosage { .. } | LdVariantCodes::Empty => LdBitplanes::default(),
+        };
+        planes.fill_packed(bytes, n_samples, swapped);
+        let moments = planes.moments();
+        *self = LdVariantCodes::HardCall(planes);
+        moments
+    }
+
     /// Re-encodes `column` in place, reusing whichever buffers the slot held.
     fn fill(&mut self, column: &[f64], mean: f64) {
         let mut planes = match std::mem::replace(self, LdVariantCodes::Empty) {
@@ -6299,14 +6455,7 @@ impl LdWeightStream {
         let mut chunk_start = 0usize;
         while chunk_start < filled {
             let chunk_end = (chunk_start + LD_PUSH_CHUNK).min(filled);
-            let first = self.pushed;
-            let last = first + (chunk_end - chunk_start);
-
-            self.evict_ring(self.schedule.data_retain_from(first));
-
-            let mut entries: Vec<LdVariantCodes> = (chunk_start..chunk_end)
-                .map(|_| self.pool.pop().unwrap_or(LdVariantCodes::Empty))
-                .collect();
+            let mut entries = self.take_slots(chunk_end - chunk_start)?;
             let columns: Vec<&[f64]> = (chunk_start..chunk_end)
                 .map(|col| {
                     block
@@ -6331,39 +6480,67 @@ impl LdWeightStream {
                     .zip(columns.iter().zip(means.iter()))
                     .for_each(encode);
             }
-            self.ring.extend(entries);
-
-            let ring = &self.ring;
-            let ring_base = self.ring_base;
-            let schedule = &self.schedule;
-            let n_samples = self.n_samples;
-            let pair_row = |k: usize| {
-                let partners = schedule.partners(k);
-                let codes = &ring[k - ring_base];
-                let r2 = partners
-                    .clone()
-                    .map(|j| {
-                        ld_pair_r2_estimate(&ld_pair_stats(codes, &ring[j - ring_base], n_samples))
-                    })
-                    .collect();
-                LdPairRow {
-                    first_partner: partners.start,
-                    r2,
-                }
-            };
-            let rows: Vec<LdPairRow> = if parallel {
-                (first..last).into_par_iter().map(pair_row).collect()
-            } else {
-                (first..last).map(pair_row).collect()
-            };
-            self.rows.extend(rows);
-            self.pushed = last;
-
-            self.solve_ready(progress, parallel)?;
+            self.push_encoded(entries, progress, parallel)?;
             chunk_start = chunk_end;
         }
 
         Ok(())
+    }
+
+    /// Code slots for the next `count` markers, recycled from ring entries that
+    /// no later marker pairs with.
+    fn take_slots(&mut self, count: usize) -> Result<Vec<LdVariantCodes>, HwePcaError> {
+        if self.pushed + count > self.schedule.len() {
+            return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
+        }
+        self.evict_ring(self.schedule.data_retain_from(self.pushed));
+        Ok((0..count)
+            .map(|_| self.pool.pop().unwrap_or(LdVariantCodes::Empty))
+            .collect())
+    }
+
+    /// Streams the next `entries.len()` encoded markers and solves every centre
+    /// they complete.
+    fn push_encoded<P: FitProgressObserver>(
+        &mut self,
+        entries: Vec<LdVariantCodes>,
+        progress: &StageProgressHandle<P>,
+        parallel: bool,
+    ) -> Result<(), HwePcaError> {
+        let first = self.pushed;
+        let last = first + entries.len();
+        if last > self.schedule.len() {
+            return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
+        }
+        self.ring.extend(entries);
+
+        let ring = &self.ring;
+        let ring_base = self.ring_base;
+        let schedule = &self.schedule;
+        let n_samples = self.n_samples;
+        let pair_row = |k: usize| {
+            let partners = schedule.partners(k);
+            let codes = &ring[k - ring_base];
+            let r2 = partners
+                .clone()
+                .map(|j| {
+                    ld_pair_r2_estimate(&ld_pair_stats(codes, &ring[j - ring_base], n_samples))
+                })
+                .collect();
+            LdPairRow {
+                first_partner: partners.start,
+                r2,
+            }
+        };
+        let rows: Vec<LdPairRow> = if parallel {
+            (first..last).into_par_iter().map(pair_row).collect()
+        } else {
+            (first..last).map(pair_row).collect()
+        };
+        self.rows.extend(rows);
+        self.pushed = last;
+
+        self.solve_ready(progress, parallel)
     }
 
     fn evict_ring(&mut self, keep_from: usize) {
@@ -7918,6 +8095,137 @@ mod tests {
                     .any(|weight| (weight - isolated).abs() > 1.0e-6),
                 "no pair in this dataset correlated, so the comparison proves nothing"
             );
+        }
+    }
+
+    #[test]
+    fn packed_ld_pass_matches_the_decoded_pass_bit_for_bit() {
+        // 131 samples leave a partial last byte and a partial last plane word.
+        // Scattered missing calls and swapped allele matches exercise every
+        // code the packed planes translate, and neighbouring markers share most
+        // genotypes so the windows carry real LD. Reading packed calls must hand
+        // back the decoding pass's weights and statistics to the bit. A packed
+        // pass that quietly fell back to decoding would fail here: this source
+        // decodes physical dosages, without the swap.
+        const N_SAMPLES: usize = 131;
+        const N_VARIANTS: usize = 40;
+        let mut physical = synthetic_genotypes(N_SAMPLES, N_VARIANTS);
+        for variant in (1..N_VARIANTS).filter(|variant| variant % 3 != 0) {
+            for sample in (0..N_SAMPLES).filter(|sample| sample % 5 != 0) {
+                physical[variant * N_SAMPLES + sample] =
+                    physical[(variant - 1) * N_SAMPLES + sample];
+            }
+        }
+        for (index, value) in physical.iter_mut().enumerate() {
+            if index % 23 == 7 || ((index / N_SAMPLES) % 7 == 2 && index % 3 == 0) {
+                *value = f64::NAN;
+            }
+        }
+        let kinds: Vec<MatchKind> = (0..N_VARIANTS)
+            .map(|variant| {
+                if variant % 4 == 1 {
+                    MatchKind::Swap
+                } else {
+                    MatchKind::Exact
+                }
+            })
+            .collect();
+        // What a decoding source yields for the same calls: a swapped match
+        // counts the other allele.
+        let logical: Vec<f64> = physical
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                if kinds[index / N_SAMPLES] == MatchKind::Swap && !value.is_nan() {
+                    2.0 - value
+                } else {
+                    value
+                }
+            })
+            .collect();
+
+        let keys: Vec<VariantKey> = (0..N_VARIANTS)
+            .map(|variant| {
+                let chromosome = if variant < 25 { "1" } else { "2" };
+                VariantKey::new(chromosome, 1_000 + (variant / 2) as u64 * 150)
+            })
+            .collect();
+        let (bp_ranges, capacity) = compute_ld_bp_ranges(&keys, 600).expect("ranges");
+        let configs = [
+            LdResolvedConfig {
+                window: LdResolvedWindow::Sites {
+                    size: 5,
+                    ranges: compute_ld_site_ranges(&keys, 5),
+                },
+                ridge: DEFAULT_LD_RIDGE,
+            },
+            LdResolvedConfig {
+                window: LdResolvedWindow::BasePairs {
+                    span_bp: 600,
+                    ranges: bp_ranges,
+                    capacity,
+                },
+                ridge: DEFAULT_LD_RIDGE,
+            },
+        ];
+
+        let bits = |values: &[f64]| {
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        let isolated = (1.0f64 / (1.0 + DEFAULT_LD_RIDGE)).sqrt();
+        for config in &configs {
+            for par in [Par::Seq, Par::rayon(4)] {
+                let progress = Arc::new(NoopFitProgress);
+                let mut decoded =
+                    DenseBlockSource::new(&logical, N_SAMPLES, N_VARIANTS).expect("dense source");
+                let (decoded_scaler, decoded_sums, decoded_count, decoded_weights) =
+                    compute_stats_and_ld_weights(
+                        &mut decoded,
+                        8,
+                        config.clone(),
+                        N_VARIANTS,
+                        &progress,
+                        par,
+                    )
+                    .expect("decoded pass");
+                let mut packed = DirectPackedSource::new(&physical, N_SAMPLES, N_VARIANTS)
+                    .with_match_kinds(kinds.clone());
+                let (packed_scaler, packed_sums, packed_count, packed_weights) =
+                    compute_stats_and_ld_weights(
+                        &mut packed,
+                        8,
+                        config.clone(),
+                        N_VARIANTS,
+                        &progress,
+                        par,
+                    )
+                    .expect("packed pass");
+
+                assert_eq!(decoded_count, packed_count);
+                assert_eq!(
+                    bits(&decoded_weights.weights),
+                    bits(&packed_weights.weights)
+                );
+                assert_eq!(
+                    bits(decoded_scaler.allele_frequencies()),
+                    bits(packed_scaler.allele_frequencies())
+                );
+                assert_eq!(
+                    bits(decoded_scaler.variant_scales()),
+                    bits(packed_scaler.variant_scales())
+                );
+                assert_eq!(bits(&decoded_sums), bits(&packed_sums));
+                assert!(
+                    decoded_weights
+                        .weights
+                        .iter()
+                        .any(|weight| (weight - isolated).abs() > 1.0e-6),
+                    "no pair in this dataset correlated, so the comparison proves nothing"
+                );
+            }
         }
     }
 
