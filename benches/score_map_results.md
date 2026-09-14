@@ -1,5 +1,38 @@
 # Score and packed projection performance
 
+## Reused row masks and bounded output blocks
+
+Sparse packed scoring builds a 2 KiB column/row membership mask once per
+256-variant chunk, then visits only set bits when assembling score schedules.
+It processes 512 people across all columns before moving on, reusing output
+cache lines. Together with the existing schedule, scratch is roughly 8 KiB
+per worker, independent of cohort size. Accumulation order within each score
+is unchanged. Rebuilding memberships for every output block was measured to
+be slower and is not used.
+
+Three real 256-marker batches sampled across the 1,188,880 reconciled rows,
+32 scores, one pinned Milan core, three paired repetitions per batch:
+
+| People | Before batch medians | After batch medians | Speedup range |
+| ---: | --- | --- | --- |
+| 512 | 0.450 / 0.495 / 0.527 ms | 0.266 / 0.316 / 0.332 ms | 1.57–1.69× |
+| 3,200 | 1.835 / 2.092 / 2.227 ms | 1.643 / 1.905 / 2.027 ms | 1.10–1.12× |
+| 51,200 | 28.074 / 33.491 / 36.132 ms | 27.447 / 32.699 / 34.535 ms | 1.02–1.05× |
+
+All batch score bits and missing counts matched exactly. These are kernel
+measurements, not complete biobank runtimes. The larger fixture replicates
+the 3,200-person seed cohort. The probe reads just the sampled BED rows and
+does not map the complete biobank file.
+
+A paired complete 1,799,239-marker, 512-person run on four cores took 828 ms
+before and 674 ms after for computation (1.23×, single observation).
+The 3,200-person candidate took 2.87 s. Complete outputs matched all missing
+counts; maximum relative differences were 2.92e-13 and 4.55e-12, respectively,
+against their references. Forty-one focused tests passed, including scalar
+checks around the 512-person block boundary. Logs use `round13-` in the MSI
+iteration directory; `benches/probes/score_batch_cache.rs` reproduces the
+sampled kernel comparison against the cached baseline library.
+
 ## Kept people and small narrow panels
 
 The packed schedules now gather arbitrary kept people directly from the physical

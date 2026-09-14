@@ -737,102 +737,116 @@ fn run_sparse_scores_packed<const SELECTED: bool>(
     for chunk_start in (0..reconciled.len()).step_by(KERNEL_MINI_BATCH_SIZE) {
         let chunk_end = (chunk_start + KERNEL_MINI_BATCH_SIZE).min(reconciled.len());
         let mut schedule = [(0usize, 0.0f64, 0.0f64); KERNEL_MINI_BATCH_SIZE];
-        for column in 0..columns {
-            let mut len = 0;
-            for variant in chunk_start..chunk_end {
-                if prep
-                    .variant_csr_view(reconciled[variant])
-                    .iter()
-                    .any(|entry| entry.score_column.0 == column)
-                {
-                    schedule[len] = (
-                        variant * row_bytes,
-                        weights[variant * stride + column] as f64,
-                        corrections[variant * stride + column] as f64,
-                    );
-                    len += 1;
-                }
+        let mut active_rows = [[0u64; KERNEL_MINI_BATCH_SIZE / 64]; 64];
+        for variant in chunk_start..chunk_end {
+            let row = variant - chunk_start;
+            for entry in prep.variant_csr_view(reconciled[variant]).iter() {
+                active_rows[entry.score_column.0][row / 64] |= 1u64 << (row % 64);
             }
-            if len == 0 {
-                continue;
-            }
-            for person in (0..full_people).step_by(32) {
-                // This topology is reused for every scheduled row. The complete
-                // cohort specialization eliminates it at compile time.
-                let byte_offsets: [[usize; 8]; 4] = if SELECTED {
-                    core::array::from_fn(|lane| {
-                        core::array::from_fn(|byte| {
-                            prep.output_idx_to_fam_idx[person + byte * 4 + lane].0 as usize / 4
-                        })
-                    })
-                } else {
-                    [[0; 8]; 4]
-                };
-                let shifts: [Simd<u32, 8>; 4] = if SELECTED {
-                    core::array::from_fn(|lane| {
-                        Simd::from_array(core::array::from_fn(|byte| {
-                            2 * (prep.output_idx_to_fam_idx[person + byte * 4 + lane].0 % 4)
-                        }))
-                    })
-                } else {
-                    [Simd::splat(0); 4]
-                };
-                let mut sums = [Simd::<f64, 8>::splat(0.0); 4];
-                let mut counts = [Simd::<u32, 8>::splat(0); 4];
-                for &(row_offset, weight, correction) in &schedule[..len] {
-                    let offset = row_offset + person / 4;
-                    let packed: Simd<u32, 8> = if SELECTED {
-                        Simd::splat(0)
-                    } else {
-                        Simd::<u8, 8>::from_slice(&data[offset..offset + 8]).cast()
-                    };
-                    for lane in 0..4 {
-                        let code = if SELECTED {
-                            let gathered: Simd<u32, 8> =
-                                Simd::<u8, 8>::from_array(core::array::from_fn(|byte| {
-                                    data[row_offset + byte_offsets[lane][byte]]
-                                }))
-                                .cast();
-                            (gathered >> shifts[lane]) & Simd::splat(3)
-                        } else {
-                            (packed >> Simd::splat(2 * lane as u32)) & Simd::splat(3)
-                        };
-                        let high = code >> Simd::splat(1);
-                        let dosage = high + (high & code);
-                        let absent = code.simd_eq(Simd::splat(1));
-                        sums[lane] += absent.cast::<i64>().select(
-                            Simd::splat(-correction),
-                            dosage.cast::<f64>() * Simd::splat(weight),
+        }
+        // Keep a person's score/count cache lines hot across columns. Walking
+        // the whole cohort for each column repeatedly streams the output matrix
+        // once it outgrows the shared cache. Rebuilding the small row schedules
+        // per person block trades cheap index work for much less output traffic.
+        for person_start in (0..people).step_by(512) {
+            let person_end = (person_start + 512).min(people);
+            let vector_end = person_end.min(full_people);
+            for column in 0..columns {
+                let mut len = 0;
+                for (word, &active) in active_rows[column].iter().enumerate() {
+                    let mut active = active;
+                    while active != 0 {
+                        let variant = chunk_start + word * 64 + active.trailing_zeros() as usize;
+                        active &= active - 1;
+                        schedule[len] = (
+                            variant * row_bytes,
+                            weights[variant * stride + column] as f64,
+                            corrections[variant * stride + column] as f64,
                         );
-                        counts[lane] += absent.select(Simd::splat(1), Simd::splat(0));
+                        len += 1;
                     }
                 }
-                for lane in 0..4 {
-                    let sums = sums[lane].to_array();
-                    let counts = counts[lane].to_array();
-                    for byte in 0..8 {
-                        let cell = (person + byte * 4 + lane) * columns + column;
-                        scores[cell] += sums[byte];
-                        missing[cell] += counts[byte];
-                    }
+                if len == 0 {
+                    continue;
                 }
-            }
-            for person in full_people..people {
-                let cell = person * columns + column;
-                let physical = if SELECTED {
-                    prep.output_idx_to_fam_idx[person].0 as usize
-                } else {
-                    person
-                };
-                for &(offset, weight, correction) in &schedule[..len] {
-                    let code = (data[offset + physical / 4] >> (2 * (physical % 4))) & 3;
-                    match code {
-                        0 => (),
-                        1 => {
-                            scores[cell] -= correction;
-                            missing[cell] += 1;
+                for person in (person_start..vector_end).step_by(32) {
+                    // This topology is reused for every scheduled row. The complete
+                    // cohort specialization eliminates it at compile time.
+                    let byte_offsets: [[usize; 8]; 4] = if SELECTED {
+                        core::array::from_fn(|lane| {
+                            core::array::from_fn(|byte| {
+                                prep.output_idx_to_fam_idx[person + byte * 4 + lane].0 as usize / 4
+                            })
+                        })
+                    } else {
+                        [[0; 8]; 4]
+                    };
+                    let shifts: [Simd<u32, 8>; 4] = if SELECTED {
+                        core::array::from_fn(|lane| {
+                            Simd::from_array(core::array::from_fn(|byte| {
+                                2 * (prep.output_idx_to_fam_idx[person + byte * 4 + lane].0 % 4)
+                            }))
+                        })
+                    } else {
+                        [Simd::splat(0); 4]
+                    };
+                    let mut sums = [Simd::<f64, 8>::splat(0.0); 4];
+                    let mut counts = [Simd::<u32, 8>::splat(0); 4];
+                    for &(row_offset, weight, correction) in &schedule[..len] {
+                        let offset = row_offset + person / 4;
+                        let packed: Simd<u32, 8> = if SELECTED {
+                            Simd::splat(0)
+                        } else {
+                            Simd::<u8, 8>::from_slice(&data[offset..offset + 8]).cast()
+                        };
+                        for lane in 0..4 {
+                            let code = if SELECTED {
+                                let gathered: Simd<u32, 8> =
+                                    Simd::<u8, 8>::from_array(core::array::from_fn(|byte| {
+                                        data[row_offset + byte_offsets[lane][byte]]
+                                    }))
+                                    .cast();
+                                (gathered >> shifts[lane]) & Simd::splat(3)
+                            } else {
+                                (packed >> Simd::splat(2 * lane as u32)) & Simd::splat(3)
+                            };
+                            let high = code >> Simd::splat(1);
+                            let dosage = high + (high & code);
+                            let absent = code.simd_eq(Simd::splat(1));
+                            sums[lane] += absent.cast::<i64>().select(
+                                Simd::splat(-correction),
+                                dosage.cast::<f64>() * Simd::splat(weight),
+                            );
+                            counts[lane] += absent.select(Simd::splat(1), Simd::splat(0));
                         }
-                        _ => scores[cell] += (code - 1) as f64 * weight,
+                    }
+                    for lane in 0..4 {
+                        let sums = sums[lane].to_array();
+                        let counts = counts[lane].to_array();
+                        for byte in 0..8 {
+                            let cell = (person + byte * 4 + lane) * columns + column;
+                            scores[cell] += sums[byte];
+                            missing[cell] += counts[byte];
+                        }
+                    }
+                }
+                for person in vector_end.max(person_start)..person_end {
+                    let cell = person * columns + column;
+                    let physical = if SELECTED {
+                        prep.output_idx_to_fam_idx[person].0 as usize
+                    } else {
+                        person
+                    };
+                    for &(offset, weight, correction) in &schedule[..len] {
+                        let code = (data[offset + physical / 4] >> (2 * (physical % 4))) & 3;
+                        match code {
+                            0 => (),
+                            1 => {
+                                scores[cell] -= correction;
+                                missing[cell] += 1;
+                            }
+                            _ => scores[cell] += (code - 1) as f64 * weight,
+                        }
                     }
                 }
             }
@@ -1424,7 +1438,7 @@ mod tests {
     #[test]
     fn sparse_panel_simd_matches_scalar_at_column_and_person_boundaries() {
         for columns in [5usize, 8, 9, 16, 31, 32, 33, 64] {
-            for people in [64usize, 65, 95, 129] {
+            for people in [64usize, 65, 95, 129, 511, 512, 513, 1025] {
                 for variants in [1usize, 3, 257] {
                     let active = [0, columns - 1];
                     let mut prep = make_sparse_panel_prep(people, columns, &active);
