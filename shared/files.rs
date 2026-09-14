@@ -1304,7 +1304,47 @@ fn compare_paths(a: &Path, b: &Path) -> std::cmp::Ordering {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| b.to_string_lossy().into_owned());
-    compare(&a_str, &b_str)
+    compare_variant_names(&a_str, &b_str)
+}
+
+/// Natural order of variant file names, except that the members of one
+/// chromosome split at its pseudoautosomal boundaries follow the chromosome:
+/// PAR1, then the non-PAR body, then PAR2. Alphabetically `chrX_non_par` sorts
+/// before `chrX_par1`, and streaming the files in that order fails the
+/// position-sorted check 21 minutes into a whole-genome fit.
+fn compare_variant_names(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a_key, a_rank) = par_rank(a);
+    let (b_key, b_rank) = par_rank(b);
+    compare(&a_key, &b_key)
+        .then(a_rank.cmp(&b_rank))
+        .then_with(|| compare(a, b))
+}
+
+/// The name with its PAR token removed, and where that token places the file on
+/// the chromosome: 0 for `par1`, 2 for `par2`, 1 for `non_par`/`nonpar` and for
+/// files without a token. Tokens are matched between `_`, `-` or `.` separators,
+/// case-insensitively, so `chrX_PAR1.bcf` and `chrx-non-par.vcf.gz` both count.
+fn par_rank(name: &str) -> (String, u8) {
+    let lower = name.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| c == '_' || c == '-' || c == '.')
+        .collect();
+    let mut rank = 1;
+    let mut kept = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i] {
+            "par1" => rank = 0,
+            "par2" => rank = 2,
+            "nonpar" => rank = 1,
+            "non" if tokens.get(i + 1) == Some(&"par") => {
+                i += 1;
+            }
+            token => kept.push(token),
+        }
+        i += 1;
+    }
+    (kept.join("_"), rank)
 }
 
 fn gather_local_variant_files(dir: &Path) -> Result<Vec<PathBuf>, PipelineError> {
@@ -1593,7 +1633,7 @@ fn resolve_remote_variant_objects(path: &Path) -> Result<(String, Vec<String>), 
         }
     }
 
-    objects.sort_by(|a, b| compare(a, b));
+    objects.sort_by(|a, b| compare_variant_names(a, b));
     Ok((bucket, objects))
 }
 
@@ -3009,6 +3049,59 @@ impl RemoteCache {
 
 #[cfg(test)]
 mod tests {
+    /// The AoU whole-genome layout splits chrX into `chrX_par1`, `chrX_non_par`
+    /// and `chrX_par2` objects. Named order streams the body before PAR1, which
+    /// the position-sorted check rejects; chromosome order is PAR1, body, PAR2.
+    #[test]
+    fn split_chromosome_members_list_in_chromosome_order() {
+        use super::*;
+        let mut names = vec![
+            "chrX_par2.bcf",
+            "chrX_non_par.bcf",
+            "chrX_par1.bcf",
+            "chr10.bcf",
+            "chr1.bcf",
+            "chr2.bcf",
+            "chrY-NON-PAR.vcf.gz",
+            "chrY.par1.vcf.gz",
+        ];
+        names.sort_by(|a, b| compare_variant_names(a, b));
+        assert_eq!(
+            names,
+            [
+                "chr1.bcf",
+                "chr2.bcf",
+                "chr10.bcf",
+                "chrX_par1.bcf",
+                "chrX_non_par.bcf",
+                "chrX_par2.bcf",
+                "chrY.par1.vcf.gz",
+                "chrY-NON-PAR.vcf.gz",
+            ]
+        );
+        assert_eq!(
+            par_rank("acaf_threshold.chr22.bcf"),
+            ("acaf_threshold_chr22_bcf".into(), 1)
+        );
+        assert_eq!(par_rank("chrX_nonpar.bcf"), ("chrx_bcf".into(), 1));
+
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "chrX_non_par.bcf",
+            "chrX_par1.bcf",
+            "chr22.bcf",
+            "notes.txt",
+        ] {
+            std::fs::File::create(dir.path().join(name)).unwrap();
+        }
+        let listed: Vec<String> = list_variant_paths(dir.path())
+            .unwrap()
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(listed, ["chr22.bcf", "chrX_par1.bcf", "chrX_non_par.bcf"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn planned_local_reads_reassemble_ranges_and_reject_truncation() {
