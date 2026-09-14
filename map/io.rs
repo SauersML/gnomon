@@ -203,7 +203,9 @@ impl GenotypeDataset {
         path: P,
         genome_build: Option<GenomeBuild>,
     ) -> Result<Self, GenotypeIoError> {
-        let path = path.as_ref();
+        // A bare prefix names the fileset whose member exists, PLINK 1 or PLINK 2.
+        let resolved = resolve_fileset_prefix(path.as_ref());
+        let path = resolved.as_deref().unwrap_or(path.as_ref());
         if is_pgen_path(path) {
             let genome_build = genome_build.ok_or_else(|| {
                 PlinkIoError::Pipeline(PipelineError::Io(
@@ -6407,12 +6409,45 @@ fn decode_table() -> &'static [[f64; 4]; 256] {
     })
 }
 
+/// `path` as the `extension` member of its PLINK 1 fileset. A member path (`.bed`,
+/// `.bim`, `.fam`) has its extension swapped; anything else is a prefix, and the
+/// extension is appended. `Path::with_extension` would replace the last dot segment
+/// of a per-chromosome prefix such as `acaf_threshold.chr22`, and look for
+/// `acaf_threshold.bed`.
 fn normalize_path(path: &Path, extension: &str) -> PathBuf {
-    if path.extension().is_some_and(|ext| ext == extension) {
-        path.to_owned()
-    } else {
-        path.with_extension(extension)
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if ext == extension => path.to_owned(),
+        Some(ext)
+            if ["bed", "bim", "fam"]
+                .iter()
+                .any(|m| ext.eq_ignore_ascii_case(m)) =>
+        {
+            path.with_extension(extension)
+        }
+        _ => append_member_extension(path, extension),
     }
+}
+
+/// `prefix` with `.extension` appended, whatever dots the prefix holds.
+fn append_member_extension(prefix: &Path, extension: &str) -> PathBuf {
+    let mut member = prefix.as_os_str().to_os_string();
+    member.push(".");
+    member.push(extension);
+    PathBuf::from(member)
+}
+
+/// The member a bare local fileset prefix names: `<prefix>.bed` when that file
+/// exists, else `<prefix>.pgen`. `None` for a path that exists, a remote path, or a
+/// prefix with neither member, all of which open as before. `.bed` wins, as it does
+/// for `gnomon score`.
+fn resolve_fileset_prefix(path: &Path) -> Option<PathBuf> {
+    if is_remote_path(path) || path.exists() {
+        return None;
+    }
+    ["bed", "pgen"]
+        .into_iter()
+        .map(|extension| append_member_extension(path, extension))
+        .find(|member| member.is_file())
 }
 
 fn is_pgen_path(path: &Path) -> bool {
@@ -6421,15 +6456,20 @@ fn is_pgen_path(path: &Path) -> bool {
         .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "pgen" | "pvar" | "psam"))
 }
 
+/// The `.pgen`, `.pvar` and `.psam` of the PLINK 2 fileset `path` names, by member
+/// or by prefix. The member extensions are appended to the prefix: swapping them in
+/// with `Path::with_extension` would turn `acaf_threshold.chr22.pgen` into
+/// `acaf_threshold.pvar`.
 fn normalize_pgen_paths(path: &Path) -> (PathBuf, PathBuf, PathBuf) {
-    let base = match path.file_stem() {
-        Some(stem) => path.with_file_name(stem),
-        None => path.to_owned(),
+    let prefix = if is_pgen_path(path) {
+        path.with_extension("")
+    } else {
+        path.to_owned()
     };
     (
-        base.with_extension("pgen"),
-        base.with_extension("pvar"),
-        base.with_extension("psam"),
+        append_member_extension(&prefix, "pgen"),
+        append_member_extension(&prefix, "pvar"),
+        append_member_extension(&prefix, "psam"),
     )
 }
 
@@ -7845,6 +7885,87 @@ X\t3000100\tds\tA\tG\t.\tPASS\t.\tGT:DS\t1:1\t0:0.25\t0/1:1\t1|1:2\t.:.
             }
             other => panic!("expected unsorted-position error, got {other:?}"),
         }
+    }
+
+    /// Member paths are built by appending, so a per-chromosome name such as
+    /// `acaf_threshold.chr22` keeps its last dot segment.
+    #[test]
+    fn fileset_members_keep_dotted_prefixes() {
+        let d = Path::new("/data");
+        assert_eq!(
+            normalize_path(&d.join("acaf_threshold.chr22"), "bed"),
+            d.join("acaf_threshold.chr22.bed")
+        );
+        assert_eq!(normalize_path(&d.join("mini"), "bed"), d.join("mini.bed"));
+        assert_eq!(
+            normalize_path(&d.join("mini.bed"), "bed"),
+            d.join("mini.bed")
+        );
+        assert_eq!(
+            normalize_path(&d.join("mini.bim"), "bed"),
+            d.join("mini.bed")
+        );
+        assert_eq!(
+            normalize_path(&d.join("mini.FAM"), "bed"),
+            d.join("mini.bed")
+        );
+
+        let members = |stem: &str| {
+            (
+                d.join(format!("{stem}.pgen")),
+                d.join(format!("{stem}.pvar")),
+                d.join(format!("{stem}.psam")),
+            )
+        };
+        assert_eq!(
+            normalize_pgen_paths(&d.join("acaf_threshold.chr22.pgen")),
+            members("acaf_threshold.chr22")
+        );
+        assert_eq!(
+            normalize_pgen_paths(&d.join("acaf_threshold.chr22.psam")),
+            members("acaf_threshold.chr22")
+        );
+        assert_eq!(
+            normalize_pgen_paths(&d.join("cohort.pvar")),
+            members("cohort")
+        );
+    }
+
+    /// A bare prefix names the fileset whose member exists: `.bed` first, then
+    /// `.pgen`. Existing paths, remote paths and prefixes with no member are left
+    /// as they are.
+    #[test]
+    fn bare_prefixes_resolve_to_the_member_that_exists() {
+        let dir = tempdir().unwrap();
+        let touch = |name: &str| {
+            let path = dir.path().join(name);
+            fs::write(&path, b"").unwrap();
+            path
+        };
+        let bed = touch("cohort.chr22.bed");
+        let pgen = touch("panel.chr1.pgen");
+        touch("both.bed");
+        touch("both.pgen");
+
+        assert_eq!(
+            resolve_fileset_prefix(&dir.path().join("cohort.chr22")),
+            Some(bed.clone())
+        );
+        assert_eq!(
+            resolve_fileset_prefix(&dir.path().join("panel.chr1")),
+            Some(pgen)
+        );
+        assert_eq!(
+            resolve_fileset_prefix(&dir.path().join("both")),
+            Some(dir.path().join("both.bed"))
+        );
+        assert_eq!(resolve_fileset_prefix(&bed), None);
+        assert_eq!(resolve_fileset_prefix(dir.path()), None);
+        assert_eq!(resolve_fileset_prefix(&dir.path().join("missing")), None);
+        assert_eq!(
+            resolve_fileset_prefix(Path::new("gs://bucket/cohort.chr22")),
+            None
+        );
     }
 
     #[test]
