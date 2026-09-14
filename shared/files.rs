@@ -229,6 +229,8 @@ pub struct BedSource {
     mmap: Option<Arc<Mmap>>,
     /// Exact range requests against a remote `.bed`, from which read plans are built.
     fetch: Option<SegmentFetch>,
+    /// Every byte of a remote `.bed` that was read whole when opened.
+    whole: Option<Arc<Vec<u8>>>,
 }
 
 impl BedSource {
@@ -237,6 +239,7 @@ impl BedSource {
             byte_source,
             mmap,
             fetch: None,
+            whole: None,
         }
     }
 
@@ -245,6 +248,7 @@ impl BedSource {
             byte_source,
             mmap: None,
             fetch: None,
+            whole: None,
         }
     }
 
@@ -277,6 +281,7 @@ impl BedSource {
             }),
             mmap: None,
             fetch: self.fetch.clone(),
+            whole: None,
         }
     }
 
@@ -288,13 +293,20 @@ impl BedSource {
         self.mmap.as_ref().map(Arc::clone)
     }
 
+    /// `len` bytes from `offset`, borrowed without a read: from the local
+    /// mapping, or from a remote `.bed` read whole when opened, so that both
+    /// decode on the same path. [`Self::mmap`] stays local-only.
     pub fn mmap_slice(&self, offset: usize, len: usize) -> Option<&[u8]> {
-        let mmap = self.mmap.as_ref()?;
+        let bytes: &[u8] = match (&self.mmap, &self.whole) {
+            (Some(mmap), _) => mmap,
+            (None, Some(whole)) => whole,
+            (None, None) => return None,
+        };
         let end = offset.checked_add(len)?;
-        if end > mmap.len() {
+        if end > bytes.len() {
             return None;
         }
-        Some(&mmap[offset..end])
+        Some(&bytes[offset..end])
     }
 
     pub fn len(&self) -> u64 {
@@ -372,18 +384,21 @@ pub fn open_bed_source(
     }
 }
 
-/// A remote `.bed` no larger than one block is read whole when opened: one
-/// request serves its header and every row, as the block reader's first block
-/// did, and no plan can need fewer. A larger one keeps its range fetcher so
-/// that callers can plan exact row reads, and its header is checked with one
-/// three-byte request rather than a block of genotypes.
+/// A remote `.bed` no larger than one block, and within the prefetch window
+/// this machine's memory allows, is read whole when opened: one request serves
+/// its header and every row, as the block reader's first block did, no plan
+/// can need fewer, and its payload is then borrowed like a local mapping. A
+/// larger one keeps its range fetcher so that callers can plan exact row reads,
+/// and its header is checked with one three-byte request rather than a block
+/// of genotypes.
 fn remote_bed_source(
     path: &Path,
     byte_source: Arc<dyn ByteRangeSource>,
     fetch: SegmentFetch,
 ) -> Result<BedSource, PipelineError> {
     let len = byte_source.len();
-    let whole = len <= REMOTE_BLOCK_SIZE as u64;
+    let window = crate::range_fetch::remote_limits().window_bytes as u64;
+    let whole = len <= (REMOTE_BLOCK_SIZE as u64).min(window);
     let header = match len {
         0..3 => Vec::new(),
         _ if whole => fetch(0, len as usize)?,
@@ -391,15 +406,21 @@ fn remote_bed_source(
     };
     validate_plink_bed_header(&header, path).map_err(PipelineError::Io)?;
     if whole {
-        return Ok(BedSource::new(
-            Arc::new(MemoryByteRangeSource { bytes: header }),
-            None,
-        ));
+        let bytes = Arc::new(header);
+        return Ok(BedSource {
+            byte_source: Arc::new(MemoryByteRangeSource {
+                bytes: Arc::clone(&bytes),
+            }),
+            mmap: None,
+            fetch: None,
+            whole: Some(bytes),
+        });
     }
     Ok(BedSource {
         byte_source,
         mmap: None,
         fetch: Some(fetch),
+        whole: None,
     })
 }
 
@@ -1659,7 +1680,7 @@ impl ByteRangeSource for MmapByteRangeSource {
 
 /// A remote object small enough to have been read whole, served from memory.
 struct MemoryByteRangeSource {
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
 }
 
 impl ByteRangeSource for MemoryByteRangeSource {
@@ -2919,6 +2940,11 @@ mod tests {
             .expect("small remote BED");
         server.join().expect("one length probe and one whole-object range");
         assert!(!source.supports_read_plan());
+        // The payload is borrowed like a mapping, so decoding takes the local
+        // path, while the source still does not claim to be a local file.
+        assert!(source.mmap().is_none());
+        assert_eq!(source.mmap_slice(3, 8), Some(&b"abcdefgh"[..]));
+        assert_eq!(source.mmap_slice(7, 5), None);
         let mut row = [0; 4];
         source.read_at(3, &mut row).expect("unrequired row from memory");
         assert_eq!(&row, b"abcd");
