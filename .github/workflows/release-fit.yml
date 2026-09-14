@@ -176,8 +176,13 @@ jobs:
       - name: Run hail PCA warmup
         run: |
           set -euo pipefail
+          # The gnomon legs fit the GSAv2 panel, so hail imports the same sites.
+          # Importing every sequenced variant did not finish in 6 h here (run 34806663406).
+          curl -sSfL --retry 3 -o GSAv2_hg38.tsv \
+            https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv
           python scripts/hail_pca.py \
             --data-path gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/*.bcf \
+            --sites GSAv2_hg38.tsv \
             2>&1 | tee hail_pca.log
 
       - name: Upload warmup log

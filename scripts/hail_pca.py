@@ -224,10 +224,39 @@ def _guess_reference_from_header(header: "pysam.libcbcf.VariantHeader") -> Optio
     return "GRCh37"
 
 
+def _normalize_contig(contig: str) -> str:
+    return contig[3:] if contig.startswith("chr") else contig
+
+
+def _load_sites(path: str) -> dict[str, set[int]]:
+    """Read a CHROM/POS table, such as GSAv2_hg38.tsv, into positions per contig.
+
+    Contigs are compared without a leading ``chr``, so ``1`` in the table matches
+    ``chr1`` in the BCFs. Rows whose POS is not an integer (the header) are skipped.
+    """
+    sites: dict[str, set[int]] = {}
+    with open(path) as handle:
+        for line in handle:
+            fields = line.split()
+            if len(fields) < 2 or not fields[1].isdigit():
+                continue
+            sites.setdefault(_normalize_contig(fields[0]), set()).add(int(fields[1]))
+    if not sites:
+        raise ValueError(f"No CHROM/POS sites could be read from '{path}'.")
+    return sites
+
+
 def _convert_single_bcf(
-    source: str, destination_directory: Path, index: int
+    source: str,
+    destination_directory: Path,
+    index: int,
+    sites: Optional[dict[str, set[int]]] = None,
 ) -> tuple[Path, Optional[str]]:
-    """Convert a single BCF *source* into a bgzipped VCF within *destination_directory*."""
+    """Convert a single BCF *source* into a bgzipped VCF within *destination_directory*.
+
+    With *sites*, only records at listed positions are written, so import, checkpoint
+    and PCA work on the panel instead of every sequenced variant.
+    """
 
     local_bcf = destination_directory / f"input_{index}.bcf"
     logging.info("Copying %s to %s for conversion", source, local_bcf)
@@ -249,8 +278,20 @@ def _convert_single_bcf(
                 writer.set_threads(threads)
             except AttributeError:  # pragma: no cover - older pysam versions
                 pass
+            kept = 0
+            current_contig: Optional[str] = None
+            allowed: set[int] = set()
             for record in reader:
+                if sites is not None:
+                    if record.chrom != current_contig:
+                        current_contig = record.chrom
+                        allowed = sites.get(_normalize_contig(current_contig), set())
+                    if record.pos not in allowed:
+                        continue
                 writer.write(record)
+                kept += 1
+    if sites is not None:
+        logging.info("Kept %d records at listed sites from %s", kept, source)
 
     logging.info("Indexing converted VCF %s", dest_path)
     pysam.tabix_index(str(dest_path), preset="vcf", force=True)
@@ -321,7 +362,9 @@ def _conversion_chunk_size(total_files: int, workers: int) -> int:
     return default_chunk
 
 
-def _import_bcf_as_matrix_table(pattern: str) -> hl.MatrixTable:
+def _import_bcf_as_matrix_table(
+    pattern: str, sites: Optional[dict[str, set[int]]] = None
+) -> hl.MatrixTable:
     """Import BCF inputs matching *pattern* by converting them incrementally to VCF."""
 
     matches = _list_matching_variant_paths(pattern)
@@ -353,7 +396,7 @@ def _import_bcf_as_matrix_table(pattern: str) -> hl.MatrixTable:
             if index >= len(matches):
                 break
             source = matches[index]
-            future = executor.submit(_convert_single_bcf, source, temp_dir, index)
+            future = executor.submit(_convert_single_bcf, source, temp_dir, index, sites)
             scheduled.append((source, future))
         return scheduled
 
@@ -491,18 +534,24 @@ def _spark_conf_for_path(path: str) -> dict[str, str]:
     return {}
 
 
-def _read_genotypes(path: str) -> hl.MatrixTable:
+def _read_genotypes(
+    path: str, sites: Optional[dict[str, set[int]]] = None
+) -> hl.MatrixTable:
     """Read genotype data from either a MatrixTable or variant inputs."""
 
-    if path.endswith(".mt"):
+    variant_path, variant_format = (
+        (path, "mt") if path.endswith(".mt") else _resolve_variant_path(path)
+    )
+    if sites is not None and variant_format != "bcf":
+        raise ValueError("--sites filters BCF inputs only; convert the input to BCF first.")
+
+    if variant_format == "mt":
         logging.info("Reading MatrixTable from %s", path)
         return hl.read_matrix_table(path)
 
-    variant_path, variant_format = _resolve_variant_path(path)
-
     if variant_format == "bcf":
         logging.info("Importing BCFs from %s", variant_path)
-        return _import_bcf_as_matrix_table(variant_path)
+        return _import_bcf_as_matrix_table(variant_path, sites)
 
     logging.info("Importing VCFs from %s", variant_path)
     reference = _infer_reference_genome(variant_path)
@@ -539,6 +588,7 @@ def run_pca(
     data_path: str,
     output_prefix: str,
     n_pcs: int,
+    sites_path: Optional[str] = None,
 ) -> None:
     """Run PCA on the provided data and export the results."""
 
@@ -550,7 +600,15 @@ def run_pca(
     )
     hl.init(spark_conf=_spark_conf_for_path(data_path))
 
-    mt = _read_genotypes(data_path)
+    sites = None
+    if sites_path is not None:
+        sites = _load_sites(sites_path)
+        logging.info(
+            "Restricting PCA to %d listed sites from %s",
+            sum(len(positions) for positions in sites.values()),
+            sites_path,
+        )
+    mt = _read_genotypes(data_path, sites)
 
     if "GT" not in mt.entry:
         raise ValueError("Genotype MatrixTable must contain a 'GT' entry field")
@@ -589,6 +647,14 @@ def parse_args(args: List[str] | None = None) -> argparse.Namespace:
         help="Number of principal components to compute.",
     )
     parser.add_argument(
+        "--sites",
+        default=None,
+        help=(
+            "CHROM/POS table (for example GSAv2_hg38.tsv) restricting PCA to those "
+            "positions. BCF inputs only."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
@@ -604,6 +670,7 @@ def main(argv: List[str] | None = None) -> None:
         args.data_path,
         args.output_prefix,
         args.num_pcs,
+        args.sites,
     )
 
 
