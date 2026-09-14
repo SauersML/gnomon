@@ -1412,6 +1412,10 @@ fn run_small_keep_direct_single_file(
     pb.set_position(resume_from as u64);
     let mut scratch = [0u8; 1];
     let mut processed_since_update = 0u64;
+    // One handle on the map for the whole loop: cloning it per genotype costs an
+    // atomic reference-count update each time.
+    let mmap = bed_source.mmap();
+    let mapped = mmap.as_deref();
 
     for (i, &bim_row_idx) in prep_result.required_bim_indices.iter().enumerate() {
         if i < resume_from {
@@ -1443,7 +1447,7 @@ fn run_small_keep_direct_single_file(
             let byte_offset = row_base
                 .checked_add((fam_idx / 4) as u64)
                 .ok_or_else(|| PipelineError::Compute("PLINK byte offset overflow.".to_string()))?;
-            let byte = if let Some(mmap) = bed_source.mmap() {
+            let byte = if let Some(mmap) = mapped {
                 *mmap.get(byte_offset as usize).ok_or_else(|| {
                     PipelineError::Io(format!(
                         "Fatal: Attempted to read past the end of the .bed source for variant at BIM row {}.",
@@ -1545,6 +1549,8 @@ fn run_small_keep_direct_multi_file(
             .checked_add(prep_result.bytes_per_variant)
             .ok_or_else(|| PipelineError::Compute("PLINK row end overflow.".to_string()))?;
         let bed_source = &bed_sources[current_fileset_idx];
+        let mmap = bed_source.mmap();
+        let mapped = mmap.as_deref();
         if row_end > bed_source.len() {
             return Err(PipelineError::Io(format!(
                 "Fatal: Read past end of .bed source '{}' for variant with global index {}. Source may be corrupt.",
@@ -1558,7 +1564,7 @@ fn run_small_keep_direct_multi_file(
             let byte_offset = row_base
                 .checked_add((fam_idx / 4) as u64)
                 .ok_or_else(|| PipelineError::Compute("PLINK byte offset overflow.".to_string()))?;
-            let byte = if let Some(mmap) = bed_source.mmap() {
+            let byte = if let Some(mmap) = mapped {
                 *mmap.get(byte_offset as usize).ok_or_else(|| {
                     PipelineError::Io(format!(
                         "Fatal: Read past end of .bed source '{}' for variant with global index {}.",
