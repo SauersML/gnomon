@@ -1,5 +1,6 @@
 """Compare uncached full-marker compilers on MSI using the existing warm artifacts."""
 from build_cached_probe import build, root
+import sys
 
 # Add a benchmark entry point to an MSI-only source copy, without changing the
 # production API or disabling content validation in the shipped cache path.
@@ -16,9 +17,14 @@ source = source.replace('pub use gnomon::{pipeline_error, score};',
 source = source.replace(
     'score::prepare::prepare_for_computation(&args[..1], &files, None, None).unwrap()',
     'candidate_prepare::compile_uncached(&args[..1], &files)')
+cached = sys.argv[1:] == ['--cached']
+if cached:
+    source = source.replace('before_prepare::prepare_for_computation(', 'gnomon::score::prepare::prepare_for_computation(')
+    source = source.replace('candidate_prepare::compile_uncached(&args[..1], &files)',
+        'candidate_prepare::prepare_for_computation(&args[..1], &files, None, None).unwrap()')
 probe = root / 'cold_wide_plan.rs'
 probe.write_text(source)
 try:
-    build(probe, 'cold-wide-plan', ['-C', 'panic=abort'])
+    build(probe, 'cached-wide-plan' if cached else 'cold-wide-plan', ['-C', 'panic=abort'])
 finally:
     candidate.unlink()

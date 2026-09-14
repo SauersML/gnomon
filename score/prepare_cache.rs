@@ -6,6 +6,7 @@ use crate::score::types::{
     ScoreColumnIndex, ScoreInfo,
 };
 use memmap2::MmapOptions;
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -16,6 +17,45 @@ use std::{
 
 const MAGIC: &[u8] = b"GNOMON_VARIANT_PLAN_1\n";
 const MAX_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const HASH_CHUNK_BYTES: usize = 256 * 1024;
+const MAX_HASH_CHUNKS: usize = 4;
+
+// Fixed chunk boundaries make the identity independent of worker count, read
+// sizes, and the memory budget. Read a bounded window, hash its chunks in
+// parallel, then incorporate their digests in input order.
+fn hash_contents(
+    reader: &mut impl Read,
+    len: u64,
+    buffer: &mut [u8],
+    hash: &mut Sha256,
+) -> io::Result<()> {
+    debug_assert!(!buffer.is_empty() && buffer.len() % HASH_CHUNK_BYTES == 0);
+    debug_assert!(buffer.len() <= HASH_CHUNK_BYTES * MAX_HASH_CHUNKS);
+    hash.update(len.to_le_bytes());
+    let mut remaining = len;
+    let mut digests = [[0u8; 32]; MAX_HASH_CHUNKS];
+    while remaining != 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        reader.read_exact(&mut buffer[..count])?;
+        let chunks = count.div_ceil(HASH_CHUNK_BYTES);
+        if chunks == 1 {
+            digests[0] = Sha256::digest(&buffer[..count]).into();
+        } else {
+            digests[..chunks]
+                .par_iter_mut()
+                .zip(buffer[..count].par_chunks(HASH_CHUNK_BYTES))
+                .for_each(|(digest, bytes)| *digest = Sha256::digest(bytes).into());
+        }
+        for digest in &digests[..chunks] {
+            hash.update(digest);
+        }
+        remaining -= count as u64;
+    }
+    if reader.read(&mut [0u8; 1])? != 0 {
+        return Err(invalid("Variant input grew during content hashing"));
+    }
+    Ok(())
+}
 
 pub(super) struct VariantPlan {
     pub weights: Vec<f32>,
@@ -63,6 +103,19 @@ impl PlanCache {
         let Some(directory) = dirs::cache_dir() else {
             return Ok(None);
         };
+        let (_, available) = crate::memory::memory_bytes();
+        let chunks = rayon::current_num_threads()
+            .min(MAX_HASH_CHUNKS)
+            .min((available / 64 / HASH_CHUNK_BYTES as u64).min(MAX_HASH_CHUNKS as u64) as usize)
+            .min(input_bytes.div_ceil(HASH_CHUNK_BYTES as u64).max(1) as usize);
+        if chunks == 0 {
+            return Ok(None);
+        }
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(chunks * HASH_CHUNK_BYTES)
+            .map_err(|_| invalid("Cannot allocate content hash window"))?;
+        buffer.resize(chunks * HASH_CHUNK_BYTES, 0);
         let mut hash = Sha256::new();
         hash.update(MAGIC);
         // Compiler changes invalidate plans automatically, including changes
@@ -75,17 +128,10 @@ impl PlanCache {
             scores.iter().map(PathBuf::as_path).collect(),
         ] {
             hash.update((paths.len() as u64).to_le_bytes());
-            let mut buffer = [0u8; 64 * 1024];
             for path in paths {
                 let mut file = File::open(path)?;
-                hash.update(file.metadata()?.len().to_le_bytes());
-                loop {
-                    let count = file.read(&mut buffer)?;
-                    if count == 0 {
-                        break;
-                    }
-                    hash.update(&buffer[..count]);
-                }
+                let len = file.metadata()?.len();
+                hash_contents(&mut file, len, &mut buffer, &mut hash)?;
             }
         }
         let mut filters: Vec<_> = regions.into_iter().flat_map(|r| r.iter()).collect();
@@ -439,6 +485,64 @@ mod tests {
     }
 
     use std::path::Path;
+
+    #[test]
+    fn chunk_hash_is_independent_of_window_and_short_reads() {
+        struct ShortReads<'a>(&'a [u8]);
+        impl Read for ShortReads<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let count = buffer.len().min(1237);
+                self.0.read(&mut buffer[..count])
+            }
+        }
+        let mut data = vec![0u8; HASH_CHUNK_BYTES * 5 + 37];
+        for (index, byte) in data.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let mut expected = Sha256::new();
+        expected.update((data.len() as u64).to_le_bytes());
+        for chunk in data.chunks(HASH_CHUNK_BYTES) {
+            expected.update(Sha256::digest(chunk));
+        }
+        let expected = expected.finalize();
+        for chunks in 1..=MAX_HASH_CHUNKS {
+            let mut buffer = vec![0; chunks * HASH_CHUNK_BYTES];
+            let mut hash = Sha256::new();
+            hash_contents(
+                &mut ShortReads(&data),
+                data.len() as u64,
+                &mut buffer,
+                &mut hash,
+            )
+            .unwrap();
+            assert_eq!(hash.finalize(), expected);
+        }
+        let mut buffer = vec![0; HASH_CHUNK_BYTES];
+        for index in [0, HASH_CHUNK_BYTES - 1, HASH_CHUNK_BYTES, data.len() - 1] {
+            data[index] ^= 1;
+            let mut hash = Sha256::new();
+            hash_contents(
+                &mut data.as_slice(),
+                data.len() as u64,
+                &mut buffer,
+                &mut hash,
+            )
+            .unwrap();
+            assert_ne!(hash.finalize(), expected);
+            data[index] ^= 1;
+        }
+        for len in [data.len() - 1, data.len() + 1] {
+            assert!(
+                hash_contents(
+                    &mut data.as_slice(),
+                    len as u64,
+                    &mut buffer,
+                    &mut Sha256::new()
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn content_key_detects_same_size_same_timestamp_edits_and_regions() {

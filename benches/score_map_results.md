@@ -26,6 +26,18 @@ are retained in `real-genome/round6-mixed32` to avoid shared fixture cleanup.
 
 ## Content-addressed compiled plans
 
+The subsequent hashing revision uses fixed 256 KiB content chunks, hashing at
+most four concurrently within a reusable window capped at 1 MiB and 1/64 of
+available memory. Chunk identities are independent of worker count and window
+size. Short reads, changed boundary bytes, truncation, and growth are tested;
+all source bytes are still verified on every lookup. Thirty-eight focused
+checks pass. Paired warm preparation checks measured 134–136 ms before versus
+71–101 ms after for PGS000018, and 543–555 ms versus 332–433 ms for 32 PGS
+files. Compiled values and the wide panel's final arrays matched exactly.
+These are two warm observations following cache creation, not broad medians.
+Logs use the `round7-` prefix; `cold_wide_plan.py --cached` builds the paired
+wide-cache probe.
+
 Local BIM inputs can now reuse a compiled variant plan across cohort sizes,
 keep lists, and file locations. Every lookup hashes the complete BIM and
 normalized score contents, score order, region filters, and compiler source
