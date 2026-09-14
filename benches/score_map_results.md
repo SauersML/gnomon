@@ -24,13 +24,21 @@ Every weight bit, missing-correction bit, column index, row offset, and complex
 flag matched the expected permutation. The allocation figures measure live
 Rust allocation bytes above the starting value, not process RSS.
 
+Construction of that same CSR was checked separately to avoid moving the cost
+into ordinary preparation. Capacity checks guard an outlined fallible growth
+routine; after they establish available slots, direct writes avoid a second,
+infallible reserve path. Six alternating before/after pairs took median 62.87 ms
+before and 58.92 ms after, with identical bits and identical 117.44 MB peak
+extra allocation. The first implementation called reservation machinery on
+every contribution and was substantially slower; it is not the final path.
+
 `benches/csr_reorder_probe.py` extracts both production CSR builders and reuses
 the MSI compilation cache. Its allocator-injection checks passed for constructor,
 all three contribution-array growth points, row-offset growth, and all seven
 reorder allocation points. Failed contribution growth preserves parallel lengths;
 ordered rows allocate nothing. Empty rows, signed zero, and invalid row metadata
-are also checked. Logs use `round16-` in the MSI iteration directory. The wider
-preparation integration check remains pending after a VPN session failure.
+are also checked. All 42 focused preparation, scoring, and memory tests passed
+in the warm MSI harness. Logs use `round16-` in the MSI iteration directory.
 
 ## Independent source-weight accuracy audit
 

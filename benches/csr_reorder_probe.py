@@ -1,7 +1,8 @@
 """Build the actual CSR builders against warm MSI dependencies, including OOM injection.
 
 Arguments: previous prepare.rs, candidate prepare.rs. The resulting executable
-takes: baseline|candidate|failures BED-prefix normalized-score-directory identity|reverse.
+takes: baseline|candidate|paired|failures BED-prefix normalized-score-directory identity|reverse|growth.
+The paired mode alternates old/new growth runs over the same prepared data.
 """
 from pathlib import Path
 import sys
@@ -94,15 +95,25 @@ failures = r'''
 pub fn failures() {
     crate::FAIL_AFTER.store(0, crate::SeqCst);
     assert!(CsrBuilder::new().is_err());
-    for allocation in 0..3 {
-        let mut csr = CsrBuilder::new().unwrap();
-        crate::FAIL_AFTER.store(allocation, crate::SeqCst);
-        assert!(csr.push_contribution(ScoreColumnIndex(0), SimpleScoreAssignment {
-            dosage_weight: 1.0, missing_correction: -0.0
-        }).is_err());
-        assert!(csr.sparse_weights.is_empty());
-        assert!(csr.sparse_missing_corrections.is_empty());
-        assert!(csr.sparse_score_columns.is_empty());
+    for filled in [0, 4, 16] {
+        for allocation in 0..3 {
+            let mut csr = CsrBuilder::new().unwrap();
+            for _ in 0..filled {
+                csr.push_contribution(ScoreColumnIndex(0), SimpleScoreAssignment {
+                    dosage_weight: 1.0, missing_correction: -0.0
+                }).unwrap();
+            }
+            assert_eq!(csr.sparse_weights.len(), csr.sparse_weights.capacity());
+            crate::FAIL_AFTER.store(allocation, crate::SeqCst);
+            assert!(csr.push_contribution(ScoreColumnIndex(0), SimpleScoreAssignment {
+                dosage_weight: 1.0, missing_correction: -0.0
+            }).is_err());
+            assert_eq!(csr.sparse_weights.len(), filled);
+            assert_eq!(csr.sparse_missing_corrections.len(), filled);
+            assert_eq!(csr.sparse_score_columns.len(), filled);
+            assert!(csr.sparse_weights.iter().all(|v| *v == 1.0));
+            assert!(csr.sparse_missing_corrections.iter().all(|v| v.to_bits() == (-0.0f32).to_bits()));
+        }
     }
     let mut csr = CsrBuilder::new().unwrap();
     crate::FAIL_AFTER.store(0, crate::SeqCst);
@@ -154,10 +165,42 @@ pub fn failures() {
 }
 '''
 
+growth = r'''
+pub fn growth(prep: &PreparationResult) {
+    let before = crate::LIVE.load(crate::SeqCst);
+    crate::PEAK.store(before, crate::SeqCst);
+    let started = std::time::Instant::now();
+    let mut csr = CONSTRUCTOR;
+    for row in prep.sparse_row_offsets().windows(2) {
+        for entry in row[0] as usize..row[1] as usize {
+            csr.push_contribution(ScoreColumnIndex(prep.sparse_score_columns()[entry] as usize),
+                SimpleScoreAssignment {
+                    dosage_weight: prep.sparse_weights()[entry],
+                    missing_correction: prep.sparse_missing_corrections()[entry],
+                }).unwrap();
+        }
+        csr.finish_variant().unwrap();
+    }
+    let elapsed = started.elapsed();
+    let peak = crate::PEAK.load(crate::SeqCst).saturating_sub(before);
+    let (weights, corrections, columns, offsets) = csr.into_parts();
+    assert!(weights.iter().zip(prep.sparse_weights()).all(|(a,b)| a.to_bits() == b.to_bits()));
+    assert!(corrections.iter().zip(prep.sparse_missing_corrections()).all(|(a,b)| a.to_bits() == b.to_bits()));
+    assert_eq!(weights.len(), prep.sparse_weights().len());
+    assert_eq!(corrections.len(), prep.sparse_missing_corrections().len());
+    assert_eq!(columns, prep.sparse_score_columns());
+    assert_eq!(offsets, prep.sparse_row_offsets());
+    println!("rows={} nnz={} growth_ms={:.3} peak_extra_bytes={peak} all_bits_match=true",
+        prep.required_bim_indices.len(), weights.len(), elapsed.as_secs_f64() * 1000.0);
+}
+'''
+
 source = allocator
 imports = 'use gnomon::score::{prepare::PrepError, types::{BimRowIndex, ScoreColumnIndex, PreparationResult}};\n'
 for name, path in zip(['baseline', 'candidate'], sys.argv[1:]):
     source += 'mod ' + name + ' {\n' + imports + builder(path) + exercise
+    constructor = 'CsrBuilder::with_capacity(0, 0)' if name == 'baseline' else 'CsrBuilder::new().unwrap()'
+    source += growth.replace('CONSTRUCTOR', constructor)
     if name == 'candidate':
         source += failures
     source += '}\n'
@@ -172,6 +215,28 @@ fn main() {
         .collect();
     files.sort();
     let prep = gnomon::score::prepare::prepare_for_computation(&[args[1].clone().into()], &files, None, None).unwrap();
+    if args[3] == "growth" {
+        if args[0] == "paired" {
+            for rep in 0..6 {
+                if rep % 2 == 0 {
+                    print!("baseline rep={rep} "); baseline::growth(&prep);
+                    print!("candidate rep={rep} "); candidate::growth(&prep);
+                } else {
+                    print!("candidate rep={rep} "); candidate::growth(&prep);
+                    print!("baseline rep={rep} "); baseline::growth(&prep);
+                }
+            }
+            return;
+        }
+        for _ in 0..3 {
+            match args[0].as_str() {
+                "baseline" => baseline::growth(&prep),
+                "candidate" => candidate::growth(&prep),
+                _ => panic!("unknown implementation"),
+            }
+        }
+        return;
+    }
     let reverse = match args[3].as_str() { "identity" => false, "reverse" => true, _ => panic!("unknown order") };
     for _ in 0..3 {
         match args[0].as_str() {

@@ -205,9 +205,9 @@ struct CsrBuilder {
 impl CsrBuilder {
     fn new() -> Result<Self, PrepError> {
         let mut sparse_row_offsets = Vec::<u64>::new();
-        sparse_row_offsets.try_reserve_exact(1).map_err(|e| {
-            PrepError::Invariant(format!("Cannot allocate CSR row offsets: {e}"))
-        })?;
+        sparse_row_offsets
+            .try_reserve_exact(1)
+            .map_err(|e| PrepError::Invariant(format!("Cannot allocate CSR row offsets: {e}")))?;
         sparse_row_offsets.push(0);
         Ok(Self {
             sparse_weights: Vec::new(),
@@ -217,6 +217,7 @@ impl CsrBuilder {
         })
     }
 
+    #[inline(always)]
     fn push_contribution(
         &mut self,
         score_col_idx: ScoreColumnIndex,
@@ -230,22 +231,50 @@ impl CsrBuilder {
         })?;
         // Reserve every parallel array before changing any length. Vec::push
         // alone would abort on allocation failure while growing a large panel.
-        self.sparse_score_columns.try_reserve(1).map_err(|e| {
-            PrepError::Invariant(format!("Cannot grow CSR score columns: {e}"))
-        })?;
-        self.sparse_weights.try_reserve(1).map_err(|e| {
-            PrepError::Invariant(format!("Cannot grow CSR weights: {e}"))
-        })?;
-        self.sparse_missing_corrections.try_reserve(1).map_err(|e| {
-            PrepError::Invariant(format!("Cannot grow CSR missing corrections: {e}"))
-        })?;
-        self.sparse_score_columns.push(col_u32);
-        self.sparse_weights.push(assignment.dosage_weight);
-        self.sparse_missing_corrections
-            .push(assignment.missing_correction);
+        if self.sparse_score_columns.len() == self.sparse_score_columns.capacity()
+            || self.sparse_weights.len() == self.sparse_weights.capacity()
+            || self.sparse_missing_corrections.len() == self.sparse_missing_corrections.capacity()
+        {
+            Self::reserve_entry(&mut self.sparse_score_columns, "score columns")?;
+            Self::reserve_entry(&mut self.sparse_weights, "weights")?;
+            Self::reserve_entry(&mut self.sparse_missing_corrections, "missing corrections")?;
+        }
+        // SAFETY: the capacity checks or successful reservations above establish
+        // room in every array. Nothing between those checks and these writes can
+        // consume that room. Avoid repeating Vec::push's infallible growth path.
+        unsafe {
+            Self::push_reserved(&mut self.sparse_score_columns, col_u32);
+            Self::push_reserved(&mut self.sparse_weights, assignment.dosage_weight);
+            Self::push_reserved(
+                &mut self.sparse_missing_corrections,
+                assignment.missing_correction,
+            );
+        }
         Ok(())
     }
 
+    /// The caller must establish `values.len() < values.capacity()` first.
+    #[inline(always)]
+    unsafe fn push_reserved<T>(values: &mut Vec<T>, value: T) {
+        let len = values.len();
+        debug_assert!(len < values.capacity());
+        // SAFETY: the caller reserves this uninitialized element; writing it
+        // before extending the length preserves Vec's initialization invariant.
+        unsafe {
+            values.as_mut_ptr().add(len).write(value);
+            values.set_len(len + 1);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn reserve_entry<T>(values: &mut Vec<T>, name: &'static str) -> Result<(), PrepError> {
+        values
+            .try_reserve(1)
+            .map_err(|e| PrepError::Invariant(format!("Cannot grow CSR {name}: {e}")))
+    }
+
+    #[inline(always)]
     fn finish_variant(&mut self) -> Result<(), PrepError> {
         let offset_u64 = u64::try_from(self.sparse_score_columns.len()).map_err(|_| {
             PrepError::Invariant(format!(
@@ -253,10 +282,11 @@ impl CsrBuilder {
                 self.sparse_score_columns.len()
             ))
         })?;
-        self.sparse_row_offsets.try_reserve(1).map_err(|e| {
-            PrepError::Invariant(format!("Cannot grow CSR row offsets: {e}"))
-        })?;
-        self.sparse_row_offsets.push(offset_u64);
+        if self.sparse_row_offsets.len() == self.sparse_row_offsets.capacity() {
+            Self::reserve_entry(&mut self.sparse_row_offsets, "row offsets")?;
+        }
+        // SAFETY: the capacity check or successful reservation provides one slot.
+        unsafe { Self::push_reserved(&mut self.sparse_row_offsets, offset_u64) };
         Ok(())
     }
 
@@ -1346,11 +1376,17 @@ mod tests {
         assert_eq!(csr.sparse_row_offsets, [0, 0, 2, 3]);
         assert_eq!(csr.sparse_score_columns, [0, 3, 2]);
         assert_eq!(
-            csr.sparse_weights.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            csr.sparse_weights
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
             [0.1f32, 0.2, -0.0].map(f32::to_bits),
         );
         assert_eq!(
-            csr.sparse_missing_corrections.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            csr.sparse_missing_corrections
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
             [-0.0f32, 3.0, 2.0].map(f32::to_bits),
         );
     }
