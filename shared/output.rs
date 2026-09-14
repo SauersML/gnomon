@@ -14,7 +14,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Temporary names tried before giving up. A collision needs another writer of
 /// the same destination with the same pid and clock reading.
@@ -57,7 +57,7 @@ where
         let file = writer.into_inner().map_err(io::IntoInnerError::into_error)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temp_path, dest)
+        rename_replacing(&temp_path, dest)
     })();
     if let Err(err) = published {
         let _ = fs::remove_file(&temp_path);
@@ -135,6 +135,109 @@ pub fn validate_out_prefix(prefix: &Path) -> io::Result<()> {
         return reject("names a directory, not a file prefix");
     }
     Ok(())
+}
+
+/// Fails fast, before any heavy work, when `path` could not be published: its
+/// directory, or the nearest existing ancestor it would be created in, does not
+/// let this process create files. Nothing is created. The error names `path` and
+/// suggests `--out`, because the usual cause is a default output beside
+/// read-only inputs.
+pub fn ensure_output_writable(path: &Path) -> io::Result<()> {
+    let mut dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    while !dir.exists() {
+        match dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(parent) => dir = parent,
+            None => {
+                dir = Path::new(".");
+                break;
+            }
+        }
+    }
+    let probe = dir.join(format!(".gnomon-write-probe.{}", std::process::id()));
+    match OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(&probe);
+            Ok(())
+        }
+        // Only a writable directory could hold an earlier probe from this pid.
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(io::Error::new(
+            err.kind(),
+            format!(
+                "cannot write {}: {} (the directory {} is not writable); pass --out PREFIX to write elsewhere",
+                path.display(),
+                err.kind(),
+                dir.display()
+            ),
+        )),
+    }
+}
+
+/// Pauses between attempts to replace a destination that another program holds
+/// open. On Windows a program that opened the file without FILE_SHARE_DELETE, such
+/// as an editor or a spreadsheet, makes the rename fail until it closes the file.
+const RENAME_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_millis(10),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+];
+
+/// Renames `from` over `to`, retrying while another program holds `to` open.
+pub fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
+    rename_retrying(
+        from,
+        to,
+        |from, to| fs::rename(from, to),
+        is_sharing_violation,
+        &RENAME_RETRY_DELAYS,
+    )
+}
+
+fn rename_retrying(
+    from: &Path,
+    to: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+    retryable: impl Fn(&io::Error) -> bool,
+    delays: &[Duration],
+) -> io::Result<()> {
+    let mut delays = delays.iter();
+    loop {
+        match rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(err) if retryable(&err) => match delays.next() {
+                Some(delay) => std::thread::sleep(*delay),
+                None => {
+                    return Err(io::Error::new(
+                        err.kind(),
+                        format!(
+                            "could not replace '{}': another program may have it open ({err})",
+                            to.display()
+                        ),
+                    ));
+                }
+            },
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Windows reports a destination held open by another program as a sharing or
+/// lock violation, or as access denied.
+#[cfg(windows)]
+fn is_sharing_violation(err: &io::Error) -> bool {
+    // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+    matches!(err.raw_os_error(), Some(5 | 32 | 33))
+}
+
+#[cfg(not(windows))]
+fn is_sharing_violation(_err: &io::Error) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -274,5 +377,126 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "temporary files left behind: {leftovers:?}");
         assert!(dir.path().join("cohort_w.sscore").is_file());
+    }
+}
+
+#[cfg(test)]
+mod destination_tests {
+    use super::{ensure_output_writable, rename_retrying};
+    use std::fs;
+    use std::io;
+    use std::path::Path;
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_destination_is_refused_with_the_path_and_the_way_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inputs = dir.path().join("inputs");
+        fs::create_dir(&inputs).expect("mkdir");
+        fs::set_permissions(&inputs, fs::Permissions::from_mode(0o555)).expect("chmod 555");
+        let dest = inputs.join("cohort.sex.tsv");
+        let result = ensure_output_writable(&dest);
+        fs::set_permissions(&inputs, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+        // Permission bits do not bind root, so there is nothing to observe.
+        let Err(err) = result else {
+            return;
+        };
+        let message = err.to_string();
+        assert!(message.contains(&dest.display().to_string()), "{message}");
+        assert!(message.contains("--out PREFIX"), "{message}");
+        assert_eq!(fs::read_dir(&inputs).expect("read_dir").count(), 0);
+    }
+
+    #[test]
+    fn a_missing_destination_directory_is_judged_by_its_nearest_existing_ancestor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("results").join("eur").join("cohort.sscore");
+        ensure_output_writable(&dest).expect("a writable ancestor accepts the output");
+        assert!(!dir.path().join("results").exists(), "the probe created directories");
+        assert_eq!(fs::read_dir(dir.path()).expect("read_dir").count(), 0);
+    }
+
+    #[test]
+    fn a_rename_held_up_by_another_program_is_retried() {
+        let mut attempts = 0;
+        rename_retrying(
+            Path::new("temp"),
+            Path::new("cohort.sscore"),
+            |_, _| {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(io::Error::other("held open"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| true,
+            &[Duration::ZERO; 5],
+        )
+        .expect("the third attempt succeeds");
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn a_rename_that_stays_held_names_the_file_and_the_likely_cause() {
+        let mut attempts = 0;
+        let err = rename_retrying(
+            Path::new("temp"),
+            Path::new("results/cohort.sscore"),
+            |_, _| {
+                attempts += 1;
+                Err(io::Error::other("held open"))
+            },
+            |_| true,
+            &[Duration::ZERO; 2],
+        )
+        .expect_err("the rename never succeeds");
+        assert_eq!(attempts, 3);
+        let message = err.to_string();
+        assert!(message.contains("results/cohort.sscore"), "{message}");
+        assert!(message.contains("another program may have it open"), "{message}");
+    }
+
+    #[test]
+    fn other_rename_errors_are_not_retried() {
+        let mut attempts = 0;
+        let err = rename_retrying(
+            Path::new("temp"),
+            Path::new("cohort.sscore"),
+            |_, _| {
+                attempts += 1;
+                Err(io::Error::new(io::ErrorKind::NotFound, "gone"))
+            },
+            |err| err.kind() == io::ErrorKind::PermissionDenied,
+            &[Duration::ZERO; 5],
+        )
+        .expect_err("not found is final");
+        assert_eq!(attempts, 1);
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A program holding the destination without FILE_SHARE_DELETE, as editors and
+    /// spreadsheets do, makes the publish fail with a message naming the file, and
+    /// the previous version stays.
+    #[cfg(windows)]
+    #[test]
+    fn publishing_over_a_held_file_fails_clearly_and_keeps_the_previous_version() {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("cohort.sex.tsv");
+        fs::write(&dest, b"previous\n").expect("seed");
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&dest)
+            .expect("hold the destination");
+        let err = super::write_atomically(&dest, |writer| writer.write_all(b"new\n"))
+            .expect_err("the held destination cannot be replaced");
+        drop(held);
+        assert!(err.to_string().contains("another program may have it open"), "{err}");
+        assert_eq!(fs::read(&dest).expect("read"), b"previous\n");
     }
 }

@@ -191,6 +191,15 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     if let Some(prefix) = args.out.as_deref() {
         gnomon::output::validate_out_prefix(prefix)?;
     }
+    // Nothing behind the genotype path is not a format problem, so say that
+    // before anything else runs.
+    if !genotype_input_exists(&args.input_path) {
+        return Err(format!(
+            "no such file or PLINK/PGEN fileset: {}",
+            args.input_path.display()
+        )
+        .into());
+    }
     let cache_dir = score_cache_dir(args.out.as_deref(), &args.score);
     if let Some(dir) = cache_dir.as_deref() {
         fs::create_dir_all(dir).map_err(|e| {
@@ -282,6 +291,17 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         InferredSexArg::Female => genotype_convert::ConvertSex::Female,
         InferredSexArg::Unknown => genotype_convert::ConvertSex::Unknown,
     });
+    // A converted input without --out keeps its conversion and its results in a
+    // cache directory beside the input, so refuse before converting when that
+    // location is not writable.
+    if args.out.is_none()
+        && let Some(naming_prefix) = genotype_convert::default_output_prefix(&args.input_path)
+    {
+        gnomon::output::ensure_output_writable(&fileset_output_path(
+            &naming_prefix,
+            Some(&out_suffix),
+        ))?;
+    }
     // Under --out the conversion cache joins the score-file caches under PREFIX's
     // directory, so nothing is written beside the genotypes.
     let effective_input_path = genotype_convert::ensure_plink_format_in(
@@ -412,11 +432,29 @@ fn ensure_output_absent(output_path: &Path) -> Result<(), Box<dyn Error + Send +
         )
         .into());
     }
+    // Refuse now, before preparation, when the results could not be saved: typically
+    // a default location beside read-only inputs.
+    gnomon::output::ensure_output_writable(output_path)?;
     Ok(())
 }
 
 /// Remote inputs have no local parent directory; their outputs, checkpoints
 /// and caches live in the working directory.
+/// Whether anything exists at a genotype path: a file or directory, a PLINK or
+/// PGEN fileset with this prefix, or a remote location, which only its reader
+/// can check.
+fn genotype_input_exists(path: &Path) -> bool {
+    if is_remote_prefix(path) || path.exists() {
+        return true;
+    }
+    ["bed", "pgen"].iter().any(|extension| {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(".");
+        candidate.push(extension);
+        Path::new(&candidate).exists()
+    })
+}
+
 fn is_remote_prefix(path: &Path) -> bool {
     let raw = path.to_string_lossy();
     raw.starts_with("gs://") || raw.starts_with("http://") || raw.starts_with("https://")

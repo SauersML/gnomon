@@ -355,8 +355,12 @@ pub fn infer_sex_to_tsv(
     genotype_path: &Path,
     force_build: Option<GenomeBuild>,
 ) -> Result<PathBuf, SexInferenceError> {
-    let (dataset, build, records) = infer_records(genotype_path, force_build, true)?;
+    let dataset = open_inference_dataset(genotype_path, force_build)?;
+    // Refuse before inference when the table could not be saved, typically a
+    // default location beside read-only inputs.
     let default_output = dataset.output_path("sex.tsv");
+    crate::output::ensure_output_writable(&default_output)?;
+    let (build, records) = infer_dataset_records(&dataset, force_build, true)?;
 
     write_results(&default_output, &records, build)?;
 
@@ -372,6 +376,8 @@ pub fn infer_sex_to_tsv_at(
     force_build: Option<GenomeBuild>,
     output_path: &Path,
 ) -> Result<PathBuf, SexInferenceError> {
+    // Refuse before inference when the table could not be saved.
+    crate::output::ensure_output_writable(output_path)?;
     let (_dataset, build, records) = infer_records(genotype_path, force_build, true)?;
 
     write_results(output_path, &records, build)?;
@@ -392,12 +398,28 @@ fn infer_records(
     force_build: Option<GenomeBuild>,
     show_progress: bool,
 ) -> Result<(GenotypeDataset, GenomeBuild, Vec<SexInferenceRecord>), SexInferenceError> {
+    let dataset = open_inference_dataset(genotype_path, force_build)?;
+    let (build, records) = infer_dataset_records(&dataset, force_build, show_progress)?;
+    Ok((dataset, build, records))
+}
+
+fn open_inference_dataset(
+    genotype_path: &Path,
+    force_build: Option<GenomeBuild>,
+) -> Result<GenotypeDataset, SexInferenceError> {
     let pgen_build = force_build.map(|build| match build {
         GenomeBuild::Build37 => PgenGenomeBuild::Grch37,
         GenomeBuild::Build38 => PgenGenomeBuild::Grch38,
     });
-    let dataset = GenotypeDataset::open(genotype_path, pgen_build)?;
-    let loci = match &dataset {
+    Ok(GenotypeDataset::open(genotype_path, pgen_build)?)
+}
+
+fn infer_dataset_records(
+    dataset: &GenotypeDataset,
+    force_build: Option<GenomeBuild>,
+    show_progress: bool,
+) -> Result<(GenomeBuild, Vec<SexInferenceRecord>), SexInferenceError> {
+    let loci = match dataset {
         GenotypeDataset::Plink(plink) => {
             VariantLoci::from_bim(plink).map_err(GenotypeIoError::from)?
         }
@@ -409,13 +431,13 @@ fn infer_records(
         inferred
     });
     let selection = SexVariantSelection::from_loci(&loci, build);
-    let records = match &dataset {
+    let records = match dataset {
         GenotypeDataset::Plink(plink) => {
             collect_packed_inference(plink, &selection, show_progress)?
         }
-        _ => collect_inference(&dataset, &selection, show_progress)?,
+        _ => collect_inference(dataset, &selection, show_progress)?,
     };
-    Ok((dataset, build, records))
+    Ok((build, records))
 }
 
 fn collect_inference(

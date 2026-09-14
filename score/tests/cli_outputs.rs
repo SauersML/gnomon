@@ -436,3 +436,73 @@ fn score_out_rejects_a_directory_or_remote_prefix() -> TestResult {
     assert!(!tmp.path().join("results").exists());
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn score_without_out_refuses_a_read_only_input_directory_before_scoring() -> TestResult {
+    let tmp = tempdir()?;
+    let inputs = tmp.path().join("inputs");
+    let (genotypes, score) = stage_inputs(&inputs)?;
+    let _read_only = ReadOnly::new(&inputs);
+    let before = snapshot(&inputs);
+
+    let output = Command::new(SCORE_BIN)
+        .current_dir(tmp.path())
+        .env("XDG_CACHE_HOME", tmp.path().join("xdg-cache"))
+        .arg(&score)
+        .arg(&genotypes)
+        .output()?;
+
+    // Permission bits do not bind root, so there is nothing to observe.
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot write"), "{stderr}");
+    assert!(stderr.contains("cohort_w.sscore"), "{stderr}");
+    assert!(stderr.contains("--out PREFIX"), "{stderr}");
+    assert!(!stderr.contains("> Writing"), "the run scored before refusing: {stderr}");
+    assert_eq!(snapshot(&inputs), before);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn terms_without_out_refuses_a_read_only_input_directory_before_inference() -> TestResult {
+    let tmp = tempdir()?;
+    let inputs = tmp.path().join("inputs");
+    let (genotypes, _) = stage_inputs(&inputs)?;
+    let _read_only = ReadOnly::new(&inputs);
+    let before = snapshot(&inputs);
+
+    let output = run(TERMS_BIN, tmp.path(), &[genotypes.as_os_str(), OsStr::new("--sex")]);
+
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot write"), "{stderr}");
+    assert!(stderr.contains("sex.tsv"), "{stderr}");
+    assert!(stderr.contains("--out PREFIX"), "{stderr}");
+    assert!(
+        !stderr.contains("Inferred Genome Build"),
+        "inference ran before refusing: {stderr}"
+    );
+    assert_eq!(snapshot(&inputs), before);
+    Ok(())
+}
+
+#[test]
+fn score_names_a_missing_genotype_path_as_missing() -> TestResult {
+    let tmp = tempdir()?;
+    let (_, score) = stage_inputs(&tmp.path().join("inputs"))?;
+    let missing = tmp.path().join("no_such_panel");
+
+    let output = run(SCORE_BIN, tmp.path(), &[score.as_os_str(), missing.as_os_str()]);
+
+    assert!(!output.status.success(), "a missing genotype path was accepted");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no such file or PLINK/PGEN fileset"), "{stderr}");
+    assert!(!stderr.contains("Could not determine input format"), "{stderr}");
+    Ok(())
+}

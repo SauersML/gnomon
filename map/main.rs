@@ -266,6 +266,13 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
     println!("Input genotype location: {}", genotype_path.display());
 
     let dataset = open_dataset(genotype_path, genome_build)?;
+    // Refuse before any pass over the genotypes when the model could not be saved,
+    // typically a default location beside read-only inputs.
+    let model_destination = output_prefix.map_or_else(
+        || dataset.output_path("hwe.json"),
+        |prefix| fit_artifact_path(prefix, "hwe.json"),
+    );
+    crate::output::ensure_output_writable(&model_destination).map_err(MapDriverError::Io)?;
     println!(
         "Resolved genotype data file: {}",
         dataset.data_path().display()
@@ -1767,6 +1774,16 @@ fn run_project_inner(
     crate::parallel::init_global_thread_pool();
 
     let dataset = open_dataset(genotype_path, genome_build)?;
+    // Refuse before projecting when the results could not be saved, typically a
+    // default location beside read-only inputs.
+    let scores_destination = projection_scores_override.map_or_else(
+        || dataset.output_path("projection_scores.bin"),
+        Path::to_path_buf,
+    );
+    crate::output::ensure_output_writable(&scores_destination).map_err(MapDriverError::Io)?;
+    if let Some(manifest) = output_manifest {
+        crate::output::ensure_output_writable(manifest).map_err(MapDriverError::Io)?;
+    }
     println!(
         "Resolved genotype data file: {}",
         dataset.data_path().display()
@@ -3851,5 +3868,84 @@ mod ld_marker_budget_tests {
             MapDriverError::InvalidState(message)
                 if message.contains("--markers needs an indexed genotype source")
         ));
+    }
+
+    fn plain_fit(
+        genotype_path: PathBuf,
+        output_prefix: Option<PathBuf>,
+    ) -> Result<(), MapDriverError> {
+        run(MapCommand::Fit {
+            genotype_path,
+            genome_build: None,
+            output_prefix,
+            variant_list: None,
+            keep: None,
+            markers: None,
+            components: 2,
+            threads: None,
+            allow_unconverged: true,
+            max_passes: None,
+            maf: None,
+            geno: None,
+            mind: None,
+            ld: None,
+        })
+    }
+
+    #[cfg(unix)]
+    fn set_read_only(dir: &Path, read_only: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if read_only { 0o555 } else { 0o755 };
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// `gnomon fit` and `gnomon project` on a read-only input directory refuse before
+    /// any pass over the genotypes when their results would go beside the inputs, and
+    /// succeed when given a location of their own.
+    #[cfg(unix)]
+    #[test]
+    fn fit_and_project_refuse_a_read_only_default_location_and_accept_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let inputs = dir.path().join("inputs");
+        fs::create_dir(&inputs).unwrap();
+        let bed = write_plink_fileset(&inputs);
+        // A model beside the inputs, where `gnomon project` looks by default.
+        plain_fit(bed.clone(), None).expect("fit into the writable input directory");
+
+        set_read_only(&inputs, true);
+        let fit_refused = plain_fit(bed.clone(), None);
+        let project_refused = run(MapCommand::Project {
+            genotype_path: bed.clone(),
+            genome_build: None,
+            model: None,
+            output_manifest: None,
+        });
+        let results = dir.path().join("results");
+        let fit_elsewhere = plain_fit(bed.clone(), Some(results.join("fit")));
+        let project_elsewhere = super::run_project_with_output(
+            &bed,
+            None,
+            None,
+            None,
+            &results.join("projection_scores.bin"),
+        );
+        set_read_only(&inputs, false);
+
+        // Permission bits do not bind root, so there is nothing to observe.
+        if fit_refused.is_ok() {
+            return;
+        }
+        for (label, result) in [("fit", fit_refused), ("project", project_refused)] {
+            match result {
+                Err(MapDriverError::Io(err)) => {
+                    let message = err.to_string();
+                    assert!(message.contains("cannot write"), "{label}: {message}");
+                    assert!(message.contains("--out PREFIX"), "{label}: {message}");
+                }
+                other => panic!("{label}: expected a refusal, got {other:?}"),
+            }
+        }
+        fit_elsewhere.expect("fit with --out on read-only inputs");
+        project_elsewhere.expect("project to an explicit path on read-only inputs");
     }
 }
