@@ -7,12 +7,20 @@ on:
         description: 'Number of PCA components to fit'
         required: false
         default: '20'
+      gnomon_sha:
+        description: 'Full main commit SHA whose main-<sha> release binary fits the models (default: the dispatched commit)'
+        required: false
+        default: ''
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   COMPONENTS: ${{ github.event.inputs.components || '20' }}
+  # A strict pin: install.sh refuses to substitute another release. Unpinned, it
+  # falls back to the newest published binary, and the models-v3 attempt at
+  # 55a1eb0d fitted with main-f1045116, older than the component sign convention.
+  GNOMON_INSTALL_MAIN_SHA: ${{ github.event.inputs.gnomon_sha || github.sha }}
 
 jobs:
   # Download and parse manifests (shared by array-specific jobs)
