@@ -854,6 +854,27 @@ pub fn ensure_plink_format_with_options(
     ensure_plink_format_in(input_path, reference, build, panel, options, None)
 }
 
+/// The number of samples a VCF or BCF header lists.
+fn variant_file_sample_count(
+    path: &Path,
+    format: InputFormat,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    use std::io::BufRead;
+
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let gzipped = reader.fill_buf()?.starts_with(&[0x1f, 0x8b]);
+    let header = match (format, gzipped) {
+        (InputFormat::Bcf, true) => noodles_bcf::io::Reader::new(reader).read_header()?,
+        (InputFormat::Bcf, false) => noodles_bcf::io::Reader::from(reader).read_header()?,
+        (_, true) => noodles_vcf::io::Reader::new(std::io::BufReader::new(
+            flate2::read::MultiGzDecoder::new(reader),
+        ))
+        .read_header()?,
+        (_, false) => noodles_vcf::io::Reader::new(reader).read_header()?,
+    };
+    Ok(header.sample_names().len())
+}
+
 /// Variant of [`ensure_plink_format_with_options`] that keeps the conversion cache
 /// under `cache_root` (the directory of `--out PREFIX`) instead of beside the input.
 ///
@@ -889,6 +910,17 @@ pub fn ensure_plink_format_in(
             Ok(prefix)
         }
         InputFormat::Vcf | InputFormat::Bcf => {
+            // Conversion writes one genome, so a cohort would be merged into a single
+            // sample. Refuse before anything else, a cached conversion included.
+            let sample_count = variant_file_sample_count(input_path, format)?;
+            if sample_count > 1 {
+                return Err(format!(
+                    "'{}' has {sample_count} samples, but converting a VCF or BCF writes a single-sample genome and would merge them. Score a multi-sample VCF without --panel to read it natively, or convert a multi-sample BCF to VCF.gz or PLINK first.",
+                    input_path.display()
+                )
+                .into());
+            }
+
             // Check cache validity
             let cache_fingerprint = cache_params_fingerprint(build, panel, reference);
             let cache_dir = conversion_cache_dir(input_path, cache_root);
@@ -1080,6 +1112,48 @@ pub fn ensure_plink_format_in(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Converting writes one genome, so a two-sample VCF or BCF must fail loudly
+    /// with its sample count instead of being merged into one sample.
+    #[test]
+    fn multi_sample_conversion_is_refused() {
+        use noodles_vcf::variant::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let vcf_path = dir.path().join("cohort.vcf");
+        std::fs::write(
+            &vcf_path,
+            "##fileformat=VCFv4.2\n\
+             ##contig=<ID=1>\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n\
+             1\t100\trs1\tA\tG\t.\tPASS\t.\tGT\t0/1\t1/1\n",
+        )
+        .unwrap();
+        let bcf_path = dir.path().join("cohort.bcf");
+        let mut reader = noodles_vcf::io::Reader::new(std::io::BufReader::new(
+            std::fs::File::open(&vcf_path).unwrap(),
+        ));
+        let header = reader.read_header().unwrap();
+        let mut writer = noodles_bcf::io::Writer::new(std::fs::File::create(&bcf_path).unwrap());
+        writer.write_header(&header).unwrap();
+        let mut record = noodles_vcf::variant::RecordBuf::default();
+        while reader.read_record_buf(&header, &mut record).unwrap() != 0 {
+            writer.write_variant_record(&header, &record).unwrap();
+        }
+        writer.try_finish().unwrap();
+
+        for path in [&vcf_path, &bcf_path] {
+            let error = ensure_plink_format(path, None, Some("GRCh38"), None)
+                .expect_err("a two-sample input must be refused")
+                .to_string();
+            assert!(
+                error.contains("has 2 samples"),
+                "{}: {error}",
+                path.display()
+            );
+        }
+    }
 
     #[test]
     fn decompress_gz_reads_every_bgzf_member_and_refuses_a_cut_file() {
