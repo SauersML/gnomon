@@ -29,11 +29,15 @@ The semantics follow `score_oracle` (gnomon at a5f27055):
 - Every weight of score `s` is an f64, so it is an integer multiple of `2^exp[s]`.
   Scaling by the lcm of the complex-resolution denominators makes every person's sum an
   integer, accumulated exactly.
-- The quotient is taken once in double-double, as `score_oracle` takes it, so `_AVG` is
-  the oracle's value bit for bit.
+- The quotient is taken once in double-double, which is usually but not always the
+  correctly rounded value. On 2026-09-14 `score_oracle` switched to gnomon's output
+  arithmetic, dividing the correctly rounded exact sum by the used count, so gscore and the
+  current oracle can differ by 1 ulp on rare cells. Compare with `--tol 1e-12`, not byte
+  equality.
 - Integer sums do not depend on grouping or order. Every kernel, thread count, partition
   and I/O mode writes the same bytes.
-- `score_oracle compare --tol 1e-12` gives max_rel 0 on:
+- Against the double-double `score_oracle` from before that change,
+  `score_oracle compare --tol 1e-12` gave max_rel 0 on:
   - array3200 × PGS004525 and medium12800 × PGS004525
   - c500k_10k × thin_m1000_k1 and × thin_m1000_k32
   - 20 sampled scores from a 500-score and a 5,000-score catalog, scored alone by the
