@@ -529,7 +529,7 @@ pub fn format_bytes(bytes: usize) -> String {
 
 pub fn make_bed_buffer_pool(
     context: &PipelineContext,
-) -> Result<Arc<ArrayQueue<Vec<u8>>>, PipelineError> {
+) -> Result<Arc<io::RowBufferPool>, PipelineError> {
     let count = context.io_buffer_count()?;
     let row_bytes = usize::try_from(context.prep_result.bytes_per_variant).map_err(|_| {
         PipelineError::Compute(format!(
@@ -537,7 +537,9 @@ pub fn make_bed_buffer_pool(
             context.prep_result.bytes_per_variant
         ))
     })?;
-    let buffer_pool = Arc::new(ArrayQueue::new(count));
+    // A dense batcher keeps fewer than `DENSE_BATCH_SIZE` rows while it waits for the rest
+    // of its batch, so the producer must not wait for those to come back.
+    let buffer_pool = Arc::new(io::RowBufferPool::new(count, DENSE_BATCH_SIZE));
     for _ in 0..count {
         let mut buffer = Vec::new();
         buffer.try_reserve_exact(row_bytes).map_err(|e| {
@@ -1847,7 +1849,7 @@ struct BufferGuard<'a> {
     /// taken in the `drop` implementation.
     buffer: Option<Vec<u8>>,
     /// A reference to the shared pool where the buffer will be returned.
-    pool: &'a ArrayQueue<Vec<u8>>,
+    pool: &'a io::RowBufferPool,
 }
 
 struct DenseMiniBatchCanvas<'a> {
@@ -1867,9 +1869,9 @@ impl<'a> DenseMiniBatchCanvas<'a> {
 
 impl<'a> Drop for BufferGuard<'a> {
     fn drop(&mut self) {
-        // When the guard is dropped, it returns its buffer to the pool.
-        if let Some(mut buf) = self.buffer.take() {
-            buf.clear();
+        // When the guard is dropped, it returns its buffer to the pool at full length, so
+        // the producer reuses it without a zero fill.
+        if let Some(buf) = self.buffer.take() {
             let _ = self.pool.push(buf);
         }
     }
@@ -2002,8 +2004,11 @@ fn choose_consumer_threads(result_size: usize, memory_budget: MemoryBudget) -> u
 fn process_sparse_stream(
     rx: Receiver<Result<WorkItem, PipelineError>>,
     context: &PipelineContext,
-    buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
+    buffer_pool: Arc<io::RowBufferPool>,
 ) -> ConsumerResult {
+    // However this returns or unwinds, stop the producer taking buffers, so that it never
+    // parks on a pool nothing will refill.
+    let _stop_producer = ScopeGuard::new(|| buffer_pool.close());
     let prep_result = &context.prep_result;
     let result_size = checked_result_size(prep_result)?;
     let consumer_threads = choose_consumer_threads(result_size, context.memory_budget);
@@ -2069,9 +2074,10 @@ fn process_sparse_stream(
 fn process_sparse_stream_bounded(
     rx: Receiver<Result<WorkItem, PipelineError>>,
     context: &PipelineContext,
-    buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
+    buffer_pool: Arc<io::RowBufferPool>,
     accumulator: Arc<Mutex<(Vec<f64>, Vec<u32>)>>,
 ) -> ConsumerResult {
+    let _stop_producer = ScopeGuard::new(|| buffer_pool.close());
     let prep_result = &context.prep_result;
     for work_result in rx {
         let work_item = work_result?;
@@ -2102,8 +2108,9 @@ fn process_sparse_stream_bounded(
 fn process_dense_stream(
     rx: Receiver<Result<WorkItem, PipelineError>>,
     context: &PipelineContext,
-    buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
+    buffer_pool: Arc<io::RowBufferPool>,
 ) -> ConsumerResult {
+    let _stop_producer = ScopeGuard::new(|| buffer_pool.close());
     let prep_result = &context.prep_result;
     let result_size = checked_result_size(prep_result)?;
     let consumer_threads = choose_consumer_threads(result_size, context.memory_budget);
@@ -2232,9 +2239,10 @@ fn process_dense_stream(
 fn process_dense_stream_bounded(
     rx: Receiver<Result<WorkItem, PipelineError>>,
     context: &PipelineContext,
-    buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
+    buffer_pool: Arc<io::RowBufferPool>,
     accumulator: Arc<Mutex<(Vec<f64>, Vec<u32>)>>,
 ) -> ConsumerResult {
+    let _stop_producer = ScopeGuard::new(|| buffer_pool.close());
     let prep_result = &context.prep_result;
     let batch_size = bounded_dense_batch_size(&context.prep_result, context.memory_budget)?;
     let mut batch_iterator = ChannelBatcher::new(rx, batch_size);
