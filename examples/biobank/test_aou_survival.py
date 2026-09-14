@@ -142,7 +142,8 @@ class SurvivalContractTests(unittest.TestCase):
         self.assertEqual(labels, {"diagnostic__worker_fit_started.txt",
                                   "diagnostic__fit_warm_start_restored.txt",
                                   "diagnostic__fit_inner_solves_10_49.txt",
-                                  "diagnostic__fit_cpu_partial.txt"})
+                                  "diagnostic__fit_cpu_partial.txt",
+                                  "diagnostic__fit_wall_development_under_2min.txt"})
 
     def test_compute_bounds_never_change_the_checkpoint_identity(self):
         from aou_checkpoint import result_identity
