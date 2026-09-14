@@ -41,6 +41,56 @@ pub(crate) fn build_table(calls: &[f64], columns: usize, table: &mut [f64]) {
     assert!(columns > 0);
     assert_eq!(calls.len(), VARIANTS_PER_TABLE * 4 * columns);
     assert_eq!(table.len(), TABLE_ROWS * columns);
+    if columns <= REGISTER_COLUMNS && columns % 4 == 0 {
+        macro_rules! lanes {
+            ($($lanes:literal)*) => {
+                match columns / 4 {
+                    $($lanes => return build_lanes::<$lanes>(calls, table),)*
+                    _ => unreachable!("row widths are checked above"),
+                }
+            };
+        }
+        lanes!(1 2 3 4 5 6 7 8);
+    }
+    build_table_rows(calls, columns, table);
+}
+
+/// `build_table` for rows of whole lanes, with every row sum a constant-size
+/// lane loop rather than a copy followed by a runtime-length addition. Each
+/// entry is still `prefix + contribution`, so the table is bit-identical.
+#[inline(always)]
+fn build_lanes<const LANES: usize>(calls: &[f64], table: &mut [f64]) {
+    let (calls, _) = calls.as_chunks::<4>();
+    let (table, _) = table.as_chunks_mut::<4>();
+    for lane in 0..4 * LANES {
+        table[lane] = calls[lane];
+    }
+    for variant in 1..VARIANTS_PER_TABLE {
+        let prefix_rows = 1 << (2 * variant);
+        for code in (1..4).rev() {
+            let contribution = (variant * 4 + code) * LANES;
+            for row in 0..prefix_rows {
+                let (dst, src) = ((code * prefix_rows + row) * LANES, row * LANES);
+                for lane in 0..LANES {
+                    table[dst + lane] = (Simd::from_array(table[src + lane])
+                        + Simd::from_array(calls[contribution + lane]))
+                    .to_array();
+                }
+            }
+        }
+        let contribution = variant * 4 * LANES;
+        for row in 0..prefix_rows {
+            for lane in 0..LANES {
+                let dst = row * LANES + lane;
+                table[dst] = (Simd::from_array(table[dst])
+                    + Simd::from_array(calls[contribution + lane]))
+                .to_array();
+            }
+        }
+    }
+}
+
+fn build_table_rows(calls: &[f64], columns: usize, table: &mut [f64]) {
     table[..4 * columns].copy_from_slice(&calls[..4 * columns]);
     for variant in 1..VARIANTS_PER_TABLE {
         let prefix_rows = 1 << (2 * variant);
@@ -274,6 +324,23 @@ mod tests {
                     "{columns} columns, {groups} groups"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn lane_tables_equal_row_tables_bit_for_bit() {
+        for columns in (4..=REGISTER_COLUMNS).step_by(4) {
+            let calls: Vec<f64> = (0..16 * columns)
+                .map(|i| ((i * 7919) % 1009) as f64 / 3.0 - 150.0)
+                .collect();
+            let mut lanes = vec![f64::NAN; TABLE_ROWS * columns];
+            let mut rows = vec![f64::NAN; TABLE_ROWS * columns];
+            build_table(&calls, columns, &mut lanes);
+            build_table_rows(&calls, columns, &mut rows);
+            assert!(
+                lanes.iter().zip(&rows).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{columns} columns"
+            );
         }
     }
 
