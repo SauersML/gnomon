@@ -1,5 +1,29 @@
 # Score and packed projection performance
 
+## Uncached wide-panel reconciliation
+
+Ordinary singleton BIM loci now accumulate duplicate contributions in reusable
+score slots and sort only touched columns before CSR emission. This removes
+per-locus reconciliation trees and match lists while preserving f32 input
+addition order, zero-weight entries, missing corrections, and complex-locus
+semantics. Scratch scales with score count and is allocated fallibly once.
+
+On the full 1,799,239-marker input with 32 normalized PGS files, three paired
+uncached preparations measured 5.324/3.546, 4.690/3.619, and 5.301/3.599 seconds
+before/after: median 1.47× faster. All 1,188,880 matched rows, 5,385,268 sparse
+weights, float bits, corrections, counts, and complex rules matched; final
+single-person score and missing-count arrays were exactly equal. Both calls
+exclude normalization and cache lookup/publication. The comparison uses the
+archived pre-cache compiler and the candidate compiler against the same warm
+library on four pinned MSI Milan cores.
+
+Thirty-seven focused checks pass, including a new wide-panel fixture with
+cancellation-sensitive duplicates, allele flips, sparse column resets, and
+unmatched allele pairs. Reproduce with `cold_wide_plan.py`, then the emitted
+`cold-wide-plan` binary and full-marker inputs. Logs: `round6-cold-wide.log`
+and `round6-checks.log` in the MSI iteration directory. Prepared score inputs
+are retained in `real-genome/round6-mixed32` to avoid shared fixture cleanup.
+
 ## Content-addressed compiled plans
 
 Local BIM inputs can now reuse a compiled variant plan across cohort sizes,

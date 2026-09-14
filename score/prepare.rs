@@ -303,13 +303,6 @@ struct BimIterator<'a> {
     total_variants: u64,
 }
 
-/// Enum to represent the outcome of reconciling one score file line.
-enum ReconciliationOutcome<'a> {
-    Simple(Vec<&'a KeyedBimRecord>),
-    Complex(Vec<&'a KeyedBimRecord>),
-    NotFound,
-}
-
 // ========================================================================================
 //                                  Public API
 // ========================================================================================
@@ -546,6 +539,21 @@ fn prepare_for_computation_with_retry(
     let mut final_complex_rules: Vec<GroupedComplexRule> = Vec::new();
     let mut bim_group = Vec::new();
     let mut score_group = Vec::new();
+    // Reuse score slots across singleton loci. Only touched columns are visited
+    // or cleared, so sparse panels do not incur a full score-panel scan per locus.
+    let mut simple_assignments = Vec::new();
+    simple_assignments
+        .try_reserve_exact(score_names.len())
+        .map_err(|e| {
+            PrepError::Invariant(format!("Cannot allocate score reconciliation slots: {e}"))
+        })?;
+    simple_assignments.resize(score_names.len(), None::<SimpleScoreAssignment>);
+    let mut touched_columns = Vec::new();
+    touched_columns
+        .try_reserve_exact(score_names.len())
+        .map_err(|e| {
+            PrepError::Invariant(format!("Cannot allocate score reconciliation columns: {e}"))
+        })?;
 
     while bim_iter.peek().is_some() && score_iter.peek().is_some() {
         let bim_key = match bim_iter.peek().unwrap() {
@@ -670,67 +678,88 @@ fn prepare_for_computation_with_retry(
                     continue;
                 }
 
-                let mut simple_for_key: BTreeMap<
-                    BimRowIndex,
-                    BTreeMap<ScoreColumnIndex, SimpleScoreAssignment>,
-                > = BTreeMap::new();
+                if let [bim] = bim_group.as_slice() {
+                    for score in &score_group {
+                        if !allele_pair_matches(
+                            score.effect_allele.as_str(),
+                            score.other_allele.as_str(),
+                            bim.allele1.as_str(),
+                            bim.allele2.as_str(),
+                        ) {
+                            continue;
+                        }
+                        let slot = &mut simple_assignments[score.score_column_index.0];
+                        let assignment = slot.get_or_insert_with(|| {
+                            touched_columns.push(score.score_column_index);
+                            SimpleScoreAssignment {
+                                dosage_weight: 0.0,
+                                missing_correction: 0.0,
+                            }
+                        });
+                        // Input order matters for duplicate f32 additions.
+                        apply_simple_score_assignment(
+                            assignment,
+                            score.weight,
+                            score.effect_allele.as_str() == bim.allele1.as_str(),
+                        );
+                    }
+                    if !touched_columns.is_empty() {
+                        touched_columns.sort_unstable();
+                        required_bim_indices.push(bim.bim_row_index);
+                        required_is_complex.push(0);
+                        for column in touched_columns.drain(..) {
+                            let assignment = simple_assignments[column.0].take().unwrap();
+                            csr_builder.push_contribution(column, assignment)?;
+                            baseline_missing_sum_by_score[column.0] +=
+                                assignment.missing_correction as f64;
+                            score_variant_counts[column.0] += 1;
+                        }
+                        csr_builder.finish_variant()?;
+                    }
+                    continue;
+                }
+
                 let mut complex_for_key: BTreeMap<
                     Vec<(BimRowIndex, String, String)>,
                     Vec<(ScoreColumnIndex, f32, String, String)>,
                 > = BTreeMap::new();
 
                 for score_record in score_group.drain(..) {
-                    let outcome = resolve_matches_for_score_line(&score_record, &bim_group)?;
-
-                    match outcome {
-                        ReconciliationOutcome::Simple(matches) => {
-                            for bim_rec in matches {
-                                let is_flipped =
-                                    score_record.effect_allele.as_ref() == bim_rec.allele1.as_str();
-                                let score_map =
-                                    simple_for_key.entry(bim_rec.bim_row_index).or_default();
-
-                                let entry = score_map
-                                    .entry(score_record.score_column_index)
-                                    .or_insert(SimpleScoreAssignment {
-                                        dosage_weight: 0.0,
-                                        missing_correction: 0.0,
-                                    });
-                                apply_simple_score_assignment(
-                                    entry,
-                                    score_record.weight,
-                                    is_flipped,
-                                );
-                            }
-                        }
-                        ReconciliationOutcome::Complex(matches) => {
-                            let possible_contexts: Vec<_> = matches
-                                .iter()
-                                .map(|rec| {
-                                    (
-                                        rec.bim_row_index,
-                                        rec.allele1.to_string(),
-                                        rec.allele2.to_string(),
-                                    )
-                                })
-                                .collect();
-                            let score_info = (
-                                score_record.score_column_index,
-                                score_record.weight,
-                                score_record.effect_allele.to_string(),
-                                score_record.other_allele.to_string(),
-                            );
-                            complex_for_key
-                                .entry(possible_contexts)
-                                .or_default()
-                                .push(score_info);
-                        }
-                        ReconciliationOutcome::NotFound => {}
+                    let possible_contexts: Vec<_> = bim_group
+                        .iter()
+                        .filter(|rec| {
+                            allele_pair_matches(
+                                score_record.effect_allele.as_str(),
+                                score_record.other_allele.as_str(),
+                                rec.allele1.as_str(),
+                                rec.allele2.as_str(),
+                            )
+                        })
+                        .map(|rec| {
+                            (
+                                rec.bim_row_index,
+                                rec.allele1.to_string(),
+                                rec.allele2.to_string(),
+                            )
+                        })
+                        .collect();
+                    if possible_contexts.is_empty() {
+                        continue;
                     }
+                    let score_info = (
+                        score_record.score_column_index,
+                        score_record.weight,
+                        score_record.effect_allele.to_string(),
+                        score_record.other_allele.to_string(),
+                    );
+                    complex_for_key
+                        .entry(possible_contexts)
+                        .or_default()
+                        .push(score_info);
                 }
 
                 // Finalize complex rules for this key immediately.
-                let mut key_complex_indices: AHashSet<BimRowIndex> = AHashSet::new();
+                let mut key_complex_indices: BTreeSet<BimRowIndex> = BTreeSet::new();
                 for (contexts, scores) in complex_for_key {
                     for (bim_idx, _, _) in &contexts {
                         key_complex_indices.insert(*bim_idx);
@@ -764,23 +793,9 @@ fn prepare_for_computation_with_retry(
 
                 // Emit CSR rows and required variant metadata for this key in sorted order.
                 // This preserves global row ordering while avoiding a global index set.
-                let mut key_required_indices: BTreeSet<BimRowIndex> = BTreeSet::new();
-                key_required_indices.extend(simple_for_key.keys().copied());
-                key_required_indices.extend(key_complex_indices.iter().copied());
-
-                for bim_row_index in key_required_indices {
+                for bim_row_index in key_complex_indices {
                     required_bim_indices.push(bim_row_index);
-                    required_is_complex
-                        .push(u8::from(key_complex_indices.contains(&bim_row_index)));
-
-                    if let Some(score_data_map) = simple_for_key.get(&bim_row_index) {
-                        for (&score_col_idx, assignment) in score_data_map.iter() {
-                            csr_builder.push_contribution(score_col_idx, *assignment)?;
-                            baseline_missing_sum_by_score[score_col_idx.0] +=
-                                assignment.missing_correction as f64;
-                            score_variant_counts[score_col_idx.0] += 1;
-                        }
-                    }
+                    required_is_complex.push(1);
                     csr_builder.finish_variant()?;
                 }
             }
@@ -1280,6 +1295,75 @@ mod tests {
         let (compact, dense) = build_spool_maps(&PersonSubset::All, bytes_per_variant);
         assert_eq!(compact, vec![0, 1, 2]);
         assert_eq!(dense, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn wide_singleton_join_preserves_duplicate_order_and_resets_sparse_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("panel");
+        std::fs::write(prefix.with_extension("bed"), [0x6c, 0x1b, 0x01, 0, 0, 0]).unwrap();
+        std::fs::write(prefix.with_extension("fam"), "F I 0 0 0 -9\n").unwrap();
+        std::fs::write(
+            prefix.with_extension("bim"),
+            "1 a 0 100 A G\n1 b 0 200 C T\n1 c 0 300 AC A\n",
+        )
+        .unwrap();
+        let first = dir.path().join("first.tsv");
+        let second = dir.path().join("second.tsv");
+        std::fs::write(&first, "variant_id\teffect_allele\tother_allele\tZ\tA\n1:100\tG\tA\t16777216\t1\n1:100\tG\tA\t1\t0\n1:100\tG\tA\t-16777216\t0\n1:100\tA\tG\t0\t0.5\n1:200\tA\tG\t99\t99\n1:300\tA\tAC\t2\t3\n").unwrap();
+        std::fs::write(
+            &second,
+            "variant_id\teffect_allele\tother_allele\tM\n1:100\tA\tG\t0.25\n1:200\tT\tC\t4\n",
+        )
+        .unwrap();
+        let (prep, clean) =
+            prepare_for_computation_with_retry(&[prefix], &[first, second], None, None, 0).unwrap();
+        assert!(clean);
+        let columns: Vec<_> = ["Z", "A", "M"]
+            .map(|name| prep.score_names.iter().position(|s| s == name).unwrap())
+            .into();
+        assert_eq!(prep.required_bim_indices, [0, 1, 2].map(BimRowIndex));
+        assert_eq!(prep.sparse_row_offsets(), &[0, 3, 4, 6]);
+        for (row, expected) in [
+            vec![
+                (columns[0], 0.0f32, 0.0f32),
+                (columns[1], 0.5, 1.0),
+                (columns[2], -0.25, 0.5),
+            ],
+            vec![(columns[2], 4.0, 0.0)],
+            vec![(columns[0], 2.0, 0.0), (columns[1], 3.0, 0.0)],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut expected = expected;
+            expected.sort_unstable_by_key(|x| x.0);
+            let start = prep.sparse_row_offsets()[row] as usize;
+            for (offset, (col, weight, correction)) in expected.into_iter().enumerate() {
+                assert_eq!(prep.sparse_score_columns()[start + offset], col as u32);
+                assert_eq!(
+                    prep.sparse_weights()[start + offset].to_bits(),
+                    weight.to_bits()
+                );
+                assert_eq!(
+                    prep.sparse_missing_corrections()[start + offset].to_bits(),
+                    correction.to_bits()
+                );
+            }
+        }
+        for column in columns {
+            assert_eq!(prep.score_variant_counts[column], 2);
+        }
+        assert_eq!(
+            prep.baseline_missing_sum_by_score()
+                [prep.score_names.iter().position(|s| s == "A").unwrap()],
+            1.0
+        );
+        assert_eq!(
+            prep.baseline_missing_sum_by_score()
+                [prep.score_names.iter().position(|s| s == "M").unwrap()],
+            0.5
+        );
     }
 
     #[test]
@@ -1998,53 +2082,6 @@ impl Iterator for KWayMergeIterator {
         }
 
         Some(Ok(record_to_return))
-    }
-}
-
-fn resolve_matches_for_score_line<'a>(
-    score_record: &KeyedScoreRecord,
-    bim_records_for_position: &'a [KeyedBimRecord],
-) -> Result<ReconciliationOutcome<'a>, PrepError> {
-    let is_multiallelic_site = bim_records_for_position.len() > 1;
-
-    if is_multiallelic_site {
-        let pair_contexts_for_locus: Vec<_> = bim_records_for_position
-            .iter()
-            .filter(|record_tuple| {
-                allele_pair_matches(
-                    score_record.effect_allele.as_ref(),
-                    score_record.other_allele.as_ref(),
-                    record_tuple.allele1.as_str(),
-                    record_tuple.allele2.as_str(),
-                )
-            })
-            .collect();
-        return if pair_contexts_for_locus.is_empty() {
-            Ok(ReconciliationOutcome::NotFound)
-        } else {
-            Ok(ReconciliationOutcome::Complex(pair_contexts_for_locus))
-        };
-    }
-
-    let mut simple_matches = BTreeMap::new();
-    let effect_allele = score_record.effect_allele.as_ref();
-    let other_allele = score_record.other_allele.as_ref();
-    for record_tuple in bim_records_for_position {
-        if allele_pair_matches(
-            effect_allele,
-            other_allele,
-            record_tuple.allele1.as_str(),
-            record_tuple.allele2.as_str(),
-        ) {
-            simple_matches.insert(record_tuple.bim_row_index, record_tuple);
-        }
-    }
-
-    if simple_matches.is_empty() {
-        Ok(ReconciliationOutcome::NotFound)
-    } else {
-        let matches_as_vec = simple_matches.values().copied().collect();
-        Ok(ReconciliationOutcome::Simple(matches_as_vec))
     }
 }
 
