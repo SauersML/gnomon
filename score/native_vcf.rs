@@ -27,17 +27,115 @@ pub struct NativeVcfScoreResult {
     pub matched_variants: usize,
 }
 
-#[derive(Debug, Clone)]
+/// One native score row, as spans into its `ScoreRules` buffers.
+#[derive(Debug, Clone, Copy)]
 struct ScoreRule {
-    effect_allele: String,
-    other_allele: String,
-    applications: Vec<ScoreApplication>,
+    effect_allele: (usize, usize),
+    other_allele: (usize, usize),
+    applications: (usize, usize),
 }
 
 #[derive(Debug, Clone, Copy)]
 struct ScoreApplication {
     score_index: usize,
     weight: f32,
+}
+
+/// Every native score row with at least one weight, found by position.
+///
+/// Rows live in one flat list with their allele text and weights in shared
+/// buffers, so a score file with millions of rows grows a few buffers instead
+/// of allocating two strings and a vector per row. A position's rules keep
+/// file order, the order their weights are summed in.
+#[derive(Debug)]
+struct ScoreRules {
+    /// Rules grouped by position, in file order within a position.
+    rules: Vec<ScoreRule>,
+    /// Each position's range of `rules`.
+    ranges: AHashMap<VariantKey, (usize, usize)>,
+    alleles: String,
+    applications: Vec<ScoreApplication>,
+}
+
+impl ScoreRules {
+    fn get(&self, key: &VariantKey) -> Option<&[ScoreRule]> {
+        self.ranges
+            .get(key)
+            .map(|&(start, end)| &self.rules[start..end])
+    }
+
+    fn contains_key(&self, key: &VariantKey) -> bool {
+        self.ranges.contains_key(key)
+    }
+
+    fn allele(&self, span: (usize, usize)) -> &str {
+        &self.alleles[span.0..span.1]
+    }
+
+    fn applications(&self, rule: &ScoreRule) -> &[ScoreApplication] {
+        &self.applications[rule.applications.0..rule.applications.1]
+    }
+}
+
+/// `ScoreRules` under construction: rows in file order, not yet grouped.
+#[derive(Debug, Default)]
+struct ScoreRulesBuilder {
+    rows: Vec<(VariantKey, ScoreRule)>,
+    alleles: String,
+    applications: Vec<ScoreApplication>,
+}
+
+impl ScoreRulesBuilder {
+    fn push_application(&mut self, application: ScoreApplication) {
+        self.applications.push(application);
+    }
+
+    /// Adds a row whose weights are the applications pushed since `applications_start`.
+    fn push_row(
+        &mut self,
+        key: VariantKey,
+        effect_allele: &str,
+        other_allele: &str,
+        applications_start: usize,
+    ) {
+        let effect_allele = self.push_allele(effect_allele);
+        let other_allele = self.push_allele(other_allele);
+        self.rows.push((
+            key,
+            ScoreRule {
+                effect_allele,
+                other_allele,
+                applications: (applications_start, self.applications.len()),
+            },
+        ));
+    }
+
+    fn push_allele(&mut self, allele: &str) -> (usize, usize) {
+        let start = self.alleles.len();
+        self.alleles.push_str(allele);
+        (start, self.alleles.len())
+    }
+
+    fn finish(mut self) -> ScoreRules {
+        // A stable sort groups each position's rules and keeps their file order.
+        self.rows.sort_by_key(|(key, _)| *key);
+        let mut rules = Vec::with_capacity(self.rows.len());
+        let mut ranges: AHashMap<VariantKey, (usize, usize)> =
+            AHashMap::with_capacity(self.rows.len());
+        for (index, (key, rule)) in self.rows.into_iter().enumerate() {
+            rules.push(rule);
+            ranges
+                .entry(key)
+                .and_modify(|range| range.1 = index + 1)
+                .or_insert((index, index + 1));
+        }
+        ScoreRules {
+            rules,
+            ranges,
+            alleles: self.alleles,
+            applications: self.applications,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -256,7 +354,7 @@ struct DecodedAllele {
 /// undecodable sample, or a REF-effect rule without a complete REF dosage.
 fn decode_scored_record(
     record: &noodles_vcf::Record,
-    rules_by_key: &AHashMap<VariantKey, Vec<ScoreRule>>,
+    rules_by_key: &ScoreRules,
     kept_indices: &[usize],
     score_names: &[String],
     decoded: &mut DecodedRecord,
@@ -278,7 +376,8 @@ fn decode_scored_record(
     let alt_alleles = alternate_bases.iter().collect::<Result<Vec<_>, _>>()?;
     for (alt_offset, alt_allele) in alt_alleles.iter().enumerate() {
         let alt_index = alt_offset + 1;
-        let matched_rules = match_rules_for_allele(score_rules, ref_allele, alt_allele);
+        let matched_rules =
+            match_rules_for_allele(rules_by_key, score_rules, ref_allele, alt_allele);
         if matched_rules.is_empty() {
             continue;
         }
@@ -324,7 +423,7 @@ fn ref_effect_error(score_name: &str, record: &noodles_vcf::Record, position: u3
 fn load_score_rules(
     native_score_files: &[PathBuf],
     score_regions: Option<&std::collections::HashMap<String, GenomicRegion>>,
-) -> Result<(Vec<String>, AHashMap<VariantKey, Vec<ScoreRule>>), Box<dyn Error + Send + Sync>> {
+) -> Result<(Vec<String>, ScoreRules), Box<dyn Error + Send + Sync>> {
     let headers = read_score_headers(native_score_files)?;
     let mut score_names: Vec<String> = headers
         .iter()
@@ -336,7 +435,7 @@ fn load_score_rules(
         .enumerate()
         .map(|(idx, name)| (name.clone(), idx))
         .collect();
-    let mut rules_by_key: AHashMap<VariantKey, Vec<ScoreRule>> = AHashMap::new();
+    let mut rules = ScoreRulesBuilder::default();
     let mut skipped_contigs = SkippedContigs::default();
 
     for header in &headers {
@@ -344,6 +443,17 @@ fn load_score_rules(
         let mut reader = open_text_reader(path)?;
         let mut line = String::new();
         let mut line_number = 0u64;
+        // Each column's score index and region, resolved once per file rather than per row.
+        let score_indices: Vec<Option<usize>> = header
+            .score_names
+            .iter()
+            .map(|score_name| score_name_to_index.get(score_name).copied())
+            .collect();
+        let column_regions: Vec<Option<&GenomicRegion>> = header
+            .score_names
+            .iter()
+            .map(|score_name| score_regions.and_then(|regions| regions.get(score_name)))
+            .collect();
 
         while reader.read_line(&mut line)? != 0 {
             line_number += 1;
@@ -400,8 +510,8 @@ fn load_score_rules(
                     )
                 })?,
             );
-            let mut applications = Vec::with_capacity(header.score_names.len());
-            for score_name in &header.score_names {
+            let applications_start = rules.applications.len();
+            for (column, score_name) in header.score_names.iter().enumerate() {
                 let weight_text = fields.next().unwrap_or_default();
                 if weight_text.trim().is_empty() {
                     return Err(format!(
@@ -412,15 +522,14 @@ fn load_score_rules(
                     )
                     .into());
                 }
-                let score_index = *score_name_to_index.get(score_name).ok_or_else(|| {
+                let score_index = score_indices[column].ok_or_else(|| {
                     format!(
                         "Internal error: score '{}' from '{}' was not indexed.",
                         score_name,
                         path.display()
                     )
                 })?;
-                if let Some(regions) = score_regions
-                    && let Some(region) = regions.get(score_name)
+                if let Some(region) = column_regions[column]
                     && !region.contains(key)
                 {
                     continue;
@@ -435,17 +544,13 @@ fn load_score_rules(
                     )
                 })?;
 
-                applications.push(ScoreApplication {
+                rules.push_application(ScoreApplication {
                     score_index,
                     weight,
                 });
             }
-            if !applications.is_empty() {
-                rules_by_key.entry(key).or_default().push(ScoreRule {
-                    effect_allele: effect_allele.to_string(),
-                    other_allele: other_allele.to_string(),
-                    applications,
-                });
+            if rules.applications.len() > applications_start {
+                rules.push_row(key, effect_allele, other_allele, applications_start);
             }
 
             line.clear();
@@ -454,7 +559,7 @@ fn load_score_rules(
 
     skipped_contigs.report();
 
-    Ok((score_names, rules_by_key))
+    Ok((score_names, rules.finish()))
 }
 
 /// Counts native score rows dropped for unsupported contigs, keeping a few examples
@@ -562,21 +667,27 @@ fn read_score_headers(
 }
 
 fn match_rules_for_allele(
+    rules_by_key: &ScoreRules,
     rules: &[ScoreRule],
     ref_allele: &str,
     alt_allele: &str,
 ) -> Vec<MatchedRule> {
-    let capacity = rules.iter().map(|rule| rule.applications.len()).sum();
+    let capacity = rules
+        .iter()
+        .map(|rule| rule.applications.1 - rule.applications.0)
+        .sum();
     let mut matched = Vec::with_capacity(capacity);
     for rule in rules {
-        let effect_is_ref = if rule.effect_allele == alt_allele && rule.other_allele == ref_allele {
+        let effect_allele = rules_by_key.allele(rule.effect_allele);
+        let other_allele = rules_by_key.allele(rule.other_allele);
+        let effect_is_ref = if effect_allele == alt_allele && other_allele == ref_allele {
             false
-        } else if rule.effect_allele == ref_allele && rule.other_allele == alt_allele {
+        } else if effect_allele == ref_allele && other_allele == alt_allele {
             true
         } else {
             continue;
         };
-        for application in &rule.applications {
+        for application in rules_by_key.applications(rule) {
             matched.push(MatchedRule {
                 score_index: application.score_index,
                 weight: f64::from(application.weight),
@@ -1060,10 +1171,7 @@ struct PrefilteredBgzfReader {
 }
 
 impl PrefilteredBgzfReader {
-    fn spawn(
-        source: VariantSource,
-        rules_by_key: Arc<AHashMap<VariantKey, Vec<ScoreRule>>>,
-    ) -> io::Result<Self> {
+    fn spawn(source: VariantSource, rules_by_key: Arc<ScoreRules>) -> io::Result<Self> {
         let (tx, rx) = crossbeam_channel::bounded(PREFILTER_CHANNEL_DEPTH);
         let producer = thread::Builder::new()
             .name("vcf-bgzf-prefilter".to_string())
@@ -1137,7 +1245,7 @@ impl Drop for PrefilteredBgzfReader {
 /// The producing half of [`PrefilteredBgzfReader`].
 struct BgzfLineFilter {
     source: VariantSource,
-    rules_by_key: Arc<AHashMap<VariantKey, Vec<ScoreRule>>>,
+    rules_by_key: Arc<ScoreRules>,
     tx: Sender<io::Result<Vec<u8>>>,
     /// Raw frames of the batch being read, reused across batches.
     frames: Vec<Vec<u8>>,
@@ -1170,7 +1278,7 @@ struct BlockLines {
 impl BgzfLineFilter {
     fn new(
         source: VariantSource,
-        rules_by_key: Arc<AHashMap<VariantKey, Vec<ScoreRule>>>,
+        rules_by_key: Arc<ScoreRules>,
         tx: Sender<io::Result<Vec<u8>>>,
     ) -> Self {
         Self {
@@ -1421,10 +1529,7 @@ fn inflate_bgzf_block(
 
 /// Splits an inflated block into its partial first line, the complete lines
 /// that survive [`is_skippable_record`], and its partial last line.
-fn split_block_lines(
-    block: &[u8],
-    rules_by_key: &AHashMap<VariantKey, Vec<ScoreRule>>,
-) -> BlockLines {
+fn split_block_lines(block: &[u8], rules_by_key: &ScoreRules) -> BlockLines {
     let Some(first_newline) = memchr(b'\n', block) else {
         return BlockLines {
             bytes: block.to_vec(),
@@ -1462,7 +1567,7 @@ fn split_block_lines(
 /// lookup: an unsupported contig, a telomeric position `0`, or a position no
 /// score mentions. Anything less certain, including a carriage return in the
 /// first two fields, which noodles may strip, is kept.
-fn is_skippable_record(line: &[u8], rules_by_key: &AHashMap<VariantKey, Vec<ScoreRule>>) -> bool {
+fn is_skippable_record(line: &[u8], rules_by_key: &ScoreRules) -> bool {
     let Ok(line) = std::str::from_utf8(line) else {
         return false;
     };
@@ -2215,8 +2320,13 @@ mod tests {
 
     #[test]
     fn skippable_records_are_read_cleanly_and_skipped_by_the_scorer() {
-        let mut rules_by_key: AHashMap<VariantKey, Vec<ScoreRule>> = AHashMap::new();
-        rules_by_key.insert((22, 100), Vec::new());
+        let mut builder = ScoreRulesBuilder::default();
+        builder.push_application(ScoreApplication {
+            score_index: 0,
+            weight: 1.0,
+        });
+        builder.push_row((22, 100), "G", "A", 0);
+        let rules_by_key = builder.finish();
         let cases: [(&[u8], bool); 13] = [
             (b"22\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0/1", false),
             (b"22\t101\t.\tA\tG\t.\tPASS\t.\tGT\t0/1", true),
