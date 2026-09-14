@@ -2600,32 +2600,19 @@ impl PlinkVariantRecordIter {
                     if line.iter().all(u8::is_ascii_whitespace) {
                         continue;
                     }
-                    let text = match str::from_utf8(line) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            return Some(Err(PlinkIoError::Utf8 {
-                                path: self.path.display().to_string(),
-                                source: err,
-                            }));
-                        }
-                    };
-                    let mut fields = text.split_whitespace();
-                    let fields = match (
-                        fields.next(),
-                        fields.next(),
-                        fields.next(),
-                        fields.next(),
-                        fields.next(),
-                        fields.next(),
-                    ) {
-                        (Some(chr), Some(id), Some(cm), Some(pos), Some(a1), Some(a2)) => {
-                            [chr, id, cm, pos, a1, a2]
-                        }
-                        _ => {
+                    let fields = match first_six_fields(line) {
+                        Ok(Some(fields)) => fields,
+                        Ok(None) => {
                             return Some(Err(PlinkIoError::MalformedRecord {
                                 path: self.path.display().to_string(),
                                 line: self.line,
                                 message: "expected 6 whitespace-delimited fields".to_string(),
+                            }));
+                        }
+                        Err(err) => {
+                            return Some(Err(PlinkIoError::Utf8 {
+                                path: self.path.display().to_string(),
+                                source: err,
                             }));
                         }
                     };
@@ -6321,6 +6308,44 @@ fn normalize_pgen_paths(path: &Path) -> (PathBuf, PathBuf, PathBuf) {
     )
 }
 
+/// The first six fields of a `.bim` or `.fam` line, exactly as `split_whitespace`
+/// yields them, or `None` when the line has fewer.
+///
+/// `split_whitespace` decodes the line char by char. An ASCII line is split on
+/// the ASCII members of `char::is_whitespace` (tab, LF, VT, FF, CR, space) byte
+/// by byte instead; any other line still goes through `split_whitespace`.
+fn first_six_fields(line: &[u8]) -> Result<Option<[&str; 6]>, str::Utf8Error> {
+    let text = str::from_utf8(line)?;
+    let mut fields = [""; 6];
+    if !text.is_ascii() {
+        let mut words = text.split_whitespace();
+        for field in &mut fields {
+            let Some(word) = words.next() else {
+                return Ok(None);
+            };
+            *field = word;
+        }
+        return Ok(Some(fields));
+    }
+    let bytes = text.as_bytes();
+    let is_space = |byte: u8| byte == b' ' || (b'\t'..=b'\r').contains(&byte);
+    let mut cursor = 0;
+    for field in &mut fields {
+        while cursor < bytes.len() && is_space(bytes[cursor]) {
+            cursor += 1;
+        }
+        if cursor == bytes.len() {
+            return Ok(None);
+        }
+        let start = cursor;
+        while cursor < bytes.len() && !is_space(bytes[cursor]) {
+            cursor += 1;
+        }
+        *field = &text[start..cursor];
+    }
+    Ok(Some(fields))
+}
+
 fn read_fam_records(path: &Path) -> Result<Vec<SampleRecord>, PlinkIoError> {
     let mut reader = open_text_source(path)?;
     read_fam_records_from_source(path, &mut *reader)
@@ -6338,19 +6363,11 @@ fn read_fam_records_from_source(
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let text = str::from_utf8(line).map_err(|err| PlinkIoError::Utf8 {
+        let fields = first_six_fields(line).map_err(|err| PlinkIoError::Utf8 {
             path: path.display().to_string(),
             source: err,
         })?;
-        let mut fields = text.split_whitespace();
-        let (Some(fid), Some(iid), Some(pid), Some(mid), Some(sex), Some(phenotype)) = (
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-        ) else {
+        let Some([fid, iid, pid, mid, sex, phenotype]) = fields else {
             return Err(PlinkIoError::MalformedRecord {
                 path: path.display().to_string(),
                 line: line_no,
@@ -7594,6 +7611,37 @@ mod tests {
             }
             other => panic!("expected malformed-record error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn first_six_fields_split_like_split_whitespace() {
+        let lines: [&[u8]; 14] = [
+            b"1\trs1\t0\t100\tA\tG",
+            b"chrX  rs2 0.5\t200 AT  G   extra field",
+            b"  23\trs3\t0\t300\tA\tG  ",
+            b"Y\x0brs4\x0c0\r400\tA\tG",
+            b"1\trs5\t0\t500\tA",
+            b"",
+            b"\x0b",
+            b"1\trs9\t0\t900\tA\tG\r",
+            b"\x1c1\trs10\t0\t1000\tA\tG",
+            b"1 rs12 0 1200 A G\n",
+            "1\tid\u{e9}\t0\t600\tA\tG".as_bytes(),
+            "1\u{a0}rs7\t0\t700\tA\tG\tX".as_bytes(),
+            "1\u{2003}rs8\u{2003}0\u{2003}800\u{2003}A\u{2003}G".as_bytes(),
+            "1\u{85}rs11\t0\t1100\tA\tG".as_bytes(),
+        ];
+        for line in lines {
+            let text = str::from_utf8(line).expect("fixture is UTF-8");
+            let words: Vec<&str> = text.split_whitespace().take(6).collect();
+            let expected = <[&str; 6]>::try_from(words).ok();
+            assert_eq!(
+                first_six_fields(line).expect("valid UTF-8"),
+                expected,
+                "{text:?}"
+            );
+        }
+        assert!(first_six_fields(b"1\trs\xff\t0\t1\tA\tG").is_err());
     }
 
     #[test]
