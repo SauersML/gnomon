@@ -154,10 +154,39 @@ pub fn emit_overall_skip_summary(summaries: &[SkipSummary]) {
     }
 }
 
-/// Checks if a file appears to be in the gnomon-native format by inspecting its header.
+/// Opens a score file as text, inflating a gzip or BGZF body, and says whether it
+/// was compressed. The magic bytes decide, not the name: PGS Catalog downloads
+/// are gzipped, and renamed copies keep or lose `.gz` independently of content.
+fn open_score_text(path: &Path) -> io::Result<(Box<dyn Read + Send>, bool)> {
+    let mut file = File::open(path)?;
+    let mut magic = [0u8; 2];
+    let mut filled = 0;
+    while filled < magic.len() {
+        match file.read(&mut magic[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    // The probed bytes are replayed rather than sought back over, so a pipe works too.
+    let body = io::Cursor::new(magic[..filled].to_vec()).chain(file);
+    if magic[..filled] == [0x1F, 0x8B] {
+        // BGZF is a series of gzip members, which the multi-member decoder reads whole.
+        Ok((Box::new(MultiGzDecoder::new(body)), true))
+    } else {
+        Ok((Box::new(body), false))
+    }
+}
+
+/// Checks if a file is in the gnomon-native format as it stands, by inspecting its
+/// header. A compressed file never is: `reformat_pgs_file` inflates it first.
 pub fn is_gnomon_native_format(path: &Path) -> io::Result<bool> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let (body, compressed) = open_score_text(path)?;
+    if compressed {
+        return Ok(false);
+    }
+    let mut reader = BufReader::new(body);
     let mut line = String::new();
 
     loop {
@@ -384,15 +413,12 @@ pub fn reformat_pgs_file(
             })
     };
 
-    // --- Open file and handle potential GZIP compression ---
-    let file = File::open(input_path)?;
-    let a_reader: Box<dyn Read + Send> = if input_path.extension().is_some_and(|ext| ext == "gz") {
-        Box::new(MultiGzDecoder::new(file))
-    } else {
-        Box::new(file)
-    };
-    let mut reader = BufReader::new(a_reader);
+    // --- Open the file, inflating a gzip or BGZF body ---
+    let (body, _) = open_score_text(input_path)?;
+    let mut reader = BufReader::new(body);
     let mut line_buffer = String::new();
+    // Kept only to write a compressed native file back out verbatim.
+    let mut comment_lines = String::new();
 
     // --- Read and analyze all metadata headers ---
     let mut orig_build_norm: Option<u8> = None;
@@ -421,6 +447,7 @@ pub fn reformat_pgs_file(
         if !line_buffer.starts_with('#') {
             break; // Found the data header line
         }
+        comment_lines.push_str(&line_buffer);
 
         let metadata = line_buffer.trim_start_matches('#').trim();
         if let Some(val) = metadata.strip_prefix("genome_build=") {
@@ -430,6 +457,26 @@ pub fn reformat_pgs_file(
         } else if let Some(val) = metadata.strip_prefix("pgs_id=") {
             score_id = Some(val.to_string());
         }
+    }
+
+    // A native file reaches this function only when it was compressed (see
+    // `is_gnomon_native_format`). It needs no conversion, so it is written out
+    // inflated byte for byte, and is then used exactly as the plain file would be.
+    let native_header = line_buffer.trim();
+    if native_header.starts_with("variant_id\teffect_allele\tother_allele\t") {
+        let score_label = native_header.split('\t').nth(3).unwrap_or("").to_string();
+        crate::output::write_atomically(output_path, |writer| {
+            writer.write_all(comment_lines.as_bytes())?;
+            writer.write_all(line_buffer.as_bytes())?;
+            io::copy(&mut reader, writer)?;
+            Ok(())
+        })?;
+        return Ok(ReformatOutcome {
+            score_label: Some(score_label),
+            skip_summary: None,
+            warning: None,
+            wrote_output: true,
+        });
     }
 
     // --- Determine the one, true, safe parsing strategy ---
@@ -1404,5 +1451,115 @@ chr_name\tchr_position\teffect_allele\tother_allele\tvariant_description\teffect
 
         let summary = outcome.skip_summary.expect("unrecoverable row is skipped");
         assert_eq!(summary.skipped_count, 1);
+    }
+
+    /// A catalog file whose rows run in descending position, so conversion must sort.
+    fn catalog_text(rows: usize) -> String {
+        let mut text = String::from(
+            "###PGS CATALOG SCORING FILE - test\n\
+#format_version=2.0\n\
+#pgs_id=PGS_GZ\n\
+#genome_build=GRCh38\n\
+#HmPOS_build=GRCh38\n\
+chr_name\tchr_position\teffect_allele\tother_allele\teffect_weight\thm_chr\thm_pos\n",
+        );
+        for i in 0..rows {
+            let pos = 10_000 + 7 * (rows - i);
+            text.push_str(&format!("1\t{pos}\tA\tG\t0.{i:05}\t1\t{pos}\n"));
+        }
+        text
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).expect("gzip");
+        encoder.finish().expect("gzip trailer")
+    }
+
+    fn bgzf(bytes: &[u8]) -> Vec<u8> {
+        let mut compressed = Vec::new();
+        {
+            let mut writer = noodles_bgzf::io::Writer::new(&mut compressed);
+            writer.write_all(bytes).expect("bgzf");
+            // Dropping the writer flushes the last block and the EOF marker.
+        }
+        assert_eq!(&compressed[12..14], b"BC", "BGZF extra subfield");
+        compressed
+    }
+
+    #[test]
+    fn compressed_catalog_files_convert_exactly_like_the_plain_file() {
+        let tmp = tempdir().expect("tempdir");
+        // Over a megabyte: several BGZF members and more than one decode block.
+        let plain = catalog_text(50_000);
+        let inputs = [
+            ("plain.txt", plain.as_bytes().to_vec()),
+            ("gzip.txt.gz", gzip(plain.as_bytes())),
+            ("bgzf.txt.gz", bgzf(plain.as_bytes())),
+            ("gzip_body.txt", gzip(plain.as_bytes())),
+            ("plain_body.txt.gz", plain.as_bytes().to_vec()),
+        ];
+        let mut outputs = Vec::new();
+        for (name, bytes) in &inputs {
+            let input = tmp.path().join(name);
+            fs::write(&input, bytes).expect("write input");
+            assert!(
+                !is_gnomon_native_format(&input).expect("header check reads any encoding"),
+                "{name}"
+            );
+            let output = tmp.path().join(format!("{name}.gnomon.tsv"));
+            let outcome = reformat_pgs_file(&input, &output).expect("reformat outcome");
+            assert!(outcome.wrote_output, "{name}");
+            assert_eq!(outcome.score_label.as_deref(), Some("PGS_GZ"), "{name}");
+            outputs.push(fs::read(&output).expect("read output"));
+        }
+        assert_eq!(outputs[0].iter().filter(|&&b| b == b'\n').count(), 50_001);
+        for ((name, _), output) in inputs.iter().zip(&outputs).skip(1) {
+            assert!(output == &outputs[0], "{name} converted differently");
+        }
+    }
+
+    #[test]
+    fn compressed_native_files_are_inflated_verbatim() {
+        let tmp = tempdir().expect("tempdir");
+        let native = "##source=test\n\
+variant_id\teffect_allele\tother_allele\tSCORE_A\tSCORE_B\n\
+1:200\tA\tG\t0.2\t0.1\n\
+1:100\tG\tA\t0.1\t0.3\n";
+        let plain_input = tmp.path().join("native.tsv");
+        fs::write(&plain_input, native).expect("write input");
+        assert!(is_gnomon_native_format(&plain_input).expect("header check"));
+
+        for (name, bytes) in [
+            ("native.tsv.gz", gzip(native.as_bytes())),
+            ("native.tsv.bgz", bgzf(native.as_bytes())),
+        ] {
+            let input = tmp.path().join(name);
+            fs::write(&input, bytes).expect("write input");
+            assert!(
+                !is_gnomon_native_format(&input).expect("header check"),
+                "{name} must be inflated before use"
+            );
+            let output = tmp.path().join(format!("{name}.gnomon.tsv"));
+            let outcome = reformat_pgs_file(&input, &output).expect("inflate native file");
+            assert!(outcome.wrote_output, "{name}");
+            assert_eq!(outcome.score_label.as_deref(), Some("SCORE_A"), "{name}");
+            assert_eq!(fs::read_to_string(&output).expect("read output"), native);
+        }
+    }
+
+    #[test]
+    fn truncated_gzip_score_file_fails_without_writing_output() {
+        let tmp = tempdir().expect("tempdir");
+        let compressed = gzip(catalog_text(5_000).as_bytes());
+        let input = tmp.path().join("truncated.txt.gz");
+        fs::write(&input, &compressed[..compressed.len() / 2]).expect("write input");
+        let output = tmp.path().join("truncated.gnomon.tsv");
+        assert!(reformat_pgs_file(&input, &output).is_err());
+        assert!(
+            !output.exists(),
+            "a partial download must not become a score file"
+        );
     }
 }
