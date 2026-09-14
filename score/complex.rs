@@ -198,6 +198,9 @@ struct PersonLayout {
     /// People whose byte was pruned from the spool, in increasing order.
     forced_missing: Vec<usize>,
     span: RowSpan,
+    /// Whether person `p` sits at byte `p / 4` with shift `2 * (p % 4)`, as when every
+    /// sample is scored in .fam order, so rows can be read a byte at a time.
+    contiguous: bool,
 }
 
 impl PersonLayout {
@@ -263,15 +266,20 @@ impl PersonLayout {
             },
             _ => RowSpan { start: 0, len: 0 },
         };
-        let bytes = row_bytes
+        let bytes: Vec<u32> = row_bytes
             .into_iter()
             .map(|byte| byte.map_or(0, |byte| byte - span.start as u32))
             .collect();
+        let contiguous = forced_missing.is_empty()
+            && bytes.iter().zip(&shifts).enumerate().all(|(person, (&byte, &shift))| {
+                byte as usize == person / 4 && usize::from(shift) == 2 * (person % 4)
+            });
         Ok(Self {
             bytes,
             shifts,
             forced_missing,
             span,
+            contiguous,
         })
     }
 }
@@ -735,10 +743,12 @@ mod tests {
     }
 
     /// The person-major resolver this module replaced, reduced to its arithmetic:
-    /// every person, every rule, every application, in that order.
+    /// every person, every rule, every application, in that order. People whose
+    /// byte is `pruned_byte` have missing calls, as a spool that pruned it gives them.
     fn reference_resolve(
         scenario: &Scenario,
         prep_result: &PreparationResult,
+        pruned_byte: Option<usize>,
         scores: &mut [f64],
         counts: &mut [u32],
     ) -> FinalAggregatedCollector {
@@ -746,11 +756,19 @@ mod tests {
         let num_scores = prep_result.score_names.len();
         let mut collector = FinalAggregatedCollector::new();
         for (person, fam_idx) in prep_result.output_idx_to_fam_idx.iter().enumerate() {
+            let fam_idx = fam_idx.0 as usize;
             for rule in &prep_result.complex_rules {
                 let valid: Vec<(u8, &(BimRowIndex, String, String))> = rule
                     .possible_contexts
                     .iter()
-                    .map(|context| (scenario.genotype(context.0, fam_idx.0 as usize), context))
+                    .map(|context| {
+                        let bits = if pruned_byte == Some(fam_idx / 4) {
+                            0b01
+                        } else {
+                            scenario.genotype(context.0, fam_idx)
+                        };
+                        (bits, context)
+                    })
                     .filter(|(bits, _)| *bits != 0b01)
                     .collect();
                 for score_info in &rule.score_applications {
@@ -850,6 +868,7 @@ mod tests {
             let expected_warnings = reference_resolve(
                 &scenario,
                 &prep_result,
+                None,
                 &mut expected_scores,
                 &mut expected_counts,
             );
@@ -911,6 +930,77 @@ mod tests {
         }
         // The scenarios must reach the heuristic chain, not only single interpretations.
         assert!(methods_seen.len() >= 3, "heuristics reached: {methods_seen:?}");
+    }
+
+    #[test]
+    fn pruned_spool_bytes_resolve_as_missing_calls() {
+        for (seed, total_people, keep_all) in [(21, 37, true), (22, 1001, false)] {
+            let scenario = Scenario::random(seed, total_people, keep_all);
+            let prep_result = scenario.prep_result();
+            let ComplexVariantResolver::Spool {
+                mmap,
+                offsets,
+                bytes_per_spooled_variant,
+                dense_map,
+            } = scenario.spool(&prep_result)
+            else {
+                unreachable!("scenario spool resolver");
+            };
+            // The spool loses the byte of the first scored person, so everyone in it
+            // must resolve as missing calls, whichever kernel their block uses.
+            let pruned_byte = scenario.kept[0] as usize / 4;
+            let mut dense_map = dense_map.to_vec();
+            dense_map[pruned_byte] = -1;
+            let resolver = ComplexVariantResolver::from_spool(
+                mmap,
+                offsets,
+                bytes_per_spooled_variant,
+                Arc::new(dense_map),
+            );
+            let (initial_scores, initial_counts) = scenario.initial_accumulators(seed);
+            let mut expected_scores = initial_scores.clone();
+            let mut expected_counts = initial_counts.clone();
+            let expected_warnings = reference_resolve(
+                &scenario,
+                &prep_result,
+                Some(pruned_byte),
+                &mut expected_scores,
+                &mut expected_counts,
+            );
+            for block_people in [1, 7, 256] {
+                let mut scores = initial_scores.clone();
+                let mut counts = initial_counts.clone();
+                let Ok(report) = resolve_rows(
+                    &resolver,
+                    &prep_result,
+                    &mut scores,
+                    &mut counts,
+                    ResolveLimits {
+                        block_people,
+                        streamed_group_bytes: STREAMED_GROUP_BYTES,
+                    },
+                    &ProgressBar::hidden(),
+                ) else {
+                    panic!("resolution failed for seed {seed}, {block_people} per block");
+                };
+                let context = format!("seed {seed}, {block_people} per block");
+                assert!(report.unresolvable.is_none(), "{context}");
+                assert_eq!(
+                    scores.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                    expected_scores
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    "{context}"
+                );
+                assert_eq!(counts, expected_counts, "{context}");
+                assert_eq!(
+                    rendered(&report.warnings),
+                    rendered(&expected_warnings),
+                    "{context}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1786,21 +1876,24 @@ fn resolve_outcome(
     matching: &[usize],
     genotypes: &[u8],
 ) -> Outcome {
-    let interpretations: Vec<(u8, &(BimRowIndex, String, String))> = matching
-        .iter()
-        .zip(genotypes)
-        .filter(|&(_, &bits)| bits != 0b01)
-        .map(|(&context, &bits)| (bits, &rule.possible_contexts[context]))
-        .collect();
-    match interpretations.as_slice() {
-        [] => Outcome::Missing,
-        [(packed_geno, (_, bim_a1, bim_a2))] => {
-            match Heuristic::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, score_info) {
+    let called = || {
+        matching
+            .iter()
+            .zip(genotypes)
+            .filter(|&(_, &bits)| bits != 0b01)
+            .map(|(&context, &bits)| (bits, &rule.possible_contexts[context]))
+    };
+    let mut first_two = called();
+    match (first_two.next(), first_two.next()) {
+        (None, _) => Outcome::Missing,
+        (Some((packed_geno, (_, bim_a1, bim_a2))), None) => {
+            match Heuristic::calculate_score_dosage(packed_geno, bim_a1, bim_a2, score_info) {
                 Some(dosage) => Outcome::Add(dosage * score_info.weight as f64),
                 None => Outcome::Missing,
             }
         }
         _ => {
+            let interpretations: Vec<(u8, &(BimRowIndex, String, String))> = called().collect();
             let context = ResolutionContext {
                 score_info,
                 conflicting_interpretations: &interpretations,
@@ -1823,21 +1916,76 @@ struct ApplicationPlan {
     column: usize,
     /// The rule's contexts whose allele pair matches the score's, in context order.
     matching: Vec<usize>,
+    kind: ApplicationKind,
+}
+
+enum ApplicationKind {
+    /// One matching context and nothing to report: each person's genotype on that
+    /// context selects what is added, read straight from the row.
+    Direct { values: [f64; 4], missing: [u32; 4] },
     /// Indexed by the packed genotype code over `matching`, two bits per context
-    /// with the first context lowest. Empty when `matching` is too wide to tabulate.
-    entries: Vec<TableEntry>,
-    outcomes: Vec<Outcome>,
+    /// with the first context lowest.
+    Table {
+        entries: Vec<TableEntry>,
+        outcomes: Vec<Outcome>,
+    },
+    /// Too many matching contexts to tabulate: resolved per person.
+    PerPerson,
+}
+
+impl ApplicationKind {
+    fn new(
+        pipeline: &ResolverPipeline,
+        rule: &GroupedComplexRule,
+        score_info: &ScoreInfo,
+        matching: &[usize],
+    ) -> Self {
+        if matching.len() > TABULATED_MAX_CONTEXTS {
+            return Self::PerPerson;
+        }
+        if matching.len() == 1 {
+            let entries: [TableEntry; 4] = std::array::from_fn(|code| {
+                resolve_outcome(pipeline, rule, score_info, matching, &[code as u8]).into()
+            });
+            if !entries.iter().any(|entry| entry.reported) {
+                return Self::Direct {
+                    values: entries.map(|entry| entry.value),
+                    missing: entries.map(|entry| entry.missing),
+                };
+            }
+        }
+        let mut genotypes = [0u8; TABULATED_MAX_CONTEXTS];
+        let genotypes = &mut genotypes[..matching.len()];
+        let outcomes: Vec<Outcome> = (0..1usize << (2 * matching.len()))
+            .map(|code| {
+                for (position, bits) in genotypes.iter_mut().enumerate() {
+                    *bits = ((code >> (2 * position)) & 0b11) as u8;
+                }
+                resolve_outcome(pipeline, rule, score_info, matching, genotypes)
+            })
+            .collect();
+        Self::Table {
+            entries: outcomes.iter().map(|&outcome| outcome.into()).collect(),
+            outcomes,
+        }
+    }
 }
 
 struct RulePlan {
-    /// Contexts some application reads; no other context is decoded.
+    /// Contexts decoded into genotypes for a block: first those tabulated and
+    /// per-person applications read, then those only direct applications read.
     decoded_contexts: Vec<usize>,
+    /// How many of `decoded_contexts` tabulated and per-person applications read.
+    /// The rest are decoded only when some person's calls are forced missing.
+    table_contexts: usize,
     applications: Vec<ApplicationPlan>,
 }
 
 impl RulePlan {
     fn new(pipeline: &ResolverPipeline, rule: &GroupedComplexRule) -> Self {
-        let mut decoded = vec![false; rule.possible_contexts.len()];
+        let num_contexts = rule.possible_contexts.len();
+        let mut tabulated = vec![false; num_contexts];
+        let mut direct = vec![false; num_contexts];
         let applications = rule
             .score_applications
             .iter()
@@ -1851,38 +1999,30 @@ impl RulePlan {
                     })
                     .map(|(context, _)| context)
                     .collect();
-                for &context in &matching {
-                    decoded[context] = true;
-                }
-                let outcomes: Vec<Outcome> = if matching.len() <= TABULATED_MAX_CONTEXTS {
-                    let mut genotypes = vec![0u8; matching.len()];
-                    (0..1usize << (2 * matching.len()))
-                        .map(|code| {
-                            for (position, bits) in genotypes.iter_mut().enumerate() {
-                                *bits = ((code >> (2 * position)) & 0b11) as u8;
-                            }
-                            resolve_outcome(pipeline, rule, score_info, &matching, &genotypes)
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
+                let kind = ApplicationKind::new(pipeline, rule, score_info, &matching);
+                let used = match kind {
+                    ApplicationKind::Direct { .. } => &mut direct,
+                    _ => &mut tabulated,
                 };
+                for &context in &matching {
+                    used[context] = true;
+                }
                 ApplicationPlan {
                     column: score_info.score_column_index.0,
-                    entries: outcomes.iter().map(|&outcome| outcome.into()).collect(),
                     matching,
-                    outcomes,
+                    kind,
                 }
             })
             .collect();
-        let decoded_contexts = decoded
-            .iter()
-            .enumerate()
-            .filter(|&(_, &is_decoded)| is_decoded)
-            .map(|(context, _)| context)
+        let mut decoded_contexts: Vec<usize> = (0..num_contexts)
+            .filter(|&context| tabulated[context])
             .collect();
+        let table_contexts = decoded_contexts.len();
+        decoded_contexts
+            .extend((0..num_contexts).filter(|&context| direct[context] && !tabulated[context]));
         Self {
             decoded_contexts,
+            table_contexts,
             applications,
         }
     }
@@ -1964,6 +2104,70 @@ struct GroupPass<'a> {
     stop: &'a AtomicBool,
 }
 
+/// What a direct application adds to one block of people.
+struct DirectApplication<'a> {
+    values: &'a [f64; 4],
+    missing: &'a [u32; 4],
+    column: usize,
+    num_scores: usize,
+}
+
+impl DirectApplication<'_> {
+    /// Adds the outcome of one person's genotype code (its low two bits).
+    #[inline(always)]
+    fn add(&self, person: usize, code: u8, scores: &mut [f64], counts: &mut [u32]) {
+        let cell = person * self.num_scores + self.column;
+        let code = usize::from(code & 0b11);
+        scores[cell] += self.values[code];
+        counts[cell] += self.missing[code];
+    }
+
+    fn add_decoded(&self, codes: &[u8], scores: &mut [f64], counts: &mut [u32]) {
+        for (person, &code) in codes.iter().enumerate() {
+            self.add(person, code, scores, counts);
+        }
+    }
+
+    /// For people who occupy consecutive two-bit slots of the row, the first of them at
+    /// slot `first_slot`: whole bytes are read four people at a time.
+    fn add_packed(&self, row: &[u8], first_slot: usize, scores: &mut [f64], counts: &mut [u32]) {
+        let num_people = scores.len() / self.num_scores;
+        let slot = |person: usize| {
+            let position = first_slot + person;
+            row[position / 4] >> (2 * (position % 4))
+        };
+        let head = ((4 - first_slot % 4) % 4).min(num_people);
+        let body_bytes = (num_people - head) / 4;
+        for person in 0..head {
+            self.add(person, slot(person), scores, counts);
+        }
+        let first_byte = (first_slot + head) / 4;
+        for (index, &byte) in row[first_byte..first_byte + body_bytes].iter().enumerate() {
+            let person = head + 4 * index;
+            self.add(person, byte, scores, counts);
+            self.add(person + 1, byte >> 2, scores, counts);
+            self.add(person + 2, byte >> 4, scores, counts);
+            self.add(person + 3, byte >> 6, scores, counts);
+        }
+        for person in head + 4 * body_bytes..num_people {
+            self.add(person, slot(person), scores, counts);
+        }
+    }
+
+    fn add_gathered(
+        &self,
+        row: &[u8],
+        bytes: &[u32],
+        shifts: &[u8],
+        scores: &mut [f64],
+        counts: &mut [u32],
+    ) {
+        for (person, (&byte, &shift)) in bytes.iter().zip(shifts).enumerate() {
+            self.add(person, row[byte as usize] >> shift, scores, counts);
+        }
+    }
+}
+
 /// Applies a group's rules to one block of people. Rules run in order, and each
 /// rule's applications in order, so every accumulator receives the same additions
 /// in the same order as under the person-major resolver, and ends bit-identical.
@@ -1983,6 +2187,9 @@ fn evaluate_block(
         &all[all.partition_point(|&person| person < people.start)
             ..all.partition_point(|&person| person < people.end)]
     };
+    // Direct applications read rows in place, unless some person's calls are forced
+    // missing: then they read decoded genotypes, as tabulated applications do.
+    let rows_in_place = forced_missing.is_empty();
     let first_context = pass.context_offsets[pass.group.start];
     let mut genotypes = vec![0u8; pass.max_contexts * num_people];
     let mut code_buffer = vec![0u8; num_people];
@@ -1997,7 +2204,12 @@ fn evaluate_block(
         let plan = &pass.plans[rule_idx];
         let rows = &pass.rows[pass.context_offsets[rule_idx] - first_context
             ..pass.context_offsets[rule_idx + 1] - first_context];
-        for &context in &plan.decoded_contexts {
+        let decoded_contexts = if rows_in_place {
+            &plan.decoded_contexts[..plan.table_contexts]
+        } else {
+            &plan.decoded_contexts[..]
+        };
+        for &context in decoded_contexts {
             let decoded = &mut genotypes[context * num_people..(context + 1) * num_people];
             decode_genotypes(rows[context], bytes, shifts, decoded);
             for &person in forced_missing {
@@ -2007,44 +2219,64 @@ fn evaluate_block(
 
         for (application_idx, application) in plan.applications.iter().enumerate() {
             let column = application.column;
-            let people_rows = scores
-                .chunks_exact_mut(num_scores)
-                .zip(counts.chunks_exact_mut(num_scores))
-                .enumerate();
-
-            if application.entries.is_empty() {
-                let score_info = &rule.score_applications[application_idx];
-                for (person, (person_scores, person_counts)) in people_rows {
-                    tuple.clear();
-                    tuple.extend(
-                        application
-                            .matching
-                            .iter()
-                            .map(|&context| genotypes[context * num_people + person]),
-                    );
-                    let outcome = resolve_outcome(
-                        pass.pipeline,
-                        rule,
-                        score_info,
-                        &application.matching,
-                        &tuple,
-                    );
-                    let entry = TableEntry::from(outcome);
-                    person_scores[column] += entry.value;
-                    person_counts[column] += entry.missing;
-                    if entry.reported
-                        && !report.record(
-                            outcome,
-                            (first_person + person, rule_idx, application_idx),
-                            || tuple.clone(),
-                        )
-                    {
-                        pass.stop.store(true, Ordering::Relaxed);
-                        return report;
+            let (entries, outcomes) = match &application.kind {
+                ApplicationKind::Direct { values, missing } => {
+                    let context = application.matching[0];
+                    let direct = DirectApplication {
+                        values,
+                        missing,
+                        column,
+                        num_scores,
+                    };
+                    if !rows_in_place {
+                        let decoded = &genotypes[context * num_people..(context + 1) * num_people];
+                        direct.add_decoded(decoded, scores, counts);
+                    } else if pass.layout.contiguous {
+                        direct.add_packed(rows[context], first_person, scores, counts);
+                    } else {
+                        direct.add_gathered(rows[context], bytes, shifts, scores, counts);
                     }
+                    continue;
                 }
-                continue;
-            }
+                ApplicationKind::Table { entries, outcomes } => (entries, outcomes),
+                ApplicationKind::PerPerson => {
+                    let score_info = &rule.score_applications[application_idx];
+                    let people_rows = scores
+                        .chunks_exact_mut(num_scores)
+                        .zip(counts.chunks_exact_mut(num_scores))
+                        .enumerate();
+                    for (person, (person_scores, person_counts)) in people_rows {
+                        tuple.clear();
+                        tuple.extend(
+                            application
+                                .matching
+                                .iter()
+                                .map(|&context| genotypes[context * num_people + person]),
+                        );
+                        let outcome = resolve_outcome(
+                            pass.pipeline,
+                            rule,
+                            score_info,
+                            &application.matching,
+                            &tuple,
+                        );
+                        let entry = TableEntry::from(outcome);
+                        person_scores[column] += entry.value;
+                        person_counts[column] += entry.missing;
+                        if entry.reported
+                            && !report.record(
+                                outcome,
+                                (first_person + person, rule_idx, application_idx),
+                                || tuple.clone(),
+                            )
+                        {
+                            pass.stop.store(true, Ordering::Relaxed);
+                            return report;
+                        }
+                    }
+                    continue;
+                }
+            };
 
             let codes: &[u8] = match application.matching.as_slice() {
                 [context] => &genotypes[context * num_people..(context + 1) * num_people],
@@ -2059,8 +2291,12 @@ fn evaluate_block(
                     &code_buffer
                 }
             };
+            let people_rows = scores
+                .chunks_exact_mut(num_scores)
+                .zip(counts.chunks_exact_mut(num_scores))
+                .enumerate();
             for ((person, (person_scores, person_counts)), &code) in people_rows.zip(codes) {
-                let entry = application.entries[code as usize];
+                let entry = entries[code as usize];
                 person_scores[column] += entry.value;
                 person_counts[column] += entry.missing;
                 if entry.reported {
@@ -2071,7 +2307,7 @@ fn evaluate_block(
                             .collect()
                     };
                     let order = (first_person + person, rule_idx, application_idx);
-                    if !report.record(application.outcomes[code as usize], order, unpack) {
+                    if !report.record(outcomes[code as usize], order, unpack) {
                         pass.stop.store(true, Ordering::Relaxed);
                         return report;
                     }
