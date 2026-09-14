@@ -170,6 +170,15 @@ finer-grained monitoring is needed.
   the spectral shrinkage discussed below arises from *missing* loci and
   out-of-sample projection, not from projecting a complete training cohort.
 
+Every component is stated in one sign. An eigenvector's sign carries no
+information and roundoff picks it, so two fits that agree on every eigenvalue and
+every span can still hand back a component negated. The fit decides by the data
+instead: each component's largest-magnitude loading is positive (the lowest
+variant index wins a tie in magnitude), and the component's sample basis and
+scores are negated with it. Models fitted before this convention may state some
+components in the opposite sign, so comparing PCs across versions can show
+one-time flips; `gnomon project` keeps whatever signs a stored model carries.
+
 ## The eigensolver, and why it is block-structured
 
 The fit's expensive resource is **a traversal of the genotype data**, not

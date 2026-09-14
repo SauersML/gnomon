@@ -3573,7 +3573,7 @@ impl HwePcaModel {
         // The rotation refines the pairs the solver produced; it says nothing
         // about how that solve terminated, so its record travels unaltered.
         let diagnostics = decomposition.diagnostics;
-        let refined = Eigenpairs {
+        let mut refined = Eigenpairs {
             values: eigenvalues,
             vectors: rotate_columns(decomposition.vectors, rotation.as_ref(), block_capacity),
             diagnostics,
@@ -3584,7 +3584,7 @@ impl HwePcaModel {
         // σ_i = √((n−1)·λ_i) and scores = U·Σ, both read off the refined
         // eigenvalues, so `λ_i = σ_i²/(n−1)` holds for the quantities stored
         // rather than for a canonical set computed on demand beside them.
-        let (singular_values, sample_scores) = build_sample_scores(n_samples, &refined);
+        let (singular_values, mut sample_scores) = build_sample_scores(n_samples, &refined);
 
         // V_i = B_i/σ_i. `‖B_i‖² = (n−1)·λ_i = σ_i²` and `B_iᵀ·B_j = 0` off the
         // diagonal, both by construction, because `B` was just rotated into the
@@ -3600,6 +3600,11 @@ impl HwePcaModel {
                 *value *= inverse;
             });
         }
+
+        // An eigenvector's sign is arbitrary, so roundoff picks it: two builds
+        // that agree on every eigenvalue and span to the last digit can still
+        // hand back a component negated. Let the data pick instead.
+        canonicalize_component_signs(&mut loadings, &mut refined.vectors, &mut sample_scores);
 
         // Euclidean, deliberately: this is the denominator the projector divides
         // the per-axis mass in `global_info_packed` by, and that matrix is
@@ -6803,6 +6808,32 @@ where
     })
 }
 
+/// Negates every component whose largest-magnitude loading is negative (the
+/// first such entry on a tie), in the loadings, the sample basis and the scores
+/// together, so each model states its components in one sign.
+fn canonicalize_component_signs(
+    loadings: &mut Mat<f64>,
+    basis: &mut Mat<f64>,
+    scores: &mut Mat<f64>,
+) {
+    for component in 0..loadings.ncols() {
+        let mut pivot = 0.0f64;
+        zip!(loadings.col(component)).for_each(|unzip!(value)| {
+            if value.abs() > pivot.abs() {
+                pivot = *value;
+            }
+        });
+        if pivot >= 0.0 {
+            continue;
+        }
+        for matrix in [&mut *loadings, &mut *basis, &mut *scores] {
+            if component < matrix.ncols() {
+                zip!(matrix.col_mut(component)).for_each(|unzip!(value)| *value = -*value);
+            }
+        }
+    }
+}
+
 fn compute_component_norms_sq(loadings: MatRef<'_, f64>) -> Vec<f64> {
     let n_components = loadings.ncols();
     let mut norms_sq = vec![0.0f64; n_components];
@@ -7790,6 +7821,127 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn components_are_stated_in_a_canonical_sign() {
+        let n_samples = 400;
+        let n_variants = 120;
+        let mut state = 0xBB67_AE85_84CA_A73Bu64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let factors: Vec<[u64; 2]> = (0..n_samples).map(|_| [next() % 3, next() % 3]).collect();
+        let mut data = Vec::with_capacity(n_samples * n_variants);
+        for variant in 0..n_variants {
+            for sample in &factors {
+                let call = if next() % 5 == 0 {
+                    next() % 3
+                } else {
+                    sample[variant % 2]
+                };
+                data.push(call as f64);
+            }
+        }
+        // The same cohort with every allele coded the other way round: X becomes
+        // -X, so every eigenvector comes back negated unless the fit fixes signs.
+        let recoded: Vec<f64> = data.iter().map(|&call| 2.0 - call).collect();
+        let fit = |values: &[f64]| {
+            let mut source =
+                DenseBlockSource::new(values, n_samples, n_variants).expect("dense source");
+            HwePcaModel::fit_k(&mut source, 3).expect("model fit")
+        };
+        let model = fit(&data);
+        let flipped = fit(&recoded);
+
+        let loadings = model.variant_loadings();
+        for component in 0..model.components() {
+            let mut pivot = 0.0f64;
+            for row in 0..loadings.nrows() {
+                if loadings[(row, component)].abs() > pivot.abs() {
+                    pivot = loadings[(row, component)];
+                }
+            }
+            assert!(pivot > 0.0, "component {component} leads with {pivot}");
+            let sigma = model.singular_values()[component];
+            for row in 0..model.sample_basis().nrows() {
+                assert_eq!(
+                    model.sample_scores()[(row, component)],
+                    model.sample_basis()[(row, component)] * sigma,
+                    "scores and basis must flip together"
+                );
+            }
+        }
+        let other = flipped.variant_loadings();
+        for component in 0..model.components() {
+            for row in 0..loadings.nrows() {
+                let expected = loadings[(row, component)];
+                assert!(
+                    (other[(row, component)] - expected).abs() <= 1e-9 * expected.abs().max(1e-6),
+                    "recoded alleles changed component {component} at variant {row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_negated_component_canonicalizes_to_the_same_bits() {
+        // Whatever sign the arithmetic hands back, the stored component is one.
+        let loadings = Mat::from_fn(7, 3, |row, col| {
+            ((row * 5 + col * 3) % 11) as f64 - 5.0 + 0.25 * col as f64
+        });
+        let basis = Mat::from_fn(9, 3, |row, col| ((row * 7 + col) % 13) as f64 / 13.0 - 0.5);
+        let scores = Mat::from_fn(9, 3, |row, col| basis[(row, col)] * (col + 2) as f64);
+        let canonical = |mut loadings: Mat<f64>, mut basis: Mat<f64>, mut scores: Mat<f64>| {
+            canonicalize_component_signs(&mut loadings, &mut basis, &mut scores);
+            [loadings, basis, scores]
+        };
+        let reference = canonical(loadings.clone(), basis.clone(), scores.clone());
+        for flipped in 0..3 {
+            let negate = |mut matrix: Mat<f64>| {
+                for row in 0..matrix.nrows() {
+                    matrix[(row, flipped)] = -matrix[(row, flipped)];
+                }
+                matrix
+            };
+            let negated = canonical(
+                negate(loadings.clone()),
+                negate(basis.clone()),
+                negate(scores.clone()),
+            );
+            for (lhs, rhs) in reference.iter().zip(&negated) {
+                for col in 0..lhs.ncols() {
+                    for row in 0..lhs.nrows() {
+                        assert_eq!(
+                            lhs[(row, col)].to_bits(),
+                            rhs[(row, col)].to_bits(),
+                            "component {flipped} negated: entry ({row}, {col})"
+                        );
+                    }
+                }
+            }
+        }
+
+        // A tie in magnitude goes to the lowest variant index.
+        let mut tied = Mat::from_fn(4, 1, |row, _| [0.5, -2.0, 2.0, 1.0][row]);
+        let mut tied_basis = Mat::from_fn(2, 1, |row, _| [1.0, -1.0][row]);
+        let mut tied_scores = tied_basis.clone();
+        canonicalize_component_signs(&mut tied, &mut tied_basis, &mut tied_scores);
+        assert_eq!(
+            tied[(1, 0)],
+            2.0,
+            "the first largest entry is made positive"
+        );
+        assert_eq!(tied[(2, 0)], -2.0);
+        assert_eq!(
+            tied_basis[(0, 0)],
+            -1.0,
+            "the basis flips with its loadings"
+        );
+        assert_eq!(tied_scores[(1, 0)], 1.0, "the scores flip with their basis");
     }
 
     #[test]

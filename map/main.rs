@@ -198,7 +198,12 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
                         ))
                     })?
                     .install(fit),
-                None => fit(),
+                // Without --threads the fit runs on the global pool, brought up
+                // through the one helper that sizes it, as `project` does.
+                None => {
+                    crate::parallel::init_global_thread_pool();
+                    fit()
+                }
             }
         }
         MapCommand::Project {
@@ -287,7 +292,20 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
         dataset.n_samples(),
         variant_display
     );
-    println!("Fit worker threads: {}", rayon::current_num_threads());
+    let limits = crate::cpu::cpu_limits();
+    let affinity = limits.affinity.map_or_else(
+        || "affinity not visible".to_string(),
+        |cpus| format!("affinity {cpus} CPUs"),
+    );
+    let quota = limits.quota.map_or_else(
+        || "no CPU quota".to_string(),
+        |cpus| format!("quota {cpus} CPUs"),
+    );
+    println!(
+        "Fit worker threads: {} ({affinity}, {quota}, NUMA nodes {:?})",
+        rayon::current_num_threads(),
+        limits.numa_nodes
+    );
 
     // Resolved before anything reads genotypes: every downstream statistic —
     // allele frequencies, the MAF screen, LD weights, the covariance — is

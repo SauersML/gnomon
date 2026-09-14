@@ -35,6 +35,10 @@ pub mod output;
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod memory;
 
+/// CPUs this process can run on: affinity, cgroup quota and NUMA nodes.
+#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
+pub mod cpu;
+
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 mod range_fetch;
 
