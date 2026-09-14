@@ -352,50 +352,9 @@ impl GenotypeDataset {
             Self::Pgen(dataset) => dataset
                 .select_variants_by_keys(keys)
                 .map_err(GenotypeIoError::from),
-            Self::Variants(_) => {
-                let filter = VariantFilter::from_keys(keys.iter().cloned());
-                let mut selection = self.select_variants(&filter)?;
-
-                let original_indices = std::mem::take(&mut selection.indices);
-                let original_keys = std::mem::take(&mut selection.keys);
-                let original_kinds = std::mem::take(&mut selection.match_kinds);
-                let original_missing = std::mem::take(&mut selection.missing);
-
-                let mut matched = HashMap::with_capacity(original_keys.len());
-                for ((index, key), kind) in original_indices
-                    .into_iter()
-                    .zip(original_keys.into_iter())
-                    .zip(original_kinds.into_iter())
-                {
-                    matched.insert(key.clone(), (index, key, kind));
-                }
-
-                let mut missing = HashSet::with_capacity(original_missing.len());
-                for key in original_missing {
-                    missing.insert(key);
-                }
-
-                let mut ordered_indices = Vec::with_capacity(matched.len());
-                let mut ordered_keys = Vec::with_capacity(matched.len());
-                let mut ordered_kinds = Vec::with_capacity(matched.len());
-                let mut ordered_missing = Vec::new();
-
-                for key in keys {
-                    if let Some((index, stored_key, kind)) = matched.remove(key) {
-                        ordered_indices.push(index);
-                        ordered_keys.push(stored_key);
-                        ordered_kinds.push(kind);
-                    } else if missing.contains(key) {
-                        ordered_missing.push(key.clone());
-                    }
-                }
-
-                selection.indices = ordered_indices;
-                selection.keys = ordered_keys;
-                selection.match_kinds = ordered_kinds;
-                selection.missing = ordered_missing;
-                Ok(selection)
-            }
+            Self::Variants(dataset) => dataset
+                .select_variants_by_keys(keys)
+                .map_err(GenotypeIoError::from),
         }
     }
 
@@ -2425,93 +2384,161 @@ fn select_plink_variant_records_by_keys(
     mut iter: PlinkVariantRecordIter,
     requested_keys: &[VariantKey],
 ) -> Result<VariantSelection, PlinkIoError> {
-    // Index coordinates once and borrow the model's strings. Allele candidates
-    // at the same locus form short linked lists in contiguous storage, avoiding
-    // three cloned string-key maps and three probes for every dataset marker.
-    let mut positions = ahash::AHashMap::with_capacity(requested_keys.len());
-    let mut unique_keys = Vec::with_capacity(requested_keys.len());
-    let mut next_at_position = Vec::with_capacity(requested_keys.len());
-    for key in requested_keys {
-        let coordinate = (key.chromosome.as_str(), key.position);
-        let head = positions.get(&coordinate).copied().unwrap_or(usize::MAX);
-        let mut slot = head;
-        while slot != usize::MAX && unique_keys[slot] != key {
-            slot = next_at_position[slot];
+    let mut selector = ModelKeySelector::new(requested_keys);
+    while let Some(result) = iter.next_key() {
+        selector.observe(result?);
+    }
+    Ok(selector.finish())
+}
+
+/// Matches a dataset's variant keys, offered in file order, to a model's keys,
+/// and lists the matches in model order.
+struct ModelKeySelector<'a> {
+    positions: ahash::AHashMap<(&'a str, u64), usize>,
+    unique_keys: Vec<&'a VariantKey>,
+    next_at_position: Vec<usize>,
+    matched_indices: Vec<Option<usize>>,
+    matched_keys: Vec<Option<VariantKey>>,
+    matched_kinds: Vec<MatchKind>,
+    dataset_index: usize,
+}
+
+impl<'a> ModelKeySelector<'a> {
+    fn new(requested_keys: &'a [VariantKey]) -> Self {
+        // Index coordinates once and borrow the model's strings. Allele candidates
+        // at the same locus form short linked lists in contiguous storage, avoiding
+        // three cloned string-key maps and three probes for every dataset marker.
+        let mut positions = ahash::AHashMap::with_capacity(requested_keys.len());
+        let mut unique_keys = Vec::with_capacity(requested_keys.len());
+        let mut next_at_position = Vec::with_capacity(requested_keys.len());
+        for key in requested_keys {
+            let coordinate = (key.chromosome.as_str(), key.position);
+            let head = positions.get(&coordinate).copied().unwrap_or(usize::MAX);
+            let mut slot = head;
+            while slot != usize::MAX && unique_keys[slot] != key {
+                slot = next_at_position[slot];
+            }
+            if slot == usize::MAX {
+                positions.insert(coordinate, unique_keys.len());
+                next_at_position.push(head);
+                unique_keys.push(key);
+            }
         }
-        if slot == usize::MAX {
-            positions.insert(coordinate, unique_keys.len());
-            next_at_position.push(head);
-            unique_keys.push(key);
+
+        let requested_unique = unique_keys.len();
+        Self {
+            positions,
+            unique_keys,
+            next_at_position,
+            matched_indices: vec![None; requested_unique],
+            matched_keys: vec![None; requested_unique],
+            matched_kinds: vec![MatchKind::Exact; requested_unique],
+            dataset_index: 0,
         }
     }
 
-    let requested_unique = unique_keys.len();
-    let mut matched_indices = vec![None; requested_unique];
-    let mut matched_keys = vec![None; requested_unique];
-    let mut matched_kinds = vec![MatchKind::Exact; requested_unique];
-    let mut dataset_index = 0usize;
-
-    while let Some(result) = iter.next_key() {
-        let key = result?;
-        let mut slot = positions
+    /// Offers the dataset's next variant key.
+    fn observe(&mut self, key: VariantKey) {
+        let mut slot = self
+            .positions
             .get(&(key.chromosome.as_str(), key.position))
             .copied()
             .unwrap_or(usize::MAX);
-        let mut matched = None;
+        let (mut exact, mut wildcard, mut swap) = (None, None, None);
         while slot != usize::MAX {
-            let requested = unique_keys[slot];
+            let requested = self.unique_keys[slot];
             if requested.alleles == key.alleles {
-                matched = Some((slot, MatchKind::Exact));
+                exact = Some(slot);
+            } else if requested.alleles.is_none() {
+                wildcard = Some(slot);
+            } else if requested
+                .alleles
+                .as_ref()
+                .zip(key.alleles.as_ref())
+                .is_some_and(|((a, b), (r, s))| a == s && b == r)
+            {
+                swap = Some(slot);
+            }
+            slot = self.next_at_position[slot];
+        }
+
+        let exact = exact.map(|slot| (slot, MatchKind::Exact));
+        let wildcard = wildcard.map(|slot| (slot, MatchKind::Wildcard));
+        let swap = swap.map(|slot| (slot, MatchKind::Swap));
+        // A locus can carry one allele pair in both orientations, such as an
+        // insertion and a deletion at one position. Each of the two records then
+        // matches one model variant exactly and the other swapped, and a model
+        // keyed in the other orientation (a .bim keys ALT/REF, a VCF REF/ALT)
+        // would have them cross over if the exact match always won. While both
+        // are unmatched the earlier model variant wins, and a record whose slot
+        // the other orientation took moves on to its next candidate, so a
+        // dataset listing the locus in the model's order matches it in order.
+        let candidates = match (exact, swap) {
+            (Some((exact_slot, _)), Some((swap_slot, _)))
+                if wildcard.is_none()
+                    && swap_slot < exact_slot
+                    && self.matched_indices[exact_slot].is_none()
+                    && self.matched_indices[swap_slot].is_none() =>
+            {
+                [swap, exact, None]
+            }
+            _ => [exact, wildcard, swap],
+        };
+        let mut chosen = None;
+        for (slot, kind) in candidates.into_iter().flatten() {
+            if self.matched_indices[slot].is_none() {
+                chosen = Some((slot, kind));
                 break;
             }
-            if requested.alleles.is_none() {
-                matched = Some((slot, MatchKind::Wildcard));
-            } else if matched.is_none()
-                && requested
-                    .alleles
-                    .as_ref()
-                    .zip(key.alleles.as_ref())
-                    .is_some_and(|((a, b), (r, s))| a == s && b == r)
-            {
-                matched = Some((slot, MatchKind::Swap));
+            if self.matched_kinds[slot] == kind {
+                // A record with this key already holds the slot: this one is a
+                // duplicate and matches nothing.
+                break;
             }
-            slot = next_at_position[slot];
+        }
+        if let Some((slot, kind)) = chosen {
+            self.matched_indices[slot] = Some(self.dataset_index);
+            self.matched_keys[slot] = Some(selected_model_key(kind, self.unique_keys[slot], key));
+            self.matched_kinds[slot] = kind;
         }
 
-        if let Some((slot, kind)) = matched
-            && matched_indices[slot].is_none()
-        {
-            matched_indices[slot] = Some(dataset_index);
-            matched_keys[slot] = Some(selected_model_key(kind, unique_keys[slot], key));
-            matched_kinds[slot] = kind;
-        }
-
-        dataset_index += 1;
+        self.dataset_index += 1;
     }
 
-    let mut indices = Vec::with_capacity(requested_unique);
-    let mut keys = Vec::with_capacity(requested_unique);
-    let mut match_kinds = Vec::with_capacity(requested_unique);
-    let mut missing = Vec::new();
+    fn finish(self) -> VariantSelection {
+        let Self {
+            unique_keys,
+            matched_indices,
+            mut matched_keys,
+            matched_kinds,
+            ..
+        } = self;
+        let requested_unique = unique_keys.len();
+        let mut indices = Vec::with_capacity(requested_unique);
+        let mut keys = Vec::with_capacity(requested_unique);
+        let mut match_kinds = Vec::with_capacity(requested_unique);
+        let mut missing = Vec::new();
 
-    for (slot, requested_key) in unique_keys.into_iter().enumerate() {
-        if let (Some(index), Some(stored_key)) = (matched_indices[slot], matched_keys[slot].take())
-        {
-            indices.push(index);
-            keys.push(stored_key);
-            match_kinds.push(matched_kinds[slot]);
-        } else {
-            missing.push(requested_key.clone());
+        for (slot, requested_key) in unique_keys.into_iter().enumerate() {
+            if let (Some(index), Some(stored_key)) =
+                (matched_indices[slot], matched_keys[slot].take())
+            {
+                indices.push(index);
+                keys.push(stored_key);
+                match_kinds.push(matched_kinds[slot]);
+            } else {
+                missing.push(requested_key.clone());
+            }
+        }
+
+        VariantSelection {
+            indices,
+            keys,
+            match_kinds,
+            missing,
+            requested_unique,
         }
     }
-
-    Ok(VariantSelection {
-        indices,
-        keys,
-        match_kinds,
-        missing,
-        requested_unique,
-    })
 }
 
 pub struct PlinkVariantRecordIter {
@@ -3392,17 +3419,23 @@ impl VcfLikeDataset {
         }
     }
 
-    pub fn select_variants(
+    /// Selects a model's `keys` with the same matching as the PLINK readers,
+    /// listing the matches in model order.
+    pub fn select_variants_by_keys(
         &self,
-        filter: &VariantFilter,
+        keys: &[VariantKey],
     ) -> Result<VariantSelection, VariantIoError> {
-        use std::collections::HashSet;
+        let mut selector = ModelKeySelector::new(keys);
+        self.scan_variant_list_keys(|key| selector.observe(key))?;
+        Ok(selector.finish())
+    }
 
-        let mut indices = Vec::new();
-        let mut keys = Vec::new();
-        let mut match_kinds = Vec::new();
-        let mut matched = HashSet::new();
-        let mut record_idx = 0usize;
+    /// Offers the key of every ALT of every record to `visit`, in file order,
+    /// checking position order along the way.
+    fn scan_variant_list_keys(
+        &self,
+        mut visit: impl FnMut(VariantKey),
+    ) -> Result<(), VariantIoError> {
         let mut record_number = 0usize;
         let mut sorted_positions = ChromPositionSortState::default();
 
@@ -3460,25 +3493,41 @@ impl VcfLikeDataset {
                         VariantIoError::Decode(format!("failed to read alternate allele: {err}"))
                     })?;
                     for alt_allele in &alternate_bases {
-                        let key = VariantKey::new_with_alleles(
+                        visit(VariantKey::new_with_alleles(
                             &record.chromosome,
                             pos,
                             &record.reference_bases,
                             alt_allele,
-                        );
-                        if let Some((status, requested_key)) = filter.match_key(&key)
-                            && matched.insert(requested_key.clone())
-                        {
-                            indices.push(record_idx);
-                            keys.push(selected_model_key(status, &requested_key, key));
-                            match_kinds.push(status);
-                        }
-                        record_idx += 1;
+                        ));
                     }
                     Ok(())
                 },
             )?;
         }
+        Ok(())
+    }
+
+    pub fn select_variants(
+        &self,
+        filter: &VariantFilter,
+    ) -> Result<VariantSelection, VariantIoError> {
+        use std::collections::HashSet;
+
+        let mut indices = Vec::new();
+        let mut keys = Vec::new();
+        let mut match_kinds = Vec::new();
+        let mut matched = HashSet::new();
+        let mut record_idx = 0usize;
+        self.scan_variant_list_keys(|key| {
+            if let Some((status, requested_key)) = filter.match_key(&key)
+                && matched.insert(requested_key.clone())
+            {
+                indices.push(record_idx);
+                keys.push(selected_model_key(status, &requested_key, key));
+                match_kinds.push(status);
+            }
+            record_idx += 1;
+        })?;
 
         let missing = filter.missing_keys(&matched);
         Ok(VariantSelection {
@@ -3671,6 +3720,18 @@ pub struct VcfLikeVariantBlockSource {
     block_quality: Vec<f64>,
     block_keys: Vec<VariantKey>,
     collected_keys: Vec<VariantKey>,
+    /// For a selection not in file order: the selection position of each
+    /// selected variant index. `None` when the selection ascends.
+    selected_positions: Option<HashMap<usize, usize>>,
+    /// Variants such a selection has read ahead of their turn, by variant index.
+    read_ahead: HashMap<usize, ReadAheadVariant>,
+}
+
+/// A selected variant decoded before the selection reached it.
+struct ReadAheadVariant {
+    dosages: Vec<f64>,
+    key: Option<VariantKey>,
+    quality: f64,
 }
 
 struct SpoolEntry {
@@ -4259,6 +4320,25 @@ impl VcfLikeVariantBlockSource {
                 "ordered variant indices and allele match kinds must have equal lengths".into(),
             ));
         }
+        let selected_indices = match &selection_plan {
+            SelectionPlan::ByIndices(indices) => Some(indices.as_slice()),
+            SelectionPlan::Ordered(selection) => Some(selection.indices.as_slice()),
+            SelectionPlan::All | SelectionPlan::ByKeys(_) => None,
+        };
+        let selected_positions = match selected_indices {
+            Some(indices) if indices.windows(2).any(|pair| pair[0] >= pair[1]) => {
+                let mut positions = HashMap::with_capacity(indices.len());
+                for (position, &index) in indices.iter().enumerate() {
+                    if positions.insert(index, position).is_some() {
+                        return Err(VariantIoError::Decode(format!(
+                            "variant index {index} is selected more than once"
+                        )));
+                    }
+                }
+                Some(positions)
+            }
+            _ => None,
+        };
         let n_samples = sample_names.len();
         let n_variants_hint = variant_count.get();
         let filtered_variants_hint = match &selection_plan {
@@ -4309,6 +4389,8 @@ impl VcfLikeVariantBlockSource {
             block_quality: Vec::new(),
             block_keys: Vec::new(),
             collected_keys: Vec::new(),
+            selected_positions,
+            read_ahead: HashMap::new(),
         };
         if !source.parts.is_empty() {
             source.open_part(0)?;
@@ -4478,6 +4560,7 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
         self.sorted_positions.clear();
         self.block_keys.clear();
         self.collected_keys.clear();
+        self.read_ahead.clear();
         if matches!(self.selection_plan, SelectionPlan::ByKeys(_)) {
             if !self.selection_finalized {
                 self.matched_keys.clear();
@@ -4998,38 +5081,63 @@ impl VcfLikeVariantBlockSource {
 
         let target_total = indices.len();
         let mut filled = 0usize;
+        let swap_at =
+            |position: usize| match_kinds.is_some_and(|kinds| kinds[position] == MatchKind::Swap);
 
         while filled < max_variants && self.emitted + filled < target_total {
+            let position = self.emitted + filled;
+            let target_index = indices[position];
+            let offset = filled * self.n_samples;
+            let dest = &mut storage[offset..offset + self.n_samples];
+
+            if !self.read_ahead.is_empty()
+                && let Some(variant) = self.read_ahead.remove(&target_index)
+            {
+                dest.copy_from_slice(&variant.dosages);
+                self.push_selected_variant(variant.key, variant.quality);
+                filled += 1;
+                continue;
+            }
+
             let Some((current_index, alt_index)) = self.read_next_variant(true)? else {
                 break;
             };
 
-            let target_index = indices[self.emitted + filled];
-            if current_index < target_index {
+            if current_index == target_index {
+                let (key, quality) =
+                    self.decode_selected_variant(alt_index, swap_at(position), dest)?;
+                self.push_selected_variant(key, quality);
+                filled += 1;
                 continue;
             }
+
+            // A selection that lists one locus's variants in another order than
+            // the file, such as a model holding a site's ALTs in another order,
+            // reads the variants it needs later ahead of their turn.
+            if let Some(&later) = self
+                .selected_positions
+                .as_ref()
+                .and_then(|positions| positions.get(&current_index))
+            {
+                let mut dosages = vec![0.0; self.n_samples];
+                let (key, quality) =
+                    self.decode_selected_variant(alt_index, swap_at(later), &mut dosages)?;
+                self.read_ahead.insert(
+                    current_index,
+                    ReadAheadVariant {
+                        dosages,
+                        key,
+                        quality,
+                    },
+                );
+                continue;
+            }
+
             if current_index > target_index {
                 return Err(VariantIoError::Decode(format!(
                     "variant index {target_index} requested by PCA list not found in dataset",
                 )));
             }
-
-            let offset = filled * self.n_samples;
-            let dest = &mut storage[offset..offset + self.n_samples];
-            let swap =
-                match_kinds.is_some_and(|kinds| kinds[self.emitted + filled] == MatchKind::Swap);
-            self.decode_current_variant(if swap { 0 } else { alt_index }, dest)?;
-            if let Some(mut key) = self.current_variant_key_for_alt(alt_index)? {
-                if swap && let Some((reference, alternate)) = &mut key.alleles {
-                    std::mem::swap(reference, alternate);
-                }
-                self.block_keys.push(key.clone());
-                self.collected_keys.push(key);
-            }
-            // Store imputation quality for this variant
-            self.block_quality
-                .push(self.current_variant_quality(alt_index));
-            filled += 1;
         }
 
         if filled == 0 && self.stream_exhausted && self.emitted < target_total {
@@ -5041,6 +5149,38 @@ impl VcfLikeVariantBlockSource {
 
         self.emitted += filled;
         Ok(filled)
+    }
+
+    /// Decodes the current variant into `dest`: its `alt_index` ALT dosage, or
+    /// its REF dosage when the selection matched it with alleles swapped.
+    /// Returns the variant's key as the selection sees it, and its imputation
+    /// quality.
+    fn decode_selected_variant(
+        &mut self,
+        alt_index: usize,
+        swap: bool,
+        dest: &mut [f64],
+    ) -> Result<(Option<VariantKey>, f64), VariantIoError> {
+        self.decode_current_variant(if swap { 0 } else { alt_index }, dest)?;
+        let mut key = self.current_variant_key_for_alt(alt_index)?;
+        if swap
+            && let Some(VariantKey {
+                alleles: Some((reference, alternate)),
+                ..
+            }) = key.as_mut()
+        {
+            std::mem::swap(reference, alternate);
+        }
+        Ok((key, self.current_variant_quality(alt_index)))
+    }
+
+    fn push_selected_variant(&mut self, key: Option<VariantKey>, quality: f64) {
+        if let Some(key) = key {
+            self.block_keys.push(key.clone());
+            self.collected_keys.push(key);
+        }
+        // Store imputation quality for this variant
+        self.block_quality.push(quality);
     }
 
     fn next_block_keys(
@@ -7880,5 +8020,110 @@ mod tests {
             dataset.variant_keys_all(),
             Err(VariantIoError::Unsorted { record: 2500, .. })
         ));
+    }
+
+    /// One locus can hold an allele pair in both orientations, an insertion and
+    /// a deletion at one position, and a model can hold a site's ALTs in another
+    /// order than the file. A model fit on a .bim keys ALT/REF, so each record of
+    /// the pair matches one model variant exactly and the other swapped: the
+    /// selection must still take them in the file's order, and the VCF stream
+    /// must serve the ALTs in the model's order.
+    #[test]
+    fn vcf_model_key_selection_keeps_mirrored_alleles_in_order() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mirrored.vcf");
+        fs::write(
+            &path,
+            "\
+##fileformat=VCFv4.2
+##contig=<ID=1>
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2
+1\t100\tins\tT\tTA\t.\tPASS\t.\tGT\t0/0\t0/1
+1\t100\tdel\tTA\tT\t.\tPASS\t.\tGT\t1/1\t0/0
+1\t200\tmulti\tA\tG,C\t.\tPASS\t.\tGT\t1/2\t1/1
+1\t300\tsnp\tC\tT\t.\tPASS\t.\tGT\t0/1\t1/1
+",
+        )
+        .unwrap();
+        let model_keys = vec![
+            VariantKey::new_with_alleles("1", 100, "TA", "T"),
+            VariantKey::new_with_alleles("1", 100, "T", "TA"),
+            VariantKey::new_with_alleles("1", 200, "A", "C"),
+            VariantKey::new_with_alleles("1", 200, "A", "G"),
+            VariantKey::new_with_alleles("1", 300, "T", "C"),
+        ];
+        let dataset = GenotypeDataset::open(&path, None).unwrap();
+        let selection = dataset.select_variants_by_keys(&model_keys).unwrap();
+        assert_eq!(selection.indices, vec![0, 1, 3, 2, 4]);
+        assert_eq!(
+            selection.match_kinds,
+            vec![
+                MatchKind::Swap,
+                MatchKind::Swap,
+                MatchKind::Exact,
+                MatchKind::Exact,
+                MatchKind::Swap,
+            ]
+        );
+        assert!(selection.missing.is_empty());
+
+        // Each model variant's second-allele dosage, S1 then S2.
+        let expected = [2.0, 1.0, 0.0, 2.0, 1.0, 0.0, 1.0, 2.0, 1.0, 0.0];
+        let plan = SelectionPlan::Ordered(OrderedSelectionPlan::new(
+            selection.indices,
+            selection.match_kinds,
+        ));
+        let mut source = dataset.block_source_with_plan(plan).unwrap();
+        for width in [1, 2, 5] {
+            source.reset().unwrap();
+            let mut storage = vec![f64::NAN; 2 * width];
+            let mut observed = Vec::new();
+            let mut keys = Vec::new();
+            loop {
+                let filled = source.next_block_into(width, &mut storage).unwrap();
+                if filled == 0 {
+                    break;
+                }
+                observed.extend_from_slice(&storage[..2 * filled]);
+                keys.extend_from_slice(source.block_variant_keys().unwrap());
+            }
+            assert_eq!(observed, expected, "block width {width}");
+            assert_eq!(keys, model_keys, "block width {width}");
+        }
+
+        let repeated = SelectionPlan::Ordered(OrderedSelectionPlan::new(
+            vec![2, 0, 2],
+            vec![MatchKind::Exact; 3],
+        ));
+        assert!(matches!(
+            dataset.block_source_with_plan(repeated),
+            Err(GenotypeIoError::Variant(VariantIoError::Decode(_)))
+        ));
+    }
+
+    /// The PLINK readers key A1/A2, so a model fit on a VCF (REF/ALT) meets the
+    /// same mirrored pair from the other side.
+    #[test]
+    fn plink_model_key_selection_keeps_mirrored_alleles_in_order() {
+        let dir = tempdir().unwrap();
+        let bed_path = dir.path().join("mirrored.bed");
+        fs::write(
+            bed_path.with_extension("bim"),
+            "1\tins\t0\t100\tTA\tT\n1\tdel\t0\t100\tT\tTA\n1\tsnp\t0\t300\tT\tC\n",
+        )
+        .unwrap();
+        fs::write(bed_path.with_extension("fam"), "f1\ts1\t0\t0\t0\t-9\n").unwrap();
+        fs::write(&bed_path, [0x6c_u8, 0x1b, 0x01, 0, 0, 0]).unwrap();
+        let model_keys = vec![
+            VariantKey::new_with_alleles("1", 100, "T", "TA"),
+            VariantKey::new_with_alleles("1", 100, "TA", "T"),
+            VariantKey::new_with_alleles("1", 300, "C", "T"),
+        ];
+        let dataset = GenotypeDataset::open(&bed_path, None).unwrap();
+        let selection = dataset.select_variants_by_keys(&model_keys).unwrap();
+        assert_eq!(selection.indices, vec![0, 1, 2]);
+        assert_eq!(selection.match_kinds, vec![MatchKind::Swap; 3]);
+        assert!(selection.missing.is_empty());
     }
 }
