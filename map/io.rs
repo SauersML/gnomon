@@ -3312,7 +3312,6 @@ impl VcfLikeDataset {
 
     pub fn variant_keys_all(&self) -> Result<Vec<VariantKey>, VariantIoError> {
         let mut keys = Vec::new();
-        let mut record = RecordBuf::default();
         let mut sorted_positions = ChromPositionSortState::default();
         let mut record_number = 0usize;
 
@@ -3338,46 +3337,48 @@ impl VcfLikeDataset {
                 VariantIoError::Io(err)
             })?;
 
-            loop {
-                let bytes = reader
-                    .read_record_buf(&header, &mut record)
-                    .map_err(|err| {
-                        print_variant_diagnostics(
-                            part,
-                            Some(compression),
-                            Some(format),
-                            "scanning variant records",
-                            &err,
-                        );
-                        VariantIoError::Io(err)
-                    })?;
-                if bytes == 0 {
-                    break;
-                }
-                record_number += 1;
+            scan_record_keys(
+                &mut reader,
+                &header,
+                |err| {
+                    print_variant_diagnostics(
+                        part,
+                        Some(compression),
+                        Some(format),
+                        "scanning variant records",
+                        err,
+                    );
+                },
+                |record| {
+                    record_number += 1;
 
-                let chrom = record.reference_sequence_name().to_string();
-                let Some(position) = record.variant_start() else {
-                    return Err(VariantIoError::Decode(
-                        "variant position missing from record".to_string(),
-                    ));
-                };
-                let pos = position.get() as u64;
-                validate_chrom_position_sorted(&mut sorted_positions, &chrom, pos, record_number)
+                    let Some(position) = record.position else {
+                        return Err(VariantIoError::Decode(
+                            "variant position missing from record".to_string(),
+                        ));
+                    };
+                    let pos = position as u64;
+                    validate_chrom_position_sorted(
+                        &mut sorted_positions,
+                        &record.chromosome,
+                        pos,
+                        record_number,
+                    )
                     .map_err(VariantIoError::from)?;
-                let ref_allele = record.reference_bases().to_string();
-                for alt_allele in record.alternate_bases().iter() {
-                    let alt_allele = alt_allele.map_err(|err| {
+                    let alternate_bases = record.alternate_bases.map_err(|err| {
                         VariantIoError::Decode(format!("failed to read alternate allele: {err}"))
                     })?;
-                    keys.push(VariantKey::new_with_alleles(
-                        &chrom,
-                        pos,
-                        &ref_allele,
-                        alt_allele.as_ref(),
-                    ));
-                }
-            }
+                    for alt_allele in &alternate_bases {
+                        keys.push(VariantKey::new_with_alleles(
+                            &record.chromosome,
+                            pos,
+                            &record.reference_bases,
+                            alt_allele,
+                        ));
+                    }
+                    Ok(())
+                },
+            )?;
         }
 
         Ok(keys)
@@ -3404,7 +3405,6 @@ impl VcfLikeDataset {
         let mut record_idx = 0usize;
         let mut record_number = 0usize;
         let mut sorted_positions = ChromPositionSortState::default();
-        let mut record = RecordBuf::default();
 
         for part in &self.parts {
             let (mut reader, compression, format, _) = create_variant_reader_for_file(part)
@@ -3428,50 +3428,56 @@ impl VcfLikeDataset {
                 VariantIoError::Io(err)
             })?;
 
-            loop {
-                let bytes = reader
-                    .read_record_buf(&header, &mut record)
-                    .map_err(|err| {
-                        print_variant_diagnostics(
-                            part,
-                            Some(compression),
-                            Some(format),
-                            "scanning variant records for variant list",
-                            &err,
-                        );
-                        VariantIoError::Io(err)
-                    })?;
-                if bytes == 0 {
-                    break;
-                }
-                record_number += 1;
+            scan_record_keys(
+                &mut reader,
+                &header,
+                |err| {
+                    print_variant_diagnostics(
+                        part,
+                        Some(compression),
+                        Some(format),
+                        "scanning variant records for variant list",
+                        err,
+                    );
+                },
+                |record| {
+                    record_number += 1;
 
-                let chrom = record.reference_sequence_name().to_string();
-                let Some(position) = record.variant_start() else {
-                    return Err(VariantIoError::Decode(
-                        "variant position missing from record".to_string(),
-                    ));
-                };
-                let pos = position.get() as u64;
-                validate_chrom_position_sorted(&mut sorted_positions, &chrom, pos, record_number)
+                    let Some(position) = record.position else {
+                        return Err(VariantIoError::Decode(
+                            "variant position missing from record".to_string(),
+                        ));
+                    };
+                    let pos = position as u64;
+                    validate_chrom_position_sorted(
+                        &mut sorted_positions,
+                        &record.chromosome,
+                        pos,
+                        record_number,
+                    )
                     .map_err(VariantIoError::from)?;
-                let ref_allele = record.reference_bases().to_string();
-                for alt_allele in record.alternate_bases().iter() {
-                    let alt_allele = alt_allele.map_err(|err| {
+                    let alternate_bases = record.alternate_bases.map_err(|err| {
                         VariantIoError::Decode(format!("failed to read alternate allele: {err}"))
                     })?;
-                    let key =
-                        VariantKey::new_with_alleles(&chrom, pos, &ref_allele, alt_allele.as_ref());
-                    if let Some((status, requested_key)) = filter.match_key(&key)
-                        && matched.insert(requested_key.clone())
-                    {
-                        indices.push(record_idx);
-                        keys.push(selected_model_key(status, &requested_key, key));
-                        match_kinds.push(status);
+                    for alt_allele in &alternate_bases {
+                        let key = VariantKey::new_with_alleles(
+                            &record.chromosome,
+                            pos,
+                            &record.reference_bases,
+                            alt_allele,
+                        );
+                        if let Some((status, requested_key)) = filter.match_key(&key)
+                            && matched.insert(requested_key.clone())
+                        {
+                            indices.push(record_idx);
+                            keys.push(selected_model_key(status, &requested_key, key));
+                            match_kinds.push(status);
+                        }
+                        record_idx += 1;
                     }
-                    record_idx += 1;
-                }
-            }
+                    Ok(())
+                },
+            )?;
         }
 
         let missing = filter.missing_keys(&matched);
@@ -3482,6 +3488,148 @@ impl VcfLikeDataset {
             missing,
             requested_unique: filter.requested_unique(),
         })
+    }
+}
+
+/// Record lines a key-scan batch reads per rayon worker before parsing them.
+const KEY_SCAN_LINES_PER_WORKER: usize = 256;
+/// Bytes a key-scan batch may hold, so VCFs with many samples read fewer lines at a time.
+const KEY_SCAN_BATCH_BYTES: usize = 64 << 20;
+
+/// The fields a key scan takes from one fully parsed record.
+struct ScannedRecordKey {
+    chromosome: String,
+    position: Option<usize>,
+    reference_bases: String,
+    alternate_bases: io::Result<Vec<String>>,
+}
+
+impl ScannedRecordKey {
+    fn from_record_buf(record: &RecordBuf) -> Self {
+        Self {
+            chromosome: record.reference_sequence_name().to_string(),
+            position: record.variant_start().map(|position| position.get()),
+            reference_bases: record.reference_bases().to_string(),
+            alternate_bases: record
+                .alternate_bases()
+                .iter()
+                .map(|allele| allele.map(str::to_string))
+                .collect(),
+        }
+    }
+}
+
+/// Reads every record of one variant stream with noodles' full record parser,
+/// as `read_record_buf` does, and hands each record's key fields to `visit` in
+/// file order. `on_error` sees a read or parse error before it is returned.
+///
+/// A record buffer parses every sample, so on a VCF with many samples this is
+/// the slowest pass over the file. VCF record lines are read in order, parsed
+/// in parallel by per-worker readers over the same bytes, and visited in
+/// order, so the records and the first error are those of a sequential scan.
+fn scan_record_keys<E, F>(
+    reader: &mut VariantStreamReader,
+    header: &vcf::Header,
+    mut on_error: E,
+    mut visit: F,
+) -> Result<(), VariantIoError>
+where
+    E: FnMut(&io::Error),
+    F: FnMut(ScannedRecordKey) -> Result<(), VariantIoError>,
+{
+    if let VariantStreamReader::Vcf(vcf_reader) = reader {
+        return scan_vcf_record_keys(vcf_reader, header, &mut on_error, &mut visit);
+    }
+
+    let mut record = RecordBuf::default();
+    loop {
+        let bytes = reader.read_record_buf(header, &mut record).map_err(|err| {
+            on_error(&err);
+            VariantIoError::Io(err)
+        })?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        visit(ScannedRecordKey::from_record_buf(&record))?;
+    }
+}
+
+fn scan_vcf_record_keys<E, F>(
+    reader: &mut DynVcfReader,
+    header: &vcf::Header,
+    on_error: &mut E,
+    visit: &mut F,
+) -> Result<(), VariantIoError>
+where
+    E: FnMut(&io::Error),
+    F: FnMut(ScannedRecordKey) -> Result<(), VariantIoError>,
+{
+    let workers = rayon::current_num_threads().max(1);
+    let lines_per_batch = workers * KEY_SCAN_LINES_PER_WORKER;
+    let mut batch = Vec::new();
+    let mut line_ends = Vec::new();
+    loop {
+        batch.clear();
+        line_ends.clear();
+        let mut read_error = None;
+        let mut at_eof = false;
+        while line_ends.len() < lines_per_batch && batch.len() < KEY_SCAN_BATCH_BYTES {
+            match reader.get_mut().read_until(b'\n', &mut batch) {
+                Ok(0) => {
+                    at_eof = true;
+                    break;
+                }
+                Ok(_) => line_ends.push(batch.len()),
+                Err(err) => {
+                    read_error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        let lines_per_chunk = line_ends.len().div_ceil(workers).max(1);
+        let chunks: Vec<Vec<io::Result<ScannedRecordKey>>> = line_ends
+            .par_chunks(lines_per_chunk)
+            .enumerate()
+            .map(|(chunk, ends)| {
+                let start = if chunk == 0 {
+                    0
+                } else {
+                    line_ends[chunk * lines_per_chunk - 1]
+                };
+                let end = ends[ends.len() - 1];
+                let mut chunk_reader = VcfReader::new(&batch[start..end]);
+                let mut record = RecordBuf::default();
+                let mut records = Vec::with_capacity(ends.len());
+                for _ in ends {
+                    match chunk_reader.read_record_buf(header, &mut record) {
+                        Ok(_) => records.push(Ok(ScannedRecordKey::from_record_buf(&record))),
+                        Err(err) => {
+                            records.push(Err(err));
+                            break;
+                        }
+                    }
+                }
+                records
+            })
+            .collect();
+
+        for result in chunks.into_iter().flatten() {
+            match result {
+                Ok(record) => visit(record)?,
+                Err(err) => {
+                    on_error(&err);
+                    return Err(VariantIoError::Io(err));
+                }
+            }
+        }
+        if let Some(err) = read_error {
+            on_error(&err);
+            return Err(VariantIoError::Io(err));
+        }
+        if at_eof {
+            return Ok(());
+        }
     }
 }
 
@@ -7629,5 +7777,108 @@ mod tests {
             reloaded.projection_global_info_packed(),
             model.projection_global_info_packed()
         );
+    }
+
+    /// A VCF long enough to span several key-scan batches, with multiallelic
+    /// records, a chromosome change, and optionally a record noodles cannot
+    /// parse or a record out of position order.
+    fn key_scan_vcf(records: usize, unparsable: Option<usize>, unsorted: Option<usize>) -> String {
+        let mut vcf = String::from(
+            "##fileformat=VCFv4.2\n##contig=<ID=1>\n##contig=<ID=2>\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT",
+        );
+        for sample in 0..12 {
+            vcf.push_str(&format!("\tS{sample}"));
+        }
+        vcf.push('\n');
+        for record in 1..=records {
+            let chromosome = if record <= records / 2 { "1" } else { "2" };
+            let position = if unsorted == Some(record) {
+                5
+            } else {
+                1000 + record * 10
+            };
+            let alt = if record % 5 == 0 { "G,T" } else { "G" };
+            vcf.push_str(&format!(
+                "{chromosome}\t{position}\t.\tA\t{alt}\t.\tPASS\t.\tGT:DP"
+            ));
+            for sample in 0..12 {
+                let depth = if unparsable == Some(record) && sample == 7 {
+                    "abc".to_string()
+                } else {
+                    (record + sample).to_string()
+                };
+                vcf.push_str(&format!(
+                    "\t{}:{depth}",
+                    ["0/0", "0/1", "1/1"][(record + sample) % 3]
+                ));
+            }
+            vcf.push('\n');
+        }
+        vcf
+    }
+
+    fn sequential_record_buf_keys(path: &Path) -> io::Result<Vec<VariantKey>> {
+        let mut reader = VcfReader::new(BufReader::new(File::open(path)?));
+        let header = reader.read_header()?;
+        let mut record = RecordBuf::default();
+        let mut keys = Vec::new();
+        while reader.read_record_buf(&header, &mut record)? != 0 {
+            let position = record.variant_start().expect("position").get() as u64;
+            for alt in record.alternate_bases().iter() {
+                keys.push(VariantKey::new_with_alleles(
+                    record.reference_sequence_name(),
+                    position,
+                    record.reference_bases(),
+                    alt?,
+                ));
+            }
+        }
+        Ok(keys)
+    }
+
+    #[test]
+    fn parallel_key_scan_matches_a_sequential_record_buf_scan() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("scan.vcf");
+        fs::write(&path, key_scan_vcf(3000, None, None)).unwrap();
+        let expected = sequential_record_buf_keys(&path).expect("sequential scan");
+        let dataset = VcfLikeDataset::open(&path).unwrap();
+        assert_eq!(dataset.variant_keys_all().unwrap(), expected);
+
+        let requested: Vec<VariantKey> = expected.iter().step_by(7).cloned().collect();
+        let selection = dataset
+            .select_variants(&VariantFilter::from_keys(requested.iter().cloned()))
+            .unwrap();
+        let expected_indices: Vec<usize> = (0..expected.len()).step_by(7).collect();
+        assert_eq!(selection.indices, expected_indices);
+        assert_eq!(selection.keys, requested);
+        assert!(selection.missing.is_empty());
+    }
+
+    #[test]
+    fn parallel_key_scan_reports_the_error_a_sequential_scan_reports() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("scan.vcf");
+
+        // The undecodable DP value comes before the out-of-order record, so
+        // the parse error is the one a sequential scan raises.
+        fs::write(&path, key_scan_vcf(3000, Some(2100), Some(2500))).unwrap();
+        assert!(sequential_record_buf_keys(&path).is_err());
+        let dataset = VcfLikeDataset::open(&path).unwrap();
+        assert!(matches!(
+            dataset.variant_keys_all(),
+            Err(VariantIoError::Io(_))
+        ));
+        assert!(matches!(
+            dataset.select_variants(&VariantFilter::from_keys(std::iter::empty())),
+            Err(VariantIoError::Io(_))
+        ));
+
+        fs::write(&path, key_scan_vcf(3000, None, Some(2500))).unwrap();
+        let dataset = VcfLikeDataset::open(&path).unwrap();
+        assert!(matches!(
+            dataset.variant_keys_all(),
+            Err(VariantIoError::Unsorted { record: 2500, .. })
+        ));
     }
 }
