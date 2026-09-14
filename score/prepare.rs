@@ -35,6 +35,9 @@ const LANE_COUNT: usize = 8;
 #[path = "prepare_cache.rs"]
 mod cache;
 
+#[path = "prepare_parse.rs"]
+mod parse;
+
 // ========================================================================================
 //              Type-driven domain model for streaming
 // ========================================================================================
@@ -545,8 +548,29 @@ fn prepare_for_computation_with_retry(
     let mut seen_invalid_bim_chrs: AHashSet<String> = AHashSet::new();
     let mut seen_invalid_score_chrs: AHashSet<String> = AHashSet::new();
 
-    // Create the iterators.
-    let mut bim_iterator = BimIterator::new(&fileset_paths)?;
+    // Local `.bim` files within the memory budget are read whole and parsed on
+    // the pool; anything else streams line by line.
+    let mut bim_iterator = None;
+    let mut parsed_layout = None;
+    let mut bim_rows = match parse::parse_local_bims(&fileset_paths) {
+        Some(parse::ParsedBim {
+            records,
+            errors,
+            boundaries,
+            total_variants,
+        }) => {
+            let rows = BimRows::parsed(records, errors, &boundaries, &mut seen_invalid_bim_chrs);
+            parsed_layout = Some((total_variants, boundaries));
+            rows
+        }
+        None => {
+            let iterator = bim_iterator.insert(BimIterator::new(&fileset_paths)?);
+            match bim_row_order {
+                BimRowOrder::Streamed => BimRows::streamed(iterator),
+                BimRowOrder::Sorted => BimRows::sorted(iterator, &mut seen_invalid_bim_chrs)?,
+            }
+        }
+    };
     let region_filters = score_regions.and_then(|regions| {
         let mut has_any = false;
         let mut filters = Vec::with_capacity(score_names.len());
@@ -566,10 +590,7 @@ fn prepare_for_computation_with_retry(
         region_filters.clone(),
     )?;
 
-    let mut bim_rows = match bim_row_order {
-        BimRowOrder::Streamed => BimRows::streamed(&mut bim_iterator),
-        BimRowOrder::Sorted => BimRows::sorted(&mut bim_iterator, &mut seen_invalid_bim_chrs)?,
-    };
+    let rows_sorted_by_key = matches!(bim_rows, BimRows::Sorted(_));
     let mut bim_iter = bim_rows.by_ref().peekable();
     let mut score_iter = score_iterator.by_ref().peekable();
 
@@ -892,7 +913,7 @@ fn prepare_for_computation_with_retry(
             BimRowOrder::Sorted,
         );
     }
-    if bim_row_order == BimRowOrder::Sorted {
+    if rows_sorted_by_key {
         // Rows were emitted in key order; readers visit them in file order.
         csr_builder.sort_rows_by_bim_index(&mut required_bim_indices, &mut required_is_complex)?;
     }
@@ -913,7 +934,15 @@ fn prepare_for_computation_with_retry(
         }
     }
 
-    let total_variants_in_bim = bim_iterator.total_variants();
+    let (total_variants_in_bim, bim_boundaries) = match (parsed_layout, bim_iterator) {
+        (Some(layout), _) => layout,
+        (None, Some(iterator)) => (iterator.total_variants(), iterator.boundaries),
+        (None, None) => {
+            return Err(PrepError::Invariant(
+                "Stage 3 had neither parsed nor streamed .bim rows.".to_string(),
+            ));
+        }
+    };
     eprintln!(
         "> TIMING: Stage 3 (Data Collection) took {:.2?}",
         overall_start_time.elapsed()
@@ -1021,8 +1050,7 @@ fn prepare_for_computation_with_retry(
         counts: score_variant_counts,
         flags: required_is_complex,
         total_variants: total_variants_in_bim,
-        starts: bim_iterator
-            .boundaries
+        starts: bim_boundaries
             .iter()
             .map(|b| b.starting_global_index)
             .collect(),
@@ -2045,38 +2073,9 @@ impl<'a> Iterator for BimIterator<'a> {
                 Ok(Some(line_bytes)) => {
                     self.local_line_num += 1;
                     self.total_variants = self.global_offset + self.local_line_num;
-                    let line_str = match std::str::from_utf8(line_bytes) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(PrepError::Parse(format!(
-                                "Invalid UTF-8 in BIM file '{}': {e}",
-                                self.current_path.display()
-                            ))));
-                        }
-                    };
-
-                    let mut parts = line_str.split_whitespace();
-                    let chr = parts.next();
-                    parts.next();
-                    parts.next();
-                    let pos = parts.next();
-                    let a1 = parts.next();
-                    let a2 = parts.next();
-
-                    if let (Some(chr_str), Some(pos_str), Some(a1), Some(a2)) = (chr, pos, a1, a2) {
-                        match parse_key(chr_str, pos_str) {
-                            Ok(key) => {
-                                return Some(Ok(KeyedBimRecord {
-                                    key,
-                                    bim_row_index: BimRowIndex(
-                                        self.global_offset + self.local_line_num - 1,
-                                    ),
-                                    allele1: Allele::new(a1),
-                                    allele2: Allele::new(a2),
-                                }));
-                            }
-                            Err(e) => return Some(Err(e)),
-                        }
+                    let row = BimRowIndex(self.global_offset + self.local_line_num - 1);
+                    if let Some(item) = parse::parse_bim_row(line_bytes, row, &self.current_path) {
+                        return Some(item);
                     }
                 }
                 Ok(None) => {
@@ -2111,6 +2110,13 @@ enum BimRows<'i, 'a> {
         descended_in: Option<PathBuf>,
     },
     Sorted(std::vec::IntoIter<KeyedBimRecord>),
+    /// Rows parsed from whole local files, in file order, with each unparsable
+    /// row as its error at its place: `errors` holds (rows yielded before, error).
+    Parsed {
+        records: std::vec::IntoIter<KeyedBimRecord>,
+        errors: std::iter::Peekable<std::vec::IntoIter<(usize, PrepError)>>,
+        yielded: usize,
+    },
 }
 
 impl<'i, 'a> BimRows<'i, 'a> {
@@ -2148,11 +2154,50 @@ impl<'i, 'a> BimRows<'i, 'a> {
         Ok(Self::Sorted(records.into_iter()))
     }
 
+    /// Rows parsed whole. Rows in key order are yielded as they are. Otherwise
+    /// the unparsable rows are reported and every row is sorted by key, as
+    /// `sorted` does, without reading the files again.
+    fn parsed(
+        mut records: Vec<KeyedBimRecord>,
+        errors: Vec<(usize, PrepError)>,
+        boundaries: &[FilesetBoundary],
+        seen_invalid_bim_chrs: &mut AHashSet<String>,
+    ) -> Self {
+        let Some(descent) = records
+            .windows(2)
+            .position(|pair| pair[1].key < pair[0].key)
+        else {
+            return Self::Parsed {
+                records: records.into_iter(),
+                errors: errors.into_iter().peekable(),
+                yielded: 0,
+            };
+        };
+        let row = records[descent + 1].bim_row_index.0;
+        let fileset = boundaries.partition_point(|b| b.starting_global_index <= row) - 1;
+        eprintln!(
+            "> Variants in {} are not sorted by chromosome and position. Matching them in sorted order...",
+            boundaries[fileset].bim_path.display()
+        );
+        for (_, error) in errors {
+            if let PrepError::Parse(msg) = error
+                && let Some(chr_name) = extract_chr_from_parse_error(&msg)
+                && seen_invalid_bim_chrs.insert(chr_name.to_string())
+            {
+                eprintln!(
+                    "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{chr_name}'."
+                );
+            }
+        }
+        records.par_sort_unstable_by_key(|record| (record.key, record.bim_row_index));
+        Self::Sorted(records.into_iter())
+    }
+
     /// The `.bim` file in which streamed rows stopped ascending, if they did.
     fn descended_in(&self) -> Option<&Path> {
         match self {
             Self::Streamed { descended_in, .. } => descended_in.as_deref(),
-            Self::Sorted(_) => None,
+            Self::Sorted(_) | Self::Parsed { .. } => None,
         }
     }
 }
@@ -2181,6 +2226,18 @@ impl Iterator for BimRows<'_, '_> {
                 Some(item)
             }
             Self::Sorted(records) => records.next().map(Ok),
+            Self::Parsed {
+                records,
+                errors,
+                yielded,
+            } => {
+                if let Some((_, error)) = errors.next_if(|(before, _)| *before == *yielded) {
+                    return Some(Err(error));
+                }
+                let record = records.next()?;
+                *yielded += 1;
+                Some(Ok(record))
+            }
         }
     }
 }
