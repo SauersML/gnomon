@@ -184,6 +184,12 @@ struct FileStream {
     file_line_number: u64,
     /// Counter for malformed lines in this specific file stream.
     malformed_lines_count: usize,
+    /// The file, named in messages about its rows.
+    path: PathBuf,
+    /// Lines through the header, so messages can give physical line numbers.
+    header_lines: u64,
+    /// Rows and weight fields skipped because they cannot be used.
+    rejected: RejectedScoreRows,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -421,8 +427,9 @@ struct KWayMergeIterator {
     streams: Vec<FileStream>,
     heap: BinaryHeap<HeapItem>,
     file_column_maps: Vec<Vec<ScoreColumnIndex>>,
-    // Holds a terminal error. If Some, iteration will stop after yielding the error.
-    next_error: Option<PrepError>,
+    /// Errors to yield before the next record: rows on contigs gnomon cannot key,
+    /// each skipped on its own, and then any error that ends a file.
+    pending_errors: std::collections::VecDeque<PrepError>,
     region_filters: Option<Vec<Option<GenomicRegion>>>,
     region_filter_hits: Option<Vec<bool>>,
 }
@@ -751,9 +758,12 @@ fn prepare_for_computation_with_retry(
             Ok(rec) => rec.key,
             Err(_) => match score_iter.next().unwrap().unwrap_err() {
                 PrepError::Parse(msg) => {
-                    if let Some(chr_name) = extract_chr_from_parse_error(&msg)
-                        && seen_invalid_score_chrs.insert(chr_name.to_string())
-                    {
+                    // Only a row on a contig gnomon cannot key is skipped here; any
+                    // other unusable score row fails the run.
+                    let Some(chr_name) = extract_chr_from_parse_error(&msg) else {
+                        return Err(PrepError::Parse(msg));
+                    };
+                    if seen_invalid_score_chrs.insert(chr_name.to_string()) {
                         eprintln!(
                             "Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{chr_name}'."
                         );
@@ -1013,8 +1023,17 @@ fn prepare_for_computation_with_retry(
         // Rows were emitted in key order; readers visit them in file order.
         csr_builder.sort_rows_by_bim_index(&mut required_bim_indices, &mut required_is_complex)?;
     }
+    // A score row the join peeked at but never took can still be one that fails
+    // the run; finish() below reads the rows beyond it the same way.
+    if let Some(Err(_)) = score_iter.peek()
+        && let Some(Err(error)) = score_iter.next()
+        && !is_unkeyable_contig(&error)
+    {
+        return Err(error);
+    }
 
     let region_filter_hits = score_iterator.take_region_filter_hits();
+    let mut rejected_score_rows = score_iterator.finish()?;
     if let (Some(filters), Some(hit_flags)) = (region_filters.as_ref(), region_filter_hits.as_ref())
     {
         for (idx, region_opt) in filters.iter().enumerate() {
@@ -1052,6 +1071,7 @@ fn prepare_for_computation_with_retry(
             "> Warning: Skipped {total_malformed_lines} lines from score files due to missing columns (variant_id, effect_allele, other_allele)."
         );
     }
+    rejected_score_rows.report();
 
     // --- Stage 4: Verifying data and finalizing matrix metadata ---
     eprintln!("> Stage 4: Verifying data and building final matrices...");
@@ -1119,6 +1139,7 @@ fn prepare_for_computation_with_retry(
     }
 
     let clean = total_malformed_lines == 0
+        && rejected_score_rows.total() == 0
         && seen_invalid_bim_chrs.is_empty()
         && seen_invalid_score_chrs.is_empty()
         && region_filters
@@ -1521,6 +1542,89 @@ mod tests {
             plans.push((baseline, plan_by_row_text(&prep, rows)));
         }
         assert_eq!(plans[0], plans[1]);
+    }
+
+    #[test]
+    fn unusable_score_rows_are_skipped_alone_or_fail_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("panel");
+        write_bim_fileset(
+            &prefix,
+            &[
+                "1 a 0 100 A G\n",
+                "1 b 0 200 C T\n",
+                "1 c 0 300 A C\n",
+                "1 d 0 400 G T\n",
+            ],
+            3,
+        );
+        // Region filters send score files through the streaming merge; without them
+        // the files are parsed whole. Both paths must agree.
+        let whole_chromosome: HashMap<String, GenomicRegion> = [(
+            "S".to_string(),
+            GenomicRegion {
+                chromosome: 1,
+                start: 0,
+                end: u32::MAX,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let weights = dir.path().join("weights.tsv");
+        std::fs::write(
+            &weights,
+            "variant_id\teffect_allele\tother_allele\tS\n\
+             1:100\tG\tA\t0.5\n\
+             chrUn_x:5\tA\tC\t1\n\
+             1:300\tC\tN\t2\n\
+             1:400\tT\tG\t0.25\n",
+        )
+        .unwrap();
+        for regions in [None, Some(&whole_chromosome)] {
+            let prep = prepare_for_computation(
+                std::slice::from_ref(&prefix),
+                std::slice::from_ref(&weights),
+                None,
+                regions,
+            )
+            .unwrap();
+            // Before, the unkeyable contig silently ended the file after 1:100.
+            assert_eq!(
+                prep.score_variant_counts,
+                vec![2],
+                "region filters {}",
+                regions.is_some()
+            );
+        }
+        for (name, row, problem) in [
+            ("NA inside", "1:200\tT\tC\tNA\n", "Invalid weight 'NA'"),
+            ("nan beyond", "2:5\tA\tG\tnan\n", "Invalid weight 'nan'"),
+            ("position inside", "1:x\tA\tG\t1\n", "Invalid position"),
+            ("position beyond", "2:bad\tA\tG\t1\n", "Invalid position"),
+        ] {
+            let bad = dir.path().join(format!("{}.tsv", name.replace(' ', "_")));
+            std::fs::write(
+                &bad,
+                format!("variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.5\n{row}"),
+            )
+            .unwrap();
+            for regions in [None, Some(&whole_chromosome)] {
+                let error = prepare_for_computation(
+                    std::slice::from_ref(&prefix),
+                    std::slice::from_ref(&bad),
+                    None,
+                    regions,
+                )
+                .err()
+                .unwrap()
+                .to_string();
+                assert!(
+                    error.contains("line 3") && error.contains(problem),
+                    "{name}, region filters {}: {error}",
+                    regions.is_some()
+                );
+            }
+        }
     }
 
     #[test]
@@ -2034,6 +2138,85 @@ fn map_pipeline_error(err: PipelineError, path: PathBuf) -> PrepError {
     }
 }
 
+/// Whether an error names a chromosome label gnomon cannot key. A score or .bim row
+/// on such a contig is skipped on its own, with one warning per name.
+fn is_unkeyable_contig(error: &PrepError) -> bool {
+    matches!(error, PrepError::Parse(msg) if extract_chr_from_parse_error(msg).is_some())
+}
+
+/// Parses a non-empty weight field. Only a finite decimal is usable.
+fn parse_weight(text: &str) -> Result<f32, String> {
+    match text.parse::<f32>() {
+        Ok(weight) if weight.is_finite() => Ok(weight),
+        Ok(_) => Err("not a finite number".to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// The error for a weight field that is not a finite number. `plink2 --score` stops
+/// on the same coefficients ("Invalid coefficient 'na' on line 11 of …"); before,
+/// gnomon silently dropped every later row of the file, or scored NaN or inf.
+fn unusable_weight_error(text: &str, line_number: u64, path: &Path, problem: &str) -> PrepError {
+    PrepError::Parse(format!(
+        "Invalid weight '{text}' on line {line_number} of score file '{}': {problem}. Weights must be finite numbers; leave the field empty for a score that does not use the variant.",
+        path.display()
+    ))
+}
+
+/// Score file rows whose other_allele is 'N'. No .bim record pairs with an unknown
+/// allele, so each such row is skipped on its own, and they are reported together
+/// after Stage 3.
+#[derive(Debug, Default)]
+struct RejectedScoreRows {
+    unknown_other_allele: u64,
+    /// The earliest rows of each file, as (file, physical line).
+    examples: Vec<(PathBuf, u64)>,
+}
+
+impl RejectedScoreRows {
+    const EXAMPLES: usize = 5;
+
+    fn record(&mut self, path: &Path, line: u64) {
+        self.unknown_other_allele += 1;
+        if self
+            .examples
+            .iter()
+            .filter(|(example_path, _)| example_path == path)
+            .count()
+            < Self::EXAMPLES
+        {
+            self.examples.push((path.to_path_buf(), line));
+        }
+    }
+
+    fn absorb(&mut self, other: RejectedScoreRows) {
+        self.unknown_other_allele += other.unknown_other_allele;
+        self.examples.extend(other.examples);
+    }
+
+    fn total(&self) -> u64 {
+        self.unknown_other_allele
+    }
+
+    fn report(&mut self) {
+        if self.total() == 0 {
+            return;
+        }
+        self.examples.sort();
+        eprintln!(
+            "> Warning: Skipped {} score file row(s) whose other_allele is 'N'. No .bim record can pair with an unknown allele, so they contribute nothing to any score.",
+            self.unknown_other_allele
+        );
+        eprintln!(
+            "> Examples (first {}):",
+            self.examples.len().min(Self::EXAMPLES)
+        );
+        for (path, line) in self.examples.iter().take(Self::EXAMPLES) {
+            eprintln!(">   - {}: line {line}", path.display());
+        }
+    }
+}
+
 /// Extracts the malformed chromosome name from a `PrepError::Parse` message.
 fn extract_chr_from_parse_error(msg: &str) -> Option<&str> {
     if let Some(rest) = msg.strip_prefix("Invalid chromosome format '")
@@ -2390,6 +2573,7 @@ impl KWayMergeIterator {
             let file = File::open(path).map_err(|e| PrepError::Io(e, path.clone()))?;
             let mut reader = BufReader::new(file);
             let mut header_line = String::new();
+            let mut header_lines = 0u64;
 
             loop {
                 header_line.clear();
@@ -2400,6 +2584,7 @@ impl KWayMergeIterator {
                 {
                     break;
                 }
+                header_lines += 1;
                 if !header_line.trim().is_empty() && !header_line.starts_with('#') {
                     break;
                 }
@@ -2429,6 +2614,9 @@ impl KWayMergeIterator {
                 line_string_buffer: String::new(),
                 file_line_number: 0,
                 malformed_lines_count: 0,
+                path: path.clone(),
+                header_lines,
+                rejected: RejectedScoreRows::default(),
             });
         }
 
@@ -2440,7 +2628,7 @@ impl KWayMergeIterator {
             streams,
             heap: BinaryHeap::new(),
             file_column_maps,
-            next_error: None,
+            pending_errors: std::collections::VecDeque::new(),
             region_filters,
             region_filter_hits,
         };
@@ -2464,7 +2652,13 @@ impl KWayMergeIterator {
                         return Ok(());
                     }
 
-                    Self::read_line_into_buffer(stream, column_map, None, None)?
+                    Self::read_line_into_buffer(
+                        stream,
+                        column_map,
+                        None,
+                        None,
+                        &mut self.pending_errors,
+                    )?
                 };
 
                 match outcome {
@@ -2493,7 +2687,13 @@ impl KWayMergeIterator {
 
                 let region_hits_slice = region_hits.as_deref_mut();
 
-                Self::read_line_into_buffer(stream, column_map, region_filters, region_hits_slice)?
+                Self::read_line_into_buffer(
+                    stream,
+                    column_map,
+                    region_filters,
+                    region_hits_slice,
+                    &mut self.pending_errors,
+                )?
             };
 
             match outcome {
@@ -2517,6 +2717,7 @@ impl KWayMergeIterator {
         column_map: &[ScoreColumnIndex],
         region_filters: Option<&[Option<GenomicRegion>]>,
         mut region_hits: Option<&mut [bool]>,
+        pending_errors: &mut std::collections::VecDeque<PrepError>,
     ) -> Result<LineReadOutcome, PrepError> {
         stream.line_buffer.clear();
         stream.current_line_info = None;
@@ -2552,17 +2753,31 @@ impl KWayMergeIterator {
                         continue; // Line doesn't have the required three non-empty columns
                     }
                 };
+            let line_number = stream.header_lines + stream.file_line_number;
             if other_allele == "N" {
-                return Err(PrepError::Parse(format!(
-                    "Score file line {} has unknown other_allele 'N'. Scores must provide an explicit allele pair.",
-                    stream.file_line_number
-                )));
+                // No .bim record pairs with an unknown other allele. The row is
+                // skipped on its own and reported; the rest of the file still counts.
+                stream.rejected.record(&stream.path, line_number);
+                continue;
             }
 
             let mut key_parts = variant_id.splitn(2, ':');
             let chr_str = key_parts.next().unwrap_or("");
             let pos_str = key_parts.next().unwrap_or("");
-            let key = parse_key(chr_str, pos_str)?;
+            let key = match parse_key(chr_str, pos_str) {
+                Ok(key) => key,
+                Err(error) if is_unkeyable_contig(&error) => {
+                    pending_errors.push_back(error);
+                    continue;
+                }
+                Err(PrepError::Parse(msg)) => {
+                    return Err(PrepError::Parse(format!(
+                        "Score file '{}' line {line_number}: {msg}",
+                        stream.path.display()
+                    )));
+                }
+                Err(error) => return Err(error),
+            };
             stream.current_line_info =
                 Some((key, Allele::new(effect_allele), Allele::new(other_allele)));
 
@@ -2574,14 +2789,8 @@ impl KWayMergeIterator {
                 let Some(&score_column_index) = column_map.get(i) else {
                     continue;
                 };
-                let weight = weight_str.parse::<f32>().map_err(|err| {
-                    PrepError::Parse(format!(
-                        "Invalid weight '{}' in score file line {}, column {}: {}",
-                        weight_str,
-                        stream.file_line_number,
-                        i + 4,
-                        err
-                    ))
+                let weight = parse_weight(weight_str).map_err(|problem| {
+                    unusable_weight_error(weight_str, line_number, &stream.path, &problem)
                 })?;
                 if let Some(filters) = region_filters {
                     if let Some(Some(region)) = filters.get(score_column_index.0)
@@ -2641,7 +2850,7 @@ impl Iterator for KWayMergeIterator {
     type Item = Result<KeyedScoreRecord, PrepError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(e) = self.next_error.take() {
+        if let Some(e) = self.pending_errors.pop_front() {
             return Some(Err(e));
         }
 
@@ -2650,7 +2859,7 @@ impl Iterator for KWayMergeIterator {
         let file_idx = top_item.file_idx;
 
         if let Err(e) = self.replenish_from_stream(file_idx) {
-            self.next_error = Some(e);
+            self.pending_errors.push_back(e);
         }
 
         Some(Ok(record_to_return))
@@ -2678,6 +2887,35 @@ impl ScoreRows {
             Self::Streamed(merge) => merge.take_region_filter_hits(),
             // Parsed only without region filters, which record no hits.
             Self::Parsed(_) => None,
+        }
+    }
+
+    /// Reads whatever the merge-join left unread, so a row that fails the run fails
+    /// it wherever it sits, and returns every rejected row for the report. The
+    /// malformed-line count keeps its meaning: lines the join read.
+    fn finish(&mut self) -> Result<RejectedScoreRows, PrepError> {
+        match self {
+            Self::Streamed(merge) => {
+                let malformed: Vec<usize> = merge
+                    .streams
+                    .iter()
+                    .map(|s| s.malformed_lines_count)
+                    .collect();
+                while let Some(item) = merge.next() {
+                    if let Err(error) = item
+                        && !is_unkeyable_contig(&error)
+                    {
+                        return Err(error);
+                    }
+                }
+                let mut rejected = RejectedScoreRows::default();
+                for (stream, count) in merge.streams.iter_mut().zip(malformed) {
+                    stream.malformed_lines_count = count;
+                    rejected.absorb(std::mem::take(&mut stream.rejected));
+                }
+                Ok(rejected)
+            }
+            Self::Parsed(parsed) => parsed.finish(),
         }
     }
 }
