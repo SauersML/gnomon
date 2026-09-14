@@ -393,7 +393,9 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
     // the PCA to one end of the genome, and a random draw would make the model
     // depend on a seed for no benefit, since variant order is already arbitrary
     // with respect to ancestry.
-    if let Some(budget) = markers {
+    let indexed = matches!(dataset, GenotypeDataset::Plink(_) | GenotypeDataset::Pgen(_));
+    if let Some(budget) = effective_marker_budget(markers, ld.is_some(), indexed, &selection_plan)
+    {
         selection_plan = thin_selection_plan(&dataset, selection_plan, budget)?;
         if let Some(keys) = variant_keys.take() {
             // A list-backed selection cached model-oriented keys before
@@ -743,6 +745,48 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
     println!("  • Score metadata  : {}", scores_metadata_path.display());
 
     Ok(())
+}
+
+/// The `--markers` budget `--ld` falls back to when none is given. LD weighting
+/// adds a windowed regression per marker to every stage that already scales in
+/// the marker count, so an unbudgeted 1.2M-marker array fit with a 500 kbp
+/// window can take days.
+const LD_DEFAULT_MARKER_BUDGET: usize = 100_000;
+
+/// The marker budget a fit applies.
+///
+/// An explicit `--markers` always stands, and [`thin_selection_plan`] refuses it
+/// where it cannot be honoured. `--ld` without `--markers` falls back to
+/// [`LD_DEFAULT_MARKER_BUDGET`], but only on an indexed source (PLINK/PGEN). A
+/// streamed VCF/BCF learns which variants it holds only by being read, which is
+/// the cost a budget exists to avoid, so it keeps every variant it streams, or
+/// every `--list` variant it matches.
+fn effective_marker_budget(
+    markers: Option<usize>,
+    ld: bool,
+    indexed: bool,
+    plan: &SelectionPlan,
+) -> Option<usize> {
+    if markers.is_some() || !ld {
+        return markers;
+    }
+    if indexed {
+        println!(
+            "LD safety budget: using {LD_DEFAULT_MARKER_BUDGET} evenly spaced markers; pass --markers explicitly to override."
+        );
+        return Some(LD_DEFAULT_MARKER_BUDGET);
+    }
+    let bound = match plan {
+        SelectionPlan::ByKeys(filter) => format!(
+            "the {} variants of --list bound the fit",
+            filter.requested_unique()
+        ),
+        _ => "the fit keeps every variant it streams".to_string(),
+    };
+    println!(
+        "LD safety budget not applied: a streamed VCF/BCF cannot be thinned before it is read, so {bound}. Pass a shorter --list to fit on fewer markers."
+    );
+    None
 }
 
 fn stride_indices(available: usize, budget: usize) -> Vec<usize> {
@@ -3526,5 +3570,286 @@ mod tests {
     #[test]
     fn fit_and_project_hgdp_chr20_with_remote_variant_list() -> Result<(), Box<dyn Error>> {
         run_fit_and_project_hgdp_chr20(Some(Path::new(HGDP_REMOTE_VARIANT_LIST)))
+    }
+}
+
+/// `--ld` without `--markers` on every genotype source form. The default marker
+/// budget must never make a fit fail where the source cannot honour it.
+#[cfg(test)]
+mod ld_marker_budget_tests {
+    use super::{LD_DEFAULT_MARKER_BUDGET, MapCommand, MapDriverError, effective_marker_budget, run};
+    use crate::adapt_plink2::GenomeBuild;
+    use crate::map::fit::LdWindow;
+    use crate::map::io::{SelectionPlan, fit_artifact_path};
+    use crate::map::variant_filter::{VariantFilter, VariantKey};
+    use std::fmt::Write as _;
+    use std::fs;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    const SAMPLES: usize = 40;
+    const VARIANTS: usize = 200;
+    const SPACING_BP: u64 = 10_000;
+
+    /// A deterministic draw in 0..100 for one allele of one sample at one variant.
+    fn draw(sample: usize, variant: usize, allele: usize) -> u64 {
+        let mut x = ((sample as u64) << 32) ^ ((variant as u64) << 4) ^ allele as u64;
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (x ^ (x >> 31)) % 100
+    }
+
+    /// Alternate-allele count in a two-population cohort. The allele frequency is
+    /// 0.8 in one population and 0.2 in the other, and which is which varies by
+    /// variant, so the fit has real structure to find.
+    fn dosage(sample: usize, variant: usize) -> u8 {
+        let frequency = if (sample % 2 == 0) == (variant % 3 == 0) {
+            80
+        } else {
+            20
+        };
+        (0..2)
+            .filter(|&allele| draw(sample, variant, allele) < frequency)
+            .count() as u8
+    }
+
+    fn position(variant: usize) -> u64 {
+        SPACING_BP * (variant as u64 + 1)
+    }
+
+    fn vcf_text() -> String {
+        let mut text = String::from("##fileformat=VCFv4.2\n##contig=<ID=1>\n");
+        text.push_str("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT");
+        for sample in 0..SAMPLES {
+            write!(text, "\tS{sample}").unwrap();
+        }
+        text.push('\n');
+        for variant in 0..VARIANTS {
+            write!(text, "1\t{}\trs{variant}\tA\tG\t.\tPASS\t.\tGT", position(variant)).unwrap();
+            for sample in 0..SAMPLES {
+                let genotype = match dosage(sample, variant) {
+                    0 => "0/0",
+                    1 => "0/1",
+                    _ => "1/1",
+                };
+                write!(text, "\t{genotype}").unwrap();
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    /// Every other variant, as `chrom pos` lines.
+    fn write_variant_list(dir: &Path) -> PathBuf {
+        let path = dir.join("every_other.list");
+        let mut text = String::from("chrom\tpos\n");
+        for variant in (0..VARIANTS).step_by(2) {
+            writeln!(text, "1\t{}", position(variant)).unwrap();
+        }
+        fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn write_plink_fileset(dir: &Path) -> PathBuf {
+        let prefix = dir.join("cohort");
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        let mut bim = String::new();
+        for variant in 0..VARIANTS {
+            writeln!(bim, "1\trs{variant}\t0\t{}\tG\tA", position(variant)).unwrap();
+            let mut packed = vec![0u8; SAMPLES.div_ceil(4)];
+            for sample in 0..SAMPLES {
+                // Two-bit codes counting the first allele: 00 two copies, 10 one, 11 none.
+                let code: u8 = match dosage(sample, variant) {
+                    2 => 0b00,
+                    1 => 0b10,
+                    _ => 0b11,
+                };
+                packed[sample / 4] |= code << (2 * (sample % 4));
+            }
+            bed.extend_from_slice(&packed);
+        }
+        let fam: String = (0..SAMPLES)
+            .map(|sample| format!("F{sample}\tS{sample}\t0\t0\t0\t-9\n"))
+            .collect();
+        fs::write(prefix.with_extension("bed"), bed).unwrap();
+        fs::write(prefix.with_extension("bim"), bim).unwrap();
+        fs::write(prefix.with_extension("fam"), fam).unwrap();
+        prefix.with_extension("bed")
+    }
+
+    /// Runs `gnomon fit --ld --bp_window <window_bp> --components 2` and returns the
+    /// model path.
+    fn ld_fit(
+        genotype_path: PathBuf,
+        genome_build: Option<GenomeBuild>,
+        variant_list: Option<PathBuf>,
+        markers: Option<usize>,
+        window_bp: u64,
+        out_dir: &Path,
+    ) -> Result<PathBuf, MapDriverError> {
+        let prefix = out_dir.join("fit");
+        run(MapCommand::Fit {
+            genotype_path,
+            genome_build,
+            output_prefix: Some(prefix.clone()),
+            variant_list,
+            keep: None,
+            markers,
+            components: 2,
+            threads: None,
+            allow_unconverged: true,
+            max_passes: None,
+            maf: None,
+            geno: None,
+            mind: None,
+            ld: Some(LdWindow::BasePairs(window_bp)),
+        })?;
+        Ok(fit_artifact_path(&prefix, "hwe.json"))
+    }
+
+    /// Serves `object` at `/name`: HEAD, a whole-object GET, and a `Range: bytes=`
+    /// GET, over any number of keep-alive connections.
+    fn serve_http_object(object: Vec<u8>, name: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/{name}", listener.local_addr().unwrap());
+        let object = Arc::new(object);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let object = Arc::clone(&object);
+                std::thread::spawn(move || serve_connection(stream, &object));
+            }
+        });
+        url
+    }
+
+    fn serve_connection(stream: TcpStream, object: &[u8]) {
+        let Ok(mut writer) = stream.try_clone() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream);
+        let last = object.len().saturating_sub(1);
+        loop {
+            let mut request = String::new();
+            if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                return;
+            }
+            let mut range = None;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(bounds) = line.to_ascii_lowercase().strip_prefix("range: bytes=")
+                    && let Some((start, end)) = bounds.trim().split_once('-')
+                {
+                    let end = end.parse().unwrap_or(last).min(last);
+                    range = Some((start.parse().unwrap_or(0).min(end), end));
+                }
+            }
+            let len = object.len();
+            let (head, body) = if request.starts_with("HEAD") {
+                (format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n"), &object[..0])
+            } else if let Some((start, end)) = range {
+                (
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{len}\r\nContent-Length: {}\r\n\r\n",
+                        end - start + 1
+                    ),
+                    &object[start..=end],
+                )
+            } else {
+                (format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n"), object)
+            };
+            if writer
+                .write_all(head.as_bytes())
+                .and_then(|()| writer.write_all(body))
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn ld_without_markers_budgets_only_indexed_sources() {
+        let by_keys = SelectionPlan::ByKeys(Arc::new(VariantFilter::from_keys([VariantKey::new(
+            "1", 100,
+        )])));
+        let all = SelectionPlan::All;
+        assert_eq!(
+            effective_marker_budget(None, true, true, &all),
+            Some(LD_DEFAULT_MARKER_BUDGET)
+        );
+        assert_eq!(effective_marker_budget(None, true, false, &all), None);
+        assert_eq!(effective_marker_budget(None, true, false, &by_keys), None);
+        assert_eq!(effective_marker_budget(None, false, true, &all), None);
+        // An explicit budget always stands; thinning refuses it where it cannot apply.
+        assert_eq!(effective_marker_budget(Some(500), true, false, &by_keys), Some(500));
+        assert_eq!(effective_marker_budget(Some(500), false, true, &all), Some(500));
+    }
+
+    #[test]
+    fn ld_fit_without_markers_succeeds_on_a_streamed_vcf_with_a_variant_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let vcf = dir.path().join("cohort.vcf");
+        fs::write(&vcf, vcf_text()).unwrap();
+        let list = write_variant_list(dir.path());
+        let model = ld_fit(vcf, None, Some(list), None, 50_000, dir.path())
+            .expect("a streamed VCF with --list and --ld must fit");
+        assert!(model.is_file(), "no model at {}", model.display());
+    }
+
+    #[test]
+    fn ld_fit_without_markers_succeeds_on_a_remote_vcf_with_a_variant_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = serve_http_object(vcf_text().into_bytes(), "cohort.vcf");
+        let list = write_variant_list(dir.path());
+        let model = ld_fit(PathBuf::from(url), None, Some(list), None, 50_000, dir.path())
+            .expect("a remote VCF with --list and --ld must fit");
+        assert!(model.is_file(), "no model at {}", model.display());
+    }
+
+    #[test]
+    fn ld_fit_without_markers_succeeds_on_a_plink_fileset() {
+        let dir = tempfile::tempdir().unwrap();
+        let bed = write_plink_fileset(dir.path());
+        let model = ld_fit(bed, None, None, None, 50_000, dir.path())
+            .expect("a PLINK fileset with --ld must fit");
+        assert!(model.is_file(), "no model at {}", model.display());
+    }
+
+    #[test]
+    fn ld_fit_without_markers_succeeds_on_a_pgen_fileset() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/testdata");
+        for extension in ["pgen", "pvar", "psam"] {
+            let name = format!("ld_p.{extension}");
+            fs::copy(fixtures.join(&name), dir.path().join(&name)).unwrap();
+        }
+        let build = GenomeBuild::parse("38").expect("build");
+        let model = ld_fit(dir.path().join("ld_p.pgen"), Some(build), None, None, 1_000, dir.path())
+            .expect("a PGEN fileset with --ld must fit");
+        assert!(model.is_file(), "no model at {}", model.display());
+    }
+
+    #[test]
+    fn explicit_markers_on_a_streamed_vcf_with_a_variant_list_are_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let vcf = dir.path().join("cohort.vcf");
+        fs::write(&vcf, vcf_text()).unwrap();
+        let list = write_variant_list(dir.path());
+        let error = ld_fit(vcf, None, Some(list), Some(50), 50_000, dir.path())
+            .expect_err("an explicit budget cannot apply to a stream");
+        assert!(matches!(
+            &error,
+            MapDriverError::InvalidState(message)
+                if message.contains("--markers needs an indexed genotype source")
+        ));
     }
 }

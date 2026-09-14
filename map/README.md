@@ -95,9 +95,12 @@ Optional arguments:
   lies inside a nearly degenerate ancestry/noise cluster and a fixed component
   count is operationally required; without it, an unconverged fit is refused.
 * `--ld` – Enable linkage disequilibrium flattening. When present, LD weights
-  use a default window of 51 variants unless `--sites_window <SITES>` (odd
-  number of variants) or `--bp_window <BP>` (total genomic span in base pairs)
-  is supplied. Every window is clipped to its chromosome; site-count windows
+  use a 500 kbp window unless `--sites_window <SITES>` (odd number of variants)
+  or `--bp_window <BP>` (total genomic span in base pairs) is supplied. Without
+  `--markers`, a PLINK or PGEN fit also keeps at most 100,000 evenly spaced
+  markers. A streamed VCF/BCF cannot be thinned before it is read, so it keeps
+  every variant it streams, or every `--list` variant it matches. Every window
+  is clipped to its chromosome; site-count windows
   never borrow markers from the next chromosome. Base-pair windows additionally
   require nondecreasing positions within each chromosome run. The resulting
   weights are stored inside `hwe.json` so projections can apply the same

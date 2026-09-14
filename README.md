@@ -86,10 +86,13 @@ removes the need to stage or symlink PLINK files. Without `--out`, artifacts
 remain beside the input for quick interactive runs.
 
 `--ld` is safe by default on biobank arrays: when no expert overrides are
-provided it uses a 500 kbp physical window and an evenly spaced 100,000-marker
-budget. This matters because a full 1.2M-marker array with 500 kbp local solves
-can take days. Pass `--markers`, `--bp_window`, or `--sites_window` explicitly
-to override the production defaults.
+provided it uses a 500 kbp physical window and, on a PLINK or PGEN source, an
+evenly spaced 100,000-marker budget. This matters because a full 1.2M-marker
+array with 500 kbp local solves can take days. A streamed VCF or BCF cannot be
+thinned before it is read, so there the fit keeps every variant it streams, or
+every `--list` variant it matches; pass a shorter `--list` to fit on fewer.
+Pass `--markers`, `--bp_window`, or `--sites_window` explicitly to override the
+production defaults.
 
 `--threads N` configures both the fit-local and process-wide Rayon pools before
 any fit work starts, so library kernels cannot silently escape the requested

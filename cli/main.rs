@@ -141,7 +141,8 @@ struct FitArgs {
     /// Cap the number of variants the fit reads, as an evenly spaced subsample.
     /// Every fit stage scales linearly in the variant count, and the leading
     /// axes are estimated well before the last marker is read. Applies after
-    /// --list, and needs an indexed source (PLINK/PGEN).
+    /// --list, and needs an indexed source (PLINK/PGEN). With --ld on such a
+    /// source it defaults to 100000.
     #[arg(long, value_name = "N")]
     markers: Option<usize>,
 
@@ -179,7 +180,10 @@ struct FitArgs {
     #[arg(long = "mind", value_name = "RATE")]
     mind: Option<f64>,
 
-    /// Enable LD normalization when fitting the PCA model
+    /// Enable LD normalization when fitting the PCA model. Uses a 500 kbp window
+    /// unless --sites_window or --bp_window is given, and on a PLINK/PGEN source
+    /// without --markers keeps at most 100000 evenly spaced markers. A streamed
+    /// VCF/BCF keeps every variant it streams, or every --list variant it matches.
     #[arg(long)]
     ld: bool,
 
@@ -784,22 +788,15 @@ fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let markers = if args.ld && args.markers.is_none() {
-        println!(
-            "LD safety budget: using 100000 evenly spaced markers; pass --markers explicitly to override."
-        );
-        Some(100_000)
-    } else {
-        args.markers
-    };
-
+    // `--ld` without `--markers` gets its default marker budget inside the fit,
+    // where the genotype source is known: only an indexed source can honour it.
     map_cli::run(map_cli::MapCommand::Fit {
         genotype_path: args.genotype_path,
         genome_build,
         output_prefix: args.out,
         variant_list: args.list,
         keep: args.keep,
-        markers,
+        markers: args.markers,
         components: args.components,
         threads: args.threads.map(NonZeroUsize::get),
         allow_unconverged: args.allow_unconverged,
