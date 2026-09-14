@@ -25,6 +25,8 @@ LABELS = frozenset({
     "transforming_score", "applying_reference_ctn", "score_transform_ready", "fitting_disease", "fitting_death",
     "fit_cpu_low", "fit_cpu_partial", "fit_cpu_saturated",
     "failed_fit_worker_signal", "failed_fit_worker_error",
+    "benchmark_started", "benchmark_projection_ready", "benchmark_cohort_ready",
+    "benchmark_fitting", "benchmark_completed", "failed_benchmark",
     "fit_warm_start_restored", "fit_inner_solves_1_9", "fit_inner_solves_10_49",
     "fit_inner_solves_50_199", "fit_inner_solves_200_plus",
     "failed_score_missingness_absent", "failed_score_missingness_invalid",
