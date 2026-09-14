@@ -20,10 +20,11 @@
 //!   that costs is counted as the `.pgen` is read and reported: see
 //!   `VirtualPlink19::dosage_coercion_report`, and the stderr warning the
 //!   adapter raises on its own once the counts are decisive.
-//! - Ploidy: autosomes plus pseudoautosomal regions are diploid; `X`
-//!   (non-PAR), `Y`, and `MT` are treated as haploid for males.
-//!   Heterozygotes in these contexts are coerced to missing before PLINK
-//!   1.9 packing.
+//! - Ploidy: no call depends on the `.psam` SEX column. Stored hard calls pass
+//!   through as they are, heterozygous haploid ones included, as plink2
+//!   `--make-bed` writes them without `--set-invalid-haploid-missing`, and a
+//!   dosage-only entry rounds to a hard call on the diploid scale for every
+//!   sample. So a sex check or a score never reads a call its label rewrote.
 //! - `.bed` encoding: exact PLINK 1.9 2-bit codes (`00` hom ALT, `01`
 //!   missing, `10` het, `11` hom REF; least-significant bit first within
 //!   each byte).
@@ -162,15 +163,18 @@ pub fn open_virtual_plink19_from_paths(
 /// `.pvar` is supplied as a *factory* rather than a stream: it is read once to
 /// build the variant plan, and reopened whenever the virtual `.bim` is walked,
 /// so its rows never have to be held in memory.
+///
+/// The genome build is accepted for callers that pass `--build`; no decoded call
+/// depends on it, since no call depends on ploidy or sex.
 pub fn open_virtual_plink19_from_sources(
     pgen: Arc<dyn ByteRangeSource>,
     pvar: PvarFactory,
     psam_for_plan: &mut dyn TextSource,
-    build: GenomeBuild,
+    _build: GenomeBuild,
 ) -> Result<VirtualPlink19, PipelineError> {
     let header = PgenHeader::parse(&*pgen)?;
     let psam_info = PsamInfo::from_psam(psam_for_plan)?;
-    let plan = VariantPlan::from_pvar(&mut *pvar()?, build)?;
+    let plan = VariantPlan::from_pvar(&mut *pvar()?)?;
 
     if header.m_variants != 0 && header.m_variants as usize != plan.in_variants {
         return Err(PipelineError::Io(format!(
@@ -211,14 +215,8 @@ pub fn open_virtual_plink19_from_sources(
                 // Taken before the decoder is moved into the block source: the
                 // decoder is the only writer, and this handle the only reader.
                 let meter = Arc::clone(&decoder.dosage_meter);
-                let sex_by_sample_arc: Arc<[u8]> =
-                    Arc::from(psam_info.sex_by_sample.clone().into_boxed_slice());
-                let bed: Arc<dyn ByteRangeSource> = Arc::new(VirtualBed::new(
-                    decoder,
-                    plan.clone(),
-                    psam_info.n_samples,
-                    sex_by_sample_arc,
-                )?);
+                let bed: Arc<dyn ByteRangeSource> =
+                    Arc::new(VirtualBed::new(decoder, plan.clone(), psam_info.n_samples));
                 (bed, Some(meter))
             }
         };
@@ -240,7 +238,6 @@ pub fn open_virtual_plink19_from_sources(
 #[derive(Clone)]
 struct PsamInfo {
     n_samples: usize,
-    sex_by_sample: Vec<u8>,
     fam_rows: Vec<FamRow>,
 }
 
@@ -279,7 +276,6 @@ impl PsamInfo {
     fn from_psam(source: &mut dyn TextSource) -> Result<Self, PipelineError> {
         let mut header_tokens: Option<Vec<String>> = None;
         let mut columns: Option<PsamColumns> = None;
-        let mut sex_by_sample: Vec<u8> = Vec::new();
         let mut fam_rows: Vec<FamRow> = Vec::new();
 
         while let Some(line) = source.next_line()? {
@@ -319,8 +315,6 @@ impl PsamInfo {
                     "IID must not be '0' (PSAM/FAM contract)".into(),
                 ));
             }
-            let sex_code = parse_sex_token(&fam_row.sex);
-            sex_by_sample.push(sex_code);
             fam_rows.push(fam_row);
         }
 
@@ -331,26 +325,9 @@ impl PsamInfo {
         }
 
         Ok(Self {
-            n_samples: sex_by_sample.len(),
-            sex_by_sample,
+            n_samples: fam_rows.len(),
             fam_rows,
         })
-    }
-}
-
-fn parse_sex_token(token: &str) -> u8 {
-    match token.trim() {
-        "1" => 1,
-        "2" => 2,
-        "M" | "m" => 1,
-        "F" | "f" => 2,
-        t if t.eq_ignore_ascii_case("male") => 1,
-        t if t.eq_ignore_ascii_case("female") => 2,
-        t if t.eq_ignore_ascii_case("unknown") => 0,
-        t if t.eq_ignore_ascii_case("unk") => 0,
-        t if t.eq_ignore_ascii_case("u") => 0,
-        "0" | "NA" | "na" | "Na" | "nA" | "." | "nan" | "NaN" | "NAN" => 0,
-        _ => 0,
     }
 }
 
@@ -476,14 +453,6 @@ impl FamRow {
 
 /// Mapping from virtual BED variant index (post-split) to PGEN record index
 /// and the ALT ordinal within that record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HaploidyKind {
-    Diploid,
-    HaploidMales,
-    HaploidAll,
-    HaploidMalesFemalesMissing,
-}
-
 #[derive(Clone)]
 struct VariantPlan {
     /// Total input variants before splitting (to sanity check decoder bounds).
@@ -492,18 +461,8 @@ struct VariantPlan {
     out_variants: usize,
     /// Dense mapping: out_idx → (in_idx, alt_ordinal_1based).
     out_to_in: Vec<(u32, u16)>,
-    /// Per-output variant haploidy behaviour.
-    haploidy: Vec<HaploidyKind>,
     /// ALT allele count per input variant.
     alts_per_in: Vec<u16>,
-}
-
-#[derive(Clone)]
-struct VariantRangeEntry {
-    chrom: String,
-    pos: u64,
-    out_start: usize,
-    out_end: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -585,10 +544,8 @@ impl PvarCols {
 }
 
 impl VariantPlan {
-    fn from_pvar(pvar: &mut dyn TextSource, build: GenomeBuild) -> Result<Self, PipelineError> {
+    fn from_pvar(pvar: &mut dyn TextSource) -> Result<Self, PipelineError> {
         let mut out_to_in: Vec<(u32, u16)> = Vec::with_capacity(1 << 20);
-        let mut haploidy: Vec<HaploidyKind> = Vec::with_capacity(1 << 20);
-        let mut per_variant: Vec<VariantRangeEntry> = Vec::with_capacity(1 << 16);
         let mut alts_per_in: Vec<u16> = Vec::with_capacity(1 << 16);
         let mut header_cols: Option<PvarCols> = None;
         let mut in_idx: u32 = 0;
@@ -654,24 +611,8 @@ impl VariantPlan {
             // readers keep them: dropping or rejecting them would make a PGEN
             // disagree with the same data read as BED or VCF.
 
-            let out_start = out_to_in.len();
             for alt_ord in 1..=alt_count as u16 {
                 out_to_in.push((in_idx, alt_ord));
-                haploidy.push(HaploidyKind::Diploid);
-            }
-            let out_end = out_to_in.len();
-            // Autosomes are diploid under every build, so there is nothing to
-            // revisit once the build is known. Only the sex chromosomes and MT
-            // need their coordinates retained -- which keeps this buffer empty
-            // for the 22 autosomal filesets rather than holding a String per
-            // variant.
-            if !is_autosome(&chrom) {
-                per_variant.push(VariantRangeEntry {
-                    chrom: chrom.clone(),
-                    pos,
-                    out_start,
-                    out_end,
-                });
             }
 
             alts_per_in.push(alt_count as u16);
@@ -685,20 +626,10 @@ impl VariantPlan {
             ));
         }
 
-        for entry in per_variant {
-            let hap = haploidy_for_variant(&entry.chrom, entry.pos, build);
-            for idx in entry.out_start..entry.out_end {
-                if let Some(slot) = haploidy.get_mut(idx) {
-                    *slot = hap;
-                }
-            }
-        }
-
         Ok(Self {
             in_variants,
             out_variants: out_to_in.len(),
             out_to_in,
-            haploidy,
             alts_per_in,
         })
     }
@@ -706,11 +637,6 @@ impl VariantPlan {
     #[inline]
     fn mapping(&self, out_idx: usize) -> Option<(u32, u16)> {
         self.out_to_in.get(out_idx).copied()
-    }
-
-    #[inline]
-    fn haploidy_of(&self, out_idx: usize) -> Option<HaploidyKind> {
-        self.haploidy.get(out_idx).copied()
     }
 
     #[inline]
@@ -810,42 +736,6 @@ fn normalize_chrom_into(raw: &str, chrom: &mut String) {
     chrom.make_ascii_uppercase();
     if chrom == "M" {
         chrom.push('T');
-    }
-}
-
-const GRCH37_X_PAR: &[(u64, u64)] = &[(60_001, 2_699_520), (154_931_044, 155_260_560)];
-const GRCH38_X_PAR: &[(u64, u64)] = &[(10_001, 2_781_479), (155_701_383, 156_030_895)];
-
-/// True for a normalized chromosome label that is a plain numbered autosome.
-///
-/// Autosomes are diploid under every genome build, so their ploidy never
-/// depends on the declared build.
-fn is_autosome(chrom: &str) -> bool {
-    !chrom.is_empty() && chrom.bytes().all(|b| b.is_ascii_digit())
-}
-
-fn in_any_range(pos: u64, ranges: &[(u64, u64)]) -> bool {
-    ranges
-        .iter()
-        .any(|(start, end)| pos >= *start && pos <= *end)
-}
-
-fn haploidy_for_variant(chrom: &str, pos: u64, build: GenomeBuild) -> HaploidyKind {
-    match chrom {
-        "X" => {
-            let ranges = match build {
-                GenomeBuild::Grch37 => GRCH37_X_PAR,
-                GenomeBuild::Grch38 => GRCH38_X_PAR,
-            };
-            if in_any_range(pos, ranges) {
-                HaploidyKind::Diploid
-            } else {
-                HaploidyKind::HaploidMales
-            }
-        }
-        "Y" => HaploidyKind::HaploidMalesFemalesMissing,
-        "MT" => HaploidyKind::HaploidAll,
-        _ => HaploidyKind::Diploid,
     }
 }
 
@@ -1109,33 +999,17 @@ struct VirtualBed {
     block_bytes: usize, // ceil(n_samples / 4)
     // small LRU of packed blocks by out-variant index
     cache: Arc<Mutex<BlockCache>>,
-    sex_by_sample: Arc<[u8]>,
-    sex_masks: Arc<SexMasks>,
 }
 
 impl VirtualBed {
-    fn new(
-        decoder: PgenDecoder,
-        plan: VariantPlan,
-        n_samples: usize,
-        sex_by_sample: Arc<[u8]>,
-    ) -> Result<Self, PipelineError> {
-        if sex_by_sample.len() != n_samples {
-            return Err(PipelineError::Compute(
-                "SEX column count mismatch with sample count".into(),
-            ));
-        }
-        let block_bytes = n_samples.div_ceil(4);
-        let sex_masks = Arc::new(SexMasks::new(&sex_by_sample));
-        Ok(Self {
+    fn new(decoder: PgenDecoder, plan: VariantPlan, n_samples: usize) -> Self {
+        Self {
             inner: Arc::new(Mutex::new(decoder)),
             plan,
             n_samples,
-            block_bytes,
+            block_bytes: n_samples.div_ceil(4),
             cache: Arc::new(Mutex::new(BlockCache::new(256))),
-            sex_by_sample,
-            sex_masks,
-        })
+        }
     }
 
     #[inline]
@@ -1173,76 +1047,6 @@ impl VirtualBed {
     }
 }
 
-fn enforce_haploidy(hardcalls: &mut [u8], sex_by_sample: &[u8], kind: HaploidyKind) {
-    match kind {
-        HaploidyKind::Diploid => {}
-        HaploidyKind::HaploidAll => {
-            for val in hardcalls.iter_mut() {
-                if *val == 1 {
-                    *val = 255;
-                }
-            }
-        }
-        HaploidyKind::HaploidMales => {
-            let n = hardcalls.len().min(sex_by_sample.len());
-            for i in 0..n {
-                if sex_by_sample[i] == 1 && hardcalls[i] == 1 {
-                    hardcalls[i] = 255;
-                }
-            }
-        }
-        HaploidyKind::HaploidMalesFemalesMissing => {
-            let n = hardcalls.len().min(sex_by_sample.len());
-            for i in 0..n {
-                let sex = sex_by_sample[i];
-                if sex == 2 {
-                    hardcalls[i] = 255;
-                    continue;
-                }
-                if hardcalls[i] == 1 {
-                    hardcalls[i] = 255;
-                }
-            }
-        }
-    }
-}
-
-fn fill_sample_ploidy(
-    buf: &mut Vec<u8>,
-    kind: HaploidyKind,
-    sex_by_sample: &[u8],
-    n_samples: usize,
-) {
-    buf.clear();
-    buf.resize(n_samples, 2);
-    match kind {
-        HaploidyKind::Diploid => {}
-        HaploidyKind::HaploidAll => {
-            for v in buf.iter_mut() {
-                *v = 1;
-            }
-        }
-        HaploidyKind::HaploidMales => {
-            let limit = sex_by_sample.len().min(n_samples);
-            for i in 0..limit {
-                if sex_by_sample[i] == 1 {
-                    buf[i] = 1;
-                }
-            }
-        }
-        HaploidyKind::HaploidMalesFemalesMissing => {
-            let limit = sex_by_sample.len().min(n_samples);
-            for i in 0..limit {
-                match sex_by_sample[i] {
-                    1 => buf[i] = 1,
-                    2 => buf[i] = 0,
-                    _ => {}
-                }
-            }
-        }
-    }
-}
-
 impl ByteRangeSource for VirtualBed {
     fn len(&self) -> u64 {
         self.total_len()
@@ -1262,7 +1066,6 @@ impl ByteRangeSource for VirtualBed {
         }
 
         let mut written = 0usize;
-        let mut sample_ploidy_buf: Vec<u8> = Vec::new();
         let mut hard_buf: Vec<u8> = Vec::new();
 
         // 1) Serve the 3-byte header if requested.
@@ -1292,7 +1095,6 @@ impl ByteRangeSource for VirtualBed {
                 out_idx,
                 within_block,
                 &mut dst[written..written + to_copy],
-                &mut sample_ploidy_buf,
                 &mut hard_buf,
             )?;
             written += to_copy;
@@ -1314,16 +1116,9 @@ impl ByteRangeSource for VirtualBed {
                 .par_chunks_mut(self.block_bytes)
                 .enumerate()
                 .map_init(
-                    || (template.fork(), Vec::new(), Vec::new()),
-                    |(decoder, sample_ploidy_buf, hard_buf), (block_idx, block)| {
-                        decode_virtual_block(
-                            self,
-                            decoder,
-                            out_idx + block_idx,
-                            sample_ploidy_buf,
-                            hard_buf,
-                            block,
-                        )
+                    || (template.fork(), Vec::new()),
+                    |(decoder, hard_buf), (block_idx, block)| {
+                        decode_virtual_block(self, decoder, out_idx + block_idx, hard_buf, block)
                     },
                 )
                 .collect();
@@ -1348,7 +1143,6 @@ impl ByteRangeSource for VirtualBed {
                     self,
                     &mut decoder,
                     out_idx,
-                    &mut sample_ploidy_buf,
                     &mut hard_buf,
                     &mut dst[written..written + to_copy],
                 )?;
@@ -1359,7 +1153,6 @@ impl ByteRangeSource for VirtualBed {
                     out_idx,
                     0,
                     &mut dst[written..written + to_copy],
-                    &mut sample_ploidy_buf,
                     &mut hard_buf,
                 )?;
             }
@@ -1383,7 +1176,6 @@ fn copy_virtual_block(
     out_idx: usize,
     within_block: usize,
     dst: &mut [u8],
-    sample_ploidy_buf: &mut Vec<u8>,
     hard_buf: &mut Vec<u8>,
 ) -> Result<(), PipelineError> {
     let end = within_block + dst.len();
@@ -1395,14 +1187,7 @@ fn copy_virtual_block(
         }
     }
     let mut block = vec![0u8; bed.block_bytes];
-    decode_virtual_block(
-        bed,
-        decoder,
-        out_idx,
-        sample_ploidy_buf,
-        hard_buf,
-        &mut block,
-    )?;
+    decode_virtual_block(bed, decoder, out_idx, hard_buf, &mut block)?;
     let mut cache = bed.cache.lock().unwrap();
     let stored = cache.put(out_idx, block);
     dst.copy_from_slice(&stored[within_block..end]);
@@ -1414,7 +1199,6 @@ fn decode_virtual_block(
     bed: &VirtualBed,
     decoder: &mut PgenDecoder,
     out_idx: usize,
-    sample_ploidy_buf: &mut Vec<u8>,
     hard_buf: &mut Vec<u8>,
     block: &mut [u8],
 ) -> Result<(), PipelineError> {
@@ -1433,30 +1217,17 @@ fn decode_virtual_block(
     if alt_count != 0 && alt_ord > alt_count {
         return Err(ioerr("ALT ordinal exceeds allele count in .pvar"));
     }
-    let haploidy_kind = bed.plan.haploidy_of(out_idx);
-    if decoder.try_decode_packed_block(in_idx, haploidy_kind, &bed.sex_masks, block) {
+    if decoder.try_decode_packed_block(in_idx, block) {
         return Ok(());
     }
-    let sample_ploidy = haploidy_kind.and_then(|kind| {
-        if matches!(kind, HaploidyKind::Diploid) {
-            None
-        } else {
-            fill_sample_ploidy(sample_ploidy_buf, kind, &bed.sex_by_sample, bed.n_samples);
-            Some(sample_ploidy_buf.as_slice())
-        }
-    });
 
-    // Reused across variants: a scoring run decodes millions of blocks, and
-    // two fresh sample-sized allocations per block is pure allocator traffic.
+    // Reused across variants: a scoring run decodes millions of blocks, and a
+    // fresh sample-sized allocation per block is pure allocator traffic.
     hard_buf.clear();
     hard_buf.resize(bed.n_samples, 255); // 255 = missing
-    decoder.decode_variant_hardcalls(in_idx, alt_ord, hard_buf, sample_ploidy)?;
-
-    if let Some(kind) = haploidy_kind
-        && !matches!(kind, HaploidyKind::Diploid)
-    {
-        enforce_haploidy(hard_buf, &bed.sex_by_sample, kind);
-    }
+    // No per-sample ploidy: a dosage-only entry rounds on the diploid scale for
+    // every sample, whatever the .psam records as its sex.
+    decoder.decode_variant_hardcalls(in_idx, alt_ord, hard_buf, None)?;
 
     VirtualBed::pack_to_block(block, hard_buf);
     Ok(())
@@ -2696,27 +2467,18 @@ impl PgenDecoder {
         Ok(())
     }
 
-    /// Decodes record `in_idx` straight into packed PLINK 1.9 `block`, with
-    /// `haploidy`'s rules applied, when its hard calls need no per-sample
-    /// projection: no multiallelic patch track and no dosage track.
+    /// Decodes record `in_idx` straight into packed PLINK 1.9 `block` when its
+    /// hard calls need no per-sample projection: no multiallelic patch track and
+    /// no dosage track.
     ///
     /// Returns false, leaving `block` unspecified, for any other record and for
     /// a record this path cannot validate. `decode_variant_hardcalls` then
     /// decodes it and raises its errors, so the two paths agree on every block,
     /// every error and every coercion-meter count.
-    fn try_decode_packed_block(
-        &mut self,
-        in_idx: u32,
-        haploidy: Option<HaploidyKind>,
-        sex: &SexMasks,
-        block: &mut [u8],
-    ) -> bool {
+    fn try_decode_packed_block(&mut self, in_idx: u32, block: &mut [u8]) -> bool {
         let idx = in_idx as usize;
         let n = self.n;
-        if idx >= self.hdr.m_variants as usize
-            || block.len() != n.div_ceil(4)
-            || sex.male.len() != n.div_ceil(32)
-        {
+        if idx >= self.hdr.m_variants as usize || block.len() != n.div_ceil(4) {
             return false;
         }
         let Ok((_, _, rec_ty)) = self.record_offset_len(idx) else {
@@ -2763,7 +2525,7 @@ impl PgenDecoder {
             meter.maybe_report();
         }
 
-        write_packed_calls(&packed.cats, n, haploidy, sex, block);
+        write_packed_calls(&packed.cats, n, block);
         if !ld_compressed {
             // Later LD-compressed records in this variant block diff against it.
             std::mem::swap(&mut packed.cats, &mut packed.anchor);
@@ -2814,30 +2576,6 @@ struct PackedScratch {
     /// Raw categories of the LD anchor `anchor_idx`.
     anchor: Vec<u64>,
     anchor_idx: Option<usize>,
-}
-
-/// Samples' sex as masks of the low bit of each sample's two-bit position, for
-/// applying haploid rules to packed calls.
-struct SexMasks {
-    male: Vec<u64>,
-    female: Vec<u64>,
-}
-
-impl SexMasks {
-    fn new(sex_by_sample: &[u8]) -> Self {
-        let words = sex_by_sample.len().div_ceil(32);
-        let mut male = vec![0u64; words];
-        let mut female = vec![0u64; words];
-        for (sample, &sex) in sex_by_sample.iter().enumerate() {
-            let bit = 1u64 << (2 * (sample % 32));
-            match sex {
-                1 => male[sample / 32] |= bit,
-                2 => female[sample / 32] |= bit,
-                _ => {}
-            }
-        }
-        Self { male, female }
-    }
 }
 
 /// The low bit of every two-bit field.
@@ -3038,40 +2776,14 @@ fn count_set_bits(bytes: &[u8], start: usize, count: usize) -> usize {
 }
 
 /// Writes packed categories as PLINK 1.9 codes for A1 = ALT, the codes
-/// `cats_to_a1dosage`, `enforce_haploidy` and `VirtualBed::pack_to_block` give
-/// together: hom REF 11, het 10, hom ALT 00, missing and padding 01.
-fn write_packed_calls(
-    cats: &[u64],
-    n: usize,
-    haploidy: Option<HaploidyKind>,
-    sex: &SexMasks,
-    block: &mut [u8],
-) {
+/// `cats_to_a1dosage` and `VirtualBed::pack_to_block` give together: hom REF 11,
+/// het 10, hom ALT 00, missing and padding 01.
+fn write_packed_calls(cats: &[u64], n: usize, block: &mut [u8]) {
     for (w, &word) in cats.iter().enumerate() {
         let low = word & LOW_BITS;
         let high = (word >> 1) & LOW_BITS;
-        let mut out_low = !(low ^ high) & LOW_BITS;
-        let mut out_high = !high & LOW_BITS;
-        let to_missing = |fields: u64, out_low: &mut u64, out_high: &mut u64| {
-            *out_low |= fields;
-            *out_high &= !fields;
-        };
-        match haploidy {
-            None | Some(HaploidyKind::Diploid) => {}
-            Some(HaploidyKind::HaploidAll) => {
-                let het = out_high & !out_low;
-                to_missing(het, &mut out_low, &mut out_high);
-            }
-            Some(HaploidyKind::HaploidMales) => {
-                let het = out_high & !out_low & sex.male[w];
-                to_missing(het, &mut out_low, &mut out_high);
-            }
-            Some(HaploidyKind::HaploidMalesFemalesMissing) => {
-                to_missing(sex.female[w], &mut out_low, &mut out_high);
-                let het = out_high & !out_low;
-                to_missing(het, &mut out_low, &mut out_high);
-            }
-        }
+        let out_low = !(low ^ high) & LOW_BITS;
+        let out_high = !high & LOW_BITS;
         let out = (out_low | (out_high << 1)).to_le_bytes();
         let start = w * 8;
         let end = (start + 8).min(block.len());
@@ -3909,7 +3621,7 @@ mod tests {
             "1\t100\tv2\tC\tT",
         ]);
 
-        let err = match VariantPlan::from_pvar(&mut pvar, GenomeBuild::Grch38) {
+        let err = match VariantPlan::from_pvar(&mut pvar) {
             Ok(_) => panic!("expected unsorted .pvar to fail"),
             Err(err) => err,
         };
@@ -3921,21 +3633,6 @@ mod tests {
             }
             other => panic!("expected PipelineError::Io, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn explicit_build_accepts_x_coordinates_that_make_inference_ambiguous() {
-        let mut pvar = LineSource::new(vec![
-            "#CHROM\tPOS\tID\tREF\tALT",
-            "X\t50000\tv1\tA\tG",
-            "X\t155000000\tv2\tC\tT",
-        ]);
-
-        let plan = VariantPlan::from_pvar(&mut pvar, GenomeBuild::Grch38)
-            .expect("an explicit build must control PAR interpretation");
-
-        assert_eq!(plan.haploidy_of(0), Some(HaploidyKind::Diploid));
-        assert_eq!(plan.haploidy_of(1), Some(HaploidyKind::HaploidMales));
     }
 
     /// 1000 Genomes .pvar files carry structural variants (`<INS:ME:ALU>`),
@@ -3950,7 +3647,7 @@ mod tests {
             "22\t10600000\tv2\tA\tG,*",
             "22\t10700000\tbnd1\tG\tG]22:10800000]",
         ];
-        let plan = VariantPlan::from_pvar(&mut LineSource::new(lines.clone()), GenomeBuild::Grch38)
+        let plan = VariantPlan::from_pvar(&mut LineSource::new(lines.clone()))
             .expect("symbolic ALTs are allele codes");
         assert_eq!(plan.in_variants, 3);
         assert_eq!(plan.out_variants, 4);
@@ -4557,49 +4254,31 @@ mod tests {
                 PgenDecoder::new(Arc::clone(&src), hdr, n, m, vec![1; m]).unwrap()
             };
 
-            let sex: Vec<u8> = (0..n).map(|sample| (sample % 3) as u8).collect();
-            let masks = SexMasks::new(&sex);
-            let rules = [
-                None,
-                Some(HaploidyKind::Diploid),
-                Some(HaploidyKind::HaploidAll),
-                Some(HaploidyKind::HaploidMales),
-                Some(HaploidyKind::HaploidMalesFemalesMissing),
-            ];
             let forward: Vec<usize> = (0..m).collect();
             let backward: Vec<usize> = (0..m).rev().collect();
-            for (rule_index, rule) in rules.into_iter().enumerate() {
-                for order in [&forward, &backward] {
-                    let mut fast = decoder();
-                    let mut slow = decoder();
-                    for &idx in order {
-                        let mut block = vec![0u8; n.div_ceil(4)];
-                        let handled =
-                            fast.try_decode_packed_block(idx as u32, rule, &masks, &mut block);
-                        let mut hard = vec![255u8; n];
-                        let decoded = slow.decode_variant_hardcalls(idx as u32, 1, &mut hard, None);
-                        match idx {
-                            11 => {
-                                assert!(!handled, "n={n}: trailing data taken by the packed path");
-                                assert!(decoded.is_err());
-                            }
-                            12 => {
-                                assert!(!handled, "n={n}: dosage track taken by the packed path");
-                                decoded.unwrap();
-                            }
-                            _ => {
-                                assert!(
-                                    handled,
-                                    "n={n} record {idx} rule {rule_index}: not handled"
-                                );
-                                decoded.unwrap();
-                                if let Some(rule) = rule {
-                                    enforce_haploidy(&mut hard, &sex, rule);
-                                }
-                                let mut want = vec![0u8; n.div_ceil(4)];
-                                VirtualBed::pack_to_block(&mut want, &hard);
-                                assert_eq!(block, want, "n={n} record {idx} rule {rule_index}");
-                            }
+            for order in [&forward, &backward] {
+                let mut fast = decoder();
+                let mut slow = decoder();
+                for &idx in order {
+                    let mut block = vec![0u8; n.div_ceil(4)];
+                    let handled = fast.try_decode_packed_block(idx as u32, &mut block);
+                    let mut hard = vec![255u8; n];
+                    let decoded = slow.decode_variant_hardcalls(idx as u32, 1, &mut hard, None);
+                    match idx {
+                        11 => {
+                            assert!(!handled, "n={n}: trailing data taken by the packed path");
+                            assert!(decoded.is_err());
+                        }
+                        12 => {
+                            assert!(!handled, "n={n}: dosage track taken by the packed path");
+                            decoded.unwrap();
+                        }
+                        _ => {
+                            assert!(handled, "n={n} record {idx}: not handled");
+                            decoded.unwrap();
+                            let mut want = vec![0u8; n.div_ceil(4)];
+                            VirtualBed::pack_to_block(&mut want, &hard);
+                            assert_eq!(block, want, "n={n} record {idx}");
                         }
                     }
                 }
@@ -4724,14 +4403,6 @@ mod tests {
         let fam = FamRow::from_fields(&fields, &cols);
         assert_eq!(fam.iid, "iid789");
         assert_eq!(fam.fid, "iid789");
-    }
-
-    #[test]
-    fn parse_sex_token_supports_common_words() {
-        assert_eq!(parse_sex_token("male"), 1);
-        assert_eq!(parse_sex_token("FEMALE"), 2);
-        assert_eq!(parse_sex_token("Unknown"), 0);
-        assert_eq!(parse_sex_token("UNK"), 0);
     }
 
     #[test]

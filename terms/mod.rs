@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod cross_format_tests;
 pub mod sex;
 mod sex_counts;
 
