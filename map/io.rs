@@ -566,7 +566,9 @@ const PROJECTION_ROW_IDS_MAGIC: &[u8; 8] = b"GNPSID01";
 const PROJECTION_ROW_IDS_VERSION: u32 = 1;
 const PROJECTION_ROW_IDS_HEADER_LEN: usize = 32;
 const PROJECTION_CACHE_MAGIC: &[u8; 8] = b"GNPCCH01";
-const PROJECTION_CACHE_VERSION: u32 = 3;
+// 4: models parsed from JSON are exact (serde_json float_roundtrip), so caches built from
+// an inexact parse are rebuilt.
+const PROJECTION_CACHE_VERSION: u32 = 4;
 const PROJECTION_CACHE_NO_BP_WINDOW: u64 = u64::MAX;
 
 pub struct ProjectionMatrixSink {

@@ -10,6 +10,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, SystemTime};
 
 use tempfile::tempdir;
 
@@ -497,5 +498,38 @@ fn concurrent_all_runs_with_different_out_prefixes_agree() -> TestResult {
         })
         .collect();
     assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    Ok(())
+}
+
+/// A model parsed from its JSON must project exactly like the fitted model `fit` cached.
+/// Restamping the JSON invalidates that cache, so projection has to parse the JSON, and a
+/// parse that is a ULP off anywhere changes the scores.
+#[test]
+fn projection_from_a_reparsed_json_matches_the_fit_written_cache() -> TestResult {
+    let tmp = tempdir()?;
+    let dir = tmp.path().join("cohort");
+    stage_plink(&dir)?;
+    let json = dir.join("cohort.hwe.json");
+    let cache = dir.join("cohort.hwe.project.bin");
+    let cache_written_by_fit = fs::metadata(&cache)?.modified()?;
+
+    assert_success(&gnomon(&dir, &["project", "cohort"], Some(4)));
+    let from_cache = dir.join("from_cache.projection_scores.bin");
+    fs::rename(dir.join("cohort.projection_scores.bin"), &from_cache)?;
+
+    fs::File::options()
+        .write(true)
+        .open(&json)?
+        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000))?;
+    assert_success(&gnomon(&dir, &["project", "cohort"], Some(4)));
+    assert_ne!(
+        fs::metadata(&cache)?.modified()?,
+        cache_written_by_fit,
+        "projection read the stale cache instead of parsing the JSON"
+    );
+    assert!(
+        fs::read(dir.join("cohort.projection_scores.bin"))? == fs::read(&from_cache)?,
+        "projection from the reparsed JSON differs from projection from the fit-written cache"
+    );
     Ok(())
 }

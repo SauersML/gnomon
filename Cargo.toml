@@ -104,7 +104,9 @@ libdeflater = "1.26.0"
 memchr = "2.8.0"
 reqwest = { version = "0.12.9", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
 rustls = { version = "0.23.36", features = ["ring"] }
-serde_json = "1.0.145"
+# float_roundtrip parses JSON floats exactly, so a model read from its JSON projects
+# the fitted model's values.
+serde_json = { version = "1.0.145", features = ["float_roundtrip"] }
 sysinfo = "0.30.12"
 ratatui = "0.30"
 crossterm = "0.28.1"
