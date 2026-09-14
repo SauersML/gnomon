@@ -1040,6 +1040,7 @@ struct VirtualBed {
     // small LRU of packed blocks by out-variant index
     cache: Arc<Mutex<BlockCache>>,
     sex_by_sample: Arc<[u8]>,
+    sex_masks: Arc<SexMasks>,
 }
 
 impl VirtualBed {
@@ -1055,6 +1056,7 @@ impl VirtualBed {
             ));
         }
         let block_bytes = n_samples.div_ceil(4);
+        let sex_masks = Arc::new(SexMasks::new(&sex_by_sample));
         Ok(Self {
             inner: Arc::new(Mutex::new(decoder)),
             plan,
@@ -1062,6 +1064,7 @@ impl VirtualBed {
             block_bytes,
             cache: Arc::new(Mutex::new(BlockCache::new(256))),
             sex_by_sample,
+            sex_masks,
         })
     }
 
@@ -1267,15 +1270,29 @@ impl ByteRangeSource for VirtualBed {
                 break;
             }
             let to_copy = self.block_bytes.min(dst.len() - written);
-            copy_virtual_block(
-                self,
-                &mut decoder,
-                out_idx,
-                0,
-                &mut dst[written..written + to_copy],
-                &mut sample_ploidy_buf,
-                &mut hard_buf,
-            )?;
+            if to_copy == self.block_bytes {
+                // A whole block goes straight into `dst`, as a scoring pass
+                // reads one block per call. Only a partial read, which comes
+                // back for the rest of its block, goes through the cache.
+                decode_virtual_block(
+                    self,
+                    &mut decoder,
+                    out_idx,
+                    &mut sample_ploidy_buf,
+                    &mut hard_buf,
+                    &mut dst[written..written + to_copy],
+                )?;
+            } else {
+                copy_virtual_block(
+                    self,
+                    &mut decoder,
+                    out_idx,
+                    0,
+                    &mut dst[written..written + to_copy],
+                    &mut sample_ploidy_buf,
+                    &mut hard_buf,
+                )?;
+            }
             written += to_copy;
             out_idx += 1;
         }
@@ -1347,6 +1364,9 @@ fn decode_virtual_block(
         return Err(ioerr("ALT ordinal exceeds allele count in .pvar"));
     }
     let haploidy_kind = bed.plan.haploidy_of(out_idx);
+    if decoder.try_decode_packed_block(in_idx, haploidy_kind, &bed.sex_masks, block) {
+        return Ok(());
+    }
     let sample_ploidy = haploidy_kind.and_then(|kind| {
         if matches!(kind, HaploidyKind::Diploid) {
             None
@@ -2139,6 +2159,8 @@ struct PgenDecoder {
     /// Reused per-decode scratch so a scoring run doing millions of variant
     /// reads does not allocate two sample-sized buffers per variant.
     cats_buf: Vec<u8>,
+    /// Scratch and LD anchor of `try_decode_packed_block`.
+    packed: PackedScratch,
     alt_counts: Arc<[u16]>,
     /// Tallies what the hard-call projection discards, and says so out loud
     /// once it has seen enough records to mean it. Shared with the
@@ -2188,6 +2210,7 @@ impl PgenDecoder {
             anchor_idx: None,
             anchor_cats: Vec::new(),
             cats_buf: Vec::new(),
+            packed: PackedScratch::default(),
             alt_counts: Arc::from(alt_counts),
             dosage_meter: Arc::new(DosageCoercionMeter::new(n_samples_from_psam, in_variants)),
         })
@@ -2205,6 +2228,7 @@ impl PgenDecoder {
             anchor_idx: None,
             anchor_cats: Vec::new(),
             cats_buf: Vec::new(),
+            packed: PackedScratch::default(),
             alt_counts: Arc::clone(&self.alt_counts),
             dosage_meter: Arc::clone(&self.dosage_meter),
         }
@@ -2600,6 +2624,391 @@ impl PgenDecoder {
 
         dst.copy_from_slice(&a1dosage);
         Ok(())
+    }
+
+    /// Decodes record `in_idx` straight into packed PLINK 1.9 `block`, with
+    /// `haploidy`'s rules applied, when its hard calls need no per-sample
+    /// projection: no multiallelic patch track and no dosage track.
+    ///
+    /// Returns false, leaving `block` unspecified, for any other record and for
+    /// a record this path cannot validate. `decode_variant_hardcalls` then
+    /// decodes it and raises its errors, so the two paths agree on every block,
+    /// every error and every coercion-meter count.
+    fn try_decode_packed_block(
+        &mut self,
+        in_idx: u32,
+        haploidy: Option<HaploidyKind>,
+        sex: &SexMasks,
+        block: &mut [u8],
+    ) -> bool {
+        let idx = in_idx as usize;
+        let n = self.n;
+        if idx >= self.hdr.m_variants as usize
+            || block.len() != n.div_ceil(4)
+            || sex.male.len() != n.div_ceil(32)
+        {
+            return false;
+        }
+        let Ok((_, _, rec_ty)) = self.record_offset_len(idx) else {
+            return false;
+        };
+        if rec_ty & 0b1110_1000 != 0 {
+            return false;
+        }
+        let main_kind = rec_ty & 0x07;
+        let ld_compressed = matches!(main_kind, 2 | 3);
+        if ld_compressed && ((idx & 0xffff) == 0 || self.ensure_packed_anchor(idx).is_err()) {
+            return false;
+        }
+        let Ok((len, _)) = self.load_record(idx) else {
+            return false;
+        };
+
+        let Self {
+            scratch,
+            packed,
+            dosage_meter,
+            ..
+        } = self;
+        let buf = &scratch[..len];
+        let mut cursor = 0usize;
+        let anchor = ld_compressed.then_some(packed.anchor.as_slice());
+        if decode_main_track_packed(buf, &mut cursor, n, main_kind, anchor, &mut packed.cats).is_err()
+        {
+            return false;
+        }
+        if (rec_ty & 0b0001_0000) != 0
+            && skip_phase_track(buf, &mut cursor, packed_het_count(&packed.cats, n)).is_err()
+        {
+            return false;
+        }
+        if cursor != len {
+            return false;
+        }
+
+        let meter: &DosageCoercionMeter = dosage_meter;
+        if meter.claim(idx) {
+            meter.note_variant(false);
+            meter.maybe_report();
+        }
+
+        write_packed_calls(&packed.cats, n, haploidy, sex, block);
+        if !ld_compressed {
+            // Later LD-compressed records in this variant block diff against it.
+            std::mem::swap(&mut packed.cats, &mut packed.anchor);
+            packed.anchor_idx = Some(idx);
+        }
+        true
+    }
+
+    /// `ensure_anchor` for the packed path: leaves the raw categories of the LD
+    /// anchor for `target` in `self.packed.anchor`.
+    fn ensure_packed_anchor(&mut self, target: usize) -> Result<(), PipelineError> {
+        let anchor_idx = self.ld_anchor_index(target)?;
+        if self.packed.anchor_idx == Some(anchor_idx) {
+            return Ok(());
+        }
+        self.packed.anchor_idx = None;
+
+        let (len, rec_ty) = self.load_record(anchor_idx)?;
+        let main_kind = rec_ty & 0x07;
+        if matches!(main_kind, 2 | 3) {
+            return Err(ioerr("LD anchor is itself LD-compressed"));
+        }
+        let n = self.n;
+        let Self {
+            scratch, packed, ..
+        } = self;
+        let mut cursor = 0usize;
+        decode_main_track_packed(
+            &scratch[..len],
+            &mut cursor,
+            n,
+            main_kind,
+            None,
+            &mut packed.anchor,
+        )?;
+        packed.anchor_idx = Some(anchor_idx);
+        Ok(())
+    }
+}
+
+/// Scratch for decoding records straight into packed PLINK blocks. Categories
+/// are packed two bits per sample, sample `i` at bits `2 * (i % 32)` of word
+/// `i / 32`, the layout of a type-0 main track read as little-endian words.
+#[derive(Default)]
+struct PackedScratch {
+    /// Raw categories of the record being decoded.
+    cats: Vec<u64>,
+    /// Raw categories of the LD anchor `anchor_idx`.
+    anchor: Vec<u64>,
+    anchor_idx: Option<usize>,
+}
+
+/// Samples' sex as masks of the low bit of each sample's two-bit position, for
+/// applying haploid rules to packed calls.
+struct SexMasks {
+    male: Vec<u64>,
+    female: Vec<u64>,
+}
+
+impl SexMasks {
+    fn new(sex_by_sample: &[u8]) -> Self {
+        let words = sex_by_sample.len().div_ceil(32);
+        let mut male = vec![0u64; words];
+        let mut female = vec![0u64; words];
+        for (sample, &sex) in sex_by_sample.iter().enumerate() {
+            let bit = 1u64 << (2 * (sample % 32));
+            match sex {
+                1 => male[sample / 32] |= bit,
+                2 => female[sample / 32] |= bit,
+                _ => {}
+            }
+        }
+        Self { male, female }
+    }
+}
+
+/// The low bit of every two-bit field.
+const LOW_BITS: u64 = 0x5555_5555_5555_5555;
+
+/// `decode_main_track_into` into packed categories. Fields past the last
+/// sample are left unspecified.
+fn decode_main_track_packed(
+    buf: &[u8],
+    cursor: &mut usize,
+    n: usize,
+    main_kind: u8,
+    anchor: Option<&[u64]>,
+    cats: &mut Vec<u64>,
+) -> Result<(), PipelineError> {
+    let len = buf.len();
+    let words = n.div_ceil(32);
+    cats.clear();
+    cats.resize(words, 0);
+
+    match main_kind {
+        0 => {
+            let need = n.div_ceil(4);
+            if *cursor + need > len {
+                return Err(ioerr("Truncated type-0 main track"));
+            }
+            for (word, bytes) in cats.iter_mut().zip(buf[*cursor..*cursor + need].chunks(8)) {
+                let mut chunk = [0u8; 8];
+                chunk[..bytes.len()].copy_from_slice(bytes);
+                *word = u64::from_le_bytes(chunk);
+            }
+            *cursor += need;
+        }
+        1 => {
+            if *cursor >= len {
+                return Err(ioerr("Truncated type-1 header byte"));
+            }
+            let pair = buf[*cursor];
+            *cursor += 1;
+            let (low, high) = match pair {
+                1 => (0u8, 1),
+                2 => (0, 2),
+                3 => (0, 3),
+                5 => (1, 2),
+                6 => (1, 3),
+                9 => (2, 3),
+                _ => return Err(ioerr("Invalid 1-bit pair code")),
+            };
+            let nbytes = n.div_ceil(8);
+            if *cursor + nbytes > len {
+                return Err(ioerr("EOF in bitarray"));
+            }
+            let low_fields = repeated_category(low);
+            let high_fields = repeated_category(high);
+            for (word, bytes) in cats.iter_mut().zip(buf[*cursor..*cursor + nbytes].chunks(4)) {
+                let mut chunk = [0u8; 4];
+                chunk[..bytes.len()].copy_from_slice(bytes);
+                let set = spread_to_low_bits(u32::from_le_bytes(chunk));
+                let fields = set | (set << 1);
+                *word = (low_fields & !fields) | (high_fields & fields);
+            }
+            *cursor += nbytes;
+            patch_packed_categories(buf, cursor, n, cats)?;
+        }
+        2 | 3 => {
+            let anchor = anchor.ok_or_else(|| ioerr("Missing LD anchor"))?;
+            if anchor.len() != words {
+                return Err(ioerr("LD anchor sample-count mismatch"));
+            }
+            cats.copy_from_slice(anchor);
+            patch_packed_categories(buf, cursor, n, cats)?;
+            if main_kind == 3 {
+                // Swap REF and ALT homozygotes: flip the high bit where the low
+                // bit is clear.
+                for word in cats.iter_mut() {
+                    let low = *word & LOW_BITS;
+                    let high = (*word >> 1) & LOW_BITS;
+                    *word = low | ((high ^ (!low & LOW_BITS)) << 1);
+                }
+            }
+        }
+        4 | 6 | 7 => {
+            let category = match main_kind {
+                4 => 0u8,
+                6 => 2,
+                _ => 3,
+            };
+            cats.fill(repeated_category(category));
+            patch_packed_categories(buf, cursor, n, cats)?;
+        }
+        _ => {
+            return Err(PipelineError::Io(format!(
+                "Unsupported main-track type {main_kind}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn repeated_category(category: u8) -> u64 {
+    u64::from(category) * LOW_BITS
+}
+
+/// Moves bit `i` of `bits` to bit `2 * i`.
+#[inline]
+fn spread_to_low_bits(bits: u32) -> u64 {
+    let mut x = u64::from(bits);
+    x = (x | (x << 16)) & 0x0000_ffff_0000_ffff;
+    x = (x | (x << 8)) & 0x00ff_00ff_00ff_00ff;
+    x = (x | (x << 4)) & 0x0f0f_0f0f_0f0f_0f0f;
+    x = (x | (x << 2)) & 0x3333_3333_3333_3333;
+    (x | (x << 1)) & LOW_BITS
+}
+
+fn patch_packed_categories(
+    buf: &[u8],
+    cursor: &mut usize,
+    n: usize,
+    cats: &mut [u64],
+) -> Result<(), PipelineError> {
+    for (sid, val) in difflist_pairs(buf, cursor, n)? {
+        let sample = sid as usize;
+        if sample < n {
+            let shift = 2 * (sample % 32);
+            let word = &mut cats[sample / 32];
+            *word = (*word & !(0b11 << shift)) | (u64::from(val) << shift);
+        }
+    }
+    Ok(())
+}
+
+/// Samples in category 1 (heterozygous).
+fn packed_het_count(cats: &[u64], n: usize) -> usize {
+    let mut count = 0usize;
+    for (w, &word) in cats.iter().enumerate() {
+        let mut het = word & !(word >> 1) & LOW_BITS;
+        let samples_in_word = (n - w * 32).min(32);
+        if samples_in_word < 32 {
+            het &= (1u64 << (2 * samples_in_word)) - 1;
+        }
+        count += het.count_ones() as usize;
+    }
+    count
+}
+
+/// Steps `cursor` over a phase track for `het` heterozygous samples, with the
+/// bounds checks `decode_variant_hardcalls` applies.
+fn skip_phase_track(buf: &[u8], cursor: &mut usize, het: usize) -> Result<(), PipelineError> {
+    let len = buf.len();
+    let start = *cursor;
+    if start >= len {
+        return Err(ioerr("EOF in phase header"));
+    }
+    let mut bit_cursor = 1usize;
+    let mut phased = het;
+    if (buf[start] & 1) == 1 {
+        if het > 0 && start + (het >> 3) >= len {
+            return Err(ioerr("EOF in phase presence"));
+        }
+        phased = count_set_bits(&buf[start..], 1, het);
+        bit_cursor = (1 + het).next_multiple_of(8);
+    }
+    if phased > 0 && start + ((bit_cursor + phased - 1) >> 3) >= len {
+        return Err(ioerr("EOF in phase info"));
+    }
+    bit_cursor += phased;
+    let bytes_needed = bit_cursor.div_ceil(8);
+    if start + bytes_needed > len {
+        return Err(ioerr("EOF in phase track"));
+    }
+    *cursor = start + bytes_needed;
+    Ok(())
+}
+
+/// Set bits among bits `start..start + count` of `bytes`, least significant
+/// bit of each byte first.
+fn count_set_bits(bytes: &[u8], start: usize, count: usize) -> usize {
+    let end = start + count;
+    let mut bit = start;
+    let mut set = 0usize;
+    while bit < end && (bit & 7) != 0 {
+        set += usize::from((bytes[bit >> 3] >> (bit & 7)) & 1);
+        bit += 1;
+    }
+    while bit + 8 <= end {
+        set += bytes[bit >> 3].count_ones() as usize;
+        bit += 8;
+    }
+    while bit < end {
+        set += usize::from((bytes[bit >> 3] >> (bit & 7)) & 1);
+        bit += 1;
+    }
+    set
+}
+
+/// Writes packed categories as PLINK 1.9 codes for A1 = ALT, the codes
+/// `cats_to_a1dosage`, `enforce_haploidy` and `VirtualBed::pack_to_block` give
+/// together: hom REF 11, het 10, hom ALT 00, missing and padding 01.
+fn write_packed_calls(
+    cats: &[u64],
+    n: usize,
+    haploidy: Option<HaploidyKind>,
+    sex: &SexMasks,
+    block: &mut [u8],
+) {
+    for (w, &word) in cats.iter().enumerate() {
+        let low = word & LOW_BITS;
+        let high = (word >> 1) & LOW_BITS;
+        let mut out_low = !(low ^ high) & LOW_BITS;
+        let mut out_high = !high & LOW_BITS;
+        let to_missing = |fields: u64, out_low: &mut u64, out_high: &mut u64| {
+            *out_low |= fields;
+            *out_high &= !fields;
+        };
+        match haploidy {
+            None | Some(HaploidyKind::Diploid) => {}
+            Some(HaploidyKind::HaploidAll) => {
+                let het = out_high & !out_low;
+                to_missing(het, &mut out_low, &mut out_high);
+            }
+            Some(HaploidyKind::HaploidMales) => {
+                let het = out_high & !out_low & sex.male[w];
+                to_missing(het, &mut out_low, &mut out_high);
+            }
+            Some(HaploidyKind::HaploidMalesFemalesMissing) => {
+                to_missing(sex.female[w], &mut out_low, &mut out_high);
+                let het = out_high & !out_low;
+                to_missing(het, &mut out_low, &mut out_high);
+            }
+        }
+        let out = (out_low | (out_high << 1)).to_le_bytes();
+        let start = w * 8;
+        let end = (start + 8).min(block.len());
+        block[start..end].copy_from_slice(&out[..end - start]);
+    }
+    let tail = n % 4;
+    if tail != 0
+        && let Some(last) = block.last_mut()
+    {
+        let kept = (1u8 << (2 * tail)) - 1;
+        *last = (*last & kept) | (0x55 & !kept);
     }
 }
 
@@ -3905,6 +4314,190 @@ mod tests {
         }
         // Record 0 begins the block, so it has nothing to diff against.
         assert!(decoder.ld_anchor_index(0).is_err());
+    }
+
+    /// The packed path must give the byte path's block for every main-track
+    /// type, with and without a phase track, under every haploid rule and in
+    /// either read order, and must hand the records it does not cover (a
+    /// dosage track, a malformed record) back to the byte path.
+    #[test]
+    fn packed_block_decode_matches_byte_path() {
+        fn rand(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        fn random_cats(n: usize, state: &mut u64) -> Vec<u8> {
+            (0..n).map(|_| (rand(state) & 3) as u8).collect()
+        }
+        /// A difflist over up to 10 samples, also applied to `cats`.
+        fn difflist(n: usize, state: &mut u64, cats: &mut [u8]) -> Vec<u8> {
+            let mut sids = Vec::new();
+            let mut sid = (rand(state) % 3) as usize;
+            while sid < n && sids.len() < 10 {
+                sids.push(sid);
+                sid += 1 + (rand(state) % 7) as usize;
+            }
+            let vals: Vec<u8> = sids.iter().map(|_| (rand(state) & 3) as u8).collect();
+            let mut out = encode_varint(sids.len() as u64);
+            if sids.is_empty() {
+                return out;
+            }
+            push_sid(&mut out, sids[0] as u32, sample_id_bytes(n));
+            out.extend_from_slice(&pack_twobit_values(&vals));
+            for pair in sids.windows(2) {
+                out.extend_from_slice(&encode_varint((pair[1] - pair[0]) as u64));
+            }
+            for (&sample, &val) in sids.iter().zip(&vals) {
+                cats[sample] = val;
+            }
+            out
+        }
+        fn phase_track(het: usize, present: bool, state: &mut u64) -> Vec<u8> {
+            let mut bits = vec![present];
+            let mut phased = het;
+            if present {
+                phased = 0;
+                for _ in 0..het {
+                    let bit = rand(state) & 1 == 1;
+                    phased += usize::from(bit);
+                    bits.push(bit);
+                }
+                while bits.len() % 8 != 0 {
+                    bits.push(false);
+                }
+            }
+            for _ in 0..phased {
+                bits.push(rand(state) & 1 == 1);
+            }
+            let mut out = vec![0u8; bits.len().div_ceil(8)];
+            for (i, &bit) in bits.iter().enumerate() {
+                if bit {
+                    out[i >> 3] |= 1 << (i & 7);
+                }
+            }
+            out
+        }
+        let het = |cats: &[u8]| cats.iter().filter(|&&c| c == 1).count();
+
+        for n in [1usize, 2, 3, 4, 5, 31, 32, 33, 63, 64, 65, 127, 200, 255] {
+            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ n as u64;
+            let mut records: Vec<(u8, Vec<u8>)> = Vec::new();
+
+            let cats0 = random_cats(n, &mut state);
+            records.push((0, pack_twobit_values(&cats0)));
+            for ld_type in [2u8, 3] {
+                let mut cats = cats0.clone();
+                records.push((ld_type, difflist(n, &mut state, &mut cats)));
+            }
+
+            // Type 1: het everywhere, hom ALT where the bit is set, then patched.
+            let mut cats3 = vec![1u8; n];
+            let mut rec = vec![5u8];
+            let mut bits = vec![0u8; n.div_ceil(8)];
+            for sample in 0..n {
+                if rand(&mut state) & 1 == 1 {
+                    bits[sample >> 3] |= 1 << (sample & 7);
+                    cats3[sample] = 2;
+                }
+            }
+            rec.extend_from_slice(&bits);
+            rec.extend_from_slice(&difflist(n, &mut state, &mut cats3));
+            records.push((1, rec));
+            let mut cats = cats3.clone();
+            records.push((2, difflist(n, &mut state, &mut cats)));
+
+            for (main_type, fill) in [(4u8, 0u8), (6, 2), (7, 3)] {
+                let mut cats = vec![fill; n];
+                records.push((main_type, difflist(n, &mut state, &mut cats)));
+            }
+
+            let cats8 = random_cats(n, &mut state);
+            let mut rec = pack_twobit_values(&cats8);
+            rec.extend_from_slice(&phase_track(het(&cats8), false, &mut state));
+            records.push((0x10, rec));
+            let cats9 = random_cats(n, &mut state);
+            let mut rec = pack_twobit_values(&cats9);
+            rec.extend_from_slice(&phase_track(het(&cats9), true, &mut state));
+            records.push((0x10, rec));
+            let mut cats10 = cats9.clone();
+            let mut rec = difflist(n, &mut state, &mut cats10);
+            rec.extend_from_slice(&phase_track(het(&cats10), true, &mut state));
+            records.push((0x12, rec));
+
+            // 11: a trailing byte; 12: a dense dosage track.
+            let mut rec = pack_twobit_values(&cats0);
+            rec.push(0);
+            records.push((0, rec));
+            let mut rec = pack_twobit_values(&cats0);
+            for sample in 0..n {
+                rec.extend_from_slice(&(sample as u16).wrapping_mul(977).to_le_bytes());
+            }
+            records.push((0x40, rec));
+
+            let m = records.len();
+            let rec_types: Vec<u8> = records.iter().map(|(ty, _)| *ty).collect();
+            let rec_lens: Vec<u32> = records.iter().map(|(_, rec)| rec.len() as u32).collect();
+            let data: Vec<u8> = records.iter().flat_map(|(_, rec)| rec.clone()).collect();
+            let src: Arc<dyn ByteRangeSource> = Arc::new(VecSource::new(data));
+            let decoder = || {
+                let hdr = PgenHeader {
+                    mode: PgenMode::Var,
+                    m_variants: m as u32,
+                    n_samples: n as u32,
+                    fmt_byte: 0,
+                    block_offsets: vec![0],
+                    rec_types: rec_types.clone(),
+                    rec_lens: rec_lens.clone(),
+                };
+                PgenDecoder::new(Arc::clone(&src), hdr, n, m, vec![1; m]).unwrap()
+            };
+
+            let sex: Vec<u8> = (0..n).map(|sample| (sample % 3) as u8).collect();
+            let masks = SexMasks::new(&sex);
+            let rules = [
+                None,
+                Some(HaploidyKind::Diploid),
+                Some(HaploidyKind::HaploidAll),
+                Some(HaploidyKind::HaploidMales),
+                Some(HaploidyKind::HaploidMalesFemalesMissing),
+            ];
+            let forward: Vec<usize> = (0..m).collect();
+            let backward: Vec<usize> = (0..m).rev().collect();
+            for (rule_index, rule) in rules.into_iter().enumerate() {
+                for order in [&forward, &backward] {
+                    let mut fast = decoder();
+                    let mut slow = decoder();
+                    for &idx in order {
+                        let mut block = vec![0u8; n.div_ceil(4)];
+                        let handled = fast.try_decode_packed_block(idx as u32, rule, &masks, &mut block);
+                        let mut hard = vec![255u8; n];
+                        let decoded = slow.decode_variant_hardcalls(idx as u32, 1, &mut hard, None);
+                        match idx {
+                            11 => {
+                                assert!(!handled, "n={n}: trailing data taken by the packed path");
+                                assert!(decoded.is_err());
+                            }
+                            12 => {
+                                assert!(!handled, "n={n}: dosage track taken by the packed path");
+                                decoded.unwrap();
+                            }
+                            _ => {
+                                assert!(handled, "n={n} record {idx} rule {rule_index}: not handled");
+                                decoded.unwrap();
+                                if let Some(rule) = rule {
+                                    enforce_haploidy(&mut hard, &sex, rule);
+                                }
+                                let mut want = vec![0u8; n.div_ceil(4)];
+                                VirtualBed::pack_to_block(&mut want, &hard);
+                                assert_eq!(block, want, "n={n} record {idx} rule {rule_index}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
