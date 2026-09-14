@@ -259,6 +259,38 @@ jobs:
       - name: Check the release binaries for Windows
         run: cargo +nightly check --release --bins
 
+  # The three arm64 release legs compile code the x86-64 build above never
+  # does: the fused multiply-add in score/kernel.rs and the four-lane SIMD path
+  # in map/fit.rs. Release legs build but run no tests, so the library suite
+  # runs here on Apple silicon, which also covers the not(target_os = "linux")
+  # fallbacks macOS users get. calibrate stays in its own Linux partition.
+  macos_arm_tests:
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: '-C target-cpu=apple-m1'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-arm-tests-${{ hashFiles('Cargo.lock') }}
+          cache-on-failure: true
+
+      - name: Install cargo-nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Run the library tests on arm64 macOS
+        run: |
+          cargo +nightly nextest run --profile ci --release --lib \
+            --filter-expr 'not test(calibrate::)'
+
   rust_tests:
     needs: build_and_test
     runs-on: ubuntu-latest
