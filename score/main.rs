@@ -283,7 +283,9 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         InferredSexArg::Female => genotype_convert::ConvertSex::Female,
         InferredSexArg::Unknown => genotype_convert::ConvertSex::Unknown,
     });
-    let effective_input_path = genotype_convert::ensure_plink_format_with_options(
+    // Under --out the conversion cache joins the score-file caches under PREFIX's
+    // directory, so nothing is written beside the genotypes.
+    let effective_input_path = genotype_convert::ensure_plink_format_in(
         &args.input_path,
         args.reference.as_deref(),
         args.build.as_deref(),
@@ -292,20 +294,25 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
             skip_sex_inference: false,
             inferred_sex: inferred_sex_override,
         },
+        args.out.as_deref().and(cache_dir.as_deref()),
     )?;
     let genome_build = args.build.as_deref().map(GenomeBuild::parse).transpose()?;
 
     let fileset_prefixes = resolve_filesets(&effective_input_path)?;
+    // A converted input's default results and downloads keep their place in its cache
+    // directory, outside the generation directories that later conversions replace.
+    let naming_prefix = genotype_convert::default_output_prefix(&args.input_path)
+        .unwrap_or_else(|| fileset_prefixes[0].clone());
     let output_path = match args.out.as_deref() {
         Some(prefix) => gnomon::output::prefixed_path(prefix, "sscore"),
-        None => fileset_output_path(&fileset_prefixes[0], Some(&out_suffix)),
+        None => fileset_output_path(&naming_prefix, Some(&out_suffix)),
     };
     ensure_output_absent(&output_path)?;
 
     let (resolved_score_files, score_regions_map) = resolve_score_files(
         &args.score,
         &score_arg_str,
-        args.out.as_deref().unwrap_or(&fileset_prefixes[0]),
+        args.out.as_deref().unwrap_or(&naming_prefix),
     )?;
 
     if resolved_score_files.is_empty() {

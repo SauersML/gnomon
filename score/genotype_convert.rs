@@ -21,10 +21,12 @@ use convert_genome::{ConversionConfig, OutputFormat, convert_dtc_file};
 pub use convert_genome::cli::Sex as ConvertSex;
 use flate2::read::GzDecoder;
 use infer_sex::{GenomeBuild, InferredSex};
+use sha2::{Digest, Sha256};
 use std::error::Error;
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::terms::infer_first_sample_sex;
 
@@ -343,13 +345,18 @@ fn download_with_progress(url: &str, dest: &Path) -> Result<(), Box<dyn Error + 
     Ok(())
 }
 
-/// Computes the cache directory path for a VCF/BCF/DTC file.
+/// Computes the default cache directory path for a VCF/BCF/DTC file.
 ///
 /// The cache directory is created alongside the input file as:
 /// `{parent}/{stem}.gnomon_cache/`
 fn get_cache_dir(input_path: &Path) -> PathBuf {
     let parent = input_path.parent().unwrap_or(Path::new("."));
-    let stem = input_path
+    parent.join(format!("{}.gnomon_cache", cache_stem(input_path)))
+}
+
+/// The input's file name without its extension, and without `.vcf` for `.vcf.gz`.
+fn cache_stem(input_path: &Path) -> String {
+    input_path
         .file_stem()
         .map(|s| {
             // Handle .vcf.gz by stripping the .vcf part too
@@ -360,9 +367,33 @@ fn get_cache_dir(input_path: &Path) -> PathBuf {
                 s_str.to_string()
             }
         })
-        .unwrap_or_else(|| "converted".to_string());
+        .unwrap_or_else(|| "converted".to_string())
+}
 
-    parent.join(format!("{}.gnomon_cache", stem))
+/// Where the conversion cache for `input_path` lives: beside the input, or under
+/// `cache_root` (the directory of `--out PREFIX`) when one is given. A shared root holds
+/// caches for inputs from many directories, so there the directory name also carries a
+/// key over the input's canonical path.
+fn conversion_cache_dir(input_path: &Path, cache_root: Option<&Path>) -> PathBuf {
+    let Some(root) = cache_root else {
+        return get_cache_dir(input_path);
+    };
+    let canonical = fs::canonicalize(input_path).unwrap_or_else(|_| input_path.to_path_buf());
+    let key = hex::encode(&Sha256::digest(canonical.as_os_str().as_encoded_bytes())[..8]);
+    root.join(format!("{}.{key}.gnomon_cache", cache_stem(input_path)))
+}
+
+/// The prefix a default run names its results after when `input_path` needs conversion:
+/// `{parent}/{stem}.gnomon_cache/genotypes`, where those results have always landed. It
+/// is not the converted fileset, which sits in a generation directory below it. `None`
+/// for PLINK inputs, which name results after their own prefix.
+pub fn default_output_prefix(input_path: &Path) -> Option<PathBuf> {
+    match detect_input_format(input_path)? {
+        InputFormat::Plink => None,
+        InputFormat::Vcf | InputFormat::Bcf | InputFormat::Dtc => {
+            Some(get_cache_dir(input_path).join("genotypes"))
+        }
+    }
 }
 
 /// File recording the conversion parameters a cache was produced under.
@@ -387,41 +418,176 @@ fn cache_params_fingerprint(
     format!("v1\nbuild={assembly}\npanel={panel}\nreference={reference}\n")
 }
 
-/// Records the parameter fingerprint alongside a freshly written cache.
-fn write_cache_params(cache_dir: &Path, fingerprint: &str) {
-    let _ = fs::write(cache_dir.join(CACHE_PARAMS_FILE), fingerprint);
+/// Staging directory names tried before giving up. A collision needs another
+/// conversion of the same generation with the same pid and clock reading.
+const STAGING_NAME_ATTEMPTS: u32 = 32;
+
+/// Name prefix of a generation converted from a source whose metadata could not be read.
+const UNIDENTIFIED_GENERATION_PREFIX: &str = "g-u";
+
+/// The directory holding one conversion inside a cache directory. Its name is a key
+/// over the conversion parameters and the source's size and modification time, so an
+/// edited source, or another `--build`, `--panel` or `--reference`, gets a generation
+/// of its own and no run reads a fileset converted from something else. A source whose
+/// metadata cannot be read, such as a remote one, cannot be identified, so its
+/// generation (`g-u…`, keyed by the parameters alone) is never served from the cache.
+/// Every run converts it again and replaces it, as before generations existed.
+fn generation_dir(cache_dir: &Path, source_path: &Path, fingerprint: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update((fingerprint.len() as u64).to_le_bytes());
+    hasher.update(fingerprint.as_bytes());
+    let identity = fs::metadata(source_path).ok().and_then(|metadata| {
+        let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some((metadata.len(), modified.as_nanos()))
+    });
+    let prefix = match identity {
+        Some((len, modified_nanos)) => {
+            hasher.update(len.to_le_bytes());
+            hasher.update(modified_nanos.to_le_bytes());
+            "g-"
+        }
+        None => UNIDENTIFIED_GENERATION_PREFIX,
+    };
+    cache_dir.join(format!("{prefix}{}", hex::encode(&hasher.finalize()[..8])))
 }
 
-/// Checks if the cache is valid: the converted output exists, the source has not
-/// been modified since, and it was produced under the same conversion parameters.
-fn is_cache_valid(source_path: &Path, cache_dir: &Path, expected_fingerprint: &str) -> bool {
-    let cache_bed = cache_dir.join("genotypes.bed");
+/// Whether `generation` holds a complete conversion made under `fingerprint` that may be
+/// served. A generation is published whole, by renaming its directory into place, so
+/// its files are complete whenever it exists; the parameters are still compared as a
+/// guard, and an unidentified source's generation is never served.
+fn is_generation_valid(generation: &Path, fingerprint: &str) -> bool {
+    let unidentified = generation
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with(UNIDENTIFIED_GENERATION_PREFIX));
+    !unidentified
+        && ["genotypes.bed", "genotypes.bim", "genotypes.fam"]
+            .iter()
+            .all(|name| generation.join(name).is_file())
+        && fs::read_to_string(generation.join(CACHE_PARAMS_FILE))
+            .is_ok_and(|found| found == fingerprint)
+}
 
-    if !cache_bed.exists() {
-        return false;
+/// Converts into a private staging directory inside the cache directory, fsyncs every
+/// file the converter wrote, and renames the directory into place as `generation`.
+/// Readers therefore see no generation or a complete one, never files still being
+/// written. A failed conversion removes its staging directory. When runs convert the
+/// same source at once, the first rename wins and the others use that generation.
+fn publish_generation<F>(
+    generation: &Path,
+    fingerprint: &str,
+    convert: F,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    F: FnOnce(&Path) -> Result<(), Box<dyn Error + Send + Sync>>,
+{
+    let cache_dir = generation.parent().ok_or_else(|| {
+        format!(
+            "Conversion cache path '{}' has no parent directory.",
+            generation.display()
+        )
+    })?;
+    fs::create_dir_all(cache_dir)?;
+    let staging = create_staging_dir(cache_dir, generation)?;
+    let staged = (|| -> Result<(), Box<dyn Error + Send + Sync>> {
+        convert(&staging)?;
+        fs::write(staging.join(CACHE_PARAMS_FILE), fingerprint)?;
+        // The converter does not fsync. Make every file durable before the rename can
+        // publish it, so a crash cannot leave a generation of truncated files.
+        for entry in fs::read_dir(&staging)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                // Opened for writing: Windows cannot flush a read-only handle.
+                OpenOptions::new()
+                    .write(true)
+                    .open(entry.path())?
+                    .sync_all()?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(err) = staged {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(err);
     }
-
-    // Reject caches produced under different parameters (build/panel/reference).
-    // A missing params file means a pre-fingerprint cache of unknown provenance,
-    // which we conservatively treat as invalid.
-    match fs::read_to_string(cache_dir.join(CACHE_PARAMS_FILE)) {
-        Ok(found) if found == expected_fingerprint => {}
-        _ => return false,
+    if let Err(first_err) = fs::rename(&staging, generation) {
+        if is_generation_valid(generation, fingerprint) {
+            // Another run published this generation first.
+            let _ = fs::remove_dir_all(&staging);
+            return Ok(());
+        }
+        let replaced = if generation.is_dir() {
+            // A published generation that may not be served, such as an unidentified
+            // source's, is replaced: moved aside under a fresh private name, then
+            // removed once the new one is in place. A run still reading it keeps its
+            // open files on Unix.
+            create_staging_dir(cache_dir, generation).and_then(|aside| {
+                fs::remove_dir(&aside)?;
+                fs::rename(generation, &aside)?;
+                let published = fs::rename(&staging, generation);
+                let _ = fs::remove_dir_all(&aside);
+                published
+            })
+        } else {
+            Err(first_err)
+        };
+        if let Err(err) = replaced {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(format!(
+                "Could not publish the PLINK conversion cache '{}': {err}",
+                generation.display()
+            )
+            .into());
+        }
     }
+    Ok(())
+}
 
-    // Compare modification times
-    let source_mtime = match fs::metadata(source_path).and_then(|m| m.modified()) {
-        Ok(t) => t,
-        Err(_) => return false,
+/// Creates `.{generation}.{pid}.{nanos}.tmp` in `cache_dir` exclusively, so concurrent
+/// conversions never share a staging directory.
+fn create_staging_dir(cache_dir: &Path, generation: &Path) -> io::Result<PathBuf> {
+    let name = generation
+        .file_name()
+        .map_or_else(|| "generation".into(), |name| name.to_string_lossy());
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    for attempt in 0..STAGING_NAME_ATTEMPTS {
+        let candidate =
+            cache_dir.join(format!(".{name}.{pid}.{}.tmp", nanos + u128::from(attempt)));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "Failed to allocate a staging directory in '{}'.",
+            cache_dir.display()
+        ),
+    ))
+}
+
+/// Removes the generations in `cache_dir` made under `fingerprint`, other than
+/// `current`. They were converted from an earlier version of the source, so they can
+/// never be served again. Generations made under other parameters stay for the runs
+/// that use them, and files from the previous cache layout are left alone. Best effort.
+fn prune_superseded_generations(cache_dir: &Path, current: &Path, fingerprint: &str) {
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
     };
-
-    let cache_mtime = match fs::metadata(&cache_bed).and_then(|m| m.modified()) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-
-    // Cache is valid if it was created after the source was last modified
-    cache_mtime > source_mtime
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == current || !entry.file_name().to_string_lossy().starts_with("g-") {
+            continue;
+        }
+        if fs::read_to_string(path.join(CACHE_PARAMS_FILE)).is_ok_and(|found| found == fingerprint)
+        {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
 }
 
 /// Options controlling how `ensure_plink_format_with_options` performs its work.
@@ -480,6 +646,25 @@ pub fn ensure_plink_format_with_options(
     panel: Option<&Path>,
     options: EnsurePlinkOptions,
 ) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+    ensure_plink_format_in(input_path, reference, build, panel, options, None)
+}
+
+/// Variant of [`ensure_plink_format_with_options`] that keeps the conversion cache
+/// under `cache_root` (the directory of `--out PREFIX`) instead of beside the input.
+///
+/// Converted filesets are published whole. Each lives in a generation directory
+/// keyed by the conversion parameters and the source's size and modification time,
+/// and is written under a private staging name, then renamed into place once
+/// complete. A reader, a concurrent run, or a run after a killed conversion
+/// therefore never reads a partial or mixed fileset.
+pub fn ensure_plink_format_in(
+    input_path: &Path,
+    reference: Option<&Path>,
+    build: Option<&str>,
+    panel: Option<&Path>,
+    options: EnsurePlinkOptions,
+    cache_root: Option<&Path>,
+) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
     let format = detect_input_format(input_path).ok_or_else(|| {
         format!(
             "Could not determine input format for '{}'. \
@@ -500,20 +685,18 @@ pub fn ensure_plink_format_with_options(
         }
         InputFormat::Vcf | InputFormat::Bcf => {
             // Check cache validity
-            let cache_dir = get_cache_dir(input_path);
-            let cache_prefix = cache_dir.join("genotypes");
             let cache_fingerprint = cache_params_fingerprint(build, panel, reference);
+            let cache_dir = conversion_cache_dir(input_path, cache_root);
+            let generation = generation_dir(&cache_dir, input_path, &cache_fingerprint);
+            let cache_prefix = generation.join("genotypes");
 
-            if is_cache_valid(input_path, &cache_dir, &cache_fingerprint) {
+            if is_generation_valid(&generation, &cache_fingerprint) {
                 eprintln!(
                     "> Using cached PLINK conversion from '{}'",
-                    cache_dir.display()
+                    generation.display()
                 );
                 return Ok(cache_prefix);
             }
-
-            // Create cache directory
-            fs::create_dir_all(&cache_dir)?;
 
             eprintln!("> Converting {} to PLINK format...", input_path.display());
 
@@ -557,57 +740,61 @@ pub fn ensure_plink_format_with_options(
                 }
             };
 
-            // No reference needed for VCF/BCF - they have embedded reference info
-            let config = ConversionConfig {
-                input: input_path.to_path_buf(),
-                input_format,
-                input_origin: input_path.display().to_string(),
-                reference_fasta: None,
-                reference_origin: None,
-                reference_fai: None,
-                reference_fai_origin: None,
-                output: cache_prefix.clone(),
-                output_dir: Some(cache_dir.clone()),
-                output_format: OutputFormat::Plink,
-                sample_id: "sample".to_string(),
-                assembly,
-                input_build: build.map(|b| b.to_string()),
-                include_reference_sites: false,
-                sex: Some(inferred_sex),
-                par_boundaries: None,
-                standardize: false,
-                panel: panel.map(|p| p.to_path_buf()),
-                // Clinical-safety gates: reject a conversion that silently
-                // produces almost nothing, cannot confidently identify the
-                // source build, or fails to parse much of its input. Upstream
-                // owns these thresholds, so track its defaults rather than
-                // pinning our own copies.
-                min_emitted_variants: DEFAULT_MIN_EMITTED_VARIANTS,
-                min_build_confidence: DEFAULT_MIN_BUILD_CONFIDENCE,
-                max_parse_error_ratio: DEFAULT_MAX_PARSE_ERROR_RATIO,
-            };
+            publish_generation(&generation, &cache_fingerprint, |staging| {
+                // No reference needed for VCF/BCF - they have embedded reference info
+                let config = ConversionConfig {
+                    input: input_path.to_path_buf(),
+                    input_format,
+                    input_origin: input_path.display().to_string(),
+                    reference_fasta: None,
+                    reference_origin: None,
+                    reference_fai: None,
+                    reference_fai_origin: None,
+                    output: staging.join("genotypes"),
+                    output_dir: Some(staging.to_path_buf()),
+                    output_format: OutputFormat::Plink,
+                    sample_id: "sample".to_string(),
+                    assembly,
+                    input_build: build.map(|b| b.to_string()),
+                    include_reference_sites: false,
+                    sex: Some(inferred_sex),
+                    par_boundaries: None,
+                    standardize: false,
+                    panel: panel.map(|p| p.to_path_buf()),
+                    // Clinical-safety gates: reject a conversion that silently
+                    // produces almost nothing, cannot confidently identify the
+                    // source build, or fails to parse much of its input. Upstream
+                    // owns these thresholds, so track its defaults rather than
+                    // pinning our own copies.
+                    min_emitted_variants: DEFAULT_MIN_EMITTED_VARIANTS,
+                    min_build_confidence: DEFAULT_MIN_BUILD_CONFIDENCE,
+                    max_parse_error_ratio: DEFAULT_MAX_PARSE_ERROR_RATIO,
+                };
 
-            // Run conversion
-            convert_dtc_file(config)?;
-            write_cache_params(&cache_dir, &cache_fingerprint);
+                // Run conversion
+                convert_dtc_file(config)?;
+                Ok(())
+            })?;
+            prune_superseded_generations(&cache_dir, &generation, &cache_fingerprint);
 
             eprintln!(
                 "> Conversion complete. Cache stored at '{}'",
-                cache_dir.display()
+                generation.display()
             );
 
             Ok(cache_prefix)
         }
         InputFormat::Dtc => {
             // Check cache validity
-            let cache_dir = get_cache_dir(input_path);
-            let cache_prefix = cache_dir.join("genotypes");
             let cache_fingerprint = cache_params_fingerprint(build, panel, reference);
+            let cache_dir = conversion_cache_dir(input_path, cache_root);
+            let generation = generation_dir(&cache_dir, input_path, &cache_fingerprint);
+            let cache_prefix = generation.join("genotypes");
 
-            if is_cache_valid(input_path, &cache_dir, &cache_fingerprint) {
+            if is_generation_valid(&generation, &cache_fingerprint) {
                 eprintln!(
                     "> Using cached PLINK conversion from '{}'",
-                    cache_dir.display()
+                    generation.display()
                 );
                 return Ok(cache_prefix);
             }
@@ -630,50 +817,50 @@ pub fn ensure_plink_format_with_options(
                 }
             };
 
-            // Create cache directory
-            fs::create_dir_all(&cache_dir)?;
-
             eprintln!("> Converting {} to PLINK format...", input_path.display());
 
-            let config = ConversionConfig {
-                input: input_path.to_path_buf(),
-                input_format: ConvertInputFormat::Dtc,
-                input_origin: input_path.display().to_string(),
-                reference_fasta: Some(reference_path.clone()),
-                reference_origin: Some(reference_path.display().to_string()),
-                reference_fai: None,
-                reference_fai_origin: None,
-                output: cache_prefix.clone(),
-                output_dir: Some(cache_dir.clone()),
-                output_format: OutputFormat::Plink,
-                sample_id: input_path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "sample".to_string()),
-                assembly,
-                input_build: build.map(|b| b.to_string()),
-                include_reference_sites: false,
-                sex: None,
-                par_boundaries: None,
-                standardize: false,
-                panel: panel.map(|p| p.to_path_buf()),
-                // Clinical-safety gates: reject a conversion that silently
-                // produces almost nothing, cannot confidently identify the
-                // source build, or fails to parse much of its input. Upstream
-                // owns these thresholds, so track its defaults rather than
-                // pinning our own copies.
-                min_emitted_variants: DEFAULT_MIN_EMITTED_VARIANTS,
-                min_build_confidence: DEFAULT_MIN_BUILD_CONFIDENCE,
-                max_parse_error_ratio: DEFAULT_MAX_PARSE_ERROR_RATIO,
-            };
+            publish_generation(&generation, &cache_fingerprint, |staging| {
+                let config = ConversionConfig {
+                    input: input_path.to_path_buf(),
+                    input_format: ConvertInputFormat::Dtc,
+                    input_origin: input_path.display().to_string(),
+                    reference_fasta: Some(reference_path.clone()),
+                    reference_origin: Some(reference_path.display().to_string()),
+                    reference_fai: None,
+                    reference_fai_origin: None,
+                    output: staging.join("genotypes"),
+                    output_dir: Some(staging.to_path_buf()),
+                    output_format: OutputFormat::Plink,
+                    sample_id: input_path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "sample".to_string()),
+                    assembly,
+                    input_build: build.map(|b| b.to_string()),
+                    include_reference_sites: false,
+                    sex: None,
+                    par_boundaries: None,
+                    standardize: false,
+                    panel: panel.map(|p| p.to_path_buf()),
+                    // Clinical-safety gates: reject a conversion that silently
+                    // produces almost nothing, cannot confidently identify the
+                    // source build, or fails to parse much of its input. Upstream
+                    // owns these thresholds, so track its defaults rather than
+                    // pinning our own copies.
+                    min_emitted_variants: DEFAULT_MIN_EMITTED_VARIANTS,
+                    min_build_confidence: DEFAULT_MIN_BUILD_CONFIDENCE,
+                    max_parse_error_ratio: DEFAULT_MAX_PARSE_ERROR_RATIO,
+                };
 
-            // Run conversion
-            convert_dtc_file(config)?;
-            write_cache_params(&cache_dir, &cache_fingerprint);
+                // Run conversion
+                convert_dtc_file(config)?;
+                Ok(())
+            })?;
+            prune_superseded_generations(&cache_dir, &generation, &cache_fingerprint);
 
             eprintln!(
                 "> Conversion complete. Cache stored at '{}'",
-                cache_dir.display()
+                generation.display()
             );
             eprintln!(
                 "> Note: Using raw genotyped data. Missing variants will be mean-imputed during scoring."
@@ -757,5 +944,167 @@ mod tests {
     fn test_cache_dir_dtc() {
         let cache = get_cache_dir(Path::new("/data/23andme_raw.txt"));
         assert_eq!(cache, Path::new("/data/23andme_raw.gnomon_cache"));
+    }
+
+    fn fake_conversion(staging: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
+        for name in ["genotypes.bed", "genotypes.bim", "genotypes.fam"] {
+            fs::write(staging.join(name), name)?;
+        }
+        Ok(())
+    }
+
+    fn entry_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_published_generation_is_complete_and_leaves_no_staging_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("sample.bcf");
+        fs::write(&source, b"version one").expect("source");
+        let cache_dir = conversion_cache_dir(&source, None);
+        assert_eq!(cache_dir, dir.path().join("sample.gnomon_cache"));
+        let generation = generation_dir(&cache_dir, &source, "v1\n");
+
+        publish_generation(&generation, "v1\n", fake_conversion).expect("publish");
+
+        assert!(is_generation_valid(&generation, "v1\n"));
+        assert!(!is_generation_valid(&generation, "v2\n"));
+        let name = generation.file_name().expect("name").to_string_lossy().into_owned();
+        assert_eq!(entry_names(&cache_dir), [name]);
+    }
+
+    #[test]
+    fn a_failed_conversion_publishes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = dir.path().join("sample.gnomon_cache");
+        let generation = cache_dir.join("g-0");
+        let err = publish_generation(&generation, "v1\n", |staging| {
+            fs::write(staging.join("genotypes.bed"), b"partial")?;
+            Err("converter failed".into())
+        })
+        .expect_err("the conversion error must propagate");
+        assert_eq!(err.to_string(), "converter failed");
+        assert!(!generation.exists());
+        assert!(entry_names(&cache_dir).is_empty());
+    }
+
+    #[test]
+    fn concurrent_conversions_of_one_source_all_succeed_with_one_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = dir.path().join("sample.gnomon_cache");
+        let generation = cache_dir.join("g-0");
+        std::thread::scope(|scope| {
+            let runs: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        publish_generation(&generation, "v1\n", fake_conversion)
+                            .map_err(|err| err.to_string())
+                    })
+                })
+                .collect();
+            for run in runs {
+                run.join().expect("thread").expect("every run must succeed");
+            }
+        });
+        assert!(is_generation_valid(&generation, "v1\n"));
+        assert_eq!(entry_names(&cache_dir), ["g-0"]);
+    }
+
+    #[test]
+    fn generation_keys_follow_the_parameters_and_the_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("sample.bcf");
+        fs::write(&source, b"version one").expect("source");
+        let cache_dir = dir.path().join("sample.gnomon_cache");
+        let first = generation_dir(&cache_dir, &source, "v1\nbuild=GRCh38\n");
+        assert_eq!(first, generation_dir(&cache_dir, &source, "v1\nbuild=GRCh38\n"));
+        assert_ne!(first, generation_dir(&cache_dir, &source, "v1\nbuild=GRCh37\n"));
+        fs::write(&source, b"version two, longer").expect("edit the source");
+        assert_ne!(first, generation_dir(&cache_dir, &source, "v1\nbuild=GRCh38\n"));
+    }
+
+    #[test]
+    fn an_unidentified_source_is_never_served_and_is_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = dir.path().join("remote.gnomon_cache");
+        let missing = dir.path().join("absent.bcf");
+        let generation = generation_dir(&cache_dir, &missing, "v1\n");
+        assert_eq!(generation, generation_dir(&cache_dir, &missing, "v1\n"));
+        for version in ["first", "second"] {
+            publish_generation(&generation, "v1\n", |staging| {
+                for name in ["genotypes.bed", "genotypes.bim", "genotypes.fam"] {
+                    fs::write(staging.join(name), version)?;
+                }
+                Ok(())
+            })
+            .expect("publish");
+            assert!(!is_generation_valid(&generation, "v1\n"));
+            assert_eq!(
+                fs::read_to_string(generation.join("genotypes.bed")).expect("read"),
+                version
+            );
+        }
+        assert_eq!(entry_names(&cache_dir).len(), 1, "{:?}", entry_names(&cache_dir));
+    }
+
+    #[test]
+    fn pruning_removes_only_superseded_generations_of_the_same_parameters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = dir.path().join("sample.gnomon_cache");
+        for (name, fingerprint) in [("g-old", "v1\n"), ("g-new", "v1\n"), ("g-other", "v2\n")] {
+            publish_generation(&cache_dir.join(name), fingerprint, fake_conversion)
+                .expect("publish");
+        }
+        // The previous layout kept its files directly in the cache directory.
+        fs::write(cache_dir.join("genotypes.bed"), b"legacy").expect("legacy");
+
+        prune_superseded_generations(&cache_dir, &cache_dir.join("g-new"), "v1\n");
+
+        assert_eq!(entry_names(&cache_dir), ["g-new", "g-other", "genotypes.bed"]);
+    }
+
+    #[test]
+    fn a_shared_cache_root_keys_conversion_caches_by_input_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("results").join("gnomon_score_cache");
+        let a = dir.path().join("a").join("sample.vcf.gz");
+        let b = dir.path().join("b").join("sample.vcf.gz");
+        for input in [&a, &b] {
+            fs::create_dir_all(input.parent().expect("parent")).expect("mkdir");
+            fs::write(input, b"source").expect("source");
+        }
+        let cache_a = conversion_cache_dir(&a, Some(&root));
+        let cache_b = conversion_cache_dir(&b, Some(&root));
+        assert_ne!(cache_a, cache_b);
+        for cache in [&cache_a, &cache_b] {
+            assert_eq!(cache.parent(), Some(root.as_path()));
+            let name = cache.file_name().expect("name").to_string_lossy().into_owned();
+            assert!(name.starts_with("sample.") && name.ends_with(".gnomon_cache"), "{name}");
+        }
+        assert_eq!(
+            conversion_cache_dir(&a, None),
+            dir.path().join("a").join("sample.gnomon_cache")
+        );
+    }
+
+    #[test]
+    fn converted_inputs_name_default_results_after_their_cache_directory() {
+        assert_eq!(
+            default_output_prefix(Path::new("/data/sample.bcf")),
+            Some(PathBuf::from("/data/sample.gnomon_cache/genotypes"))
+        );
+        assert_eq!(default_output_prefix(Path::new("/data/arrays.bed")), None);
     }
 }

@@ -53,13 +53,20 @@ Catalog files, and the score-file caches (`gnomon_score_cache/`).
 ./gnomon/target/release/gnomon score "PGS003725" arrays --out results/arrays_pgs003725
 ```
 
-Nothing is written beside a PLINK or VCF input or beside the score files, so the inputs
-may sit in a read-only or shared directory. Concurrent runs on the same inputs are safe
-when their prefixes differ. Two genotype-side intermediates still go beside the
-genotypes:
-- the PLINK conversion cache for BCF, DTC and `--panel` inputs (`<stem>.gnomon_cache/`)
-- the re-sorted fileset written when a `.bim` is out of order
-  (`<prefix>.sorted.{bed,bim,fam}`)
+Nothing is written beside the genotypes or the score files, so the inputs may sit in a
+read-only or shared directory. Concurrent runs on the same inputs are safe when their
+prefixes differ. BCF, DTC and `--panel` inputs are converted to PLINK into a
+`<stem>.<key>.gnomon_cache/` directory under `gnomon_score_cache/`. One genotype-side
+intermediate still goes beside the genotypes: the re-sorted fileset written when a
+`.bim` is out of order (`<prefix>.sorted.{bed,bim,fam}`).
+
+Without `--out`, the conversion cache stays in `<stem>.gnomon_cache/` beside the input,
+and so do the results. Each conversion is written to a private temporary directory and
+renamed into place as `g-<key>/` once complete. The key covers the source file's size
+and modification time and the `--build`, `--panel` and `--reference` in use, so a run
+never reads a partial conversion or one made from something else. Once a newer
+conversion under the same parameters is published, the older one is removed. Caches
+written by earlier gnomon versions are ignored and left in place.
 
 Each score-file cache entry under `gnomon_score_cache/` is named with a key over the
 gnomon build and the score file's path, size and modification time, so an edited score
