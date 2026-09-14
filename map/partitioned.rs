@@ -12,6 +12,12 @@
 //! and combine the leaves in a fixed order. Rayon decides only which thread
 //! computes which leaf, so the result is the same bits on one thread or on a
 //! hundred, and no thread spins waiting for another.
+//!
+//! The same holds for the tiles a streamed product arrives in.
+//! [`gram_rows_in_chunks`] and [`add_mul_rows_in_chunks`] take a tile's columns
+//! a fixed number at a time, so a product split into tiles at chunk multiples
+//! gives the bits of the product taken whole, and a memory budget that widens
+//! or narrows the tiles changes only how much is held at once.
 
 use dyn_stack::{MemBuffer, MemStack};
 use faer::diag::Diag;
@@ -196,6 +202,87 @@ fn gram_subtree(
     (left, left_compensation)
 }
 
+/// `out ← aᵀ·b`, taking `a`'s columns `chunk` at a time.
+///
+/// Row `j` of the product depends only on column `j` of `a`, so the chunks
+/// write disjoint rows, and each is a [`gram_rows`] product whose leaves follow
+/// the chunk's shape. A column's bits then depend on the chunk it falls in,
+/// never on how wide a tile it arrived in.
+pub(crate) fn gram_rows_in_chunks(
+    out: MatMut<'_, f64>,
+    a: MatRef<'_, f64>,
+    b: MatRef<'_, f64>,
+    chunk: usize,
+) {
+    debug_assert_eq!(out.nrows(), a.ncols());
+    debug_assert_eq!(out.ncols(), b.ncols());
+    let chunk = chunk.max(1);
+    if out.nrows() <= chunk {
+        gram_rows(out, a, b);
+        return;
+    }
+    out.par_row_chunks_mut(chunk)
+        .enumerate()
+        .for_each(|(index, rows)| {
+            let width = rows.nrows();
+            gram_rows(rows, a.subcols(index * chunk, width), b);
+        });
+}
+
+/// `out ← out + alpha·a·b`, taking `a`'s columns `chunk` at a time.
+///
+/// Every entry of `out` takes one addition per chunk, in column order, and
+/// each addition is a product whose shape is fixed by `chunk` and by row leaves
+/// sized for `leaf_cols` columns, not by `a`'s width. Applied to consecutive
+/// column tiles of a matrix, each a whole number of chunks wide, this gives the
+/// bits of the matrix applied whole.
+pub(crate) fn add_mul_rows_in_chunks(
+    out: MatMut<'_, f64>,
+    a: MatRef<'_, f64>,
+    b: MatRef<'_, f64>,
+    alpha: f64,
+    chunk: usize,
+    leaf_cols: usize,
+) {
+    let leaf = leaf_rows(out.nrows(), leaf_cols.saturating_mul(b.ncols()));
+    add_mul_rows_in_chunks_in_leaves(out, a, b, alpha, chunk, leaf);
+}
+
+fn add_mul_rows_in_chunks_in_leaves(
+    out: MatMut<'_, f64>,
+    a: MatRef<'_, f64>,
+    b: MatRef<'_, f64>,
+    alpha: f64,
+    chunk: usize,
+    leaf: usize,
+) {
+    debug_assert_eq!(out.nrows(), a.nrows());
+    debug_assert_eq!(out.ncols(), b.ncols());
+    debug_assert_eq!(a.ncols(), b.nrows());
+    if out.nrows() == 0 || out.ncols() == 0 {
+        return;
+    }
+    let chunk = chunk.max(1);
+    out.par_row_chunks_mut(leaf)
+        .enumerate()
+        .for_each(|(index, mut rows)| {
+            let lhs = a.subrows(index * leaf, rows.nrows());
+            let mut first = 0usize;
+            while first < a.ncols() {
+                let width = chunk.min(a.ncols() - first);
+                matmul(
+                    rows.as_mut(),
+                    Accum::Add,
+                    lhs.subcols(first, width),
+                    b.subrows(first, width),
+                    alpha,
+                    Par::Seq,
+                );
+                first += width;
+            }
+        });
+}
+
 /// `A = U·diag(s)·Uᵀ` for a symmetric `A` given by its `side` triangle,
 /// computed sequentially.
 ///
@@ -376,6 +463,85 @@ mod tests {
                     serial.as_ref(),
                     product(threads, leaf).as_ref(),
                     &format!("gram_rows with {leaf}-row leaves at {threads} threads"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_products_do_not_depend_on_the_tile_width() {
+        // 203 columns are twelve chunks of 16 and a remainder of 11. The tiles
+        // hold one chunk, three, four and all of them, and 8,209 rows give
+        // every chunk's Gram product two row leaves, 8,192 rows and 17.
+        const CHUNK: usize = 16;
+        const ROWS: usize = 8_209;
+        const COLS: usize = 203;
+        const RHS: usize = 40;
+        assert_eq!(gram_leaf_rows(ROWS, CHUNK * RHS), GRAM_MIN_LEAF_ROWS);
+        let a = pseudo_random(ROWS, COLS, 41);
+        let b = pseudo_random(ROWS, RHS, 42);
+        let weights = pseudo_random(COLS, RHS, 43);
+        let start = pseudo_random(ROWS, RHS, 44);
+        let tiled = |tile: usize, threads: usize| {
+            with_threads(threads, || {
+                let mut gram = Mat::from_fn(COLS, RHS, |_, _| f64::NAN);
+                let mut sum = start.clone();
+                let mut first = 0usize;
+                while first < COLS {
+                    let width = tile.min(COLS - first);
+                    gram_rows_in_chunks(
+                        gram.as_mut().subrows_mut(first, width),
+                        a.as_ref().subcols(first, width),
+                        b.as_ref(),
+                        CHUNK,
+                    );
+                    add_mul_rows_in_chunks(
+                        sum.as_mut(),
+                        a.as_ref().subcols(first, width),
+                        weights.as_ref().subrows(first, width),
+                        -0.75,
+                        CHUNK,
+                        512,
+                    );
+                    first += width;
+                }
+                (gram, sum)
+            })
+        };
+
+        let (gram, sum) = tiled(COLS, 1);
+        let mut reference_gram = Mat::zeros(COLS, RHS);
+        matmul(
+            reference_gram.as_mut(),
+            Accum::Replace,
+            a.as_ref().transpose(),
+            b.as_ref(),
+            1.0,
+            Par::Seq,
+        );
+        let mut reference_sum = start.clone();
+        matmul(
+            reference_sum.as_mut(),
+            Accum::Add,
+            a.as_ref(),
+            weights.as_ref(),
+            -0.75,
+            Par::Seq,
+        );
+        assert!(max_abs_diff(gram.as_ref(), reference_gram.as_ref()) < 1e-10);
+        assert!(max_abs_diff(sum.as_ref(), reference_sum.as_ref()) < 1e-10);
+        for tile in [CHUNK, 3 * CHUNK, 4 * CHUNK] {
+            for threads in [1usize, 3] {
+                let (tile_gram, tile_sum) = tiled(tile, threads);
+                assert_same_bits(
+                    gram.as_ref(),
+                    tile_gram.as_ref(),
+                    &format!("Gram product in {tile}-column tiles at {threads} threads"),
+                );
+                assert_same_bits(
+                    sum.as_ref(),
+                    tile_sum.as_ref(),
+                    &format!("row product in {tile}-column tiles at {threads} threads"),
                 );
             }
         }

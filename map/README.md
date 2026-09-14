@@ -45,7 +45,13 @@ Optional arguments:
   prints the active worker count before reading genotypes. The count changes
   speed, never the answer: every product in the fit runs on row leaves whose
   size depends only on the matrix shape, so the model and scores are the same
-  bytes at any thread count.
+  bytes at any thread count. Free memory is the same: products take variants in
+  chunks sized by the sample count alone, whatever tile width the memory budget
+  affords, and the budgets that steer the solver (how deep its basis grows,
+  whether it keeps factor images, whether it forms the covariance) follow the
+  machine's memory limit rather than what is free at startup. When less is free
+  than that plan assumes, the fit halves those budgets until they fit and says
+  so on stderr.
 * `--list <PATH>` – Restrict fitting to a variant subset. The file (local or
   remote) should contain two whitespace-separated columns—chromosome and
   1-based position—with an optional header. Any variants that cannot be found

@@ -1,5 +1,7 @@
 use super::blocklanczos::{BlockKrylovError, BlockKrylovParams, BlockOperator, block_krylov_eigen};
-use super::partitioned::{gram_rows, mul_rows, self_adjoint_eigen_seq};
+use super::partitioned::{
+    add_mul_rows_in_chunks, gram_rows, gram_rows_in_chunks, mul_rows, self_adjoint_eigen_seq,
+};
 use super::progress::{
     FitProgressObserver, FitProgressStage, NoopFitProgress, StageProgressHandle,
 };
@@ -112,14 +114,25 @@ enum CovarianceComputationMode {
 /// source mmaps, their page cache and allocator slack are resident at the same
 /// time. Independent budgets that do not know about each other are not budgets.
 ///
-/// So: one pool, apportioned once, from *available* rather than total memory —
-/// what is free now is what a fit can actually spend — with a deliberate slice
-/// left unapportioned for everything this plan does not name.
+/// So: one pool, apportioned once, with a deliberate slice left unapportioned
+/// for everything this plan does not name.
+///
+/// The shares differ in what they can change. The source cache and the
+/// streaming tiles buy speed and nothing else (products run over fixed chunks
+/// however many a tile holds; see [`product_chunk_width`]), so they are cut
+/// from *available* memory: what is free now is what a fit can actually spend.
+/// The Gram and Krylov-basis shares steer the computation itself: whether the
+/// covariance is formed, how deep a basis grows before a restart, whether the
+/// solver keeps the factor images that stand in for a loadings pass. Cut from
+/// availability, they would give one machine different answers run to run as
+/// page cache and other processes come and go. They are cut from the machine's
+/// memory limit instead (the cgroup limit, or physical memory), and
+/// availability only guards them: when that plan does not fit in what is free,
+/// it is halved until it does, and the fit says so on stderr.
 ///
 /// Measured once per process, deliberately. Availability drifts while a fit
-/// runs, and a plan that re-measured would hand the same fit different tile
-/// widths at different moments — different tilings mean different summation
-/// order, and a fit that is not reproducible run to run is not a fit.
+/// runs, and a plan that re-measured would hand one fit different budgets at
+/// different moments.
 struct FitMemoryPlan {
     /// Dense n×n covariance. Only the small-problem reference path spends it.
     gram_bytes: usize,
@@ -132,9 +145,9 @@ struct FitMemoryPlan {
     streaming_tile_bytes: usize,
 }
 
-/// Fraction of available memory the plan is allowed to apportion at all. The
+/// Fraction of a memory figure the plan is allowed to apportion at all. The
 /// remainder is headroom for the allocations no budget here can size.
-const FIT_POOL_PERCENT_OF_AVAILABLE: u64 = 70;
+const FIT_POOL_PERCENT: u64 = 70;
 // Shares of that pool, in percent, summing to 100.
 const GRAM_SHARE_PERCENT: u64 = 15;
 const SOURCE_CACHE_SHARE_PERCENT: u64 = 45;
@@ -148,18 +161,45 @@ fn fit_memory_plan() -> &'static FitMemoryPlan {
 
 fn compute_fit_memory_plan() -> FitMemoryPlan {
     let (total, available) = crate::memory::memory_bytes();
-    let pool = available.min(total).saturating_mul(FIT_POOL_PERCENT_OF_AVAILABLE) / 100;
-    let share = |percent: u64| -> usize {
+    let (plan, halvings) = plan_fit_memory(total, available);
+    if halvings > 0 {
+        const MIB: u64 = 1 << 20;
+        eprintln!(
+            "> Memory plan: {} MiB free is less than this machine's {} MiB limit plans for, so the solver-basis and dense-Gram budgets are halved {halvings} time(s), to {} MiB and {} MiB. A fit with more memory free can take a different solver path and differ at roundoff.",
+            available / MIB,
+            total / MIB,
+            plan.krylov_basis_bytes as u64 / MIB,
+            plan.gram_bytes as u64 / MIB,
+        );
+    }
+    plan
+}
+
+/// Cuts the fit's shares from the machine's memory limit `total` and the memory
+/// `available` now, and returns the plan with the number of times the steering
+/// shares were halved to fit in what is free.
+fn plan_fit_memory(total: u64, available: u64) -> (FitMemoryPlan, u32) {
+    let share = |pool: u64, percent: u64| -> usize {
         let bytes = pool.saturating_mul(percent) / 100;
         bytes.min(usize::MAX as u64) as usize
     };
-
-    FitMemoryPlan {
-        gram_bytes: share(GRAM_SHARE_PERCENT),
-        source_cache_bytes: share(SOURCE_CACHE_SHARE_PERCENT),
-        krylov_basis_bytes: share(KRYLOV_BASIS_SHARE_PERCENT),
-        streaming_tile_bytes: share(STREAMING_TILE_SHARE_PERCENT),
+    // Buys speed alone, so it follows what is free.
+    let spendable = available.min(total).saturating_mul(FIT_POOL_PERCENT) / 100;
+    // Steers the solver, so it follows the limit and halves only under pressure.
+    let mut steering = total.saturating_mul(FIT_POOL_PERCENT) / 100;
+    let mut halvings = 0u32;
+    while steering > available {
+        steering /= 2;
+        halvings += 1;
     }
+
+    let plan = FitMemoryPlan {
+        gram_bytes: share(steering, GRAM_SHARE_PERCENT),
+        source_cache_bytes: share(spendable, SOURCE_CACHE_SHARE_PERCENT),
+        krylov_basis_bytes: share(steering, KRYLOV_BASIS_SHARE_PERCENT),
+        streaming_tile_bytes: share(spendable, STREAMING_TILE_SHARE_PERCENT),
+    };
+    (plan, halvings)
 }
 
 fn gram_matrix_budget_bytes() -> usize {
@@ -3258,6 +3298,7 @@ impl HwePcaModel {
         let par = Par::rayon(rayon::current_num_threads());
         let block_capacity =
             adaptive_block_capacity(source.block_storage_samples(), n_variants_hint);
+        let product_chunk = product_chunk_width(source.block_storage_samples());
         let ld_hint = if n_variants_hint > 0 {
             n_variants_hint
         } else if let Some(keys) = options
@@ -3453,6 +3494,7 @@ impl HwePcaModel {
                 let operator = StandardizedCovarianceOp::new(
                     source,
                     block_capacity,
+                    product_chunk,
                     n_variants_hint,
                     observed_variants,
                     scaler.clone(),
@@ -3545,6 +3587,7 @@ impl HwePcaModel {
                 &scaler,
                 variant_count,
                 block_capacity,
+                product_chunk,
                 decomposition.vectors.as_ref(),
                 ld_weights_arc.as_deref(),
                 progress,
@@ -3586,11 +3629,11 @@ impl HwePcaModel {
         let diagnostics = decomposition.diagnostics;
         let mut refined = Eigenpairs {
             values: eigenvalues,
-            vectors: rotate_columns(decomposition.vectors, rotation.as_ref(), block_capacity),
+            vectors: rotate_columns(decomposition.vectors, rotation.as_ref()),
             diagnostics,
             factor_products: None,
         };
-        loadings = rotate_columns(loadings, rotation.as_ref(), block_capacity);
+        loadings = rotate_columns(loadings, rotation.as_ref());
 
         // σ_i = √((n−1)·λ_i) and scores = U·Σ, both read off the refined
         // eigenvalues, so `λ_i = σ_i²/(n−1)` holds for the quantities stored
@@ -3844,6 +3887,8 @@ where
     n_samples: usize,
     n_variants_hint: usize,
     block_capacity: usize,
+    /// Variants each product takes at a time; see [`product_chunk_width`].
+    product_chunk: usize,
     scale: f64,
     scaler: HweScaler,
     observed_variants: usize,
@@ -3862,6 +3907,7 @@ where
     fn new(
         source: &'a mut S,
         block_capacity: usize,
+        product_chunk: usize,
         n_variants_hint: usize,
         observed_variants: usize,
         scaler: HweScaler,
@@ -3876,6 +3922,7 @@ where
             n_samples,
             n_variants_hint,
             block_capacity,
+            product_chunk,
             scale,
             scaler,
             observed_variants,
@@ -3893,6 +3940,7 @@ where
             n_samples: _,
             n_variants_hint: _,
             block_capacity: _,
+            product_chunk: _,
             scale: _,
             scaler,
             observed_variants: _,
@@ -4241,7 +4289,15 @@ where
 
                         let mut proj_block = proj_storage.rb_mut().subrows_mut(0, filled);
 
-                        gram_rows(proj_block.as_mut(), block.as_ref(), rhs);
+                        // Both products take the tile a chunk at a time: the
+                        // tile's width follows the memory budget, and it must
+                        // not decide how any sum is grouped.
+                        gram_rows_in_chunks(
+                            proj_block.as_mut(),
+                            block.as_ref(),
+                            rhs,
+                            self.product_chunk,
+                        );
 
                         if let Some(factor) = factor.as_mut() {
                             factor
@@ -4250,12 +4306,13 @@ where
                                 .copy_from(proj_block.as_ref());
                         }
 
-                        mul_rows(
+                        add_mul_rows_in_chunks(
                             out.rb_mut(),
-                            Accum::Add,
                             block.as_ref(),
                             proj_block.as_ref(),
                             scale,
+                            self.product_chunk,
+                            DEFAULT_BLOCK_WIDTH,
                         );
 
                         processed = start + filled;
@@ -4331,6 +4388,33 @@ impl<'a> LinOp<f64> for DenseSymmetricOp<'a> {
     }
 }
 
+/// Bytes one chunk of variants may occupy across the streaming operator's two
+/// decode buffers and its projection temp: the floor of every tile.
+const PRODUCT_CHUNK_BYTES: usize = 64 << 20;
+
+/// Variants a covariance product takes at a time, from the cohort size alone.
+///
+/// A product over a tile sums each sample's contributions across the tile's
+/// variants and each variant's across the samples, and faer groups those sums
+/// by the shape it is handed. While tiles followed the memory budget, so did
+/// the grouping, and the same fit gave different bits with more memory free.
+/// Products now run over chunks of this width at fixed variant multiples; a
+/// tile is a whole number of chunks, and how many it holds decides memory,
+/// never the answer.
+///
+/// The width is the largest power of two, at most [`DEFAULT_BLOCK_WIDTH`],
+/// whose decode buffers and projection temp fit in [`PRODUCT_CHUNK_BYTES`].
+/// Every such width divides every wider one, and the floor it sets stays small
+/// at any cohort size: 512 variants up to a few thousand samples, 16 at 100k,
+/// 4 at 500k, 1 from 1.4M.
+fn product_chunk_width(n_samples: usize) -> usize {
+    let bytes_per_variant = n_samples
+        .saturating_mul(3 * std::mem::size_of::<f64>())
+        .max(1);
+    let affordable = (PRODUCT_CHUNK_BYTES / bytes_per_variant).clamp(1, DEFAULT_BLOCK_WIDTH);
+    1usize << affordable.ilog2()
+}
+
 /// Variants per streamed tile, sized from the sample count rather than fixed.
 ///
 /// A tile is `n_samples × block_capacity` f64s, and the covariance operator
@@ -4338,17 +4422,18 @@ impl<'a> LinOp<f64> for DenseSymmetricOp<'a> {
 /// At the historical fixed 2048 that is ~3.3 GiB per buffer at 200k samples and
 /// ~8 GiB at 500k — scratch alone, before the Krylov basis.
 ///
-/// The tile exists only to amortize per-block overhead, and there is nothing
-/// mathematically special about any particular width: the arithmetic is
-/// identical whatever the tiling. So the budget decides, all the way down. A
-/// former floor of 256 variants meant 2M samples still demanded ~7.6 GiB of
-/// scratch on a machine whose plan said it could afford a tenth of that; the
-/// only real floor is one variant, because a zero-width tile makes no progress.
+/// The tile exists only to amortize per-block overhead: products run over
+/// [`product_chunk_width`] chunks whatever the tile holds, so the budget decides
+/// the width in whole chunks, down to a single chunk. A former floor of 256
+/// variants meant 2M samples still demanded ~7.6 GiB of scratch on a machine
+/// whose plan said it could afford a tenth of that; the chunk floor is at most
+/// [`PRODUCT_CHUNK_BYTES`].
 ///
-/// The result is a pure function of `(n_samples, n_variants_hint)` and the fit
-/// memory plan — deliberately *not* of measured throughput, so two machines
-/// with the same memory produce the same tiling and the same arithmetic.
+/// A variant hint below that width shrinks the tile to the hint: a source that
+/// holds no more variants than it reports then fits in one tile, whose chunks
+/// start where a wider tile's would.
 fn adaptive_block_capacity(n_samples: usize, n_variants_hint: usize) -> usize {
+    let chunk = product_chunk_width(n_samples);
     let cap = if n_samples == 0 {
         DEFAULT_BLOCK_WIDTH
     } else {
@@ -4361,13 +4446,13 @@ fn adaptive_block_capacity(n_samples: usize, n_variants_hint: usize) -> usize {
         } else {
             (budget / 3) / bytes_per_variant
         };
-        affordable.min(DEFAULT_BLOCK_WIDTH)
+        (affordable.min(DEFAULT_BLOCK_WIDTH) / chunk).max(1) * chunk
     };
 
     if n_variants_hint > 0 {
-        min(cap.max(1), n_variants_hint)
+        min(cap, n_variants_hint)
     } else {
-        cap.max(1)
+        cap
     }
 }
 
@@ -6939,9 +7024,10 @@ fn rayleigh_ritz_rotation(
 /// `rotation` never has more columns than `matrix` does, so the product is
 /// written back over a prefix of the columns it was read from; anything past
 /// `rotation.ncols()` is stale afterwards and the narrowing copy at the end
-/// discards it. `row_chunk` is a blocking granularity and nothing more — any
-/// positive value gives the same answer up to summation order inside the GEMM.
-fn rotate_columns(mut matrix: Mat<f64>, rotation: MatRef<'_, f64>, row_chunk: usize) -> Mat<f64> {
+/// discards it. The rows go through [`DEFAULT_BLOCK_WIDTH`] at a time. Any
+/// positive chunk gives the same answer up to summation order inside the GEMM,
+/// so the chunk is a constant rather than the memory budget's tile width.
+fn rotate_columns(mut matrix: Mat<f64>, rotation: MatRef<'_, f64>) -> Mat<f64> {
     let rows = matrix.nrows();
     let width = matrix.ncols();
     let kept = rotation.ncols();
@@ -6949,7 +7035,7 @@ fn rotate_columns(mut matrix: Mat<f64>, rotation: MatRef<'_, f64>, row_chunk: us
     debug_assert!(kept <= width);
 
     if rows > 0 && width > 0 && kept > 0 {
-        let chunk = row_chunk.clamp(1, rows);
+        let chunk = DEFAULT_BLOCK_WIDTH.min(rows);
         let mut scratch = Mat::zeros(chunk, width);
         let mut start = 0usize;
         while start < rows {
@@ -7014,6 +7100,7 @@ fn compute_loading_cross_products<S, P>(
     scaler: &HweScaler,
     expected_variants: usize,
     block_capacity: usize,
+    product_chunk: usize,
     sample_basis: MatRef<'_, f64>,
     ld_weights: Option<&[f64]>,
     progress: &Arc<P>,
@@ -7195,18 +7282,26 @@ where
                         n_components,
                     );
 
-                    gram_rows(chunk.as_mut(), block_ref, sample_basis);
+                    gram_rows_in_chunks(chunk.as_mut(), block_ref, sample_basis, product_chunk);
 
                     // Fold this block's contribution to BᵀB in while the chunk is
-                    // still in cache, before it is copied out to `loadings`.
-                    matmul(
-                        restricted_gram.as_mut(),
-                        Accum::Add,
-                        chunk.as_ref().transpose(),
-                        chunk.as_ref(),
-                        1.0,
-                        Par::Seq,
-                    );
+                    // still in cache, before it is copied out to `loadings`. It
+                    // goes in one product chunk at a time, so the sum is grouped
+                    // by chunks and not by the budget's tile.
+                    let mut first = 0usize;
+                    while first < filled {
+                        let width = product_chunk.clamp(1, filled - first);
+                        let rows = chunk.as_ref().subrows(first, width);
+                        matmul(
+                            restricted_gram.as_mut(),
+                            Accum::Add,
+                            rows.transpose(),
+                            rows,
+                            1.0,
+                            Par::Seq,
+                        );
+                        first += width;
+                    }
 
                     loadings
                         .submatrix_mut(start, 0, filled, n_components)
@@ -9468,6 +9563,7 @@ mod tests {
         StandardizedCovarianceOp::new(
             source,
             block_capacity,
+            block_capacity,
             observed_variants,
             observed_variants,
             scaler,
@@ -9607,6 +9703,169 @@ mod tests {
         // plan just said the machine does not have. One is the only real floor:
         // a zero-width tile makes no progress.
         assert_eq!(adaptive_block_capacity(usize::MAX / 16, 0), 1);
+    }
+
+    #[test]
+    fn product_chunks_follow_the_cohort_alone() {
+        assert_eq!(product_chunk_width(0), DEFAULT_BLOCK_WIDTH);
+        assert_eq!(product_chunk_width(1_000), DEFAULT_BLOCK_WIDTH);
+        assert_eq!(product_chunk_width(100_000), 16);
+        assert_eq!(product_chunk_width(500_000), 4);
+        assert_eq!(product_chunk_width(2_000_000), 1);
+        assert_eq!(product_chunk_width(usize::MAX / 16), 1);
+        for n_samples in [1usize, 5_461, 5_462, 100_000, 250_000, 1_398_101, 1_398_102] {
+            let chunk = product_chunk_width(n_samples);
+            let chunk_bytes = 3 * std::mem::size_of::<f64>() * n_samples * chunk;
+            assert!(chunk.is_power_of_two() && DEFAULT_BLOCK_WIDTH % chunk == 0);
+            assert!(chunk == 1 || chunk_bytes <= PRODUCT_CHUNK_BYTES);
+            assert!(chunk == DEFAULT_BLOCK_WIDTH || 2 * chunk_bytes > PRODUCT_CHUNK_BYTES);
+            let tile = adaptive_block_capacity(n_samples, 0);
+            assert!(
+                tile >= chunk && tile % chunk == 0,
+                "{n_samples} samples: tile {tile} is not a whole number of {chunk}-variant chunks"
+            );
+        }
+    }
+
+    #[test]
+    fn steering_budgets_follow_the_memory_limit_not_what_is_free() {
+        const GIB: u64 = 1 << 30;
+
+        // While the limit's plan fits in what is free, what is free moves the
+        // speed shares and nothing else.
+        let (roomy, roomy_halvings) = plan_fit_memory(16 * GIB, 15 * GIB);
+        let (busier, busier_halvings) = plan_fit_memory(16 * GIB, 12 * GIB);
+        assert_eq!((roomy_halvings, busier_halvings), (0, 0));
+        assert_eq!(roomy.krylov_basis_bytes, busier.krylov_basis_bytes);
+        assert_eq!(roomy.gram_bytes, busier.gram_bytes);
+        assert!(busier.streaming_tile_bytes < roomy.streaming_tile_bytes);
+        assert!(busier.source_cache_bytes < roomy.source_cache_bytes);
+
+        // Under real pressure the steering shares halve in whole steps until
+        // they fit: 11.2 GiB, then 5.6, then 2.8, which fits in 5 GiB free, and
+        // the plan is the same at any availability that takes the same steps.
+        let (pressed, halvings) = plan_fit_memory(16 * GIB, 5 * GIB);
+        assert_eq!(halvings, 2);
+        let steering = 16 * GIB * FIT_POOL_PERCENT / 100 / 2 / 2;
+        assert_eq!(
+            pressed.krylov_basis_bytes as u64,
+            steering * KRYLOV_BASIS_SHARE_PERCENT / 100
+        );
+        assert_eq!(
+            pressed.gram_bytes as u64,
+            steering * GRAM_SHARE_PERCENT / 100
+        );
+        let (also_pressed, also_halvings) = plan_fit_memory(16 * GIB, 3 * GIB);
+        assert_eq!(also_halvings, 2);
+        assert_eq!(also_pressed.krylov_basis_bytes, pressed.krylov_basis_bytes);
+
+        // Nothing free means no budget, not an overflow or an endless loop.
+        let (starved, _) = plan_fit_memory(16 * GIB, 0);
+        assert_eq!(
+            (starved.krylov_basis_bytes, starved.source_cache_bytes),
+            (0, 0)
+        );
+    }
+
+    /// The operator, its factor image and the loadings pass give the same bits
+    /// whatever tile width the memory budget picks, for one product chunk.
+    #[test]
+    fn covariance_products_do_not_depend_on_the_tile_width() {
+        // 10,000 samples take their products sixteen variants at a time. 203
+        // variants are twelve chunks and a remainder, in tiles of one chunk,
+        // three, four, and one tile holding everything.
+        const N_SAMPLES: usize = 10_000;
+        const N_VARIANTS: usize = 203;
+        const CHUNK: usize = 16;
+
+        let data = synthetic_genotypes(N_SAMPLES, N_VARIANTS);
+        let mut stats_source =
+            DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("dense source");
+        let stats_progress = StageProgressHandle::new(
+            Arc::new(NoopFitProgress),
+            FitProgressStage::AlleleStatistics,
+        );
+        let (scaler, _, observed_variants) = compute_variant_statistics(
+            &mut stats_source,
+            CHUNK,
+            Par::Seq,
+            stats_progress,
+            N_VARIANTS,
+        )
+        .expect("variant statistics");
+        assert_eq!(observed_variants, N_VARIANTS);
+
+        let rhs = Mat::<f64>::from_fn(N_SAMPLES, 12, |row, col| {
+            ((row * 31 + col * 17) % 29) as f64 - 14.0
+        });
+        let basis = Mat::<f64>::from_fn(N_SAMPLES, 4, |row, col| {
+            ((row * 13 + col * 7) % 23) as f64 - 11.0
+        });
+        let par = Par::rayon(3);
+        let products = |capacity: usize| {
+            let mut source =
+                DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("dense source");
+            let mut image = Mat::<f64>::zeros(N_SAMPLES, rhs.ncols());
+            let mut factor = Mat::<f64>::zeros(observed_variants, rhs.ncols());
+            {
+                let operator = StandardizedCovarianceOp::<_, NoopFitProgress>::new(
+                    &mut source,
+                    capacity,
+                    CHUNK,
+                    N_VARIANTS,
+                    observed_variants,
+                    scaler.clone(),
+                    None,
+                    None,
+                );
+                let mut mem = MemBuffer::new(operator.apply_scratch(rhs.ncols(), par));
+                operator.apply_with_factor(
+                    image.as_mut(),
+                    Some(factor.as_mut()),
+                    rhs.as_ref(),
+                    par,
+                    MemStack::new(&mut mem),
+                );
+            }
+            let (loadings, restricted_gram) = compute_loading_cross_products(
+                &mut source,
+                &scaler,
+                observed_variants,
+                capacity,
+                CHUNK,
+                basis.as_ref(),
+                None,
+                &Arc::new(NoopFitProgress),
+                par,
+            )
+            .expect("loadings pass");
+            [image, factor, loadings, restricted_gram]
+        };
+        let same_bits = |expected: &Mat<f64>, actual: &Mat<f64>| {
+            expected.nrows() == actual.nrows()
+                && expected.ncols() == actual.ncols()
+                && (0..expected.ncols()).all(|col| {
+                    (0..expected.nrows())
+                        .all(|row| expected[(row, col)].to_bits() == actual[(row, col)].to_bits())
+                })
+        };
+
+        let whole = products(DEFAULT_BLOCK_WIDTH);
+        for capacity in [CHUNK, 3 * CHUNK, 4 * CHUNK] {
+            let tiled = products(capacity);
+            let names = [
+                "operator image",
+                "factor image",
+                "loadings",
+                "restricted Gram",
+            ];
+            for (name, (expected, actual)) in names.into_iter().zip(whole.iter().zip(&tiled)) {
+                assert!(
+                    same_bits(expected, actual),
+                    "{name} differs between {capacity}-variant tiles and one tile"
+                );
+            }
+        }
     }
 
     #[test]
