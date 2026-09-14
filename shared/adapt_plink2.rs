@@ -1224,93 +1224,168 @@ impl ByteRangeSource for VirtualBed {
         // 2) Serve the body: contiguous blocks of size self.block_bytes per variant.
         let body_off = offset - 3;
         let mut out_idx = (body_off / (self.block_bytes as u64)) as usize;
-        let mut within_block = (body_off % (self.block_bytes as u64)) as usize;
+        let within_block = (body_off % (self.block_bytes as u64)) as usize;
+
+        if within_block > 0 && out_idx < self.plan.out_variants {
+            let to_copy = (self.block_bytes - within_block).min(dst.len() - written);
+            let mut decoder = self.inner.lock().unwrap();
+            copy_virtual_block(
+                self,
+                &mut decoder,
+                out_idx,
+                within_block,
+                &mut dst[written..written + to_copy],
+                &mut sample_ploidy_buf,
+                &mut hard_buf,
+            )?;
+            written += to_copy;
+            out_idx += 1;
+        }
+
+        // A pass over many whole blocks (a PCA pass reads thousands per call)
+        // decodes them on the rayon pool straight into `dst`, one forked
+        // decoder per worker. Each block is the same bytes the one-at-a-time
+        // path produces, and the first error in block order is the one
+        // returned.
+        let whole_blocks = (dst.len() - written) / self.block_bytes;
+        if whole_blocks >= PARALLEL_DECODE_MIN_BLOCKS {
+            use rayon::prelude::*;
+
+            let template = self.inner.lock().unwrap().fork();
+            let region = &mut dst[written..written + whole_blocks * self.block_bytes];
+            let results: Vec<Result<(), PipelineError>> = region
+                .par_chunks_mut(self.block_bytes)
+                .enumerate()
+                .map_init(
+                    || (template.fork(), Vec::new(), Vec::new()),
+                    |(decoder, sample_ploidy_buf, hard_buf), (block_idx, block)| {
+                        decode_virtual_block(
+                            self,
+                            decoder,
+                            out_idx + block_idx,
+                            sample_ploidy_buf,
+                            hard_buf,
+                            block,
+                        )
+                    },
+                )
+                .collect();
+            if let Some(err) = results.into_iter().find_map(Result::err) {
+                return Err(err);
+            }
+            written += whole_blocks * self.block_bytes;
+            out_idx += whole_blocks;
+        }
 
         let mut decoder = self.inner.lock().unwrap();
-
         while written < dst.len() {
             if out_idx >= self.plan.out_variants {
                 break;
             }
-
-            // Copy bytes from this block.
-            let remaining_in_block = self.block_bytes - within_block;
-            let remaining_in_dst = dst.len() - written;
-            let to_copy = remaining_in_block.min(remaining_in_dst);
-
-            // Fetch or produce the packed block for this out-variant.
-            let mut cache_hit = false;
-            {
-                let cache = self.cache.lock().unwrap();
-                if let Some(buf) = cache.get(out_idx) {
-                    let start = within_block;
-                    let end = start + to_copy;
-                    dst[written..written + to_copy].copy_from_slice(&buf[start..end]);
-                    cache_hit = true;
-                }
-            }
-            if !cache_hit {
-                // Decode hard-calls for this (in_idx, alt_ord) into a scratch buffer.
-                let (in_idx, alt_ord) = self
-                    .plan
-                    .mapping(out_idx)
-                    .ok_or_else(|| ioerr("VariantPlan mapping out of bounds"))?;
-                let alt_count = self.plan.alt_count_of_in(in_idx);
-                if alt_count == 0 {
-                    return Err(PipelineError::Io(format!(
-                        "ALT count missing for variant {} in .pvar plan",
-                        in_idx
-                    )));
-                }
-                if alt_count != 0 && alt_ord > alt_count {
-                    return Err(ioerr("ALT ordinal exceeds allele count in .pvar"));
-                }
-                let haploidy_kind = self.plan.haploidy_of(out_idx);
-                let sample_ploidy = haploidy_kind.and_then(|kind| {
-                    if matches!(kind, HaploidyKind::Diploid) {
-                        None
-                    } else {
-                        fill_sample_ploidy(
-                            &mut sample_ploidy_buf,
-                            kind,
-                            &self.sex_by_sample,
-                            self.n_samples,
-                        );
-                        Some(sample_ploidy_buf.as_slice())
-                    }
-                });
-
-                // Reused across variants: a scoring run decodes millions of
-                // blocks, and two fresh sample-sized allocations per block is
-                // pure allocator traffic.
-                hard_buf.clear();
-                hard_buf.resize(self.n_samples, 255); // 255 = missing
-                decoder.decode_variant_hardcalls(in_idx, alt_ord, &mut hard_buf, sample_ploidy)?;
-
-                if let Some(kind) = haploidy_kind
-                    && !matches!(kind, HaploidyKind::Diploid)
-                {
-                    enforce_haploidy(&mut hard_buf, &self.sex_by_sample, kind);
-                }
-
-                let mut block = vec![0u8; self.block_bytes];
-                Self::pack_to_block(&mut block, &hard_buf);
-
-                let mut cache = self.cache.lock().unwrap();
-                let stored = cache.put(out_idx, block);
-
-                let start = within_block;
-                let end = start + to_copy;
-                dst[written..written + to_copy].copy_from_slice(&stored[start..end]);
-            }
-
+            let to_copy = self.block_bytes.min(dst.len() - written);
+            copy_virtual_block(
+                self,
+                &mut decoder,
+                out_idx,
+                0,
+                &mut dst[written..written + to_copy],
+                &mut sample_ploidy_buf,
+                &mut hard_buf,
+            )?;
             written += to_copy;
-            within_block = 0;
             out_idx += 1;
         }
 
         Ok(())
     }
+}
+
+/// Whole blocks one `read_at` must span before they are decoded in parallel.
+const PARALLEL_DECODE_MIN_BLOCKS: usize = 16;
+
+/// Copies bytes `within_block..within_block + dst.len()` of out-variant
+/// `out_idx`'s packed block into `dst`, from the block cache, or by decoding
+/// the block and caching it.
+fn copy_virtual_block(
+    bed: &VirtualBed,
+    decoder: &mut PgenDecoder,
+    out_idx: usize,
+    within_block: usize,
+    dst: &mut [u8],
+    sample_ploidy_buf: &mut Vec<u8>,
+    hard_buf: &mut Vec<u8>,
+) -> Result<(), PipelineError> {
+    let end = within_block + dst.len();
+    {
+        let cache = bed.cache.lock().unwrap();
+        if let Some(buf) = cache.get(out_idx) {
+            dst.copy_from_slice(&buf[within_block..end]);
+            return Ok(());
+        }
+    }
+    let mut block = vec![0u8; bed.block_bytes];
+    decode_virtual_block(
+        bed,
+        decoder,
+        out_idx,
+        sample_ploidy_buf,
+        hard_buf,
+        &mut block,
+    )?;
+    let mut cache = bed.cache.lock().unwrap();
+    let stored = cache.put(out_idx, block);
+    dst.copy_from_slice(&stored[within_block..end]);
+    Ok(())
+}
+
+/// Decodes out-variant `out_idx` into its packed PLINK 1.9 `block`.
+fn decode_virtual_block(
+    bed: &VirtualBed,
+    decoder: &mut PgenDecoder,
+    out_idx: usize,
+    sample_ploidy_buf: &mut Vec<u8>,
+    hard_buf: &mut Vec<u8>,
+    block: &mut [u8],
+) -> Result<(), PipelineError> {
+    // Decode hard-calls for this (in_idx, alt_ord) into a scratch buffer.
+    let (in_idx, alt_ord) = bed
+        .plan
+        .mapping(out_idx)
+        .ok_or_else(|| ioerr("VariantPlan mapping out of bounds"))?;
+    let alt_count = bed.plan.alt_count_of_in(in_idx);
+    if alt_count == 0 {
+        return Err(PipelineError::Io(format!(
+            "ALT count missing for variant {} in .pvar plan",
+            in_idx
+        )));
+    }
+    if alt_count != 0 && alt_ord > alt_count {
+        return Err(ioerr("ALT ordinal exceeds allele count in .pvar"));
+    }
+    let haploidy_kind = bed.plan.haploidy_of(out_idx);
+    let sample_ploidy = haploidy_kind.and_then(|kind| {
+        if matches!(kind, HaploidyKind::Diploid) {
+            None
+        } else {
+            fill_sample_ploidy(sample_ploidy_buf, kind, &bed.sex_by_sample, bed.n_samples);
+            Some(sample_ploidy_buf.as_slice())
+        }
+    });
+
+    // Reused across variants: a scoring run decodes millions of blocks, and
+    // two fresh sample-sized allocations per block is pure allocator traffic.
+    hard_buf.clear();
+    hard_buf.resize(bed.n_samples, 255); // 255 = missing
+    decoder.decode_variant_hardcalls(in_idx, alt_ord, hard_buf, sample_ploidy)?;
+
+    if let Some(kind) = haploidy_kind
+        && !matches!(kind, HaploidyKind::Diploid)
+    {
+        enforce_haploidy(hard_buf, &bed.sex_by_sample, kind);
+    }
+
+    VirtualBed::pack_to_block(block, hard_buf);
+    Ok(())
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2065,11 +2140,11 @@ fn build_stride_offsets(hdr: &PgenHeader, n_samples: usize) -> Result<Vec<u64>, 
 
 struct PgenDecoder {
     src: Arc<dyn ByteRangeSource>,
-    hdr: PgenHeader,
+    hdr: Arc<PgenHeader>,
     n: usize,
     scratch: Vec<u8>,
     /// Absolute file offset of record `k * OFFSET_STRIDE`.
-    stride_offsets: Vec<u64>,
+    stride_offsets: Arc<[u64]>,
     /// Raw (pre-projection) genotype categories of the LD anchor identified by
     /// `anchor_idx`. An LD-compressed record diffs against the most recent
     /// *non*-LD-compressed record in its block, so decoding record `i` out of
@@ -2080,7 +2155,7 @@ struct PgenDecoder {
     /// Reused per-decode scratch so a scoring run doing millions of variant
     /// reads does not allocate two sample-sized buffers per variant.
     cats_buf: Vec<u8>,
-    alt_counts: Vec<u16>,
+    alt_counts: Arc<[u16]>,
     /// Tallies what the hard-call projection discards, and says so out loud
     /// once it has seen enough records to mean it. Shared with the
     /// `VirtualPlink19` handle rather than owned outright, because the caller
@@ -2122,16 +2197,33 @@ impl PgenDecoder {
 
         Ok(Self {
             src,
-            hdr,
+            hdr: Arc::new(hdr),
             n: n_samples_from_psam,
             scratch: Vec::new(),
-            stride_offsets,
+            stride_offsets: Arc::from(stride_offsets),
             anchor_idx: None,
             anchor_cats: Vec::new(),
             cats_buf: Vec::new(),
-            alt_counts,
+            alt_counts: Arc::from(alt_counts),
             dosage_meter: Arc::new(DosageCoercionMeter::new(n_samples_from_psam, in_variants)),
         })
+    }
+
+    /// A decoder over the same file, index and coercion meter with its own
+    /// scratch buffers and LD anchor, so separate threads can decode at once.
+    fn fork(&self) -> Self {
+        Self {
+            src: Arc::clone(&self.src),
+            hdr: Arc::clone(&self.hdr),
+            n: self.n,
+            scratch: Vec::new(),
+            stride_offsets: Arc::clone(&self.stride_offsets),
+            anchor_idx: None,
+            anchor_cats: Vec::new(),
+            cats_buf: Vec::new(),
+            alt_counts: Arc::clone(&self.alt_counts),
+            dosage_meter: Arc::clone(&self.dosage_meter),
+        }
     }
 
     fn record_offset_len(&self, idx: usize) -> Result<(u64, usize, u8), PipelineError> {

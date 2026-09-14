@@ -146,6 +146,36 @@ fn virtual_bed_multi_block_reads_match() {
     assert_eq!(got, &bed[off..off + bb * span], "multi-block mismatch");
 }
 
+/// Reads over many whole blocks decode them in parallel. A whole-file read,
+/// a read that starts and ends inside blocks, one exactly at the parallel
+/// threshold, and one ending at the last variant must all match the real
+/// `.bed`, LD anchors included.
+#[test]
+fn virtual_bed_parallel_block_reads_match() {
+    let vp = open_fixture();
+    let bed = real_bed();
+    let src = vp.bed_source();
+    let bb = block_bytes();
+
+    let mut whole = vec![0u8; bed.len()];
+    src.read_at(0, &mut whole).expect("whole-file read");
+    assert_eq!(whole, bed, "whole-file mismatch");
+
+    for (start, len) in [
+        (3 + 17 * bb + 5, 40 * bb + 11),
+        (3 + bb, 16 * bb),
+        (3 + (N_VARIANTS - 100) * bb, 100 * bb),
+    ] {
+        let mut got = vec![0u8; len];
+        src.read_at(start as u64, &mut got).expect("virtual read");
+        assert_eq!(
+            got,
+            &bed[start..start + len],
+            "mismatch reading {len} bytes at {start}"
+        );
+    }
+}
+
 /// For a biallelic cohort the virtual `.bim` must be field-for-field identical
 /// to the real one — same IDs, same A1/A2, same order.
 ///
