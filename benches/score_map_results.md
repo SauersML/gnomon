@@ -1,5 +1,37 @@
 # Score and packed projection performance
 
+## Sparse row reordering without duplicating the complete plan
+
+Preparation now skips CSR reordering when matched BIM indices already strictly
+ascend. Otherwise it reorders and releases one old value array at a time,
+instead of constructing a second complete CSR plan. Row permutations,
+reordered values, row metadata, and CSR growth reserve memory fallibly.
+An allocation failure aborts preparation with an error. This does not establish
+OOM freedom for the rest of preparation or the host operating system.
+
+On the real 1,188,880-row, 5,385,268-weight, 32-score plan, one pinned Milan
+core and three repetitions per case:
+
+| Matched row order | Previous median | New median | Previous peak extra allocation | New peak extra allocation |
+| --- | ---: | ---: | ---: | ---: |
+| Already ascending | 91.95 ms | 0.84 ms | 93.16 MB | 0 |
+| Reversed physical indices | 65.68 ms | 39.80 ms | 93.16 MB | 31.05 MB |
+
+These are isolated reorder times (about 110× and 1.65× faster), not full
+scoring speedups. The reversal permutes physical row indices of the actual
+genome-scale plan; its weights and row sizes come from the real PGS panel.
+Every weight bit, missing-correction bit, column index, row offset, and complex
+flag matched the expected permutation. The allocation figures measure live
+Rust allocation bytes above the starting value, not process RSS.
+
+`benches/csr_reorder_probe.py` extracts both production CSR builders and reuses
+the MSI compilation cache. Its allocator-injection checks passed for constructor,
+all three contribution-array growth points, row-offset growth, and all seven
+reorder allocation points. Failed contribution growth preserves parallel lengths;
+ordered rows allocate nothing. Empty rows, signed zero, and invalid row metadata
+are also checked. Logs use `round16-` in the MSI iteration directory. The wider
+preparation integration check remains pending after a VPN session failure.
+
 ## Independent source-weight accuracy audit
 
 `benches/compare_exact_score.py` compares the cohort probe's SUM output with

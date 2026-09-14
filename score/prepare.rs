@@ -203,15 +203,18 @@ struct CsrBuilder {
 }
 
 impl CsrBuilder {
-    fn with_capacity(num_variants: usize, estimated_nnz: usize) -> Self {
-        let mut sparse_row_offsets = Vec::<u64>::with_capacity(num_variants + 1);
+    fn new() -> Result<Self, PrepError> {
+        let mut sparse_row_offsets = Vec::<u64>::new();
+        sparse_row_offsets.try_reserve_exact(1).map_err(|e| {
+            PrepError::Invariant(format!("Cannot allocate CSR row offsets: {e}"))
+        })?;
         sparse_row_offsets.push(0);
-        Self {
-            sparse_weights: Vec::with_capacity(estimated_nnz),
-            sparse_missing_corrections: Vec::with_capacity(estimated_nnz),
-            sparse_score_columns: Vec::with_capacity(estimated_nnz),
+        Ok(Self {
+            sparse_weights: Vec::new(),
+            sparse_missing_corrections: Vec::new(),
+            sparse_score_columns: Vec::new(),
             sparse_row_offsets,
-        }
+        })
     }
 
     fn push_contribution(
@@ -224,6 +227,17 @@ impl CsrBuilder {
                 "Score column index {} exceeds u32::MAX while building CSR.",
                 score_col_idx.0
             ))
+        })?;
+        // Reserve every parallel array before changing any length. Vec::push
+        // alone would abort on allocation failure while growing a large panel.
+        self.sparse_score_columns.try_reserve(1).map_err(|e| {
+            PrepError::Invariant(format!("Cannot grow CSR score columns: {e}"))
+        })?;
+        self.sparse_weights.try_reserve(1).map_err(|e| {
+            PrepError::Invariant(format!("Cannot grow CSR weights: {e}"))
+        })?;
+        self.sparse_missing_corrections.try_reserve(1).map_err(|e| {
+            PrepError::Invariant(format!("Cannot grow CSR missing corrections: {e}"))
         })?;
         self.sparse_score_columns.push(col_u32);
         self.sparse_weights.push(assignment.dosage_weight);
@@ -238,6 +252,9 @@ impl CsrBuilder {
                 "CSR non-zero count {} exceeds u64::MAX while building row offsets.",
                 self.sparse_score_columns.len()
             ))
+        })?;
+        self.sparse_row_offsets.try_reserve(1).map_err(|e| {
+            PrepError::Invariant(format!("Cannot grow CSR row offsets: {e}"))
         })?;
         self.sparse_row_offsets.push(offset_u64);
         Ok(())
@@ -267,7 +284,14 @@ impl CsrBuilder {
                 required.len()
             )));
         }
-        let mut order: Vec<usize> = (0..required.len()).collect();
+        if required.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Ok(());
+        }
+        let mut order = Vec::new();
+        order.try_reserve_exact(required.len()).map_err(|e| {
+            PrepError::Invariant(format!("Cannot allocate CSR row permutation: {e}"))
+        })?;
+        order.extend(0..required.len());
         order.sort_unstable_by_key(|&row| required[row]);
         // Each `.bim` row has one key, so no row can have been emitted twice.
         if order
@@ -278,24 +302,54 @@ impl CsrBuilder {
                 "A .bim row was matched under two different keys.".to_string(),
             ));
         }
-        let mut sorted = CsrBuilder::with_capacity(order.len(), self.sparse_weights.len());
-        for &row in &order {
-            let start = self.sparse_row_offsets[row] as usize;
-            let end = self.sparse_row_offsets[row + 1] as usize;
-            sorted
-                .sparse_weights
-                .extend_from_slice(&self.sparse_weights[start..end]);
-            sorted
-                .sparse_missing_corrections
-                .extend_from_slice(&self.sparse_missing_corrections[start..end]);
-            sorted
-                .sparse_score_columns
-                .extend_from_slice(&self.sparse_score_columns[start..end]);
-            sorted.finish_variant()?;
+        // Finish and release each old column before allocating the next one.
+        // Temporary entry storage is one array, not a second complete CSR.
+        fn reorder<T: Copy>(
+            values: &[T],
+            offsets: &[u64],
+            order: &[usize],
+        ) -> Result<Vec<T>, PrepError> {
+            let mut sorted = Vec::new();
+            sorted.try_reserve_exact(values.len()).map_err(|e| {
+                PrepError::Invariant(format!("Cannot allocate CSR reordered values: {e}"))
+            })?;
+            for &row in order {
+                sorted.extend_from_slice(&values[offsets[row] as usize..offsets[row + 1] as usize]);
+            }
+            Ok(sorted)
         }
-        *required = order.iter().map(|&row| required[row]).collect();
-        *flags = order.iter().map(|&row| flags[row]).collect();
-        *self = sorted;
+        self.sparse_weights = reorder(&self.sparse_weights, &self.sparse_row_offsets, &order)?;
+        self.sparse_missing_corrections = reorder(
+            &self.sparse_missing_corrections,
+            &self.sparse_row_offsets,
+            &order,
+        )?;
+        self.sparse_score_columns =
+            reorder(&self.sparse_score_columns, &self.sparse_row_offsets, &order)?;
+        let mut offsets = Vec::new();
+        let mut indices = Vec::new();
+        let mut row_flags = Vec::new();
+        offsets.try_reserve_exact(order.len() + 1).map_err(|e| {
+            PrepError::Invariant(format!("Cannot allocate reordered CSR offsets: {e}"))
+        })?;
+        indices.try_reserve_exact(order.len()).map_err(|e| {
+            PrepError::Invariant(format!("Cannot allocate reordered BIM indices: {e}"))
+        })?;
+        row_flags.try_reserve_exact(order.len()).map_err(|e| {
+            PrepError::Invariant(format!("Cannot allocate reordered complex flags: {e}"))
+        })?;
+        offsets.push(0);
+        for &row in &order {
+            offsets.push(
+                offsets.last().unwrap() + self.sparse_row_offsets[row + 1]
+                    - self.sparse_row_offsets[row],
+            );
+            indices.push(required[row]);
+            row_flags.push(flags[row]);
+        }
+        self.sparse_row_offsets = offsets;
+        *required = indices;
+        *flags = row_flags;
         Ok(())
     }
 }
@@ -623,7 +677,7 @@ fn prepare_for_computation_with_retry(
     // genome-scale intermediate maps that duplicate the final CSR/rule structures.
     let mut required_bim_indices: Vec<BimRowIndex> = Vec::new();
     let mut required_is_complex: Vec<u8> = Vec::new();
-    let mut csr_builder = CsrBuilder::with_capacity(0, 0);
+    let mut csr_builder = CsrBuilder::new()?;
     let mut baseline_missing_sum_by_score = vec![0.0f64; score_names.len()];
     let mut score_variant_counts = vec![0u32; score_names.len()];
     let mut final_complex_rules: Vec<GroupedComplexRule> = Vec::new();
@@ -1263,6 +1317,43 @@ fn build_spool_maps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csr_reordering_preserves_empty_rows_and_weight_bits() {
+        let mut csr = CsrBuilder::new().unwrap();
+        for entries in [
+            vec![(2, -0.0f32, 2.0f32)],
+            vec![],
+            vec![(0, 0.1f32, -0.0f32), (3, 0.2f32, 3.0f32)],
+        ] {
+            for (column, dosage_weight, missing_correction) in entries {
+                csr.push_contribution(
+                    ScoreColumnIndex(column),
+                    SimpleScoreAssignment {
+                        dosage_weight,
+                        missing_correction,
+                    },
+                )
+                .unwrap();
+            }
+            csr.finish_variant().unwrap();
+        }
+        let mut rows = vec![BimRowIndex(10), BimRowIndex(1), BimRowIndex(5)];
+        let mut flags = vec![0, 1, 0];
+        csr.sort_rows_by_bim_index(&mut rows, &mut flags).unwrap();
+        assert_eq!(rows, [BimRowIndex(1), BimRowIndex(5), BimRowIndex(10)]);
+        assert_eq!(flags, [1, 0, 0]);
+        assert_eq!(csr.sparse_row_offsets, [0, 0, 2, 3]);
+        assert_eq!(csr.sparse_score_columns, [0, 3, 2]);
+        assert_eq!(
+            csr.sparse_weights.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            [0.1f32, 0.2, -0.0].map(f32::to_bits),
+        );
+        assert_eq!(
+            csr.sparse_missing_corrections.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            [-0.0f32, 3.0, 2.0].map(f32::to_bits),
+        );
+    }
 
     fn write_bim_fileset(prefix: &Path, rows: &[&str], people: usize) {
         std::fs::write(prefix.with_extension("bim"), rows.concat()).unwrap();
