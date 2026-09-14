@@ -223,7 +223,7 @@ impl<'a> BedRows<'a> {
     /// map is sliced in one batch when the selected rows fit in available memory,
     /// and in batches sized from that headroom when they do not; any other source
     /// is read in batches of at most `batch_bytes`, one ranged read per run of
-    /// consecutive rows.
+    /// consecutive rows, and a remote one first plans exactly the selected rows.
     fn for_each_batch(
         &self,
         indices: &[usize],
@@ -274,6 +274,16 @@ impl<'a> BedRows<'a> {
             return Ok(());
         }
 
+        // A remote `.bed` serves exactly these rows, fetched concurrently ahead of the
+        // counters, rather than one block request at a time.
+        let planned;
+        let source = if self.source.supports_read_plan() {
+            let rows: Vec<u64> = indices.iter().map(|&index| index as u64).collect();
+            planned = self.source.with_read_plan(&rows, row_len as u64)?;
+            &planned
+        } else {
+            self.source
+        };
         let mut buffer = Vec::new();
         for batch in indices.chunks((batch_bytes / row_len).max(1)) {
             buffer.resize(batch.len() * row_len, 0);
@@ -284,8 +294,7 @@ impl<'a> BedRows<'a> {
                     end += 1;
                 }
                 let offset = (BED_HEADER_LEN + batch[start] * row_len) as u64;
-                self.source
-                    .read_at(offset, &mut buffer[start * row_len..end * row_len])?;
+                source.read_at(offset, &mut buffer[start * row_len..end * row_len])?;
                 start = end;
             }
             let rows: Vec<&[u8]> = buffer.chunks_exact(row_len).collect();
@@ -860,6 +869,108 @@ mod tests {
                 assert_eq!(reported.last().copied(), Some(loci.len()));
             }
         }
+    }
+
+    /// Serves `object` over HTTP/1.1 byte ranges, a thread per connection, and records
+    /// every requested range.
+    fn serve_ranges(object: Vec<u8>) -> (String, Arc<std::sync::Mutex<Vec<(u64, u64)>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/cohort.bed", listener.local_addr().unwrap());
+        let object = Arc::new(object);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let (object, log) = (Arc::clone(&object), Arc::clone(&log));
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    loop {
+                        let (mut request, mut range) = (String::new(), None);
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                            if request.is_empty() {
+                                request = line.clone();
+                            }
+                            if let Some(value) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                                let (start, end) = value.trim().split_once('-').unwrap();
+                                range = Some((start.parse::<u64>().unwrap(), end.parse::<u64>().unwrap()));
+                            }
+                        }
+                        let len = object.len();
+                        let response = match range {
+                            _ if request.starts_with("HEAD") => {
+                                format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n").into_bytes()
+                            }
+                            Some((start, end)) => {
+                                log.lock().unwrap().push((start, end));
+                                let mut response = format!(
+                                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{len}\r\nContent-Length: {}\r\n\r\n",
+                                    end - start + 1
+                                )
+                                .into_bytes();
+                                response.extend_from_slice(&object[start as usize..=end as usize]);
+                                response
+                            }
+                            None => b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                        };
+                        if stream.write_all(&response).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, requests)
+    }
+
+    /// A remote `.bed` too large to be read whole plans only the selected rows of each
+    /// class, and counts them like the naive decoding.
+    #[test]
+    fn remote_rows_are_planned_and_count_like_the_naive_decoding() {
+        let mut rng = TestRng(0x6a09_e667_f3bc_c908);
+        let (n_samples, n_variants) = (8_001usize, 4_200usize);
+        let row_len = n_samples.div_ceil(4);
+        let payload = random_rows(&mut rng, n_variants * row_len);
+        // Autosomes 40 rows apart, wider than a request covers between rows, a run of
+        // X rows with a repeat, and a run on Y.
+        let mut loci: Vec<(usize, LocusClass)> = (0..n_variants)
+            .step_by(40)
+            .map(|index| (index, LocusClass::Autosome))
+            .collect();
+        loci.extend((1_000..1_100).map(|index| (index, LocusClass::XNonPar)));
+        loci.push((1_050, LocusClass::XNonPar));
+        loci.extend((3_000..3_020).map(|index| (index, LocusClass::YNonPar)));
+        loci.sort_by_key(|&(index, _)| index);
+        let expected = naive_evidence(&payload, row_len, n_samples, &loci);
+
+        let mut object = vec![0x6c, 0x1b, 0x01];
+        object.extend_from_slice(&payload);
+        let object_len = object.len() as u64;
+        let (url, requests) = serve_ranges(object);
+        let source = crate::shared::files::open_bed_source(std::path::Path::new(&url), None).unwrap();
+        assert!(source.supports_read_plan());
+        let rows = BedRows::new(&source, row_len, n_variants, n_samples);
+        for batch_bytes in [3 * row_len, READ_BATCH_BYTES] {
+            let evidence =
+                count_evidence_batched(&rows, &loci, batch_bytes, u64::MAX, |_| {}).unwrap();
+            assert_eq!(evidence, expected, "batch {batch_bytes}");
+        }
+        // Two passes over about 230 selected rows, not the object.
+        let fetched: u64 = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|&(start, end)| end - start + 1)
+            .sum();
+        assert!(fetched < object_len / 4, "fetched {fetched} of {object_len} bytes");
     }
 
     /// A mapped `.bed` counted with every selected row in one batch, and in the
