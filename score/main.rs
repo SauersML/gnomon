@@ -522,19 +522,26 @@ fn resolve_score_files(
 
     let files: Vec<PathBuf> = if score_arg.is_dir() {
         let mut source_files: Vec<(PathBuf, String)> = Vec::new();
-        let mut cache_files: Vec<(PathBuf, String)> = Vec::new();
+        let mut cache_files: Vec<(PathBuf, String, Option<std::time::SystemTime>)> = Vec::new();
         let mut source_mtimes: std::collections::HashMap<String, std::time::SystemTime> =
             std::collections::HashMap::new();
 
-        for entry in fs::read_dir(score_arg)? {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let path = entry.path();
-            if !path.is_file() {
+        // Each entry costs a metadata round trip, so every entry is looked up at once.
+        let entries: Vec<PathBuf> = fs::read_dir(score_arg)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect();
+        let described: Vec<(PathBuf, Option<fs::Metadata>)> = entries
+            .into_par_iter()
+            .map(|path| {
+                let metadata = fs::metadata(&path).ok();
+                (path, metadata)
+            })
+            .collect();
+
+        for (path, metadata) in described {
+            let Some(metadata) = metadata.filter(fs::Metadata::is_file) else {
                 continue;
-            }
+            };
 
             let name = path
                 .file_name()
@@ -543,12 +550,10 @@ fn resolve_score_files(
 
             if name.ends_with(".gnomon.tsv") {
                 if let Some(stem) = name.strip_suffix(".gnomon.tsv") {
-                    cache_files.push((path, stem.to_string()));
+                    cache_files.push((path, stem.to_string(), metadata.modified().ok()));
                 }
             } else if let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string()) {
-                if let Ok(m) = fs::metadata(&path)
-                    && let Ok(mtime) = m.modified()
-                {
+                if let Ok(mtime) = metadata.modified() {
                     source_mtimes.insert(stem.clone(), mtime);
                 }
                 source_files.push((path, stem));
@@ -564,16 +569,13 @@ fn resolve_score_files(
         // with a duplicate score ID.
         let derived_sorted_copies: std::collections::HashSet<PathBuf> = cache_files
             .iter()
-            .map(|(path, _)| sorted_native_score_path(path, None))
+            .map(|(path, _, _)| sorted_native_score_path(path, None))
             .collect();
-        cache_files.retain(|(path, _)| !derived_sorted_copies.contains(path));
+        cache_files.retain(|(path, _, _)| !derived_sorted_copies.contains(path));
 
-        for (path, stem) in cache_files {
+        for (path, stem, cache_mtime) in cache_files {
             let keep_cache = match source_mtimes.get(&stem) {
-                Some(&src_mtime) => fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .map(|cache_mtime| cache_mtime >= src_mtime)
-                    .unwrap_or(false),
+                Some(&src_mtime) => cache_mtime.is_some_and(|cache_mtime| cache_mtime >= src_mtime),
                 None => true,
             };
 
@@ -789,8 +791,9 @@ fn sort_native_score_files(
         return Ok(sorted_files);
     }
 
+    // Each decision is a few metadata round trips, made for every file at once.
     let plan: Vec<(PathBuf, PathBuf, bool)> = pairs
-        .into_iter()
+        .into_par_iter()
         .map(|(path, sorted_path)| {
             let should_sort = needs_sort(&path, &sorted_path);
             (path, sorted_path, should_sort)
@@ -843,73 +846,80 @@ fn normalize_score_files(
     score_files: &[PathBuf],
     cache_dir: Option<&Path>,
 ) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
+    type BoxError = Box<dyn Error + Send + Sync>;
     enum Prep {
-        Resolved(String, PathBuf),
+        Resolved(PathBuf),
         Pending(PathBuf, PathBuf),
     }
+    enum Class {
+        Native,
+        Cached(PathBuf),
+        Pending(PathBuf),
+    }
 
-    let mut prep_items: Vec<(PathBuf, Prep)> = Vec::with_capacity(score_files.len());
-    for score_file_path in score_files {
-        match reformat::is_gnomon_native_format(score_file_path) {
-            Ok(true) => {
-                let label = read_label_from_cached_file(score_file_path)?;
-                prep_items.push((
-                    score_file_path.clone(),
-                    Prep::Resolved(label, score_file_path.clone()),
-                ));
-            }
-            Ok(false) => {
-                let output_dir = match score_file_path.parent() {
-                    Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-                    _ => Path::new(".").to_path_buf(),
-                };
-                fs::create_dir_all(&output_dir)?;
-
-                let new_path = match cache_dir {
-                    Some(dir) => keyed_cache_path(dir, score_file_path, "gnomon.tsv"),
-                    None => score_file_path.with_extension("gnomon.tsv"),
-                };
-                let should_reformat = if new_path.exists() {
-                    let source_meta = fs::metadata(score_file_path).and_then(|m| m.modified());
-                    let cache_meta = fs::metadata(&new_path).and_then(|m| m.modified());
-                    match (source_meta, cache_meta) {
-                        (Ok(src_time), Ok(cache_time)) => src_time > cache_time,
-                        _ => true,
+    // Every file is classified at once: a header sniff and, for a file that needs
+    // converting, a look at its cache. Each is a round trip on a network filesystem,
+    // so a directory of many small score files waits on them in parallel. Messages
+    // and the first error still come out in file order.
+    let classified: Vec<Result<(Class, Result<(), BoxError>), String>> = score_files
+        .par_iter()
+        .map(
+            |score_file_path| match reformat::is_gnomon_native_format(score_file_path) {
+                Ok(true) => Ok((
+                    Class::Native,
+                    read_label_from_cached_file(score_file_path).map(drop),
+                )),
+                Ok(false) => {
+                    let new_path = match cache_dir {
+                        Some(dir) => keyed_cache_path(dir, score_file_path, "gnomon.tsv"),
+                        None => score_file_path.with_extension("gnomon.tsv"),
+                    };
+                    let fresh = match (
+                        fs::metadata(score_file_path).and_then(|m| m.modified()),
+                        fs::metadata(&new_path).and_then(|m| m.modified()),
+                    ) {
+                        (Ok(src_time), Ok(cache_time)) => src_time <= cache_time,
+                        _ => false,
+                    };
+                    if fresh {
+                        let header = read_label_from_cached_file(&new_path).map(drop);
+                        Ok((Class::Cached(new_path), header))
+                    } else {
+                        Ok((Class::Pending(new_path), Ok(())))
                     }
-                } else {
-                    true
-                };
-
-                if should_reformat {
-                    prep_items.push((
-                        score_file_path.clone(),
-                        Prep::Pending(score_file_path.clone(), new_path),
-                    ));
-                } else {
-                    eprintln!(
-                        "> Info: Using cached converted file '{}'.",
-                        new_path.display()
-                    );
-                    let label = read_label_from_cached_file(&new_path)?;
-                    prep_items.push((score_file_path.clone(), Prep::Resolved(label, new_path)));
                 }
-            }
-            Err(e) => {
-                return Err(format!(
+                Err(e) => Err(format!(
                     "Error reading score file '{}': {}",
                     score_file_path.display(),
                     e
-                )
-                .into());
+                )),
+            },
+        )
+        .collect();
+
+    let mut prep_items: Vec<(PathBuf, Prep)> = Vec::with_capacity(score_files.len());
+    for (score_file_path, class) in score_files.iter().zip(classified) {
+        let (class, header) = class?;
+        let item = match class {
+            Class::Native => Prep::Resolved(score_file_path.clone()),
+            Class::Cached(new_path) => {
+                eprintln!(
+                    "> Info: Using cached converted file '{}'.",
+                    new_path.display()
+                );
+                Prep::Resolved(new_path)
             }
-        }
+            Class::Pending(new_path) => Prep::Pending(score_file_path.clone(), new_path),
+        };
+        header?;
+        prep_items.push((score_file_path.clone(), item));
     }
 
-    type ReformatRow = Option<(String, PathBuf, Option<reformat::SkipSummary>)>;
+    type ReformatRow = Option<(PathBuf, Option<reformat::SkipSummary>)>;
     let reformat_results: Vec<Result<ReformatRow, reformat::ReformatError>> = prep_items
         .par_iter()
         .map(|(_, item)| match item {
-            Prep::Resolved(label, path) => Ok(Some((label.clone(), path.clone(), None))),
+            Prep::Resolved(path) => Ok(Some((path.clone(), None))),
             Prep::Pending(src, dst) => {
                 eprintln!(
                     "> Info: Score file '{}' is not in native format. Attempting conversion...",
@@ -918,12 +928,12 @@ fn normalize_score_files(
                 let outcome = reformat::reformat_pgs_file(src, dst)?;
                 if outcome.wrote_output {
                     eprintln!("> Success: Converted to '{}'.", dst.display());
-                    let label = outcome.score_label.ok_or_else(|| {
-                        reformat::ReformatError::Io(io::Error::other(
+                    if outcome.score_label.is_none() {
+                        return Err(reformat::ReformatError::Io(io::Error::other(
                             "Internal error: missing score label after successful conversion.",
-                        ))
-                    })?;
-                    Ok(Some((label, dst.clone(), outcome.skip_summary)))
+                        )));
+                    }
+                    Ok(Some((dst.clone(), outcome.skip_summary)))
                 } else {
                     if let Some(warning) = outcome.warning {
                         eprintln!("> Warning: {warning}");
@@ -939,35 +949,43 @@ fn normalize_score_files(
         })
         .collect();
 
+    // The native headers are read in parallel as well; duplicates are then checked
+    // in file order.
+    let names: Vec<Option<Result<Vec<String>, BoxError>>> = reformat_results
+        .par_iter()
+        .map(|row| match row {
+            Ok(Some((out_path, _))) => Some(read_score_names_from_cached_file(out_path)),
+            _ => None,
+        })
+        .collect();
+
     let mut native_score_files = Vec::with_capacity(prep_items.len());
     let mut label_to_path: HashMap<String, PathBuf> = HashMap::new();
     let mut skip_summaries = Vec::new();
     let mut freshly_converted = HashSet::new();
-    for ((src_path, item), row) in prep_items.iter().zip(reformat_results.into_iter()) {
-        match row.map_err(Box::new)? {
-            None => continue,
-            Some((_label, out_path, skip_summary)) => {
-                for label in read_score_names_from_cached_file(&out_path)? {
-                    if let Some(existing_path) = label_to_path.get(&label) {
-                        return Err(format!(
-                            "Duplicate Score ID '{}' detected!\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score column has a unique identifier.",
-                            label,
-                            existing_path.display(),
-                            src_path.display()
-                        )
-                        .into());
-                    }
-                    label_to_path.insert(label, src_path.clone());
-                }
-                if let Some(summary) = skip_summary {
-                    skip_summaries.push(summary);
-                }
-                if matches!(item, Prep::Pending(..)) {
-                    freshly_converted.insert(out_path.clone());
-                }
-                native_score_files.push(out_path);
+    for (((src_path, item), row), names) in prep_items.iter().zip(reformat_results).zip(names) {
+        let (Some((out_path, skip_summary)), Some(names)) = (row.map_err(Box::new)?, names) else {
+            continue;
+        };
+        for label in names? {
+            if let Some(existing_path) = label_to_path.get(&label) {
+                return Err(format!(
+                    "Duplicate Score ID '{}' detected!\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score column has a unique identifier.",
+                    label,
+                    existing_path.display(),
+                    src_path.display()
+                )
+                .into());
             }
+            label_to_path.insert(label, src_path.clone());
         }
+        if let Some(summary) = skip_summary {
+            skip_summaries.push(summary);
+        }
+        if matches!(item, Prep::Pending(..)) {
+            freshly_converted.insert(out_path.clone());
+        }
+        native_score_files.push(out_path);
     }
 
     reformat::emit_overall_skip_summary(&skip_summaries);
@@ -994,28 +1012,6 @@ fn run_preparation_phase(
     score_regions: Option<&HashMap<String, GenomicRegion>>,
     cache_dir: Option<&Path>,
 ) -> Result<Arc<PreparationResult>, Box<dyn Error + Send + Sync>> {
-    /// Reads the score label from a cached .gnomon.tsv file by parsing its header.
-    /// Format: variant_id\teffect_allele\tother_allele\tSCORE_LABEL\n
-    fn read_label_from_cached_file(path: &Path) -> Result<String, Box<dyn Error + Send + Sync>> {
-        use std::fs::File;
-        use std::io::{BufRead, BufReader};
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let line = line?;
-            if line.starts_with('#') {
-                continue;
-            }
-            // First non-comment line is the header
-            let cols: Vec<&str> = line.split('\t').collect();
-            if cols.len() >= 4 {
-                return Ok(cols[3].to_string());
-            }
-            return Err(format!("Invalid header in cached file '{}'", path.display()).into());
-        }
-        Err(format!("Empty cached file '{}'", path.display()).into())
-    }
-
     if fileset_prefixes.len() > 1 {
         eprintln!(
             "> Found {} PLINK filesets, starting with: {}",
@@ -1031,159 +1027,7 @@ fn run_preparation_phase(
         score_files.len()
     );
     let prep_phase_start = Instant::now();
-
-    // Classify each source file serially (cheap: header sniff + mtime check).
-    // Files whose cached .gnomon.tsv is fresh are resolved here without using
-    // a worker slot. Files that truly need reformatting are queued for the
-    // parallel pass below.
-    enum Prep {
-        // (label, source path to push into native_score_files)
-        Resolved(String, PathBuf),
-        // (source path, destination .gnomon.tsv path) — needs parallel reformat
-        Pending(PathBuf, PathBuf),
-    }
-
-    let mut prep_items: Vec<(PathBuf, Prep)> = Vec::with_capacity(score_files.len());
-    for score_file_path in score_files {
-        match reformat::is_gnomon_native_format(score_file_path) {
-            Ok(true) => {
-                let label = read_label_from_cached_file(score_file_path)?;
-                prep_items.push((
-                    score_file_path.clone(),
-                    Prep::Resolved(label, score_file_path.clone()),
-                ));
-            }
-            Ok(false) => {
-                let output_dir = match score_file_path.parent() {
-                    Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-                    _ => Path::new(".").to_path_buf(),
-                };
-                fs::create_dir_all(&output_dir)?;
-
-                let new_path = match cache_dir {
-                    Some(dir) => keyed_cache_path(dir, score_file_path, "gnomon.tsv"),
-                    None => score_file_path.with_extension("gnomon.tsv"),
-                };
-
-                let should_reformat = if new_path.exists() {
-                    let source_meta = fs::metadata(score_file_path).and_then(|m| m.modified());
-                    let cache_meta = fs::metadata(&new_path).and_then(|m| m.modified());
-                    match (source_meta, cache_meta) {
-                        (Ok(src_time), Ok(cache_time)) => src_time > cache_time,
-                        _ => true,
-                    }
-                } else {
-                    true
-                };
-
-                if should_reformat {
-                    prep_items.push((
-                        score_file_path.clone(),
-                        Prep::Pending(score_file_path.clone(), new_path),
-                    ));
-                } else {
-                    eprintln!(
-                        "> Info: Using cached converted file '{}'.",
-                        new_path.display()
-                    );
-                    let label = read_label_from_cached_file(&new_path)?;
-                    prep_items.push((score_file_path.clone(), Prep::Resolved(label, new_path)));
-                }
-            }
-            Err(e) => {
-                return Err(format!(
-                    "Error reading score file '{}': {}",
-                    score_file_path.display(),
-                    e
-                )
-                .into());
-            }
-        }
-    }
-
-    // Parallel reformat pass. The inner reformat already uses rayon; running
-    // files in parallel saturates all vCPUs when there are many small files.
-    // One entry per prep_items element; Ok(None) = skipped (unsupported format).
-    type ReformatRow = Option<(String, PathBuf, Option<reformat::SkipSummary>)>;
-    let reformat_results: Vec<Result<ReformatRow, reformat::ReformatError>> = prep_items
-        .par_iter()
-        .map(|(_, item)| match item {
-            Prep::Resolved(label, path) => Ok(Some((label.clone(), path.clone(), None))),
-            Prep::Pending(src, dst) => {
-                eprintln!(
-                    "> Info: Score file '{}' is not in native format. Attempting conversion...",
-                    src.display()
-                );
-                let outcome = reformat::reformat_pgs_file(src, dst)?;
-                if outcome.wrote_output {
-                    eprintln!("> Success: Converted to '{}'.", dst.display());
-                    let label = outcome.score_label.ok_or_else(|| {
-                        reformat::ReformatError::Io(io::Error::new(
-                            io::ErrorKind::Other,
-                            "Internal error: missing score label after successful conversion.",
-                        ))
-                    })?;
-                    Ok(Some((label, dst.clone(), outcome.skip_summary)))
-                } else {
-                    if let Some(warning) = outcome.warning {
-                        eprintln!("> Warning: {warning}");
-                    } else {
-                        eprintln!(
-                            "> Warning: Unsupported score format for '{}'; skipping.",
-                            src.display()
-                        );
-                    }
-                    Ok(None)
-                }
-            }
-        })
-        .collect();
-
-    // Serial post-pass: duplicate-label detection + accumulate outputs.
-    let mut native_score_files = Vec::with_capacity(prep_items.len());
-    let mut label_to_path: HashMap<String, PathBuf> = HashMap::new();
-    let mut skip_summaries = Vec::new();
-    let mut freshly_converted = HashSet::new();
-    for ((src_path, item), row) in prep_items.iter().zip(reformat_results.into_iter()) {
-        match row.map_err(Box::new)? {
-            None => continue,
-            Some((_label, out_path, skip_summary)) => {
-                for label in read_score_names_from_cached_file(&out_path)? {
-                    if let Some(existing_path) = label_to_path.get(&label) {
-                        return Err(format!(
-                            "Duplicate Score ID '{}' detected!\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score column has a unique identifier.",
-                            label,
-                            existing_path.display(),
-                            src_path.display()
-                        ).into());
-                    }
-                    label_to_path.insert(label, src_path.clone());
-                }
-                if let Some(summary) = skip_summary {
-                    skip_summaries.push(summary);
-                }
-                if matches!(item, Prep::Pending(..)) {
-                    freshly_converted.insert(out_path.clone());
-                }
-                native_score_files.push(out_path);
-            }
-        }
-    }
-
-    reformat::emit_overall_skip_summary(&skip_summaries);
-
-    // Deduplicate the list to handle cases where a directory scan picks up both
-    // a source file (e.g. score.txt) and its converted output (score.gnomon.tsv).
-    native_score_files.sort();
-    native_score_files.dedup();
-    if native_score_files.is_empty() {
-        return Err("No compatible score files remained after normalization. \
-Scores that only provide dosage-specific weights \
-('dosage_0_weight', 'dosage_1_weight', 'dosage_2_weight') are currently unsupported."
-            .into());
-    }
-    let native_score_files =
-        sort_native_score_files(native_score_files, &freshly_converted, cache_dir)?;
+    let native_score_files = normalize_score_files(score_files, cache_dir)?;
 
     // --- Run the main preparation logic with the fully normalized and sorted files ---
     let prep = prepare::prepare_for_computation(
