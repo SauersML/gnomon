@@ -26,7 +26,7 @@ use gnomon::score::reformat;
 use gnomon::score::types::{GenomicRegion, PreparationResult};
 use natord::compare;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
@@ -570,27 +570,100 @@ fn sorted_native_score_path(path: &Path) -> PathBuf {
     parent.join(format!("{stem}.sorted.gnomon.tsv"))
 }
 
+/// Writes the sorted copy of each native score file that lacks a fresh one.
+///
+/// `freshly_converted` names the files this run just wrote with
+/// `reformat_pgs_file`. Those can neither warn nor fail to parse, so each
+/// maximal run of them is sorted in parallel; every other file is sorted on its
+/// own, in order, so warnings and the first error come out as they always did
+/// and no file after a failing one is touched.
 fn sort_native_score_files(
     native_score_files: Vec<PathBuf>,
+    freshly_converted: &HashSet<PathBuf>,
 ) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
-    let mut sorted_files = Vec::with_capacity(native_score_files.len());
-    for path in native_score_files {
-        let sorted_path = sorted_native_score_path(&path);
-        let should_sort = if sorted_path.exists() {
-            let source_meta = fs::metadata(&path).and_then(|m| m.modified());
-            let sorted_meta = fs::metadata(&sorted_path).and_then(|m| m.modified());
+    let needs_sort = |path: &Path, sorted_path: &Path| {
+        if sorted_path.exists() {
+            let source_meta = fs::metadata(path).and_then(|m| m.modified());
+            let sorted_meta = fs::metadata(sorted_path).and_then(|m| m.modified());
             match (source_meta, sorted_meta) {
                 (Ok(src_time), Ok(sorted_time)) => src_time > sorted_time,
                 _ => true,
             }
         } else {
             true
-        };
-        if should_sort {
-            reformat::sort_native_file(&path, &sorted_path)?;
         }
-        sorted_files.push(sorted_path);
+    };
+    let pairs: Vec<(PathBuf, PathBuf)> = native_score_files
+        .into_iter()
+        .map(|path| {
+            let sorted_path = sorted_native_score_path(&path);
+            (path, sorted_path)
+        })
+        .collect();
+
+    // Deciding every file up front is only the same as deciding each just before
+    // sorting it when no sort writes a path another file reads or writes.
+    let mut touched = HashSet::with_capacity(2 * pairs.len());
+    let independent = pairs.iter().all(|(_, sorted_path)| touched.insert(sorted_path))
+        && pairs.iter().all(|(path, _)| !touched.contains(path));
+    if !independent {
+        for (path, sorted_path) in &pairs {
+            if needs_sort(path, sorted_path) {
+                reformat::sort_native_file(path, sorted_path)?;
+            }
+        }
+        let mut sorted_files: Vec<PathBuf> =
+            pairs.into_iter().map(|(_, sorted_path)| sorted_path).collect();
+        sorted_files.sort();
+        sorted_files.dedup();
+        return Ok(sorted_files);
     }
+
+    let plan: Vec<(PathBuf, PathBuf, bool)> = pairs
+        .into_iter()
+        .map(|(path, sorted_path)| {
+            let should_sort = needs_sort(&path, &sorted_path);
+            (path, sorted_path, should_sort)
+        })
+        .collect();
+    let is_parallel = |(path, _, should_sort): &(PathBuf, PathBuf, bool)| {
+        !should_sort || freshly_converted.contains(path)
+    };
+
+    let mut start = 0;
+    while start < plan.len() {
+        let run = plan[start..]
+            .iter()
+            .position(|item| !is_parallel(item))
+            .unwrap_or(plan.len() - start);
+        if run == 0 {
+            let (path, sorted_path, should_sort) = &plan[start];
+            if *should_sort {
+                reformat::sort_native_file(path, sorted_path)?;
+            }
+            start += 1;
+            continue;
+        }
+        let results: Vec<Result<(), reformat::ReformatError>> = plan[start..start + run]
+            .par_iter()
+            .map(|(path, sorted_path, should_sort)| {
+                if *should_sort {
+                    reformat::sort_native_file(path, sorted_path)
+                } else {
+                    Ok(())
+                }
+            })
+            .collect();
+        for result in results {
+            result?;
+        }
+        start += run;
+    }
+
+    let mut sorted_files: Vec<PathBuf> = plan
+        .into_iter()
+        .map(|(_, sorted_path, _)| sorted_path)
+        .collect();
     sorted_files.sort();
     sorted_files.dedup();
     Ok(sorted_files)
@@ -695,7 +768,8 @@ fn normalize_score_files(
     let mut native_score_files = Vec::with_capacity(prep_items.len());
     let mut label_to_path: HashMap<String, PathBuf> = HashMap::new();
     let mut skip_summaries = Vec::new();
-    for ((src_path, _), row) in prep_items.iter().zip(reformat_results.into_iter()) {
+    let mut freshly_converted = HashSet::new();
+    for ((src_path, item), row) in prep_items.iter().zip(reformat_results.into_iter()) {
         match row.map_err(Box::new)? {
             None => continue,
             Some((_label, out_path, skip_summary)) => {
@@ -714,6 +788,9 @@ fn normalize_score_files(
                 if let Some(summary) = skip_summary {
                     skip_summaries.push(summary);
                 }
+                if matches!(item, Prep::Pending(..)) {
+                    freshly_converted.insert(out_path.clone());
+                }
                 native_score_files.push(out_path);
             }
         }
@@ -726,7 +803,7 @@ fn normalize_score_files(
         return Err("No compatible score files remained after normalization. Scores that only provide dosage-specific weights ('dosage_0_weight', 'dosage_1_weight', 'dosage_2_weight') are currently unsupported.".into());
     }
 
-    sort_native_score_files(native_score_files)
+    sort_native_score_files(native_score_files, &freshly_converted)
 }
 
 /// **Helper 1:** Encapsulates the entire preparation and file normalization phase.
@@ -888,7 +965,8 @@ fn run_preparation_phase(
     let mut native_score_files = Vec::with_capacity(prep_items.len());
     let mut label_to_path: HashMap<String, PathBuf> = HashMap::new();
     let mut skip_summaries = Vec::new();
-    for ((src_path, _), row) in prep_items.iter().zip(reformat_results.into_iter()) {
+    let mut freshly_converted = HashSet::new();
+    for ((src_path, item), row) in prep_items.iter().zip(reformat_results.into_iter()) {
         match row.map_err(Box::new)? {
             None => continue,
             Some((_label, out_path, skip_summary)) => {
@@ -905,6 +983,9 @@ fn run_preparation_phase(
                 }
                 if let Some(summary) = skip_summary {
                     skip_summaries.push(summary);
+                }
+                if matches!(item, Prep::Pending(..)) {
+                    freshly_converted.insert(out_path.clone());
                 }
                 native_score_files.push(out_path);
             }
@@ -923,7 +1004,7 @@ Scores that only provide dosage-specific weights \
 ('dosage_0_weight', 'dosage_1_weight', 'dosage_2_weight') are currently unsupported."
             .into());
     }
-    let native_score_files = sort_native_score_files(native_score_files)?;
+    let native_score_files = sort_native_score_files(native_score_files, &freshly_converted)?;
 
     // --- Run the main preparation logic with the fully normalized and sorted files ---
     let prep = prepare::prepare_for_computation(
