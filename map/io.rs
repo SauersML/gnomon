@@ -3775,6 +3775,9 @@ pub struct VcfLikeVariantBlockSource {
     current_alt_count: usize,
     current_alt_alleles: Vec<String>,
     prefer_ds: bool,
+    /// Whether a one-allele call decodes on the diploid scale, as the homozygous
+    /// call PLINK imports it as. Off by default, so dosages stay allele counts.
+    haploid_calls_as_homozygous: bool,
     sample_names: Arc<Vec<String>>,
     n_samples: usize,
     variant_count: Arc<VariantCountTracker>,
@@ -4446,6 +4449,7 @@ impl VcfLikeVariantBlockSource {
             current_alt_count: 0,
             current_alt_alleles: Vec::new(),
             prefer_ds: false,
+            haploid_calls_as_homozygous: false,
             sample_names,
             n_samples,
             variant_count,
@@ -4751,6 +4755,14 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
 }
 
 impl VcfLikeVariantBlockSource {
+    /// Decodes a one-allele call on the diploid scale: a haploid ALT call is 2.0,
+    /// a haploid REF call 0.0, and a haploid DS or GP dosage is doubled. This is
+    /// how plink2 imports haploid calls, as homozygous ones, so a heterozygous
+    /// dosage of exactly 1.0 can only come from a call with two alleles.
+    pub fn count_haploid_calls_as_homozygous(&mut self) {
+        self.haploid_calls_as_homozygous = true;
+    }
+
     fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
         if matches!(self.selection_plan, SelectionPlan::ByKeys(_)) {
             return None;
@@ -4793,6 +4805,7 @@ impl VcfLikeVariantBlockSource {
                 self.current_alt_count,
                 self.n_samples,
                 self.prefer_ds,
+                self.haploid_calls_as_homozygous,
                 dest,
             ),
             Some(VariantFormat::Bcf) => {
@@ -4807,6 +4820,7 @@ impl VcfLikeVariantBlockSource {
                     self.current_alt_count,
                     self.n_samples,
                     self.prefer_ds,
+                    self.haploid_calls_as_homozygous,
                     dest,
                 )
             }
@@ -5754,6 +5768,7 @@ fn decode_vcf_record(
     alt_count: usize,
     n_samples: usize,
     prefer_ds: bool,
+    haploid_calls_as_homozygous: bool,
     dest: &mut [f64],
 ) -> Result<(), VariantIoError> {
     dest[..n_samples].fill(f64::NAN);
@@ -5810,22 +5825,24 @@ fn decode_vcf_record(
             }
         }
 
+        let ploidy = vcf_genotype_ploidy(gt_field);
+        let scale = if haploid_calls_as_homozygous && ploidy == 1 {
+            2.0
+        } else {
+            1.0
+        };
+
         if prefer_ds {
             if let Some(value) = ds_field
-                && let Some(parsed) = parse_vcf_dosage_field(
-                    value,
-                    alt_index,
-                    alt_count,
-                    vcf_genotype_ploidy(gt_field),
-                )?
+                && let Some(parsed) = parse_vcf_dosage_field(value, alt_index, alt_count, ploidy)?
             {
-                dest[sample_idx] = parsed;
+                dest[sample_idx] = scale * parsed;
                 continue;
             }
             if let Some(value) = gp_field
                 && let Some(parsed) = parse_vcf_gp(value, alt_index, alt_count)?
             {
-                dest[sample_idx] = parsed;
+                dest[sample_idx] = scale * parsed;
                 continue;
             }
         }
@@ -5833,7 +5850,7 @@ fn decode_vcf_record(
         if let Some(value) = gt_field
             && let Some(parsed) = parse_vcf_genotype(value, alt_index)?
         {
-            dest[sample_idx] = parsed;
+            dest[sample_idx] = scale * parsed;
         }
     }
 
@@ -5847,6 +5864,7 @@ fn decode_bcf_record(
     alt_count: usize,
     n_samples: usize,
     prefer_ds: bool,
+    haploid_calls_as_homozygous: bool,
     dest: &mut [f64],
 ) -> Result<(), VariantIoError> {
     dest[..n_samples].fill(f64::NAN);
@@ -5899,6 +5917,13 @@ fn decode_bcf_record(
             gt_series.as_ref(),
             dest,
         )?;
+    }
+    if haploid_calls_as_homozygous && let Some(series) = &gt_series {
+        for (sample_idx, value) in dest[..n_samples].iter_mut().enumerate() {
+            if !value.is_nan() && bcf_genotype_ploidy(Some(series), header, sample_idx)? == 1 {
+                *value *= 2.0;
+            }
+        }
     }
 
     Ok(())
@@ -7698,6 +7723,54 @@ mod tests {
         assert_eq!(filled, 2);
         assert_eq!(&storage[..2], &[1.25, 0.5]);
         assert_eq!(&storage[2..4], &[0.25, 1.75]);
+    }
+
+    /// Haploid calls are allele counts by default. Counted as homozygous, a
+    /// haploid ALT call or dosage lands on the diploid scale, where a
+    /// heterozygous 1.0 can only come from two alleles.
+    #[test]
+    fn haploid_calls_decode_as_homozygous_only_when_asked() {
+        use crate::map::fit::VariantBlockSource;
+
+        let dir = tempdir().unwrap();
+        let vcf_path = dir.path().join("haploid.vcf");
+        let vcf_content = "\
+##fileformat=VCFv4.2
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Alternate allele dosage\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\tS4\tS5
+X\t3000000\tgt\tA\tG\t.\tPASS\t.\tGT\t1\t0\t0/1\t1/1\t.
+X\t3000100\tds\tA\tG\t.\tPASS\t.\tGT:DS\t1:1\t0:0.25\t0/1:1\t1|1:2\t.:.
+";
+        {
+            let mut file = File::create(&vcf_path).unwrap();
+            file.write_all(vcf_content.as_bytes()).unwrap();
+        }
+
+        let dataset = VcfLikeDataset::open(&vcf_path).unwrap();
+        for (homozygous, expected) in [
+            (
+                false,
+                [1.0, 0.0, 1.0, 2.0, f64::NAN, 1.0, 0.25, 1.0, 2.0, f64::NAN],
+            ),
+            (
+                true,
+                [2.0, 0.0, 1.0, 2.0, f64::NAN, 2.0, 0.5, 1.0, 2.0, f64::NAN],
+            ),
+        ] {
+            let mut source = dataset.block_source().unwrap();
+            if homozygous {
+                source.count_haploid_calls_as_homozygous();
+            }
+            let mut storage = vec![0.0; 10];
+            assert_eq!(source.next_block_into(2, &mut storage).unwrap(), 2);
+            for (index, (&actual, &expected)) in storage.iter().zip(&expected).enumerate() {
+                assert!(
+                    actual == expected || (actual.is_nan() && expected.is_nan()),
+                    "homozygous={homozygous} value {index}: {actual} != {expected}"
+                );
+            }
+        }
     }
 
     #[test]

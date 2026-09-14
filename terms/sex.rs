@@ -14,7 +14,9 @@ use thiserror::Error;
 
 use crate::adapt_plink2::GenomeBuild as PgenGenomeBuild;
 use crate::map::fit::VariantBlockSource;
-use crate::map::io::{GenotypeDataset, GenotypeIoError, PlinkDataset, PlinkIoError, SelectionPlan};
+use crate::map::io::{
+    DatasetBlockSource, GenotypeDataset, GenotypeIoError, PlinkDataset, PlinkIoError, SelectionPlan,
+};
 use crate::map::variant_filter::VariantKey;
 use crate::terms::sex_counts::{BedRows, LocusClass, count_evidence, finish_counts};
 
@@ -442,6 +444,11 @@ fn collect_inference(
 
     let mut block_source =
         dataset.block_source_with_plan(SelectionPlan::ByIndices(selection.indices.clone()))?;
+    // A haploid call is hemizygous, never heterozygous. Read it as the homozygous
+    // call a PLINK import makes of it, so a dosage of 1.0 below means two alleles.
+    if let DatasetBlockSource::Variants(source) = &mut block_source {
+        source.count_haploid_calls_as_homozygous();
+    }
     let total_variants = selection.keys.len();
     let block_capacity = 256usize;
     let mut storage = vec![f64::NAN; block_capacity * n_samples];
