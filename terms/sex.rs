@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use infer_sex::{
-    Chromosome, GenomeBuild, InferenceConfig, InferenceError, InferenceResult, InferredSex,
-    PlatformDefinition, SexInferenceAccumulator, VariantInfo,
+    Chromosome, EvidenceReport, GenomeBuild, InferenceConfig, InferenceError, InferenceResult,
+    InferredSex, PlatformDefinition, SexInferenceAccumulator, VariantInfo,
 };
 use thiserror::Error;
 
@@ -460,48 +460,62 @@ fn collect_packed_inference(
     )
 }
 
-/// True when no sample in the panel missed any attempted locus: every sample
-/// called every attempted autosome and every attempted Y non-PAR locus.
+/// True when the Y density cannot separate the sexes in this panel: the panel
+/// carries no Y non-PAR locus, or no sample missed any Y non-PAR locus it carries.
 ///
 /// `derive_platform_definition` defines "attempted" as "present in this file",
-/// so on such an input the Y density is `observed / observed = 1.0` by
-/// construction -- for every sample, of either sex. It is not a measurement of
-/// Y coverage, it is a restatement of the filtering.
+/// so when every sample called every attempted Y locus the Y call rate is
+/// `observed / observed = 1.0` by construction -- for every sample, of either
+/// sex. It is not a measurement of Y coverage, it is a restatement of the
+/// filtering. chrY dropout is what distinguishes the sexes, and a panel without
+/// any has been filtered to called sites, or carries female chrY calls that no
+/// genotyper should have made.
 ///
-/// Real genotype data never looks like this: arrays and sequencing both drop
-/// some loci, and chrY dropout in particular is what distinguishes the sexes.
-/// A panel with zero missingness has therefore been filtered to called sites,
-/// and a caller that reads the resulting density as evidence will find every
-/// sample male -- most confidently for the females, whose no-calls were the
-/// signal that got removed.
-///
-/// Saturation belongs to the panel, not to a sample. A panel with real dropout
-/// can still hold samples that called every locus -- males on WGS calls whose
+/// This belongs to the panel, not to a sample. A panel with real dropout can
+/// still hold samples that called every locus -- males on WGS calls whose
 /// autosomes carry no no-calls, or on a thin Y panel -- and their densities
 /// measure something, because the females beside them did miss chrY.
-fn panel_is_saturated(records: &[SexInferenceRecord], platform: &PlatformDefinition) -> bool {
-    platform.n_attempted_y_nonpar > 0
-        && records.iter().all(|record| {
-            let report = &record.inference.report;
-            report.y_non_par_valid_count == platform.n_attempted_y_nonpar
-                && report.auto_valid_count == platform.n_attempted_autosomes
+fn y_density_is_uninformative(
+    records: &[SexInferenceRecord],
+    platform: &PlatformDefinition,
+) -> bool {
+    platform.n_attempted_y_nonpar == 0
+        || records.iter().all(|record| {
+            record.inference.report.y_non_par_valid_count == platform.n_attempted_y_nonpar
         })
 }
 
-/// Collects every sample's result, then withholds the calls of a saturated panel.
+/// The X/autosome heterozygosity ratio under which a sample is called male on
+/// X alone. A male's non-PAR X is hemizygous, so every heterozygous call he
+/// shows there is an error, while a female's X is diploid and heterozygous on
+/// the order of her autosomes. PLINK's `--check-sex` calls a male when his X
+/// heterozygosity is under a fifth of its expectation (F above 0.8); the ratio
+/// takes the sample's own autosomal heterozygosity as that expectation.
+const MALE_X_AUTOSOME_HET_RATIO: f64 = 0.2;
+
+/// The call on X evidence alone.
+fn call_on_x(report: &EvidenceReport) -> InferredSex {
+    match report.x_autosome_het_ratio {
+        Some(ratio) if ratio < MALE_X_AUTOSOME_HET_RATIO => InferredSex::Male,
+        Some(_) => InferredSex::Female,
+        None => InferredSex::Indeterminate,
+    }
+}
+
+/// Collects every sample's result. Where the panel's Y density is
+/// uninformative, the calls come from X alone.
 fn finalize_records(
     records: impl IntoIterator<Item = Result<SexInferenceRecord, InferenceError>>,
     platform: &PlatformDefinition,
 ) -> Result<Vec<SexInferenceRecord>, SexInferenceError> {
     let mut records = records.into_iter().collect::<Result<Vec<_>, _>>()?;
-    // Withhold the calls rather than emit confident ones derived from a
-    // denominator the input defined into existence. Indeterminate is the
-    // honest answer here and it is also the useful one: a caller can fall
-    // back to evidence measured before the filtering, whereas a wrong
-    // binary call is indistinguishable from a right one downstream.
-    if panel_is_saturated(&records, platform) {
+    // infer_sex reads a missing density as zero, which calls every sample
+    // female, and a saturated density is one, which calls nearly every sample
+    // male -- most confidently the females, whose no-calls were the signal that
+    // got removed. Neither is evidence; the X heterozygosity is.
+    if y_density_is_uninformative(&records, platform) {
         for record in &mut records {
-            record.inference.final_call = InferredSex::Indeterminate;
+            record.inference.final_call = call_on_x(&record.inference.report);
         }
     }
     Ok(records)
@@ -917,7 +931,7 @@ mod tests {
             "a filtered panel yields a saturated density by construction, got {density}"
         );
         assert!(
-            panel_is_saturated(&[record("F1", result)], &platform),
+            y_density_is_uninformative(&[record("F1", result)], &platform),
             "zero missingness across the panel must be recognized"
         );
     }
@@ -932,8 +946,8 @@ mod tests {
     /// A male genotyped at every locus of a thin chrY panel, or on WGS calls
     /// whose autosomes carry no no-calls, beside females who miss chrY. The
     /// panel has real dropout, so his density measures something and his call
-    /// stands. Alone, the same male is a saturated panel: nothing in the input
-    /// separates his calls from sites filtered to called ones.
+    /// stands. Alone, the same male is a panel without dropout, and his call
+    /// comes from his X.
     #[test]
     fn a_male_who_calls_every_locus_keeps_his_call_in_a_panel_with_dropout() {
         let platform = PlatformDefinition {
@@ -989,7 +1003,7 @@ mod tests {
         );
 
         let alone = finalize_records([Ok(record("M1", finish(true).unwrap()))], &platform).unwrap();
-        assert_eq!(alone[0].inference.final_call, InferredSex::Indeterminate);
+        assert_eq!(alone[0].inference.final_call, InferredSex::Male);
     }
 
     /// The ordinary case, which must keep working: some loci fail to call, so
@@ -1025,16 +1039,17 @@ mod tests {
 
         let result = acc.finish().unwrap();
         assert!(
-            !panel_is_saturated(&[record("M1", result)], &platform),
+            !y_density_is_uninformative(&[record("M1", result)], &platform),
             "a panel with genuine dropout must keep its call"
         );
     }
 
-    /// A panel with no chrY loci at all is a different condition -- there is
-    /// nothing to saturate, and the existing None-density path already covers
-    /// it. Guard the boundary so the check cannot swallow that case too.
+    /// With no chrY locus at all, infer_sex reads the missing density as zero
+    /// and calls every sample female. The calls must come from X instead: a
+    /// male's hemizygous X shows no heterozygosity, a female's about as much as
+    /// her autosomes, and a sample without an X call has nothing to be called on.
     #[test]
-    fn a_panel_without_any_y_locus_is_not_saturated() {
+    fn a_panel_without_any_y_locus_is_called_on_x() {
         let platform = PlatformDefinition {
             n_attempted_autosomes: 400,
             n_attempted_y_nonpar: 0,
@@ -1044,17 +1059,97 @@ mod tests {
             platform,
             thresholds: None,
         };
-        let mut acc = SexInferenceAccumulator::new(config);
-        for i in 0..400u64 {
-            acc.process_variant(&VariantInfo {
-                chrom: Chromosome::Autosome,
-                pos: 1_000_000 + i,
-                is_heterozygous: i % 2 == 0,
-            });
-        }
+        // Heterozygous calls among 200 non-PAR X calls, or no X call at all.
+        let finish = |x_het: Option<u64>| {
+            let mut acc = SexInferenceAccumulator::new(config);
+            for i in 0..400u64 {
+                acc.process_variant(&VariantInfo {
+                    chrom: Chromosome::Autosome,
+                    pos: 1_000_000 + i,
+                    is_heterozygous: i % 2 == 0,
+                });
+            }
+            for i in 0..x_het.map_or(0, |_| 200u64) {
+                acc.process_variant(&VariantInfo {
+                    chrom: Chromosome::X,
+                    pos: 3_000_000 + i,
+                    is_heterozygous: x_het.is_some_and(|x_het| i < x_het),
+                });
+            }
+            record("S", acc.finish().unwrap())
+        };
+        // Autosomal heterozygosity is 1/2, so 19 of 200 X calls heterozygous is a
+        // ratio of 0.19, and 21 is 0.21.
+        let panel = [Some(0), Some(19), Some(21), Some(100), None].map(finish);
+        assert!(y_density_is_uninformative(&panel, &platform));
+        let calls: Vec<InferredSex> = finalize_records(panel.map(Ok), &platform)
+            .unwrap()
+            .iter()
+            .map(|record| record.inference.final_call)
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                InferredSex::Male,
+                InferredSex::Male,
+                InferredSex::Female,
+                InferredSex::Female,
+                InferredSex::Indeterminate
+            ]
+        );
+    }
 
-        let result = acc.finish().unwrap();
-        assert!(!panel_is_saturated(&[record("S1", result)], &platform));
+    /// Female chrY calls that no genotyper should have made -- no-calls filled
+    /// as reference, or reads mismapped to chrY -- leave the panel without Y
+    /// dropout. Her density is then the male one, and infer_sex calls her male
+    /// most confidently of all; the call must come from her X.
+    #[test]
+    fn a_panel_without_y_dropout_is_called_on_x() {
+        let platform = PlatformDefinition {
+            n_attempted_autosomes: 400,
+            n_attempted_y_nonpar: 12,
+        };
+        let config = InferenceConfig {
+            build: GenomeBuild::Build38,
+            platform,
+            thresholds: None,
+        };
+        let finish = |male: bool| {
+            let mut acc = SexInferenceAccumulator::new(config);
+            // One autosomal no-call, so the panel is not saturated as a whole.
+            for i in 1..400u64 {
+                acc.process_variant(&VariantInfo {
+                    chrom: Chromosome::Autosome,
+                    pos: 1_000_000 + i,
+                    is_heterozygous: i % 3 == 0,
+                });
+            }
+            for i in 0..200u64 {
+                acc.process_variant(&VariantInfo {
+                    chrom: Chromosome::X,
+                    pos: 3_000_000 + i,
+                    is_heterozygous: !male && i % 2 == 0,
+                });
+            }
+            for i in 0..12u64 {
+                acc.process_variant(&VariantInfo {
+                    chrom: Chromosome::Y,
+                    pos: 3_000_000 + i,
+                    is_heterozygous: false,
+                });
+            }
+            acc.finish()
+        };
+        let female = finish(false).unwrap();
+        assert_eq!(female.final_call, InferredSex::Male, "infer_sex alone");
+
+        let panel = finalize_records(
+            [(false, "F1"), (true, "M1")].map(|(male, id)| Ok(record(id, finish(male)?))),
+            &platform,
+        )
+        .unwrap();
+        assert_eq!(panel[0].inference.final_call, InferredSex::Female);
+        assert_eq!(panel[1].inference.final_call, InferredSex::Male);
     }
 
     #[test]
@@ -1281,9 +1376,8 @@ mod tests {
                 .iter()
                 .map(|record| sex_label(record.inference.final_call))
                 .collect();
-            if missing_percent == 0 {
-                assert_eq!(calls, HashSet::from(["indeterminate"]));
-            } else if n_samples > 1 {
+            // A saturated panel is called on X, which separates the fixture's sexes too.
+            if n_samples > 1 {
                 assert_eq!(calls, HashSet::from(["male", "female"]));
             }
         }
