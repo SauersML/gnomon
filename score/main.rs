@@ -537,12 +537,22 @@ fn resolve_score_files(
         // run over a directory of native files fail with a duplicate score ID.
         cache_files.retain(|(_, stem, _)| !stem.ends_with(".sorted"));
 
-        for (path, stem, cache_metadata) in cache_files {
-            let keep_cache = match source_metadata.get(&stem) {
-                Some(source) => derived_copy_is_fresh(source, &cache_metadata),
-                None => true,
-            };
-
+        // A copy an older gnomon converted is converted again from its source. Each
+        // stamp costs a round trip, so every copy is checked at once.
+        let cache_files: Vec<(PathBuf, String, bool)> = cache_files
+            .into_par_iter()
+            .map(|(path, stem, cache_metadata)| {
+                let keep_cache = match source_metadata.get(&stem) {
+                    Some(source) => {
+                        derived_copy_is_fresh(source, &cache_metadata)
+                            && reformat::conversion_is_current(&path)
+                    }
+                    None => true,
+                };
+                (path, stem, keep_cache)
+            })
+            .collect();
+        for (path, stem, keep_cache) in cache_files {
             if keep_cache {
                 final_files.push(path);
                 covered_stems.insert(stem);
@@ -854,7 +864,10 @@ fn normalize_score_files(
                         None => score_file_path.with_extension("gnomon.tsv"),
                     };
                     let fresh = match (fs::metadata(score_file_path), fs::metadata(&new_path)) {
-                        (Ok(source), Ok(cache)) => derived_copy_is_fresh(&source, &cache),
+                        (Ok(source), Ok(cache)) => {
+                            derived_copy_is_fresh(&source, &cache)
+                                && reformat::conversion_is_current(&new_path)
+                        }
                         _ => false,
                     };
                     if fresh {
@@ -1871,6 +1884,38 @@ mod output_tests {
         names.sort();
         assert_eq!(names, ["a.tsv", "b.gnomon.tsv", "c.txt"]);
         assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn directory_discovery_converts_an_older_conversion_again() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("c.txt"), "#pgs_id=C\n").unwrap();
+        let cache = dir.path().join("c.gnomon.tsv");
+        let discover = || {
+            // Written well after its source, so only the stamp can make it stale.
+            fs::File::options()
+                .write(true)
+                .open(&cache)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+                .unwrap();
+            let (files, _) =
+                super::resolve_score_files(dir.path(), &dir.path().to_string_lossy(), dir.path())
+                    .unwrap();
+            files
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let rows = "variant_id\teffect_allele\tother_allele\tC\n1:100\tA\tG\t0.5\n";
+        fs::write(&cache, rows).unwrap();
+        assert_eq!(discover(), ["c.txt"]);
+        fs::write(
+            &cache,
+            format!("{}\n{rows}", super::reformat::CONVERSION_STAMP),
+        )
+        .unwrap();
+        assert_eq!(discover(), ["c.gnomon.tsv"]);
     }
 
     /// The one-row-at-a-time writer that `write_score_rows` replaced, kept verbatim as

@@ -179,6 +179,22 @@ fn open_score_text(path: &Path) -> io::Result<(Box<dyn Read + Send>, bool)> {
     }
 }
 
+/// The first line of every file `reformat_pgs_file` writes. The number changes whenever
+/// conversion would write different rows from the same input, so a copy converted by
+/// an older gnomon is converted again instead of reused. Format 2 keeps rows that name
+/// no single other allele, which format 1 skipped.
+pub const CONVERSION_STAMP: &str = "#gnomon_conversion=2";
+
+/// Whether `path` was written by this gnomon's `reformat_pgs_file`.
+pub fn conversion_is_current(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut first_line = String::new();
+    BufReader::new(file).read_line(&mut first_line).is_ok()
+        && first_line.trim_end() == CONVERSION_STAMP
+}
+
 /// Checks if a file is in the gnomon-native format as it stands, by inspecting its
 /// header. A compressed file never is: `reformat_pgs_file` inflates it first.
 pub fn is_gnomon_native_format(path: &Path) -> io::Result<bool> {
@@ -461,11 +477,13 @@ pub fn reformat_pgs_file(
 
     // A native file reaches this function only when it was compressed (see
     // `is_gnomon_native_format`). It needs no conversion, so it is written out
-    // inflated byte for byte, and is then used exactly as the plain file would be.
+    // inflated byte for byte after the stamp, and is then used exactly as the plain
+    // file would be.
     let native_header = line_buffer.trim();
     if native_header.starts_with("variant_id\teffect_allele\tother_allele\t") {
         let score_label = native_header.split('\t').nth(3).unwrap_or("").to_string();
         crate::output::write_atomically(output_path, |writer| {
+            writeln!(writer, "{CONVERSION_STAMP}")?;
             writer.write_all(comment_lines.as_bytes())?;
             writer.write_all(line_buffer.as_bytes())?;
             io::copy(&mut reader, writer)?;
@@ -877,7 +895,7 @@ pub fn reformat_pgs_file(
     crate::output::write_atomically(output_path, |writer| {
         writeln!(
             writer,
-            "variant_id\teffect_allele\tother_allele\t{score_label}"
+            "{CONVERSION_STAMP}\nvariant_id\teffect_allele\tother_allele\t{score_label}"
         )?;
         for item in &lines_to_sort {
             writer.write_all(&resolved_chunks[item.chunk].rows[item.start..item.end])?;
@@ -1444,10 +1462,10 @@ chr_name\tchr_position\teffect_allele\tother_allele\tvariant_description\teffect
 
         let written = fs::read_to_string(&output_path).expect("read output");
         let lines: Vec<_> = written.lines().collect();
-        assert_eq!(lines[1], "1:100\tA\tG\t0.5");
+        assert_eq!(lines[2], "1:100\tA\tG\t0.5");
         // No pair can be recovered, so the row keeps "." for Stage 3 to match on its
         // effect allele instead of being skipped here.
-        assert_eq!(lines[2], "1:200\tT\t.\t0.7");
+        assert_eq!(lines[3], "1:200\tT\t.\t0.7");
         assert!(outcome.skip_summary.is_none());
     }
 
@@ -1480,11 +1498,38 @@ chr_name\tchr_position\teffect_allele\teffect_weight\thm_source\thm_rsID\thm_chr
         );
         assert_eq!(
             fs::read_to_string(&output_path).expect("read output"),
-            "variant_id\teffect_allele\tother_allele\tPGS_EFFECT_ONLY\n\
+            "#gnomon_conversion=2\n\
+variant_id\teffect_allele\tother_allele\tPGS_EFFECT_ONLY\n\
 1:100\tA\tG/T\t0.5\n\
 1:200\tT\tC\t0.75\n\
 1:300\tC\t.\t-0.25\n"
         );
+    }
+
+    #[test]
+    fn only_this_conversion_is_current() {
+        let tmp = tempdir().expect("tempdir");
+        let input_path = tmp.path().join("PGS_STAMP.txt");
+        let output_path = tmp.path().join("PGS_STAMP.gnomon.tsv");
+        fs::write(
+            &input_path,
+            "#pgs_id=PGS_STAMP\n\
+chr_name\tchr_position\teffect_allele\tother_allele\teffect_weight\n\
+1\t100\tA\tG\t0.5\n",
+        )
+        .expect("write input");
+        assert!(!conversion_is_current(&output_path), "a missing file");
+
+        // What an older gnomon wrote: the same rows under no stamp.
+        fs::write(
+            &output_path,
+            "variant_id\teffect_allele\tother_allele\tPGS_STAMP\n1:100\tA\tG\t0.5\n",
+        )
+        .expect("write old conversion");
+        assert!(!conversion_is_current(&output_path));
+
+        reformat_pgs_file(&input_path, &output_path).expect("reformat outcome");
+        assert!(conversion_is_current(&output_path));
     }
 
     /// A catalog file whose rows run in descending position, so conversion must sort.
@@ -1548,7 +1593,7 @@ chr_name\tchr_position\teffect_allele\tother_allele\teffect_weight\thm_chr\thm_p
             assert_eq!(outcome.score_label.as_deref(), Some("PGS_GZ"), "{name}");
             outputs.push(fs::read(&output).expect("read output"));
         }
-        assert_eq!(outputs[0].iter().filter(|&&b| b == b'\n').count(), 50_001);
+        assert_eq!(outputs[0].iter().filter(|&&b| b == b'\n').count(), 50_002);
         for ((name, _), output) in inputs.iter().zip(&outputs).skip(1) {
             assert!(output == &outputs[0], "{name} converted differently");
         }
@@ -1579,7 +1624,10 @@ variant_id\teffect_allele\tother_allele\tSCORE_A\tSCORE_B\n\
             let outcome = reformat_pgs_file(&input, &output).expect("inflate native file");
             assert!(outcome.wrote_output, "{name}");
             assert_eq!(outcome.score_label.as_deref(), Some("SCORE_A"), "{name}");
-            assert_eq!(fs::read_to_string(&output).expect("read output"), native);
+            assert_eq!(
+                fs::read_to_string(&output).expect("read output"),
+                format!("{CONVERSION_STAMP}\n{native}")
+            );
         }
     }
 

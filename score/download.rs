@@ -99,7 +99,8 @@ pub fn resolve_and_download_scores(
         let native_path = scores_dir.join(format!("{id}.gnomon.tsv"));
         let temp_gz_path = scores_dir.join(format!("{id}.txt.gz"));
 
-        if native_path.exists() {
+        // A conversion an older gnomon wrote is converted again, from the download.
+        if reformat::conversion_is_current(&native_path) {
             existing_native_paths.push(native_path);
         } else if temp_gz_path.exists() {
             eprintln!("> Found existing downloaded file for {id}. Skipping download.");
