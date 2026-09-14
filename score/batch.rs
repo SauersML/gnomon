@@ -1500,7 +1500,7 @@ mod tests {
     #[test]
     fn selected_packed_scores_match_scalar_for_gapped_and_unaligned_people() {
         for columns in [1usize, 4, 5, 32, 64] {
-            for people in [64usize, 65, 95, 129] {
+            for people in [64usize, 65, 95, 129, 511, 512, 513, 1025] {
                 for step in [1usize, 3, 17] {
                     let physical_people = people * step + 3;
                     let active = if columns == 1 {
