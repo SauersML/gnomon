@@ -1,0 +1,19 @@
+[package]
+name = "gscore"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Its own workspace root: gnomon's workspace does not include it, so the default
+# build and CI never compile this measurement tool.
+[workspace]
+
+[dependencies]
+ryu = "=1.0.20"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
