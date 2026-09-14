@@ -172,7 +172,7 @@ pub fn score_vcf_streaming(
                 VariantCompression::Bgzf => {
                     let reader: Box<dyn BufRead + Send> = Box::new(PrefilteredBgzfReader::spawn(
                         source,
-                        Arc::clone(&rules_by_key),
+                        Some(Arc::clone(&rules_by_key)),
                     )?);
                     VcfReader::new(reader)
                 }
@@ -194,7 +194,9 @@ pub fn score_vcf_streaming(
         VariantFormat::Bcf => {
             let inner: Box<dyn Read + Send> = match source.compression() {
                 VariantCompression::Plain => Box::new(BufReader::new(source)),
-                VariantCompression::Bgzf => Box::new(noodles_bgzf::io::Reader::new(source)),
+                // BCF records are binary, so no line can be dropped before
+                // noodles parses them; the blocks are still inflated in parallel.
+                VariantCompression::Bgzf => Box::new(PrefilteredBgzfReader::spawn(source, None)?),
             };
             let mut reader = BcfReader::from(inner);
             let header = reader.read_header()?;
@@ -1429,6 +1431,12 @@ const BGZF_MAX_DATA_LEN: usize = 1 << 16;
 const BGZF_FRAMES_PER_WORKER: usize = 64;
 /// Filtered chunks buffered between the inflating thread and the scorer.
 const PREFILTER_CHANNEL_DEPTH: usize = 4;
+/// Blocks inflated per rayon worker when every block is forwarded. A batch is
+/// held inflated until it is sent, so this is smaller than
+/// [`BGZF_FRAMES_PER_WORKER`], whose blocks shrink to their kept lines.
+const BGZF_PASSTHROUGH_FRAMES_PER_WORKER: usize = 16;
+/// Inflated bytes gathered before an unfiltered chunk is sent.
+const PASSTHROUGH_CHUNK_LEN: usize = 4 << 20;
 
 /// A BGZF VCF stream reduced to the lines the native scorer can act on.
 ///
@@ -1443,6 +1451,10 @@ const PREFILTER_CHANNEL_DEPTH: usize = 4;
 /// Bytes that do not form a well-formed BGZF block (plain gzip members,
 /// truncated or corrupt blocks, trailing garbage) hand the rest of the stream,
 /// unfiltered, to `MultiGzDecoder`, which is how the whole stream used to be read.
+///
+/// Without score rules the reader only inflates: every block's bytes pass
+/// unchanged and in order, which gives a BGZF BCF the same parallel
+/// inflation without the line filter that its binary records cannot take.
 struct PrefilteredBgzfReader {
     rx: Option<Receiver<io::Result<Vec<u8>>>>,
     buf: Vec<u8>,
@@ -1452,7 +1464,7 @@ struct PrefilteredBgzfReader {
 }
 
 impl PrefilteredBgzfReader {
-    fn spawn(source: VariantSource, rules_by_key: Arc<ScoreRules>) -> io::Result<Self> {
+    fn spawn(source: VariantSource, rules_by_key: Option<Arc<ScoreRules>>) -> io::Result<Self> {
         let (tx, rx) = crossbeam_channel::bounded(PREFILTER_CHANNEL_DEPTH);
         let producer = thread::Builder::new()
             .name("vcf-bgzf-prefilter".to_string())
@@ -1526,7 +1538,8 @@ impl Drop for PrefilteredBgzfReader {
 /// The producing half of [`PrefilteredBgzfReader`].
 struct BgzfLineFilter {
     source: VariantSource,
-    rules_by_key: Arc<ScoreRules>,
+    /// `None` passes every inflated block through unfiltered.
+    rules_by_key: Option<Arc<ScoreRules>>,
     tx: Sender<io::Result<Vec<u8>>>,
     /// Raw frames of the batch being read, reused across batches.
     frames: Vec<Vec<u8>>,
@@ -1559,7 +1572,7 @@ struct BlockLines {
 impl BgzfLineFilter {
     fn new(
         source: VariantSource,
-        rules_by_key: Arc<ScoreRules>,
+        rules_by_key: Option<Arc<ScoreRules>>,
         tx: Sender<io::Result<Vec<u8>>>,
     ) -> Self {
         Self {
@@ -1572,7 +1585,101 @@ impl BgzfLineFilter {
         }
     }
 
-    fn run(mut self) -> io::Result<()> {
+    fn run(self) -> io::Result<()> {
+        match self.rules_by_key.clone() {
+            Some(rules_by_key) => self.run_filtered(&rules_by_key),
+            None => self.run_passthrough(),
+        }
+    }
+
+    /// Reads up to `batch_len` canonical blocks into `frames`, returning how
+    /// many were read and what stopped the batch short.
+    fn read_batch(&mut self, batch_len: usize) -> io::Result<(usize, Option<FrameRead>)> {
+        let mut count = 0usize;
+        while count < batch_len {
+            if self.frames.len() == count {
+                self.frames.push(Vec::new());
+            }
+            match read_bgzf_frame(&mut self.source, &mut self.frames[count])? {
+                FrameRead::Block => count += 1,
+                other => return Ok((count, Some(other))),
+            }
+        }
+        Ok((count, None))
+    }
+
+    /// Hands the frames from `index` on, plus any irregular bytes that ended
+    /// the batch, to the gzip fallback.
+    fn fall_back_from(
+        mut self,
+        index: usize,
+        count: usize,
+        end: &Option<FrameRead>,
+    ) -> io::Result<()> {
+        let mut consumed = Vec::new();
+        for frame in &self.frames[index..count] {
+            consumed.extend_from_slice(frame);
+        }
+        if matches!(end, Some(FrameRead::Irregular)) {
+            consumed.extend_from_slice(&self.frames[count]);
+        }
+        self.fall_back(consumed)
+    }
+
+    /// Finishes a batch that read every frame it could.
+    fn end_batch(mut self, count: usize, end: Option<FrameRead>) -> io::Result<Option<Self>> {
+        match end {
+            None => {
+                self.flush()?;
+                Ok(Some(self))
+            }
+            Some(FrameRead::Block) => unreachable!("a full frame never ends a batch early"),
+            Some(FrameRead::Eof) => self.finish().map(|()| None),
+            Some(FrameRead::Irregular) => {
+                let consumed = std::mem::take(&mut self.frames[count]);
+                self.fall_back(consumed).map(|()| None)
+            }
+        }
+    }
+
+    /// Inflates the blocks in parallel and forwards their bytes unchanged.
+    fn run_passthrough(mut self) -> io::Result<()> {
+        let batch_len = rayon::current_num_threads().max(1) * BGZF_PASSTHROUGH_FRAMES_PER_WORKER;
+        loop {
+            let (count, end) = self.read_batch(batch_len)?;
+            let blocks: Vec<io::Result<Vec<u8>>> = self.frames[..count]
+                .par_iter()
+                .map_init(Decompressor::new, |decompressor, frame| {
+                    let mut block = Vec::with_capacity(BGZF_MAX_DATA_LEN);
+                    inflate_bgzf_block(frame, decompressor, &mut block)?;
+                    Ok(block)
+                })
+                .collect();
+
+            for (index, result) in blocks.into_iter().enumerate() {
+                match result {
+                    Ok(block) => {
+                        if self.out.capacity() == 0 {
+                            self.out
+                                .reserve(PASSTHROUGH_CHUNK_LEN + BGZF_MAX_DATA_LEN);
+                        }
+                        self.out.extend_from_slice(&block);
+                        if self.out.len() >= PASSTHROUGH_CHUNK_LEN {
+                            self.flush()?;
+                        }
+                    }
+                    Err(_) => return self.fall_back_from(index, count, &end),
+                }
+            }
+
+            match self.end_batch(count, end)? {
+                Some(next) => self = next,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    fn run_filtered(mut self, rules_by_key: &ScoreRules) -> io::Result<()> {
         // The header ends at the first line that does not start with '#'.
         // Header lines and that first record always pass, so dropping records
         // can never pull a later '#' line into the header.
@@ -1596,7 +1703,7 @@ impl BgzfLineFilter {
                 if self.carry[line_start] != b'#' {
                     self.out.extend_from_slice(&self.carry[..scanned]);
                     self.carry.drain(..scanned);
-                    self.filter_carried_lines();
+                    self.filter_carried_lines(rules_by_key);
                     break 'header;
                 }
             }
@@ -1604,22 +1711,7 @@ impl BgzfLineFilter {
 
         let batch_len = rayon::current_num_threads().max(1) * BGZF_FRAMES_PER_WORKER;
         loop {
-            let mut count = 0usize;
-            let mut end = None;
-            while count < batch_len {
-                if self.frames.len() == count {
-                    self.frames.push(Vec::new());
-                }
-                match read_bgzf_frame(&mut self.source, &mut self.frames[count])? {
-                    FrameRead::Block => count += 1,
-                    other => {
-                        end = Some(other);
-                        break;
-                    }
-                }
-            }
-
-            let rules_by_key = &*self.rules_by_key;
+            let (count, end) = self.read_batch(batch_len)?;
             let blocks: Vec<io::Result<BlockLines>> = self.frames[..count]
                 .par_iter()
                 .map_init(
@@ -1633,38 +1725,24 @@ impl BgzfLineFilter {
 
             for (index, result) in blocks.into_iter().enumerate() {
                 match result {
-                    Ok(lines) => self.stitch(lines),
-                    Err(_) => {
-                        let mut consumed = Vec::new();
-                        for frame in &self.frames[index..count] {
-                            consumed.extend_from_slice(frame);
-                        }
-                        if matches!(end, Some(FrameRead::Irregular)) {
-                            consumed.extend_from_slice(&self.frames[count]);
-                        }
-                        return self.fall_back(consumed);
-                    }
+                    Ok(lines) => self.stitch(lines, rules_by_key),
+                    Err(_) => return self.fall_back_from(index, count, &end),
                 }
             }
 
-            match end {
-                None => self.flush()?,
-                Some(FrameRead::Block) => unreachable!("a full frame never ends a batch early"),
-                Some(FrameRead::Eof) => return self.finish(),
-                Some(FrameRead::Irregular) => {
-                    let consumed = std::mem::take(&mut self.frames[count]);
-                    return self.fall_back(consumed);
-                }
+            match self.end_batch(count, end)? {
+                Some(next) => self = next,
+                None => return Ok(()),
             }
         }
     }
 
     /// Filters every complete line in `carry`, leaving only the trailing partial line.
-    fn filter_carried_lines(&mut self) {
+    fn filter_carried_lines(&mut self, rules_by_key: &ScoreRules) {
         let mut line_start = 0usize;
         while let Some(offset) = memchr(b'\n', &self.carry[line_start..]) {
             let line_end = line_start + offset;
-            if !is_skippable_record(&self.carry[line_start..line_end], &self.rules_by_key) {
+            if !is_skippable_record(&self.carry[line_start..line_end], rules_by_key) {
                 self.out
                     .extend_from_slice(&self.carry[line_start..=line_end]);
             }
@@ -1673,14 +1751,14 @@ impl BgzfLineFilter {
         self.carry.drain(..line_start);
     }
 
-    fn stitch(&mut self, lines: BlockLines) {
+    fn stitch(&mut self, lines: BlockLines, rules_by_key: &ScoreRules) {
         if !lines.has_newline {
             self.carry.extend_from_slice(&lines.bytes);
             return;
         }
         self.carry.extend_from_slice(&lines.bytes[..lines.head_len]);
         let line_len = self.carry.len() - 1;
-        if !is_skippable_record(&self.carry[..line_len], &self.rules_by_key) {
+        if !is_skippable_record(&self.carry[..line_len], rules_by_key) {
             self.out.extend_from_slice(&self.carry);
         }
         self.carry.clear();
@@ -2483,13 +2561,46 @@ mod tests {
         )
         .expect("inflate bcf");
 
+        // The same BCF bytes in blocks small enough to span many batches, and
+        // ending in a plain gzip member that the passthrough hands to flate2.
+        let plain_bcf = std::fs::read(&plain_bcf_path).expect("read plain bcf");
+        let mut paths = vec![bcf_path.clone(), plain_bcf_path.clone()];
+        for block_len in [1, 7, 4096] {
+            let path = dir.path().join(format!("cohort.b{block_len}.bcf"));
+            std::fs::write(&path, bgzf_bytes(&plain_bcf, block_len)).expect("write bgzf bcf");
+            paths.push(path);
+        }
+        let split = plain_bcf.len() / 2;
+        let mut mixed = Vec::new();
+        for chunk in plain_bcf[..split].chunks(13) {
+            mixed.extend_from_slice(&bgzf_block(chunk));
+        }
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&plain_bcf[split..]).expect("gzip");
+        mixed.extend_from_slice(&gzip.finish().expect("finish gzip"));
+        let mixed_path = dir.path().join("cohort.mixed.bcf");
+        std::fs::write(&mixed_path, mixed).expect("write mixed bcf");
+        paths.push(mixed_path);
+
         let score = |path: &Path| {
             score_vcf_streaming(path, std::slice::from_ref(&score_path), None, None)
                 .unwrap_or_else(|err| panic!("{}: {err}", path.display()))
         };
         let expected = score(&vcf_path);
         assert!(expected.matched_variants > 0);
-        for path in [&bcf_path, &plain_bcf_path] {
+
+        let mut corrupt: Vec<Vec<u8>> = plain_bcf.chunks(64).map(bgzf_block).collect();
+        let middle = corrupt.len() / 2;
+        let crc_offset = corrupt[middle].len() - BGZF_TRAILER_LEN;
+        corrupt[middle][crc_offset] ^= 0xff;
+        let corrupt_path = dir.path().join("cohort.corrupt.bcf");
+        std::fs::write(&corrupt_path, corrupt.concat()).expect("write corrupt bcf");
+        assert!(
+            score_vcf_streaming(&corrupt_path, std::slice::from_ref(&score_path), None, None)
+                .is_err()
+        );
+
+        for path in &paths {
             let actual = score(path);
             assert_same_native_result(&expected, &actual, &path.display().to_string());
             assert_eq!(
