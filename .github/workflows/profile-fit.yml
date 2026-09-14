@@ -121,7 +121,7 @@ jobs:
           CARGO_INCREMENTAL: 0
         run: |
           set -euxo pipefail
-          cargo +nightly build --profile profiling --features no-inline-profiling
+          cargo +nightly build --profile profiling --bin gnomon
 
       - name: Profile gnomon fit workload (30 min max, disk-friendly)
         env:
