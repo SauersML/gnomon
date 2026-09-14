@@ -131,6 +131,7 @@
 //! exactly what the ceiling would have: `converged = false`, the residual, the
 //! subspace change and the gap.
 
+use super::partitioned::{gram_rows, mul_rows, self_adjoint_eigen_seq};
 use faer::linalg::matmul::matmul;
 use faer::prelude::{IntoConst, Reborrow, ReborrowMut};
 use faer::{Accum, Mat, MatMut, MatRef, Par, Side};
@@ -395,11 +396,14 @@ enum PreviousTop {
 }
 
 /// Top-`k` eigenpairs of `op` by adaptive randomized block Lanczos.
+///
+/// Every product over the sample dimension runs on fixed row leaves (see
+/// [`super::partitioned`]) and every projected-size product sequentially, so
+/// the answer is the same bits at any thread count.
 pub fn block_krylov_eigen<Op: BlockOperator>(
     op: &Op,
     k: usize,
     params: BlockKrylovParams,
-    par: Par,
 ) -> Result<BlockKrylovOutcome, BlockKrylovError<Op::Error>> {
     let n = op.dim();
     if n == 0 || k == 0 {
@@ -437,7 +441,7 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
     let mut best: Option<BlockKrylovOutcome> = None;
 
     let mut start = random_start_block(n, width, params.seed);
-    orthonormalize(start.as_mut(), None, par);
+    orthonormalize(start.as_mut(), None);
     let factor_rows = op.factor_rows();
 
     'restart: loop {
@@ -539,21 +543,13 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
             for _ in 0..2 {
                 for (i, retained) in blocks.iter().enumerate() {
                     let mut coeff = Mat::<f64>::zeros(width, width);
-                    matmul(
-                        coeff.as_mut(),
-                        Accum::Replace,
-                        retained.as_ref().transpose(),
-                        z.as_ref(),
-                        1.0,
-                        par,
-                    );
-                    matmul(
+                    gram_rows(coeff.as_mut(), retained.as_ref(), z.as_ref());
+                    mul_rows(
                         z.as_mut(),
                         Accum::Add,
                         retained.as_ref(),
                         coeff.as_ref(),
                         -1.0,
-                        par,
                     );
                     let row_base = i * width;
                     for c in 0..width {
@@ -568,7 +564,7 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
             // Q_{j+1} B_j = qr(Z). The new block extends the Krylov basis that
             // the Ritz vectors are expressed in, so it must be retained.
             let mut beta = Mat::<f64>::zeros(width, width);
-            let rank = orthonormalize(z.as_mut(), Some(beta.as_mut()), par);
+            let rank = orthonormalize(z.as_mut(), Some(beta.as_mut()));
             // `B_j` couples block `j` to block `j+1`. It is outside the window
             // the *current* Rayleigh–Ritz sees — that is exactly why it carries
             // the residual — and becomes an interior entry at the next step, so
@@ -609,15 +605,8 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
             };
 
             // Residuals from the projection alone — no extra genome pass.
-            let residuals = ritz_residuals(
-                window,
-                &theta,
-                beta.as_ref(),
-                s.as_ref(),
-                certified,
-                width,
-                par,
-            );
+            let residuals =
+                ritz_residuals(window, &theta, beta.as_ref(), s.as_ref(), certified, width);
             let relative: Vec<f64> = residuals
                 .iter()
                 .enumerate()
@@ -658,7 +647,7 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
                         .as_ref()
                         .subcols(0, shared_cols)
                         .subrows(0, *prior_dim);
-                    1.0 - mev(prior.as_ref().subcols(0, shared_cols), shared, par)
+                    1.0 - mev(prior.as_ref().subcols(0, shared_cols), shared)
                 }
                 PreviousTop::Lifted(prior) if prior.ncols() > 0 => {
                     let shared_cols = prior.ncols().min(certified);
@@ -668,9 +657,8 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
                         shared_cols,
                         width,
                         n,
-                        par,
                     );
-                    1.0 - mev(prior.as_ref().subcols(0, shared_cols), lifted.as_ref(), par)
+                    1.0 - mev(prior.as_ref().subcols(0, shared_cols), lifted.as_ref())
                 }
                 // Only the first iteration has nothing to compare against.
                 _ => f64::INFINITY,
@@ -708,7 +696,7 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
             };
 
             if converged || exhausted {
-                let (outcome, _) = finish(&blocks, images.as_deref(), &current, width, n, restarts, par);
+                let (outcome, _) = finish(&blocks, images.as_deref(), &current, width, n, restarts);
                 return Ok(outcome);
             }
 
@@ -722,12 +710,12 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
                 && boundary_gap.is_some_and(|gap| gap < params.cluster_gap)
                 && width < width_cap
             {
-                let (outcome, retained) = finish(&blocks, images.as_deref(), &current, width, n, restarts, par);
+                let (outcome, retained) = finish(&blocks, images.as_deref(), &current, width, n, restarts);
                 previous = PreviousTop::Lifted(leading_columns(&retained, current.certified));
                 best = Some(outcome);
                 widened = true;
                 width = (width + width.div_ceil(2)).min(width_cap);
-                start = restart_block(&retained, n, width, params.seed, restarts, par);
+                start = restart_block(&retained, n, width, params.seed, restarts);
                 restarts += 1;
                 continue 'restart;
             }
@@ -739,8 +727,7 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
                 && params.stop_when_unresolvable
                 && boundary_unresolvable(&boundary_history, &relative, &theta, output, passes, &params)
             {
-                let (outcome, _) =
-                    finish(&blocks, images.as_deref(), &current, width, n, restarts, par);
+                let (outcome, _) = finish(&blocks, images.as_deref(), &current, width, n, restarts);
                 return Ok(outcome);
             }
 
@@ -752,10 +739,10 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
                 // it, so what the basis had converged is kept rather than
                 // regenerated from the same deterministic padding.
                 let current = stage.take().expect("stage was set immediately above");
-                let (outcome, retained) = finish(&blocks, images.as_deref(), &current, width, n, restarts, par);
+                let (outcome, retained) = finish(&blocks, images.as_deref(), &current, width, n, restarts);
                 previous = PreviousTop::Lifted(leading_columns(&retained, current.certified));
                 best = Some(outcome);
-                start = restart_block(&retained, n, width, params.seed, restarts, par);
+                start = restart_block(&retained, n, width, params.seed, restarts);
                 restarts += 1;
                 continue 'restart;
             }
@@ -764,7 +751,7 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
         // The pass ceiling stopped the depth loop. The basis is still alive
         // here and about to be dropped, so this is the last chance to lift.
         if let Some(current) = stage.as_ref() {
-            let (outcome, _) = finish(&blocks, images.as_deref(), current, width, n, restarts, par);
+            let (outcome, _) = finish(&blocks, images.as_deref(), current, width, n, restarts);
             best = Some(outcome);
         }
         break;
@@ -791,10 +778,9 @@ fn finish(
     width: usize,
     n: usize,
     restarts: usize,
-    par: Par,
 ) -> (BlockKrylovOutcome, Mat<f64>) {
     let guard = stage.coefficients.ncols();
-    let retained = lift_ritz_vectors(blocks, stage.coefficients.as_ref(), guard, width, n, par);
+    let retained = lift_ritz_vectors(blocks, stage.coefficients.as_ref(), guard, width, n);
     let vectors = leading_columns(&retained, stage.output);
     let factor_products = images.and_then(|images| {
         debug_assert_eq!(images.len() * width, stage.coefficients.nrows());
@@ -805,7 +791,6 @@ fn finish(
                 stage.output,
                 width,
                 first.nrows(),
-                par,
             )
         })
     });
@@ -992,7 +977,6 @@ fn restart_block(
     width: usize,
     seed: u64,
     restart_index: usize,
-    par: Par,
 ) -> Mat<f64> {
     let carried = retained.ncols().min(width);
     let mut block = Mat::<f64>::zeros(n, width);
@@ -1015,7 +999,7 @@ fn restart_block(
             }
         }
     }
-    orthonormalize(block.as_mut(), None, par);
+    orthonormalize(block.as_mut(), None);
     block
 }
 
@@ -1065,7 +1049,7 @@ fn remove_constant_direction(mut block: MatMut<'_, f64>) {
 /// The collapse threshold is relative to the block's own largest column. `Z` is
 /// `C·Q` and carries the operator's units, so a fixed absolute threshold
 /// quietly changes meaning when the covariance is rescaled.
-fn orthonormalize(mut block: MatMut<'_, f64>, mut r: Option<MatMut<'_, f64>>, par: Par) -> usize {
+fn orthonormalize(mut block: MatMut<'_, f64>, mut r: Option<MatMut<'_, f64>>) -> usize {
     let n = block.nrows();
     let width = block.ncols();
     if let Some(r) = r.as_mut() {
@@ -1097,15 +1081,8 @@ fn orthonormalize(mut block: MatMut<'_, f64>, mut r: Option<MatMut<'_, f64>>, pa
                 let (done, current) = block.rb_mut().split_at_col_mut(start);
                 let done = done.into_const();
                 let mut current = current.subcols_mut(0, panel);
-                matmul(
-                    coeff.as_mut(),
-                    Accum::Replace,
-                    done.transpose(),
-                    current.rb(),
-                    1.0,
-                    par,
-                );
-                matmul(current.rb_mut(), Accum::Add, done, coeff.as_ref(), -1.0, par);
+                gram_rows(coeff.as_mut(), done, current.rb());
+                mul_rows(current.rb_mut(), Accum::Add, done, coeff.as_ref(), -1.0);
                 if let Some(r) = r.as_mut() {
                     for c in 0..panel {
                         for p in 0..start {
@@ -1213,11 +1190,10 @@ fn symmetric_part(h: MatRef<'_, f64>) -> Mat<f64> {
 }
 
 fn dense_eigen_desc<E>(mat: MatRef<'_, f64>) -> Result<(Vec<f64>, Mat<f64>), BlockKrylovError<E>> {
-    let eig = mat
-        .self_adjoint_eigen(Side::Lower)
+    let (values, vectors) = self_adjoint_eigen_seq(mat, Side::Lower)
         .map_err(|err| BlockKrylovError::Eigen(format!("{err:?}")))?;
-    let values = eig.S();
-    let vectors = eig.U();
+    let values = values.as_ref();
+    let vectors = vectors.as_ref();
     let dim = mat.nrows();
 
     let mut order: Vec<usize> = (0..dim).collect();
@@ -1280,7 +1256,6 @@ fn ritz_residuals(
     s: MatRef<'_, f64>,
     keep: usize,
     width: usize,
-    par: Par,
 ) -> Vec<f64> {
     let dim = s.nrows();
     if keep == 0 {
@@ -1293,7 +1268,7 @@ fn ritz_residuals(
 
     // Interior: ‖H s − θ s‖, i.e. ‖(H − T) s‖.
     let mut interior = Mat::<f64>::zeros(dim, keep);
-    matmul(interior.as_mut(), Accum::Replace, h, s_keep, 1.0, par);
+    matmul(interior.as_mut(), Accum::Replace, h, s_keep, 1.0, Par::Seq);
     for col in 0..keep {
         let value = theta[col];
         for row in 0..dim {
@@ -1309,7 +1284,7 @@ fn ritz_residuals(
         beta,
         s_keep.subrows(dim - width, width),
         1.0,
-        par,
+        Par::Seq,
     );
 
     (0..keep)
@@ -1334,7 +1309,6 @@ fn lift_ritz_vectors(
     keep: usize,
     width: usize,
     n: usize,
-    par: Par,
 ) -> Mat<f64> {
     let mut out = Mat::<f64>::zeros(n, keep);
     for (j, block) in blocks.iter().enumerate() {
@@ -1350,7 +1324,7 @@ fn lift_ritz_vectors(
             }
         }
         let block_view = block.as_ref().subcols(0, rows);
-        matmul(out.as_mut(), Accum::Add, block_view, coeff.as_ref(), 1.0, par);
+        mul_rows(out.as_mut(), Accum::Add, block_view, coeff.as_ref(), 1.0);
     }
     out
 }
@@ -1364,20 +1338,13 @@ fn lift_ritz_vectors(
 /// Both arguments may be coefficient matrices rather than sample-space ones:
 /// for `U = K S` with `K` orthonormal and shared, `U_prevᵀ U = S_prevᵀ S`, so
 /// the same number comes out of a projected-size product.
-fn mev(previous: MatRef<'_, f64>, current: MatRef<'_, f64>, par: Par) -> f64 {
+fn mev(previous: MatRef<'_, f64>, current: MatRef<'_, f64>) -> f64 {
     let k = current.ncols();
     if k == 0 {
         return 1.0;
     }
     let mut overlap = Mat::<f64>::zeros(previous.ncols(), k);
-    matmul(
-        overlap.as_mut(),
-        Accum::Replace,
-        previous.transpose(),
-        current,
-        1.0,
-        par,
-    );
+    gram_rows(overlap.as_mut(), previous, current);
     let mut total = 0.0;
     for col in 0..overlap.ncols() {
         for row in 0..overlap.nrows() {
@@ -1561,7 +1528,7 @@ mod tests {
             // this early in a run are not accurate enough to make the default
             // cluster test reproducible, and that is not what is under test here.
             params.cluster_gap = 0.0;
-            let outcome = block_krylov_eigen(&op, k, params, Par::Seq).expect("solver runs");
+            let outcome = block_krylov_eigen(&op, k, params).expect("solver runs");
 
             assert_eq!(outcome.passes, budget);
             assert_eq!(outcome.certified_components, k, "no cluster at this boundary");
@@ -1581,13 +1548,85 @@ mod tests {
     }
 
     #[test]
+    fn solver_output_does_not_depend_on_the_thread_count() {
+        // Wide enough that the Gram-Schmidt products split into several row
+        // leaves, so the comparison exercises the partitioned kernels.
+        let n = 20_000;
+        let k = 6;
+        let params = BlockKrylovParams::auto(k, n, 1 << 30);
+        let width = params.block_width;
+        assert!(
+            n.div_ceil(crate::map::partitioned::leaf_rows(n, width * width)) > 1,
+            "the fixture must split its products into several leaves"
+        );
+        let op = reflected(geometric(n, 0.8, 1.0), 21);
+        let run = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool")
+                .install(|| block_krylov_eigen(&op, k, params).expect("solver runs"))
+        };
+        let same_bits = |lhs: &Mat<f64>, rhs: &Mat<f64>| {
+            lhs.nrows() == rhs.nrows()
+                && lhs.ncols() == rhs.ncols()
+                && (0..lhs.ncols()).all(|col| {
+                    (0..lhs.nrows())
+                        .all(|row| lhs[(row, col)].to_bits() == rhs[(row, col)].to_bits())
+                })
+        };
+
+        let serial = run(1);
+        for threads in [2, 3, 8] {
+            let parallel = run(threads);
+            assert_eq!(
+                serial.passes, parallel.passes,
+                "passes at {threads} threads"
+            );
+            assert_eq!(
+                serial.restarts, parallel.restarts,
+                "restarts at {threads} threads"
+            );
+            assert_eq!(
+                serial.max_relative_residual.to_bits(),
+                parallel.max_relative_residual.to_bits(),
+                "residual at {threads} threads"
+            );
+            assert_eq!(
+                serial.subspace_delta.to_bits(),
+                parallel.subspace_delta.to_bits(),
+                "subspace delta at {threads} threads"
+            );
+            assert!(
+                serial
+                    .values
+                    .iter()
+                    .zip(&parallel.values)
+                    .all(|(lhs, rhs)| lhs.to_bits() == rhs.to_bits()),
+                "values at {threads} threads"
+            );
+            assert!(
+                same_bits(&serial.vectors, &parallel.vectors),
+                "vectors at {threads} threads"
+            );
+            match (&serial.factor_products, &parallel.factor_products) {
+                (Some(lhs), Some(rhs)) => {
+                    assert!(same_bits(lhs, rhs), "factor products at {threads} threads")
+                }
+                (None, None) => {}
+                _ => panic!("factor products present at one thread count only"),
+            }
+        }
+    }
+
+    #[test]
     fn recovers_a_well_separated_spectrum() {
         let n = 1500;
         let spectrum = geometric(n, 0.75, 1.0);
         let op = reflected(spectrum.clone(), 11);
 
         let params = BlockKrylovParams::auto(8, n, 1 << 30);
-        let outcome = block_krylov_eigen(&op, 8, params, Par::Seq).expect("solver runs");
+        let outcome = block_krylov_eigen(&op, 8, params).expect("solver runs");
 
         assert!(outcome.converged, "solver should converge on a clean gap");
         assert_eq!(outcome.vectors.ncols(), 8);
@@ -1604,7 +1643,7 @@ mod tests {
         let op = reflected(spectrum.clone(), 12);
 
         let params = BlockKrylovParams::auto(10, n, 1 << 30);
-        let outcome = block_krylov_eigen(&op, 10, params, Par::Seq).expect("solver runs");
+        let outcome = block_krylov_eigen(&op, 10, params).expect("solver runs");
 
         assert!(outcome.converged);
         // The whole point: the block is 18 wide, so six passes stand in for a
@@ -1640,7 +1679,7 @@ mod tests {
         // eigenspace is certified across the eigenspace, not the calibration of
         // the threshold that recognizes one.
         params.cluster_gap = 1e-2;
-        let outcome = block_krylov_eigen(&op, 5, params, Par::Seq).expect("solver runs");
+        let outcome = block_krylov_eigen(&op, 5, params).expect("solver runs");
 
         assert!(
             outcome.truncation_splits_cluster,
@@ -1687,7 +1726,7 @@ mod tests {
         // cluster is decided by the spectrum rather than by how far the Ritz
         // values have converged.
         params.cluster_gap = 1e-2;
-        let outcome = block_krylov_eigen(&op, 6, params, Par::Seq).expect("solver runs");
+        let outcome = block_krylov_eigen(&op, 6, params).expect("solver runs");
 
         assert!(outcome.truncation_splits_cluster);
         assert!(
@@ -1712,7 +1751,7 @@ mod tests {
         let op = reflected(spectrum.clone(), 16);
 
         let params = BlockKrylovParams::auto(8, n, 1 << 30);
-        let outcome = block_krylov_eigen(&op, 8, params, Par::Seq).expect("solver runs");
+        let outcome = block_krylov_eigen(&op, 8, params).expect("solver runs");
 
         if outcome.converged {
             assert_values_match(&outcome.values, &spectrum, 1e-4);
@@ -1743,7 +1782,7 @@ mod tests {
         // first restart, so this run exercises the restart path deterministically.
         params.min_passes = 4;
         params.max_passes = 16;
-        let outcome = block_krylov_eigen(&op, 6, params, Par::Seq).expect("solver runs");
+        let outcome = block_krylov_eigen(&op, 6, params).expect("solver runs");
 
         assert!(outcome.restarts >= 1, "the budget should have forced a restart");
         assert!(
@@ -1799,7 +1838,7 @@ mod tests {
         let op = reflected(geometric(n, 0.85, 1.0), 14);
 
         let params = BlockKrylovParams::auto(k, n, 1 << 30);
-        let outcome = block_krylov_eigen(&op, k, params, Par::Seq).expect("solver runs");
+        let outcome = block_krylov_eigen(&op, k, params).expect("solver runs");
         assert!(outcome.converged);
         assert_eq!(outcome.restarts, 0);
         assert_factor_products_match(&op, &outcome);
@@ -1819,7 +1858,7 @@ mod tests {
         let mut params = BlockKrylovParams::auto(k, n, 1 << 30);
         params.block_width = 400;
         params.min_passes = 4;
-        let outcome = block_krylov_eigen(&op, k, params, Par::Seq).expect("solver runs");
+        let outcome = block_krylov_eigen(&op, k, params).expect("solver runs");
         assert!(outcome.restarts >= 1, "the dense ceiling should have forced a restart");
         assert!(outcome.converged);
         assert_factor_products_match(&op, &outcome);
@@ -1854,8 +1893,8 @@ mod tests {
         let op = reflected(geometric(n, 0.9, 1.0), 15);
         let params = BlockKrylovParams::auto(4, n, 1 << 30);
 
-        let factored = block_krylov_eigen(&op, 4, params, Par::Seq).expect("factored run");
-        let plain = block_krylov_eigen(&Unfactored(&op), 4, params, Par::Seq).expect("plain run");
+        let factored = block_krylov_eigen(&op, 4, params).expect("factored run");
+        let plain = block_krylov_eigen(&Unfactored(&op), 4, params).expect("plain run");
 
         assert!(factored.factor_products.is_some());
         assert!(plain.factor_products.is_none());
@@ -1891,7 +1930,7 @@ mod tests {
         let op = reflected(axes_over_a_flat_bulk(n), 23);
         let params = BlockKrylovParams::auto(k, n, 1 << 30);
 
-        let early = block_krylov_eigen(&op, k, params, Par::Seq).expect("solver runs");
+        let early = block_krylov_eigen(&op, k, params).expect("solver runs");
         assert!(!early.converged);
         assert!(
             early.passes < params.max_passes,
@@ -1919,13 +1958,13 @@ mod tests {
         // the rule switched off, and without it this fit runs to the ceiling.
         let mut unstopped = params;
         unstopped.stop_when_unresolvable = false;
-        let full = block_krylov_eigen(&op, k, unstopped, Par::Seq).expect("unstopped run");
+        let full = block_krylov_eigen(&op, k, unstopped).expect("unstopped run");
         assert!(!full.converged);
         assert_eq!(full.passes, params.max_passes);
 
         let mut capped = unstopped;
         capped.max_passes = early.passes;
-        let ceiling = block_krylov_eigen(&op, k, capped, Par::Seq).expect("capped run");
+        let ceiling = block_krylov_eigen(&op, k, capped).expect("capped run");
         assert!(!ceiling.converged);
         assert_eq!(ceiling.passes, early.passes);
         assert_eq!(ceiling.restarts, early.restarts);
@@ -1955,7 +1994,7 @@ mod tests {
         let op = reflected(spectrum, 29);
         let params = BlockKrylovParams::auto(6, n, 1 << 30);
 
-        let outcome = block_krylov_eigen(&op, 6, params, Par::Seq).expect("solver runs");
+        let outcome = block_krylov_eigen(&op, 6, params).expect("solver runs");
         assert!(
             outcome.converged,
             "stopped unconverged after {} passes, residual {:.3e}",
@@ -1980,7 +2019,7 @@ mod tests {
         let op = reflected(spectrum.clone(), 27);
 
         let params = BlockKrylovParams::auto(3, n, 1 << 30);
-        let outcome = block_krylov_eigen(&op, 3, params, Par::Seq).expect("solver runs");
+        let outcome = block_krylov_eigen(&op, 3, params).expect("solver runs");
 
         assert!(outcome.converged, "an invariant subspace is a complete answer");
         assert!(
@@ -1998,7 +2037,7 @@ mod tests {
         let op = reflected(geometric(n, 0.85, 1.0), 14);
 
         let params = BlockKrylovParams::auto(k, n, 1 << 30);
-        let outcome = block_krylov_eigen(&op, k, params, Par::Seq).expect("solver runs");
+        let outcome = block_krylov_eigen(&op, k, params).expect("solver runs");
         assert!(outcome.converged);
         let u = &outcome.vectors;
 
@@ -2015,7 +2054,7 @@ mod tests {
 
         // Eigenvalues can be right while the subspace is wrong, so check the
         // subspace directly against the operator's exact eigenvectors.
-        let overlap = mev(op.exact_basis(k).as_ref(), u.as_ref(), Par::Seq);
+        let overlap = mev(op.exact_basis(k).as_ref(), u.as_ref());
         assert!(
             1.0 - overlap < 1e-8,
             "recovered subspace differs from the exact one: 1-MEV = {}",
@@ -2042,7 +2081,7 @@ mod tests {
         let original = block.clone();
 
         let mut r = Mat::<f64>::zeros(width, width);
-        let rank = orthonormalize(block.as_mut(), Some(r.as_mut()), Par::Seq);
+        let rank = orthonormalize(block.as_mut(), Some(r.as_mut()));
         assert_eq!(rank, width - 2, "both duplicates must be reported as collapsed");
 
         for col in [5usize, 13] {
@@ -2155,7 +2194,7 @@ mod tests {
         let op = reflected(geometric(600, 0.86, 1.0), 41);
 
         let params = BlockKrylovParams::auto(8, op.dim(), 1 << 30);
-        let outcome = block_krylov_eigen(&op, 8, params, Par::Seq).expect("solver runs");
+        let outcome = block_krylov_eigen(&op, 8, params).expect("solver runs");
 
         assert!(
             outcome.subspace_delta.is_finite(),
@@ -2181,8 +2220,8 @@ mod tests {
         params.min_passes = 4;
         params.max_passes = 10;
 
-        let first = block_krylov_eigen(&op, 4, params, Par::Seq).expect("first run");
-        let second = block_krylov_eigen(&op, 4, params, Par::Seq).expect("second run");
+        let first = block_krylov_eigen(&op, 4, params).expect("first run");
+        let second = block_krylov_eigen(&op, 4, params).expect("second run");
 
         assert!(first.restarts >= 1, "this run should exercise the restart path");
         assert_eq!(first.passes, second.passes);
@@ -2207,7 +2246,7 @@ mod tests {
         let n = 600;
         let op = reflected(vec![0.0; n], 31);
         let params = BlockKrylovParams::auto(4, n, 1 << 30);
-        let outcome = block_krylov_eigen(&op, 4, params, Par::Seq).expect("solver runs");
+        let outcome = block_krylov_eigen(&op, 4, params).expect("solver runs");
 
         assert!(outcome.converged);
         assert!(!outcome.truncation_splits_cluster);

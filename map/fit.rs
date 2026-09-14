@@ -1,4 +1,5 @@
 use super::blocklanczos::{BlockKrylovError, BlockKrylovParams, BlockOperator, block_krylov_eigen};
+use super::partitioned::{gram_rows, mul_rows, self_adjoint_eigen_seq};
 use super::progress::{
     FitProgressObserver, FitProgressStage, NoopFitProgress, StageProgressHandle,
 };
@@ -20,10 +21,7 @@ use faer::matrix_free::eigen::{
     PartialEigenParams, partial_eigen_scratch, partial_self_adjoint_eigen,
 };
 use faer::prelude::ReborrowMut;
-use faer::{
-    Accum, ColMut, Conj, Mat, MatMut, MatRef, Par, Side, get_global_parallelism,
-    set_global_parallelism, unzip, zip,
-};
+use faer::{Accum, ColMut, Conj, Mat, MatMut, MatRef, Par, Side, unzip, zip};
 use rayon::prelude::*;
 use serde::de::Error as DeError;
 use serde::ser::SerializeStruct;
@@ -1077,29 +1075,6 @@ struct SendPtr(*mut f64);
 // owned, and channel coordination guarantees that at most one thread accesses a
 // given buffer at a time.
 unsafe impl Send for SendPtr {}
-
-struct ParallelismGuard {
-    previous: Par,
-}
-
-impl ParallelismGuard {
-    fn new() -> Self {
-        let previous = get_global_parallelism();
-        let desired = Par::rayon(rayon::current_num_threads());
-        set_global_parallelism(desired);
-        Self { previous }
-    }
-
-    fn active_parallelism(&self) -> Par {
-        get_global_parallelism()
-    }
-}
-
-impl Drop for ParallelismGuard {
-    fn drop(&mut self) {
-        set_global_parallelism(self.previous);
-    }
-}
 
 #[derive(Debug)]
 struct OperatorError;
@@ -3266,8 +3241,10 @@ impl HwePcaModel {
             ));
         }
 
-        let parallelism_guard = ParallelismGuard::new();
-        let par = parallelism_guard.active_parallelism();
+        // Chooses between serial and rayon loops, and nothing else: every faer
+        // kernel below runs sequentially or on fixed row leaves, so no answer
+        // depends on how many threads there are.
+        let par = Par::rayon(rayon::current_num_threads());
         let block_capacity =
             adaptive_block_capacity(source.block_storage_samples(), n_variants_hint);
         let ld_hint = if n_variants_hint > 0 {
@@ -3354,11 +3331,11 @@ impl HwePcaModel {
                     )?;
 
                 // Decompose the dense covariance matrix
-                let eig_result = covariance.as_ref().self_adjoint_eigen(Side::Upper);
+                let eig_result = self_adjoint_eigen_seq(covariance.as_ref(), Side::Upper);
                 let decomposition = match eig_result {
-                    Ok(eig) => {
-                        let eigenvalues_diag = eig.S();
-                        let eigenvectors_mat = eig.U();
+                    Ok((eigenvalues, eigenvectors)) => {
+                        let eigenvalues_diag = eigenvalues.as_ref();
+                        let eigenvectors_mat = eigenvectors.as_ref();
                         let n_eig = eigenvalues_diag.dim();
 
                         // Only retain genuinely positive eigenvalues. Rank-deficient
@@ -3543,13 +3520,10 @@ impl HwePcaModel {
                 progress.on_stage_start(FitProgressStage::Loadings, variant_count);
                 let width = cross_products.ncols();
                 let mut restricted_gram = Mat::zeros(width, width);
-                matmul(
+                gram_rows(
                     restricted_gram.as_mut(),
-                    Accum::Replace,
-                    cross_products.as_ref().transpose(),
                     cross_products.as_ref(),
-                    1.0,
-                    par,
+                    cross_products.as_ref(),
                 );
                 progress.on_stage_advance(FitProgressStage::Loadings, variant_count);
                 progress.on_stage_finish(FitProgressStage::Loadings);
@@ -3601,16 +3575,11 @@ impl HwePcaModel {
         let diagnostics = decomposition.diagnostics;
         let refined = Eigenpairs {
             values: eigenvalues,
-            vectors: rotate_columns(
-                decomposition.vectors,
-                rotation.as_ref(),
-                block_capacity,
-                par,
-            ),
+            vectors: rotate_columns(decomposition.vectors, rotation.as_ref(), block_capacity),
             diagnostics,
             factor_products: None,
         };
-        loadings = rotate_columns(loadings, rotation.as_ref(), block_capacity, par);
+        loadings = rotate_columns(loadings, rotation.as_ref(), block_capacity);
 
         // σ_i = √((n−1)·λ_i) and scores = U·Σ, both read off the refined
         // eigenvalues, so `λ_i = σ_i²/(n−1)` holds for the quantities stored
@@ -4057,7 +4026,7 @@ where
         // anywhere in it; what it buys is never materializing an f64 tile, and
         // that only pays while there are a handful of columns to project. The
         // general path below decodes a tile and hands it to faer's `matmul`
-        // with `par`, which is parallel across every core.
+        // on fixed row leaves, which are parallel across every core.
         //
         // Past a few columns the trade reverses decisively: a block solver
         // asking for ~30 columns would run 30× the per-pass work on one core
@@ -4256,14 +4225,7 @@ where
 
                         let mut proj_block = proj_storage.rb_mut().subrows_mut(0, filled);
 
-                        matmul(
-                            proj_block.as_mut(),
-                            Accum::Replace,
-                            block.as_ref().transpose(),
-                            rhs,
-                            1.0,
-                            par,
-                        );
+                        gram_rows(proj_block.as_mut(), block.as_ref(), rhs);
 
                         if let Some(factor) = factor.as_mut() {
                             factor
@@ -4272,13 +4234,12 @@ where
                                 .copy_from(proj_block.as_ref());
                         }
 
-                        matmul(
+                        mul_rows(
                             out.rb_mut(),
                             Accum::Add,
                             block.as_ref(),
                             proj_block.as_ref(),
                             scale,
-                            par,
                         );
 
                         processed = start + filled;
@@ -4339,8 +4300,8 @@ impl<'a> LinOp<f64> for DenseSymmetricOp<'a> {
         self.matrix.ncols()
     }
 
-    fn apply(&self, mut out: MatMut<'_, f64>, rhs: MatRef<'_, f64>, par: Par, _: &mut MemStack) {
-        matmul(out.rb_mut(), Accum::Replace, self.matrix, rhs, 1.0, par);
+    fn apply(&self, mut out: MatMut<'_, f64>, rhs: MatRef<'_, f64>, _: Par, _: &mut MemStack) {
+        mul_rows(out.rb_mut(), Accum::Replace, self.matrix, rhs, 1.0);
     }
 
     fn conj_apply(
@@ -4534,7 +4495,7 @@ where
     };
 
     let outcome =
-        block_krylov_eigen(&block_operator, requested, params, par).map_err(|err| match err {
+        block_krylov_eigen(&block_operator, requested, params).map_err(|err| match err {
             BlockKrylovError::Operator(inner) => inner,
             other => HwePcaError::Eigen(other.to_string()),
         })?;
@@ -4625,12 +4586,13 @@ where
     }
 
     if n <= DENSE_EIGEN_FALLBACK_THRESHOLD || top_k + 8 >= n {
-        let eig = covariance.self_adjoint_eigen(Side::Lower).map_err(|err| {
-            HwePcaError::Eigen(format!("dense eigendecomposition failed: {err:?}"))
-        })?;
+        let (values, vectors) =
+            self_adjoint_eigen_seq(covariance.as_ref(), Side::Lower).map_err(|err| {
+                HwePcaError::Eigen(format!("dense eigendecomposition failed: {err:?}"))
+            })?;
 
-        let diag = eig.S();
-        let basis = eig.U();
+        let diag = values.as_ref();
+        let basis = vectors.as_ref();
 
         let positive = (0..n).filter(|&i| diag[i] > EIGENVALUE_EPSILON).count();
 
@@ -4681,7 +4643,7 @@ where
         let params = partial_solver_params(n, target);
         let mut eigvecs = Mat::zeros(n, target);
         let mut eigvals = vec![0.0f64; target];
-        let scratch = partial_eigen_scratch(&op, params.max_dim, par, params);
+        let scratch = partial_eigen_scratch(&op, params.max_dim, Par::Seq, params);
         let mut mem = MemBuffer::new(scratch);
         let info = {
             let stack = MemStack::new(&mut mem);
@@ -4691,7 +4653,7 @@ where
                 &op,
                 v0.as_ref(),
                 f64::EPSILON * 128.0,
-                par,
+                Par::Seq,
                 stack,
                 params,
             )
@@ -4956,7 +4918,7 @@ where
                         block_ref.transpose(),
                         triangular_matmul::BlockStructure::Rectangular,
                         1.0,
-                        par,
+                        Par::Seq,
                     );
 
                     processed = start + filled;
@@ -5520,13 +5482,12 @@ where
 
         // Step 5: Accumulate covariance using optimized GEMM
         // Cov += Block × Block^T
-        matmul(
+        mul_rows(
             covariance.as_mut(),
             Accum::Add,
             block.as_ref(),
             block.as_ref().transpose(),
             1.0,
-            par,
         );
 
         processed += filled;
@@ -6893,13 +6854,12 @@ fn rayleigh_ritz_rotation(
     n_samples: usize,
 ) -> Result<(Vec<f64>, Mat<f64>), HwePcaError> {
     let width = restricted_gram.ncols();
-    let eig = restricted_gram
-        .self_adjoint_eigen(Side::Lower)
-        .map_err(|err| {
+    let (values, vectors) =
+        self_adjoint_eigen_seq(restricted_gram, Side::Lower).map_err(|err| {
             HwePcaError::Eigen(format!("Rayleigh-Ritz eigendecomposition failed: {err:?}"))
         })?;
-    let diag = eig.S();
-    let basis = eig.U();
+    let diag = values.as_ref();
+    let basis = vectors.as_ref();
 
     // The fit rejects cohorts smaller than two samples long before this runs;
     // the floor is here only so the reciprocal is always defined.
@@ -6939,12 +6899,7 @@ fn rayleigh_ritz_rotation(
 /// `rotation.ncols()` is stale afterwards and the narrowing copy at the end
 /// discards it. `row_chunk` is a blocking granularity and nothing more — any
 /// positive value gives the same answer up to summation order inside the GEMM.
-fn rotate_columns(
-    mut matrix: Mat<f64>,
-    rotation: MatRef<'_, f64>,
-    row_chunk: usize,
-    par: Par,
-) -> Mat<f64> {
+fn rotate_columns(mut matrix: Mat<f64>, rotation: MatRef<'_, f64>, row_chunk: usize) -> Mat<f64> {
     let rows = matrix.nrows();
     let width = matrix.ncols();
     let kept = rotation.ncols();
@@ -6961,13 +6916,12 @@ fn rotate_columns(
                 .as_mut()
                 .submatrix_mut(0, 0, take, width)
                 .copy_from(matrix.as_ref().submatrix(start, 0, take, width));
-            matmul(
+            mul_rows(
                 matrix.as_mut().submatrix_mut(start, 0, take, kept),
                 Accum::Replace,
                 scratch.as_ref().submatrix(0, 0, take, width),
                 rotation,
                 1.0,
-                par,
             );
             start += take;
         }
@@ -7199,14 +7153,7 @@ where
                         n_components,
                     );
 
-                    matmul(
-                        chunk.as_mut(),
-                        Accum::Replace,
-                        block_ref.transpose(),
-                        sample_basis,
-                        1.0,
-                        par,
-                    );
+                    gram_rows(chunk.as_mut(), block_ref, sample_basis);
 
                     // Fold this block's contribution to BᵀB in while the chunk is
                     // still in cache, before it is copied out to `loadings`.
@@ -7216,7 +7163,7 @@ where
                         chunk.as_ref().transpose(),
                         chunk.as_ref(),
                         1.0,
-                        par,
+                        Par::Seq,
                     );
 
                     loadings
@@ -7842,6 +7789,68 @@ mod tests {
                     "variant {variant}: {lhs:e} at 1 thread, {rhs:e} at {threads} threads"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn fit_does_not_depend_on_the_thread_count() {
+        // Past the dense reference size, so the solve streams tiles through the
+        // covariance operator, and wide enough that its products split into
+        // several row leaves.
+        let n_samples = 10_000;
+        let n_variants = 160;
+        let mut state = 0x6A09_E667_F3BC_C909u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let factors: Vec<[u64; 3]> = (0..n_samples)
+            .map(|_| [next() % 3, next() % 3, next() % 3])
+            .collect();
+        let mut data = Vec::with_capacity(n_samples * n_variants);
+        for variant in 0..n_variants {
+            let axis = variant % 3;
+            for sample in &factors {
+                let call = if next() % 4 == 0 {
+                    next() % 3
+                } else {
+                    sample[axis]
+                };
+                data.push(call as f64);
+            }
+        }
+        let options = FitOptions {
+            allow_unconverged: true,
+            ..FitOptions::default()
+        };
+        let fit_with = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool")
+                .install(|| {
+                    let mut source =
+                        DenseBlockSource::new(&data, n_samples, n_variants).expect("dense source");
+                    let progress = Arc::new(NoopFitProgress);
+                    let model = HwePcaModel::fit_k_with_options_and_progress(
+                        &mut source,
+                        3,
+                        &options,
+                        &progress,
+                    )
+                    .expect("model fit");
+                    serde_json::to_string(&model).expect("serialize model")
+                })
+        };
+
+        let serial = fit_with(1);
+        for threads in [2, 3, 8] {
+            assert!(
+                fit_with(threads) == serial,
+                "the model fitted at {threads} threads differs from the 1-thread model"
+            );
         }
     }
 
@@ -8729,7 +8738,7 @@ mod tests {
         let block_capacity = 8;
         let hint = 1 << 15;
         let mut cache = VariantStatsCache::new(block_capacity, hint);
-        let par = get_global_parallelism();
+        let par = Par::rayon(rayon::current_num_threads());
         let n_samples = 4;
 
         assert_eq!(cache.frequencies.len(), 0);
@@ -8757,7 +8766,7 @@ mod tests {
     fn variant_stats_cache_handles_zero_hint() {
         let block_capacity = 4;
         let mut cache = VariantStatsCache::new(block_capacity, 0);
-        let par = get_global_parallelism();
+        let par = Par::rayon(rayon::current_num_threads());
         let n_samples = 3;
         let block = Mat::from_fn(n_samples, 2, |row, col| (row * 2 + col) as f64);
 
@@ -8966,7 +8975,11 @@ mod tests {
         let mut block_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         {
             let mut block = MatMut::from_column_major_slice_mut(&mut block_data, 4, 2);
-            scaler.standardize_block(block.as_mut(), 0..2, get_global_parallelism());
+            scaler.standardize_block(
+                block.as_mut(),
+                0..2,
+                Par::rayon(rayon::current_num_threads()),
+            );
             apply_ld_weights(block.as_mut(), 0..2, &weights);
         }
 
@@ -8981,7 +8994,11 @@ mod tests {
         let mut block_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         {
             let mut block = MatMut::from_column_major_slice_mut(&mut block_data, 4, 2);
-            scaler.standardize_block(block.as_mut(), 0..2, get_global_parallelism());
+            scaler.standardize_block(
+                block.as_mut(),
+                0..2,
+                Par::rayon(rayon::current_num_threads()),
+            );
             // No LD weights applied
         }
 
