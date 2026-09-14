@@ -702,70 +702,116 @@ pub fn reformat_pgs_file(
         Ok(key)
     }
 
-    // --- Read the data section once and resolve it in parallel ---
-    // One buffer split into newline-aligned chunks replaces a String per line and
+    // --- Decode the data section and resolve it block by block, concurrently ---
+    // This thread reads newline-terminated blocks and hands each to the pool as
+    // it arrives, so decompression and resolution overlap instead of running one
+    // after the other, and one buffer per block replaces a String per line and
     // two more per kept row. Lines, line numbers, skip records and the pre-sort
     // row order are exactly what the line-by-line reader produced.
-    let mut data = Vec::new();
-    if let Err(read_error) = reader.read_to_end(&mut data) {
-        // A line reader rejects an invalid complete line before it reaches the
-        // failed read that follows it; keep that precedence.
-        let complete = data.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-        if std::str::from_utf8(&data[..complete]).is_err() {
-            return Err(invalid_utf8_line_error(&data[..complete]).into());
+    let resolve_block = |chunk_index: usize, block: Vec<u8>| -> ResolvedChunk {
+        let mut resolved = ResolvedChunk {
+            line_count: 0,
+            variant_lines: 0,
+            rows: Vec::new(),
+            sortable: Vec::new(),
+            skipped: Vec::new(),
+            invalid_utf8: None,
+        };
+        let Ok(chunk) = std::str::from_utf8(&block) else {
+            resolved.invalid_utf8 = Some(invalid_utf8_line_error(&block));
+            return resolved;
+        };
+        resolved.rows.reserve(chunk.len() / 2);
+        let mut fields = Vec::new();
+        for raw_line in chunk.split_inclusive('\n') {
+            // `BufRead::lines` semantics: strip "\n" or "\r\n", nothing else.
+            let line = match raw_line.strip_suffix('\n') {
+                Some(line) => line.strip_suffix('\r').unwrap_or(line),
+                None => raw_line,
+            };
+            let line_index = resolved.line_count;
+            resolved.line_count += 1;
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            resolved.variant_lines += 1;
+            let row_start = resolved.rows.len();
+            match resolve_line(
+                strategy,
+                &column_indices,
+                line_index,
+                line,
+                &mut fields,
+                &mut resolved.rows,
+            ) {
+                Ok(key) => resolved.sortable.push(SortableRow {
+                    key,
+                    chunk: chunk_index,
+                    start: row_start,
+                    end: resolved.rows.len(),
+                }),
+                Err(record) => resolved.skipped.push(record),
+            }
         }
-        return Err(read_error.into());
-    }
-    let Ok(text) = std::str::from_utf8(&data) else {
-        return Err(invalid_utf8_line_error(&data).into());
+        resolved
     };
 
-    let mut resolved_chunks: Vec<ResolvedChunk> = newline_aligned_spans(text.as_bytes())
-        .into_par_iter()
-        .enumerate()
-        .map(|(chunk_index, (start, end))| {
-            let chunk = &text[start..end];
-            let mut resolved = ResolvedChunk {
-                line_count: 0,
-                variant_lines: 0,
-                rows: Vec::with_capacity(chunk.len() / 2),
-                sortable: Vec::new(),
-                skipped: Vec::new(),
-            };
-            let mut fields = Vec::new();
-            for raw_line in chunk.split_inclusive('\n') {
-                // `BufRead::lines` semantics: strip "\n" or "\r\n", nothing else.
-                let line = match raw_line.strip_suffix('\n') {
-                    Some(line) => line.strip_suffix('\r').unwrap_or(line),
-                    None => raw_line,
-                };
-                let line_index = resolved.line_count;
-                resolved.line_count += 1;
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
+    let (resolved_tx, resolved_rx) = std::sync::mpsc::channel::<(usize, ResolvedChunk)>();
+    let read_outcome: io::Result<()> = rayon::in_place_scope(|scope| {
+        let dispatch = |chunk_index: usize, block: Vec<u8>| {
+            let resolved_tx = resolved_tx.clone();
+            let resolve_block = &resolve_block;
+            scope.spawn(move |_| {
+                // The receiver outlives the scope, so this send cannot fail.
+                let _ = resolved_tx.send((chunk_index, resolve_block(chunk_index, block)));
+            });
+        };
+        let mut next_index = 0;
+        let mut carry = Vec::new();
+        loop {
+            let mut block = Vec::with_capacity(carry.len() + DATA_CHUNK_BYTES);
+            block.append(&mut carry);
+            let filled = (&mut reader)
+                .take(DATA_CHUNK_BYTES as u64)
+                .read_to_end(&mut block);
+            // Everything up to the last newline is complete lines; the rest waits
+            // for the next block. On a failed read, the complete lines already
+            // decoded are still checked first, as a line reader would.
+            let complete = block.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+            match filled {
+                Ok(0) => {
+                    if !block.is_empty() {
+                        dispatch(next_index, block);
+                    }
+                    return Ok(());
                 }
-                resolved.variant_lines += 1;
-                let row_start = resolved.rows.len();
-                match resolve_line(
-                    strategy,
-                    &column_indices,
-                    line_index,
-                    line,
-                    &mut fields,
-                    &mut resolved.rows,
-                ) {
-                    Ok(key) => resolved.sortable.push(SortableRow {
-                        key,
-                        chunk: chunk_index,
-                        start: row_start,
-                        end: resolved.rows.len(),
-                    }),
-                    Err(record) => resolved.skipped.push(record),
+                Ok(_) if complete == 0 => carry = block,
+                Ok(_) => {
+                    carry.extend_from_slice(&block[complete..]);
+                    block.truncate(complete);
+                    dispatch(next_index, block);
+                    next_index += 1;
+                }
+                Err(read_error) => {
+                    if complete > 0 {
+                        block.truncate(complete);
+                        dispatch(next_index, block);
+                    }
+                    return Err(read_error);
                 }
             }
-            resolved
-        })
-        .collect();
+        }
+    });
+    drop(resolved_tx);
+    let mut resolved_blocks: Vec<(usize, ResolvedChunk)> = resolved_rx.into_iter().collect();
+    resolved_blocks.sort_unstable_by_key(|(chunk_index, _)| *chunk_index);
+    let mut resolved_chunks: Vec<ResolvedChunk> =
+        resolved_blocks.into_iter().map(|(_, chunk)| chunk).collect();
+    // The first invalid line in file order wins over a later failed read.
+    if let Some(error) = resolved_chunks.iter_mut().find_map(|c| c.invalid_utf8.take()) {
+        return Err(error.into());
+    }
+    read_outcome?;
 
     let mut total_variant_lines = 0usize;
     let mut lines_to_sort =
@@ -1254,6 +1300,8 @@ struct ResolvedChunk {
     sortable: Vec<SortableRow>,
     /// Skips whose `line_number` is still relative to the chunk's first line.
     skipped: Vec<SkipRecord>,
+    /// Set, with nothing resolved, when the block is not UTF-8.
+    invalid_utf8: Option<io::Error>,
 }
 
 /// A kept row: its sort key and where its bytes sit in `ResolvedChunk::rows`.
