@@ -123,7 +123,7 @@ blake3 = "1.8.4"
 fs4 = "0.13.1"
 
 infer_sex = "0.1.0"
-convert_genome = { version = "0.3.3", git = "https://github.com/SauersML/convert_genome", rev = "f34824e7ee0d5fe1f3a09fe39fcbe265e2b6d297" }
+convert_genome = { version = "0.3.3", git = "https://github.com/SauersML/convert_genome", rev = "0fa89a7b2c04de6cf2b5091c1f755b1436862f20" }
 
 planus = "=1.1.1" # cf. https://github.com/pola-rs/polars/issues/24208
 
