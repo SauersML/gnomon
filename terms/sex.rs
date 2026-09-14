@@ -18,12 +18,22 @@ use crate::map::io::{
     DatasetBlockSource, GenotypeDataset, GenotypeIoError, PlinkDataset, PlinkIoError, SelectionPlan,
 };
 use crate::map::variant_filter::VariantKey;
-use crate::terms::sex_counts::{BedRows, LocusClass, count_evidence, finish_counts};
+use crate::terms::sex_counts::{
+    BedRows, EvidenceCounts, LocusClass, count_evidence, finish_counts,
+};
 
 #[derive(Debug, Error)]
 pub enum SexInferenceError {
     #[error("genotype I/O error: {0}")]
     Dataset(#[from] GenotypeIoError),
+    #[error(
+        "the PLINK filesets in {directory} list different samples: {first} and {other} do not match"
+    )]
+    MismatchedFilesetSamples {
+        directory: String,
+        first: String,
+        other: String,
+    },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("sex inference error: {0:?}")]
@@ -355,12 +365,12 @@ pub fn infer_sex_to_tsv(
     genotype_path: &Path,
     force_build: Option<GenomeBuild>,
 ) -> Result<PathBuf, SexInferenceError> {
-    let dataset = open_inference_dataset(genotype_path, force_build)?;
+    let input = open_inference_input(genotype_path, force_build)?;
     // Refuse before inference when the table could not be saved, typically a
     // default location beside read-only inputs.
-    let default_output = dataset.output_path("sex.tsv");
+    let default_output = input.output_path();
     crate::output::ensure_output_writable(&default_output)?;
-    let (build, records) = infer_dataset_records(&dataset, force_build, true)?;
+    let (build, records) = input.infer(force_build, true)?;
 
     write_results(&default_output, &records, build)?;
 
@@ -378,7 +388,7 @@ pub fn infer_sex_to_tsv_at(
 ) -> Result<PathBuf, SexInferenceError> {
     // Refuse before inference when the table could not be saved.
     crate::output::ensure_output_writable(output_path)?;
-    let (_dataset, build, records) = infer_records(genotype_path, force_build, true)?;
+    let (_, build, records) = infer_records(genotype_path, force_build, true)?;
 
     write_results(output_path, &records, build)?;
 
@@ -393,25 +403,76 @@ pub fn infer_first_sample_sex(
     Ok(records.first().map(|record| record.inference.final_call))
 }
 
+/// Infers sex for every sample of `genotype_path`, returning the table's default
+/// output path, the build used and one record per sample.
 fn infer_records(
     genotype_path: &Path,
     force_build: Option<GenomeBuild>,
     show_progress: bool,
-) -> Result<(GenotypeDataset, GenomeBuild, Vec<SexInferenceRecord>), SexInferenceError> {
-    let dataset = open_inference_dataset(genotype_path, force_build)?;
-    let (build, records) = infer_dataset_records(&dataset, force_build, show_progress)?;
-    Ok((dataset, build, records))
+) -> Result<(PathBuf, GenomeBuild, Vec<SexInferenceRecord>), SexInferenceError> {
+    let input = open_inference_input(genotype_path, force_build)?;
+    let (build, records) = input.infer(force_build, show_progress)?;
+    Ok((input.output_path(), build, records))
 }
 
-fn open_inference_dataset(
+/// What sex inference reads: one dataset, or a directory of PLINK 1 filesets,
+/// such as one per chromosome, read as one.
+enum InferenceInput {
+    Dataset(GenotypeDataset),
+    PlinkDirectory {
+        directory: PathBuf,
+        filesets: Vec<PlinkDataset>,
+    },
+}
+
+impl InferenceInput {
+    /// The table's default location. As for a directory of VCF files, a
+    /// directory's table goes inside it.
+    fn output_path(&self) -> PathBuf {
+        match self {
+            Self::Dataset(dataset) => dataset.output_path("sex.tsv"),
+            Self::PlinkDirectory { directory, .. } => directory.join("sex.tsv"),
+        }
+    }
+
+    fn infer(
+        &self,
+        force_build: Option<GenomeBuild>,
+        show_progress: bool,
+    ) -> Result<(GenomeBuild, Vec<SexInferenceRecord>), SexInferenceError> {
+        match self {
+            Self::Dataset(dataset) => infer_dataset_records(dataset, force_build, show_progress),
+            Self::PlinkDirectory { filesets, .. } => {
+                infer_directory_records(filesets, force_build, show_progress)
+            }
+        }
+    }
+}
+
+fn open_inference_input(
     genotype_path: &Path,
     force_build: Option<GenomeBuild>,
-) -> Result<GenotypeDataset, SexInferenceError> {
+) -> Result<InferenceInput, SexInferenceError> {
+    if let Some(beds) = plink_fileset_directory(genotype_path)? {
+        let filesets = beds
+            .iter()
+            .map(PlinkDataset::open)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(GenotypeIoError::from)?;
+        ensure_same_samples(genotype_path, &filesets)?;
+        return Ok(InferenceInput::PlinkDirectory {
+            directory: genotype_path.to_path_buf(),
+            filesets,
+        });
+    }
     let pgen_build = force_build.map(|build| match build {
         GenomeBuild::Build37 => PgenGenomeBuild::Grch37,
         GenomeBuild::Build38 => PgenGenomeBuild::Grch38,
     });
-    Ok(GenotypeDataset::open(genotype_path, pgen_build)?)
+    Ok(InferenceInput::Dataset(GenotypeDataset::open(
+        genotype_path,
+        pgen_build,
+    )?))
 }
 
 fn infer_dataset_records(
@@ -425,19 +486,102 @@ fn infer_dataset_records(
         }
         _ => VariantLoci::from_keys(&dataset.variant_keys_for_plan(&SelectionPlan::All)?),
     };
-    let build = force_build.unwrap_or_else(|| {
-        let inferred = infer_build(&loci);
-        eprintln!("Inferred Genome Build: {:?}", inferred);
-        inferred
-    });
+    let build = resolve_build(force_build, &loci);
     let selection = SexVariantSelection::from_loci(&loci, build);
     let records = match dataset {
         GenotypeDataset::Plink(plink) => {
-            collect_packed_inference(plink, &selection, show_progress)?
+            collect_packed_inference(&[(plink, 0)], &selection, show_progress)?
         }
         _ => collect_inference(dataset, &selection, show_progress)?,
     };
     Ok((build, records))
+}
+
+/// Infers sex across PLINK 1 filesets that list the same samples.
+fn infer_directory_records(
+    filesets: &[PlinkDataset],
+    force_build: Option<GenomeBuild>,
+    show_progress: bool,
+) -> Result<(GenomeBuild, Vec<SexInferenceRecord>), SexInferenceError> {
+    // The filesets read as one: rows numbered across them in natural file
+    // order, so build inference and autosome sampling see every row at once.
+    let mut loci = VariantLoci::default();
+    let mut parts = Vec::with_capacity(filesets.len());
+    for fileset in filesets {
+        parts.push((fileset, loci.positions.len()));
+        let fileset_loci = VariantLoci::from_bim(fileset).map_err(GenotypeIoError::from)?;
+        loci.chroms.extend(fileset_loci.chroms);
+        loci.positions.extend(fileset_loci.positions);
+    }
+    let build = resolve_build(force_build, &loci);
+    let selection = SexVariantSelection::from_loci(&loci, build);
+    let records = collect_packed_inference(&parts, &selection, show_progress)?;
+    Ok((build, records))
+}
+
+/// The build `force_build` names, or the one the X positions imply.
+fn resolve_build(force_build: Option<GenomeBuild>, loci: &VariantLoci) -> GenomeBuild {
+    force_build.unwrap_or_else(|| {
+        let inferred = infer_build(loci);
+        eprintln!("Inferred Genome Build: {:?}", inferred);
+        inferred
+    })
+}
+
+/// The `.bed` files of a local directory of PLINK 1 filesets, such as one per
+/// chromosome, in natural order; `None` when `path` is not a directory holding
+/// any. A directory holding VCF or BCF files stays with the variant reader, as
+/// before, whatever else it holds.
+fn plink_fileset_directory(path: &Path) -> Result<Option<Vec<PathBuf>>, SexInferenceError> {
+    if !path.is_dir() || crate::files::list_variant_paths(path).is_ok_and(|files| !files.is_empty())
+    {
+        return Ok(None);
+    }
+    let mut beds = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let bed = entry?.path();
+        // `gnomon score` leaves `<stem>.sorted.*` caches beside its inputs.
+        if bed.is_file()
+            && bed.extension().is_some_and(|ext| ext == "bed")
+            && !bed
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.ends_with(".sorted"))
+        {
+            beds.push(bed);
+        }
+    }
+    if beds.is_empty() {
+        return Ok(None);
+    }
+    beds.sort_by(|a, b| natord::compare(&a.to_string_lossy(), &b.to_string_lossy()));
+    Ok(Some(beds))
+}
+
+/// Filesets counted together must list the same samples, in the same order.
+fn ensure_same_samples(
+    directory: &Path,
+    filesets: &[PlinkDataset],
+) -> Result<(), SexInferenceError> {
+    let Some((first, rest)) = filesets.split_first() else {
+        return Ok(());
+    };
+    for other in rest {
+        let same = first.samples().len() == other.samples().len()
+            && first
+                .samples()
+                .iter()
+                .zip(other.samples())
+                .all(|(a, b)| a.family_id == b.family_id && a.individual_id == b.individual_id);
+        if !same {
+            return Err(SexInferenceError::MismatchedFilesetSamples {
+                directory: directory.display().to_string(),
+                first: first.fam_path().display().to_string(),
+                other: other.fam_path().display().to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn collect_inference(
@@ -541,11 +685,12 @@ fn collect_inference(
     )
 }
 
-/// [`collect_inference`] for a PLINK 1 fileset. The calls are counted directly on
-/// the packed `.bed` rows, and only the rows that feed a counter are read; see
-/// `sex_counts`.
+/// [`collect_inference`] for PLINK 1 filesets: one, or several read as one, each
+/// paired with the number of rows numbered before it. The calls are counted
+/// directly on the packed `.bed` rows, and only the rows that feed a counter are
+/// read; see `sex_counts`.
 fn collect_packed_inference(
-    dataset: &PlinkDataset,
+    parts: &[(&PlinkDataset, usize)],
     selection: &SexVariantSelection,
     show_progress: bool,
 ) -> Result<Vec<SexInferenceRecord>, SexInferenceError> {
@@ -569,22 +714,50 @@ fn collect_packed_inference(
         })
         .collect();
 
+    let Some(&(first, _)) = parts.first() else {
+        return Ok(Vec::new());
+    };
     let total_variants = selection.keys.len();
     let mut progress = TermsProgress::new(total_variants, show_progress);
-    let rows = BedRows::new(
-        dataset.bed_source(),
-        dataset.bytes_per_variant(),
-        dataset.n_variants(),
-        dataset.n_samples(),
-    );
-    let evidence = count_evidence(&rows, &loci, |counted| {
-        progress.update(counted, total_variants)
-    })
-    .map_err(|err| GenotypeIoError::from(PlinkIoError::from(err)))?;
+    let mut evidence = vec![EvidenceCounts::default(); first.n_samples()];
+    let mut counted_before = 0;
+    for &(dataset, first_row) in parts {
+        let end_row = first_row + dataset.n_variants();
+        let part_loci: Vec<(usize, LocusClass)> = loci
+            .iter()
+            .filter(|&&(index, _)| (first_row..end_row).contains(&index))
+            .map(|&(index, class)| (index - first_row, class))
+            .collect();
+        if part_loci.is_empty() {
+            continue;
+        }
+        let rows = BedRows::new(
+            dataset.bed_source(),
+            dataset.bytes_per_variant(),
+            dataset.n_variants(),
+            dataset.n_samples(),
+        );
+        let part_evidence = count_evidence(&rows, &part_loci, |counted| {
+            progress.update(counted_before + counted, total_variants)
+        })
+        .map_err(|err| GenotypeIoError::from(PlinkIoError::from(err)))?;
+        counted_before += part_loci.len();
+        // Every counter is a count of calls, so the filesets' counts add.
+        for (total, counts) in evidence.iter_mut().zip(&part_evidence) {
+            total.auto_valid += counts.auto_valid;
+            total.auto_het += counts.auto_het;
+            total.x_par_valid += counts.x_par_valid;
+            total.x_par_het += counts.x_par_het;
+            total.x_non_par_valid += counts.x_non_par_valid;
+            total.x_non_par_het += counts.x_non_par_het;
+            total.y_par_valid += counts.y_par_valid;
+            total.y_non_par_valid += counts.y_non_par_valid;
+        }
+    }
     progress.finish(total_variants);
 
     finalize_records(
-        dataset
+        first
             .samples()
             .iter()
             .zip(&evidence)
@@ -1495,7 +1668,7 @@ mod tests {
             assert_eq!(build, GenomeBuild::Build38);
             let selection = SexVariantSelection::from_loci(&loci, build);
             let expected = collect_inference(&dataset, &selection, false)?;
-            let packed = collect_packed_inference(plink, &selection, false)?;
+            let packed = collect_packed_inference(&[(plink, 0)], &selection, false)?;
 
             assert_eq!(packed.len(), n_samples);
             assert_eq!(expected.len(), n_samples);
@@ -1611,6 +1784,73 @@ mod tests {
             );
         }
         assert_eq!(VariantLoci::from_bim(plink)?, expected);
+        Ok(())
+    }
+
+    /// A directory of per-chromosome PLINK filesets must infer exactly what the
+    /// same rows in one fileset infer, filesets whose samples differ are refused,
+    /// and a directory that also holds VCF files stays with the variant reader.
+    #[test]
+    fn per_chromosome_filesets_infer_what_one_fileset_infers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let merged_dir = tempdir()?;
+        let bed = write_sex_fixture(merged_dir.path(), 64, 3)?;
+        let (_, expected_build, expected) = infer_records(&bed, None, false)?;
+
+        // Split the fixture at every change of chromosome label, as per-chromosome
+        // exports are, naming the parts `<stem>.chr<label>`.
+        let bim = std::fs::read_to_string(bed.with_extension("bim"))?;
+        let fam = std::fs::read_to_string(bed.with_extension("fam"))?;
+        let payload = std::fs::read(&bed)?;
+        let row_len = 64usize.div_ceil(4);
+        let mut parts: Vec<(String, String, Vec<u8>)> = Vec::new();
+        for (index, line) in bim.lines().enumerate() {
+            let label = line.split('\t').next().unwrap_or_default();
+            if parts.last().is_none_or(|(last, _, _)| last != label) {
+                parts.push((label.to_string(), String::new(), vec![0x6c, 0x1b, 0x01]));
+            }
+            let (_, part_bim, part_bed) = parts.last_mut().expect("a part was just pushed");
+            part_bim.push_str(line);
+            part_bim.push('\n');
+            let start = 3 + index * row_len;
+            part_bed.extend_from_slice(&payload[start..start + row_len]);
+        }
+        let split_dir = tempdir()?;
+        for (label, part_bim, part_bed) in &parts {
+            let member = |ext: &str| split_dir.path().join(format!("fixture.chr{label}.{ext}"));
+            std::fs::write(member("bim"), part_bim)?;
+            std::fs::write(member("fam"), &fam)?;
+            std::fs::write(member("bed"), part_bed)?;
+        }
+        assert!(parts.len() > 20, "the fixture spans many chromosomes");
+
+        let (output, build, records) = infer_records(split_dir.path(), None, false)?;
+        assert_eq!(output, split_dir.path().join("sex.tsv"));
+        assert_eq!(build, expected_build);
+        assert_eq!(records.len(), expected.len());
+        for (record, expected) in records.iter().zip(&expected) {
+            assert_eq!(record.individual_id, expected.individual_id);
+            assert_eq!(record.inference, expected.inference);
+            assert_eq!(
+                metric_bits(&record.inference),
+                metric_bits(&expected.inference)
+            );
+        }
+
+        // A directory the variant reader can read stays with it.
+        let vcf = split_dir.path().join("calls.vcf.gz");
+        std::fs::write(&vcf, b"")?;
+        assert!(plink_fileset_directory(split_dir.path())?.is_none());
+        std::fs::remove_file(&vcf)?;
+
+        std::fs::write(
+            split_dir.path().join("fixture.chrY.fam"),
+            fam.replacen("I0", "J0", 1),
+        )?;
+        match infer_records(split_dir.path(), None, false) {
+            Err(SexInferenceError::MismatchedFilesetSamples { .. }) => {}
+            other => panic!("filesets with different samples must be refused, got {other:?}"),
+        }
         Ok(())
     }
 
