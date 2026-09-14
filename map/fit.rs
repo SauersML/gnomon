@@ -10417,7 +10417,6 @@ mod tests {
         }
     }
 
-    const TEST_VCF_URL: &str = "https://raw.githubusercontent.com/SauersML/genomic_pca/refs/heads/main/tests/chr22_chunk.vcf.gz";
     const MAX_TEST_VARIANTS: usize = 32;
     const MAX_TEST_SAMPLES: usize = 8;
     const TEST_COMPONENTS: usize = 4;
@@ -10510,10 +10509,83 @@ mod tests {
         }
     }
 
+    /// Serves `object` at `/name`: HEAD, a whole-object GET, and a `Range: bytes=`
+    /// GET, over any number of keep-alive connections.
+    fn serve_http_object(object: Vec<u8>, name: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/{name}", listener.local_addr().unwrap());
+        let object = Arc::new(object);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let object = Arc::clone(&object);
+                std::thread::spawn(move || serve_connection(stream, &object));
+            }
+        });
+        url
+    }
+
+    fn serve_connection(stream: std::net::TcpStream, object: &[u8]) {
+        use std::io::{BufRead, Write};
+
+        let Ok(mut writer) = stream.try_clone() else {
+            return;
+        };
+        let mut reader = std::io::BufReader::new(stream);
+        let last = object.len().saturating_sub(1);
+        loop {
+            let mut request = String::new();
+            if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                return;
+            }
+            let mut range = None;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(bounds) = line.to_ascii_lowercase().strip_prefix("range: bytes=")
+                    && let Some((start, end)) = bounds.trim().split_once('-')
+                {
+                    let end = end.parse().unwrap_or(last).min(last);
+                    range = Some((start.parse().unwrap_or(0).min(end), end));
+                }
+            }
+            let len = object.len();
+            let (head, body) = if request.starts_with("HEAD") {
+                (format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n"), &object[..0])
+            } else if let Some((start, end)) = range {
+                (
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{len}\r\nContent-Length: {}\r\n\r\n",
+                        end - start + 1
+                    ),
+                    &object[start..=end],
+                )
+            } else {
+                (format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n"), object)
+            };
+            if writer
+                .write_all(head.as_bytes())
+                .and_then(|()| writer.write_all(body))
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Streams a bgzipped VCF over HTTP from a local server. It used to fetch
+    /// raw.githubusercontent.com, and failed whenever a runner could not resolve it.
     #[test]
     fn fit_hwe_pca_from_http_vcf_stream() {
-        let path = Path::new(TEST_VCF_URL);
-        let dataset = GenotypeDataset::open(path, None)
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/testdata/xy_sex.vcf.gz");
+        let object = std::fs::read(&fixture)
+            .unwrap_or_else(|err| panic!("Failed to read {}: {err}", fixture.display()));
+        let url = serve_http_object(object, "xy_sex.vcf.gz");
+        let dataset = GenotypeDataset::open(Path::new(&url), None)
             .unwrap_or_else(|err| panic!("Failed to open dataset: {err}"));
 
         let block_source = dataset
