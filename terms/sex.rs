@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use infer_sex::{
-    Chromosome, EvidenceReport, GenomeBuild, InferenceConfig, InferenceError, InferenceResult,
-    InferredSex, PlatformDefinition, SexInferenceAccumulator, VariantInfo,
+    Chromosome, GenomeBuild, InferenceConfig, InferenceError, InferenceResult, InferredSex,
+    PlatformDefinition, SexInferenceAccumulator, VariantInfo,
 };
 use thiserror::Error;
 
@@ -389,7 +389,18 @@ fn collect_inference(
         });
     }
 
-    finalize_records(accumulators, sample_ids, &platform)
+    finalize_records(
+        accumulators
+            .into_iter()
+            .zip(sample_ids)
+            .map(|(accumulator, individual_id)| {
+                Ok(SexInferenceRecord {
+                    individual_id,
+                    inference: accumulator.finish()?,
+                })
+            }),
+        &platform,
+    )
 }
 
 /// [`collect_inference`] for a PLINK 1 fileset. The calls are counted directly on
@@ -434,23 +445,23 @@ fn collect_packed_inference(
     .map_err(|err| GenotypeIoError::from(PlinkIoError::from(err)))?;
     progress.finish(total_variants);
 
-    dataset
-        .samples()
-        .iter()
-        .zip(&evidence)
-        .map(|(sample, counts)| {
-            let inference = finish_counts(&config, counts)?;
-            Ok(finalize_record(
-                sample.individual_id.clone(),
-                inference,
-                &platform,
-            ))
-        })
-        .collect()
+    finalize_records(
+        dataset
+            .samples()
+            .iter()
+            .zip(&evidence)
+            .map(|(sample, counts)| {
+                Ok(SexInferenceRecord {
+                    individual_id: sample.individual_id.clone(),
+                    inference: finish_counts(&config, counts)?,
+                })
+            }),
+        &platform,
+    )
 }
 
-/// True when every attempted locus produced a call, i.e. the input carries no
-/// missing genotypes at all.
+/// True when no sample in the panel missed any attempted locus: every sample
+/// called every attempted autosome and every attempted Y non-PAR locus.
 ///
 /// `derive_platform_definition` defines "attempted" as "present in this file",
 /// so on such an input the Y density is `observed / observed = 1.0` by
@@ -463,41 +474,37 @@ fn collect_packed_inference(
 /// and a caller that reads the resulting density as evidence will find every
 /// sample male -- most confidently for the females, whose no-calls were the
 /// signal that got removed.
-fn platform_is_saturated(report: &EvidenceReport, platform: &PlatformDefinition) -> bool {
+///
+/// Saturation belongs to the panel, not to a sample. A panel with real dropout
+/// can still hold samples that called every locus -- males on WGS calls whose
+/// autosomes carry no no-calls, or on a thin Y panel -- and their densities
+/// measure something, because the females beside them did miss chrY.
+fn panel_is_saturated(records: &[SexInferenceRecord], platform: &PlatformDefinition) -> bool {
     platform.n_attempted_y_nonpar > 0
-        && report.y_non_par_valid_count == platform.n_attempted_y_nonpar
-        && report.auto_valid_count == platform.n_attempted_autosomes
+        && records.iter().all(|record| {
+            let report = &record.inference.report;
+            report.y_non_par_valid_count == platform.n_attempted_y_nonpar
+                && report.auto_valid_count == platform.n_attempted_autosomes
+        })
 }
 
+/// Collects every sample's result, then withholds the calls of a saturated panel.
 fn finalize_records(
-    accumulators: Vec<SexInferenceAccumulator>,
-    sample_ids: Vec<String>,
+    records: impl IntoIterator<Item = Result<SexInferenceRecord, InferenceError>>,
     platform: &PlatformDefinition,
 ) -> Result<Vec<SexInferenceRecord>, SexInferenceError> {
-    accumulators
-        .into_iter()
-        .zip(sample_ids)
-        .map(|(acc, individual_id)| Ok(finalize_record(individual_id, acc.finish()?, platform)))
-        .collect()
-}
-
-fn finalize_record(
-    individual_id: String,
-    mut inference: InferenceResult,
-    platform: &PlatformDefinition,
-) -> SexInferenceRecord {
-    // Withhold the call rather than emit a confident one derived from a
+    let mut records = records.into_iter().collect::<Result<Vec<_>, _>>()?;
+    // Withhold the calls rather than emit confident ones derived from a
     // denominator the input defined into existence. Indeterminate is the
     // honest answer here and it is also the useful one: a caller can fall
     // back to evidence measured before the filtering, whereas a wrong
     // binary call is indistinguishable from a right one downstream.
-    if platform_is_saturated(&inference.report, platform) {
-        inference.final_call = InferredSex::Indeterminate;
+    if panel_is_saturated(&records, platform) {
+        for record in &mut records {
+            record.inference.final_call = InferredSex::Indeterminate;
+        }
     }
-    SexInferenceRecord {
-        individual_id,
-        inference,
-    }
+    Ok(records)
 }
 
 fn write_results(
@@ -910,9 +917,79 @@ mod tests {
             "a filtered panel yields a saturated density by construction, got {density}"
         );
         assert!(
-            platform_is_saturated(&result.report, &platform),
+            panel_is_saturated(&[record("F1", result)], &platform),
             "zero missingness across the panel must be recognized"
         );
+    }
+
+    fn record(individual_id: &str, inference: InferenceResult) -> SexInferenceRecord {
+        SexInferenceRecord {
+            individual_id: individual_id.to_string(),
+            inference,
+        }
+    }
+
+    /// A male genotyped at every locus of a thin chrY panel, or on WGS calls
+    /// whose autosomes carry no no-calls, beside females who miss chrY. The
+    /// panel has real dropout, so his density measures something and his call
+    /// stands. Alone, the same male is a saturated panel: nothing in the input
+    /// separates his calls from sites filtered to called ones.
+    #[test]
+    fn a_male_who_calls_every_locus_keeps_his_call_in_a_panel_with_dropout() {
+        let platform = PlatformDefinition {
+            n_attempted_autosomes: 400,
+            n_attempted_y_nonpar: 12,
+        };
+        let config = InferenceConfig {
+            build: GenomeBuild::Build38,
+            platform,
+            thresholds: None,
+        };
+        let finish = |male: bool| {
+            let mut acc = SexInferenceAccumulator::new(config);
+            for i in 0..400u64 {
+                acc.process_variant(&VariantInfo {
+                    chrom: Chromosome::Autosome,
+                    pos: 1_000_000 + i,
+                    is_heterozygous: i % 3 == 0,
+                });
+            }
+            for i in 0..200u64 {
+                acc.process_variant(&VariantInfo {
+                    chrom: Chromosome::X,
+                    pos: 3_000_000 + i,
+                    is_heterozygous: !male && i % 2 == 0,
+                });
+            }
+            if male {
+                for i in 0..12u64 {
+                    acc.process_variant(&VariantInfo {
+                        chrom: Chromosome::Y,
+                        pos: 3_000_000 + i,
+                        is_heterozygous: false,
+                    });
+                }
+            }
+            acc.finish()
+        };
+
+        let panel = finalize_records(
+            [(true, "M1"), (false, "F1"), (true, "M2")]
+                .map(|(male, id)| Ok(record(id, finish(male)?))),
+            &platform,
+        )
+        .unwrap();
+        let calls: Vec<InferredSex> = panel
+            .iter()
+            .map(|record| record.inference.final_call)
+            .collect();
+        assert_eq!(
+            calls,
+            [InferredSex::Male, InferredSex::Female, InferredSex::Male]
+        );
+
+        let alone = finalize_records([Ok(record("M1", finish(true).unwrap()))], &platform).unwrap();
+        assert_eq!(alone[0].inference.final_call, InferredSex::Indeterminate);
     }
 
     /// The ordinary case, which must keep working: some loci fail to call, so
@@ -948,7 +1025,7 @@ mod tests {
 
         let result = acc.finish().unwrap();
         assert!(
-            !platform_is_saturated(&result.report, &platform),
+            !panel_is_saturated(&[record("M1", result)], &platform),
             "a panel with genuine dropout must keep its call"
         );
     }
@@ -977,7 +1054,7 @@ mod tests {
         }
 
         let result = acc.finish().unwrap();
-        assert!(!platform_is_saturated(&result.report, &platform));
+        assert!(!panel_is_saturated(&[record("S1", result)], &platform));
     }
 
     #[test]
