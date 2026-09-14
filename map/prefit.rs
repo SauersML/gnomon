@@ -185,12 +185,13 @@ pub fn ensure_model(model: &BuiltinModel) -> Result<PathBuf, BuiltinModelError> 
     // Atomic rename to final location (only after successful decompression)
     let json_sha256 = compute_sha256(&json_temp_path)?;
     fs::rename(&json_temp_path, &json_path)?;
-    fs::write(
+    write_cache_digest(
         &digest_path,
-        format!(
-            "source_zst_sha256\t{}\njson_sha256\t{}\n",
-            model.sha256, json_sha256
-        ),
+        &CacheDigest {
+            source_zst_sha256: model.sha256.to_string(),
+            json_sha256,
+            json_identity: json_identity(&json_path),
+        },
     )?;
     eprintln!("  Decompressed to: {}", json_path.display());
 
@@ -215,18 +216,57 @@ fn cached_model_is_valid_at(
         return Ok(false);
     }
 
-    let Some((source_zst_sha256, json_sha256)) = read_cache_digest(digest_path)? else {
+    let Some(digest) = read_cache_digest(digest_path)? else {
         return Ok(false);
     };
-    if source_zst_sha256 != expected_zst_sha256 {
+    if digest.source_zst_sha256 != expected_zst_sha256 {
         return Ok(false);
     }
 
+    // Hashing the whole JSON on every load cost 0.65 s for gsa_v3 (326 MB), and a
+    // projection then reads the `.project.bin` cache, which is tied to this file by
+    // nothing more than its length and mtime. So verify the digest once per version
+    // of the file and trust it while that identity is unchanged.
+    let identity = json_identity(json_path);
+    if identity.is_some() && identity == digest.json_identity {
+        return Ok(true);
+    }
     let actual_json_sha256 = compute_sha256(json_path)?;
-    Ok(actual_json_sha256 == json_sha256)
+    if actual_json_sha256 != digest.json_sha256 {
+        return Ok(false);
+    }
+    // A sidecar that cannot be rewritten only costs the next load another hash.
+    let _ = write_cache_digest(
+        digest_path,
+        &CacheDigest {
+            json_identity: identity,
+            ..digest
+        },
+    );
+    Ok(true)
 }
 
-fn read_cache_digest(path: &Path) -> io::Result<Option<(String, String)>> {
+/// The sidecar beside a decompressed model: the release asset it came from, the
+/// digest of the JSON, and the JSON's identity when that digest was last verified.
+#[derive(Debug)]
+struct CacheDigest {
+    source_zst_sha256: String,
+    json_sha256: String,
+    json_identity: Option<(u64, u128)>,
+}
+
+/// Length and modification time (nanoseconds since the epoch) of a cached model.
+fn json_identity(path: &Path) -> Option<(u64, u128)> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((metadata.len(), modified.as_nanos()))
+}
+
+fn read_cache_digest(path: &Path) -> io::Result<Option<CacheDigest>> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -234,6 +274,8 @@ fn read_cache_digest(path: &Path) -> io::Result<Option<(String, String)>> {
     };
     let mut source_zst_sha256 = None;
     let mut json_sha256 = None;
+    let mut json_len = None;
+    let mut json_mtime_ns = None;
     for line in text.lines() {
         let mut fields = line.split_whitespace();
         match (fields.next(), fields.next(), fields.next()) {
@@ -243,10 +285,42 @@ fn read_cache_digest(path: &Path) -> io::Result<Option<(String, String)>> {
             (Some("json_sha256"), Some(value), None) => {
                 json_sha256 = Some(value.to_string());
             }
+            (Some("json_len"), Some(value), None) => {
+                json_len = value.parse::<u64>().ok();
+            }
+            (Some("json_mtime_ns"), Some(value), None) => {
+                json_mtime_ns = value.parse::<u128>().ok();
+            }
             _ => {}
         }
     }
-    Ok(source_zst_sha256.zip(json_sha256))
+    Ok(source_zst_sha256
+        .zip(json_sha256)
+        .map(|(source_zst_sha256, json_sha256)| CacheDigest {
+            source_zst_sha256,
+            json_sha256,
+            json_identity: json_len.zip(json_mtime_ns),
+        }))
+}
+
+/// Replaces the sidecar through a per-process temporary file, so neither an
+/// interrupted write nor a concurrent load can leave a truncated sidecar behind,
+/// which would discard a valid cache and download the model again.
+fn write_cache_digest(path: &Path, digest: &CacheDigest) -> io::Result<()> {
+    let mut text = format!(
+        "source_zst_sha256\t{}\njson_sha256\t{}\n",
+        digest.source_zst_sha256, digest.json_sha256
+    );
+    if let Some((len, mtime_ns)) = digest.json_identity {
+        text.push_str(&format!("json_len\t{len}\njson_mtime_ns\t{mtime_ns}\n"));
+    }
+    let mut temp_name = path.as_os_str().to_os_string();
+    temp_name.push(format!(".{}.tmp", std::process::id()));
+    let temp_path = PathBuf::from(temp_name);
+    fs::write(&temp_path, text)?;
+    fs::rename(&temp_path, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp_path);
+    })
 }
 
 /// Download a file from a URL to a local path.
@@ -335,6 +409,102 @@ mod tests {
         assert!(names.contains(&"hwe_1kg_hgdp_gsa_v3"));
         assert!(names.contains(&"hwe_1kg_hgdp_gda_v1")); // GDA is still available via release
         assert!(names.contains(&"hwe_1kg_hgdp_intersection"));
+    }
+
+    fn cache_with_sidecar(bytes: &[u8]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let json = dir.path().join("model.json");
+        let digest = dir.path().join("model.json.sha256");
+        fs::write(&json, bytes).unwrap();
+        (dir, json, digest)
+    }
+
+    fn set_mtime(path: &Path, seconds_ahead: u64) {
+        let when = std::time::SystemTime::now() + std::time::Duration::from_secs(seconds_ahead);
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_verified_unchanged_cached_model_is_not_hashed_again() {
+        let (_dir, json, digest) = cache_with_sidecar(br#"{"model":1}"#);
+        let json_sha256 = compute_sha256(&json).unwrap();
+        // A sidecar from before identities were recorded: the first load hashes the
+        // JSON and records its identity.
+        fs::write(
+            &digest,
+            format!("source_zst_sha256\tabc\njson_sha256\t{json_sha256}\n"),
+        )
+        .unwrap();
+        assert!(cached_model_is_valid_at(&json, &digest, "abc").unwrap());
+        let recorded = read_cache_digest(&digest).unwrap().unwrap();
+        assert_eq!(recorded.json_sha256, json_sha256);
+        assert!(recorded.json_identity.is_some());
+        assert_eq!(recorded.json_identity, json_identity(&json));
+
+        // Once recorded, an unchanged file is trusted without reading it: a sidecar
+        // whose JSON digest no longer matches still validates.
+        write_cache_digest(
+            &digest,
+            &CacheDigest {
+                json_sha256: "0".repeat(64),
+                ..recorded
+            },
+        )
+        .unwrap();
+        assert!(cached_model_is_valid_at(&json, &digest, "abc").unwrap());
+    }
+
+    #[test]
+    fn a_cached_model_whose_identity_changed_is_hashed_again() {
+        let (_dir, json, digest) = cache_with_sidecar(br#"{"model":1}"#);
+        let json_sha256 = compute_sha256(&json).unwrap();
+        write_cache_digest(
+            &digest,
+            &CacheDigest {
+                source_zst_sha256: "abc".into(),
+                json_sha256,
+                json_identity: json_identity(&json),
+            },
+        )
+        .unwrap();
+
+        // Same length, different bytes, and an mtime a coarse filesystem clock can
+        // tell apart: refused.
+        fs::write(&json, br#"{"model":2}"#).unwrap();
+        set_mtime(&json, 5);
+        assert!(!cached_model_is_valid_at(&json, &digest, "abc").unwrap());
+
+        // The verified bytes under yet another mtime pass the hash, and the new
+        // identity is recorded.
+        fs::write(&json, br#"{"model":1}"#).unwrap();
+        set_mtime(&json, 10);
+        assert!(cached_model_is_valid_at(&json, &digest, "abc").unwrap());
+        assert_eq!(
+            read_cache_digest(&digest).unwrap().unwrap().json_identity,
+            json_identity(&json)
+        );
+    }
+
+    #[test]
+    fn a_cached_model_from_another_release_asset_is_refused() {
+        let (_dir, json, digest) = cache_with_sidecar(br#"{"model":1}"#);
+        write_cache_digest(
+            &digest,
+            &CacheDigest {
+                source_zst_sha256: "abc".into(),
+                json_sha256: compute_sha256(&json).unwrap(),
+                json_identity: json_identity(&json),
+            },
+        )
+        .unwrap();
+        assert!(cached_model_is_valid_at(&json, &digest, "abc").unwrap());
+        assert!(!cached_model_is_valid_at(&json, &digest, "def").unwrap());
+        assert!(!cached_model_is_valid_at(&json, &digest.with_extension("absent"), "abc").unwrap());
     }
 
     #[test]
