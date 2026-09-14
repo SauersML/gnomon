@@ -3737,7 +3737,7 @@ const KEY_SCAN_LINES_PER_WORKER: usize = 256;
 /// Bytes a key-scan batch may hold, so VCFs with many samples read fewer lines at a time.
 const KEY_SCAN_BATCH_BYTES: usize = 64 << 20;
 
-/// The fields a key scan takes from one fully parsed record.
+/// The fields a key scan takes from one record.
 struct ScannedRecordKey {
     chromosome: String,
     position: Option<usize>,
@@ -3758,16 +3758,36 @@ impl ScannedRecordKey {
                 .collect(),
         }
     }
+
+    /// Takes the key fields of a VCF record without parsing its samples.
+    fn from_record(record: &VcfRecord) -> io::Result<Self> {
+        Ok(Self {
+            chromosome: record.reference_sequence_name().to_string(),
+            position: record
+                .variant_start()
+                .transpose()?
+                .map(|position| position.get()),
+            reference_bases: record.reference_bases().to_string(),
+            alternate_bases: record
+                .alternate_bases()
+                .iter()
+                .map(|allele| allele.map(str::to_string))
+                .collect(),
+        })
+    }
 }
 
-/// Reads every record of one variant stream with noodles' full record parser,
-/// as `read_record_buf` does, and hands each record's key fields to `visit` in
-/// file order. `on_error` sees a read or parse error before it is returned.
+/// Reads every record of one variant stream and hands each record's key fields
+/// to `visit` in file order. `on_error` sees a read or parse error before it is
+/// returned.
 ///
-/// A record buffer parses every sample, so on a VCF with many samples this is
-/// the slowest pass over the file. VCF record lines are read in order, parsed
-/// in parallel by per-worker readers over the same bytes, and visited in
-/// order, so the records and the first error are those of a sequential scan.
+/// A BCF record goes through noodles' full record parser, as `read_record_buf`
+/// does. A VCF record is read lazily: its key fields are parsed and its samples
+/// stay text, so a malformed FORMAT value surfaces where genotypes are decoded,
+/// if anything decodes that field, and not here. VCF record lines are read in
+/// order, parsed in parallel by per-worker readers over the same bytes, and
+/// visited in order, so the records and the first error are those of a
+/// sequential scan.
 fn scan_record_keys<E, F>(
     reader: &mut VariantStreamReader,
     header: &vcf::Header,
@@ -3779,7 +3799,7 @@ where
     F: FnMut(ScannedRecordKey) -> Result<(), VariantIoError>,
 {
     if let VariantStreamReader::Vcf(vcf_reader) = reader {
-        return scan_vcf_record_keys(vcf_reader, header, &mut on_error, &mut visit);
+        return scan_vcf_record_keys(vcf_reader, &mut on_error, &mut visit);
     }
 
     let mut record = RecordBuf::default();
@@ -3797,7 +3817,6 @@ where
 
 fn scan_vcf_record_keys<E, F>(
     reader: &mut DynVcfReader,
-    header: &vcf::Header,
     on_error: &mut E,
     visit: &mut F,
 ) -> Result<(), VariantIoError>
@@ -3840,11 +3859,14 @@ where
                 };
                 let end = ends[ends.len() - 1];
                 let mut chunk_reader = VcfReader::new(&batch[start..end]);
-                let mut record = RecordBuf::default();
+                let mut record = VcfRecord::default();
                 let mut records = Vec::with_capacity(ends.len());
                 for _ in ends {
-                    match chunk_reader.read_record_buf(header, &mut record) {
-                        Ok(_) => records.push(Ok(ScannedRecordKey::from_record_buf(&record))),
+                    match chunk_reader
+                        .read_record(&mut record)
+                        .and_then(|_| ScannedRecordKey::from_record(&record))
+                    {
+                        Ok(key) => records.push(Ok(key)),
                         Err(err) => {
                             records.push(Err(err));
                             break;
@@ -8471,23 +8493,21 @@ X\t3000100\tds\tA\tG\t.\tPASS\t.\tGT:DS\t1:1\t0:0.25\t0/1:1\t1|1:2\t.:.
         for record in 1..=records {
             let chromosome = if record <= records / 2 { "1" } else { "2" };
             let position = if unsorted == Some(record) {
-                5
+                "5".to_string()
+            } else if unparsable == Some(record) {
+                "1x0".to_string()
             } else {
-                1000 + record * 10
+                (1000 + record * 10).to_string()
             };
             let alt = if record % 5 == 0 { "G,T" } else { "G" };
             vcf.push_str(&format!(
                 "{chromosome}\t{position}\t.\tA\t{alt}\t.\tPASS\t.\tGT:DP"
             ));
             for sample in 0..12 {
-                let depth = if unparsable == Some(record) && sample == 7 {
-                    "abc".to_string()
-                } else {
-                    (record + sample).to_string()
-                };
                 vcf.push_str(&format!(
-                    "\t{}:{depth}",
-                    ["0/0", "0/1", "1/1"][(record + sample) % 3]
+                    "\t{}:{}",
+                    ["0/0", "0/1", "1/1"][(record + sample) % 3],
+                    record + sample
                 ));
             }
             vcf.push('\n');
@@ -8538,7 +8558,7 @@ X\t3000100\tds\tA\tG\t.\tPASS\t.\tGT:DS\t1:1\t0:0.25\t0/1:1\t1|1:2\t.:.
         let dir = tempdir().unwrap();
         let path = dir.path().join("scan.vcf");
 
-        // The undecodable DP value comes before the out-of-order record, so
+        // The unparsable position comes before the out-of-order record, so
         // the parse error is the one a sequential scan raises.
         fs::write(&path, key_scan_vcf(3000, Some(2100), Some(2500))).unwrap();
         assert!(sequential_record_buf_keys(&path).is_err());
@@ -8558,6 +8578,32 @@ X\t3000100\tds\tA\tG\t.\tPASS\t.\tGT:DS\t1:1\t0:0.25\t0/1:1\t1|1:2\t.:.
             dataset.variant_keys_all(),
             Err(VariantIoError::Unsorted { record: 2500, .. })
         ));
+    }
+
+    /// A key scan leaves samples unparsed: a malformed value in a FORMAT field
+    /// that nothing decodes does not stop it.
+    #[test]
+    fn key_scan_leaves_sample_values_unparsed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("scan.vcf");
+        let text = key_scan_vcf(300, None, None);
+        fs::write(&path, &text).unwrap();
+        let expected = VcfLikeDataset::open(&path)
+            .unwrap()
+            .variant_keys_all()
+            .unwrap();
+
+        let malformed = text.replacen("\t0/1:100\t", "\t0/1:abc\t", 1);
+        assert_ne!(malformed, text);
+        fs::write(&path, &malformed).unwrap();
+        assert!(sequential_record_buf_keys(&path).is_err());
+        assert_eq!(
+            VcfLikeDataset::open(&path)
+                .unwrap()
+                .variant_keys_all()
+                .unwrap(),
+            expected
+        );
     }
 
     /// One locus can hold an allele pair in both orientations, an insertion and
