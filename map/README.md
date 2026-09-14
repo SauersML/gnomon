@@ -296,6 +296,23 @@ from the unstopped fit. The two runs shared a node whose time per pass rose from
 30 s to 50 s between them, so their solve times (960 s and 803 s) do not isolate
 the effect of the stop.
 
+The 250k × 20k `--components 20 --allow-unconverged` fit ran with the stop
+first, on the same eight cores: 32 → 15 passes, 1,234 s → **532 s**, peak RSS
+6.03 → 4.93 GB, with the structured axes 4.1e-14 from the unstopped fit.
+
+On a 4-core machine with a 4 GiB memory limit (a Slurm cgroup), run without
+`--threads` as a user would run it:
+
+| cohort | request | passes | wall clock | peak RSS | output |
+| --- | --- | ---: | ---: | ---: | --- |
+| tiny, 5 populations | `--components 4` | 6 → 6 | 1.9 s → 1.4 s | 0.13 GB | unchanged |
+| 50k × 20k, 5 populations | `--components 10 --allow-unconverged` | 32 → 16 | 124.1 s → **70.9 s** | 0.91 → 0.76 GB | structured axes 2.5e-14 from the unstopped fit |
+| 1000 Genomes on GSA, 3,200 × 562,259 | `--components 20 --allow-unconverged` | 19 → 19 | 99.8 s → 89.1 s | 1.19 GB | unchanged |
+
+Under that limit the 1000 Genomes fit's solver products do not fit the Krylov
+budget, so it keeps its loadings pass. Two runs of the unstopped build produced
+identical bytes for all three fits.
+
 ### Current PLINK2 comparison
 
 The local PLINK reader maps the `.bed` payload once, decodes selected variant
