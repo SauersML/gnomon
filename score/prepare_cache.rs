@@ -229,7 +229,7 @@ fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
 
 #[cfg(windows)]
 fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
-    std::os::windows::fs::FileExt::read_at(file, buffer, offset)
+    std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
 }
 
 #[cfg(not(any(unix, windows)))]
