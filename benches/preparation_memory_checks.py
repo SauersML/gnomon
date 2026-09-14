@@ -8,7 +8,7 @@ source += 'pub use gnomon::{adapt_plink2, pipeline_error, output};\npub mod shar
 source += '#[allow(dead_code)]\n#[path="%s"] pub mod genotype_table;\n' % (root/'src/shared/genotype_table.rs')
 for name in ['batch', 'io', 'pipeline', 'prepare']:
     source += '#[path="%s"] pub mod candidate_%s;\n' % (root/('src/score/'+name+'.rs'), name)
-source += 'pub mod score { pub use gnomon::score::{types, kernel, checkpoint, complex, decide, reformat};\n'
+source += 'pub mod score { pub use gnomon::score::{types, kernel, complex, decide, reformat};\n'
 for name in ['batch', 'io', 'pipeline', 'prepare']:
     source += 'pub use crate::candidate_%s as %s;\n' % (name, name)
 source += '}\n'

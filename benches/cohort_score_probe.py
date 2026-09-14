@@ -10,7 +10,7 @@ modules = 'pub use gnomon::{adapt_plink2, memory, output, pipeline_error};\npub 
 modules += '#[allow(dead_code)] #[path="%s"] pub mod genotype_table;\n' % (root / 'src/shared/genotype_table.rs')
 for name in ['batch', 'io', 'pipeline', 'prepare']:
     modules += '#[path="%s"] pub mod candidate_%s;\n' % (root / ('src/score/' + name + '.rs'), name)
-modules += 'pub mod score { pub use gnomon::score::{types, kernel, checkpoint, complex, decide, reformat};\n'
+modules += 'pub mod score { pub use gnomon::score::{types, kernel, complex, decide, reformat};\n'
 for name in ['batch', 'io', 'pipeline', 'prepare']:
     modules += 'pub use crate::candidate_%s as %s;\n' % (name, name)
 modules += '}\n'

@@ -14,7 +14,6 @@
 
 use clap::{Parser, ValueEnum};
 use gnomon::adapt_plink2::GenomeBuild;
-use gnomon::score::checkpoint;
 use gnomon::score::download;
 use gnomon::score::genotype_convert;
 use gnomon::score::genotype_convert::{EnsurePlinkOptions, InputFormat, detect_input_format};
@@ -99,8 +98,8 @@ struct Args {
     #[clap(long)]
     emit_components: bool,
 
-    /// Output prefix: write PREFIX.sscore, and keep checkpoints and score-file
-    /// caches under PREFIX's directory, instead of beside the inputs.
+    /// Output prefix: write PREFIX.sscore, and keep score-file caches under
+    /// PREFIX's directory, instead of beside the inputs.
     #[clap(long, value_name = "PREFIX")]
     out: Option<PathBuf>,
 }
@@ -353,45 +352,12 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     )?;
     let memory_budget = MemoryBudget::default();
     pipeline::preflight_memory(&prep_result, memory_budget)?;
-    let checkpoint_path = checkpoint::checkpoint_path_for_output(&output_path);
-    let checkpoint_fingerprint = checkpoint::fingerprint_preparation(&prep_result);
-    let result_len = prep_result
-        .num_people_to_score
-        .checked_mul(prep_result.score_names.len())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Result size overflow while preparing score checkpoint.",
-            )
-        })?;
-    let resumed_checkpoint = checkpoint::load_checkpoint(
-        &checkpoint_path,
-        checkpoint_fingerprint,
-        result_len,
-        prep_result.num_reconciled_variants,
-    )?;
-    if let Some(checkpoint) = resumed_checkpoint.as_ref() {
-        eprintln!(
-            "> Loaded score checkpoint from {} ({} / {} variants complete).",
-            checkpoint_path.display(),
-            checkpoint.completed_variants,
-            prep_result.num_reconciled_variants
-        );
-    } else {
-        eprintln!("> Score checkpoint path: {}", checkpoint_path.display());
-    }
 
     // --- Phase 2: Resource Allocation ---
     // A read-only context is created, which allocates all necessary memory pools
     // for the pipeline to use.
-    let context = PipelineContext::with_checkpoint(
-        Arc::clone(&prep_result),
-        resumed_checkpoint,
-        checkpoint_path.clone(),
-        checkpoint_fingerprint,
-        memory_budget,
-        genome_build,
-    );
+    let context =
+        PipelineContext::with_budget(Arc::clone(&prep_result), memory_budget, genome_build);
     eprintln!("> Resource allocation complete.");
 
     // --- Phase 3: Pipeline Execution ---
@@ -415,7 +381,6 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         score_regions_ref,
         args.emit_components,
     )?;
-    checkpoint::remove_checkpoint(&checkpoint_path)?;
 
     eprintln!(
         "\nSuccess! Total execution time: {:.2?}",
@@ -438,8 +403,8 @@ fn ensure_output_absent(output_path: &Path) -> Result<(), Box<dyn Error + Send +
     Ok(())
 }
 
-/// Remote inputs have no local parent directory; their outputs, checkpoints
-/// and caches live in the working directory.
+/// Remote inputs have no local parent directory; their outputs and caches live
+/// in the working directory.
 /// Whether anything exists at a genotype path: a file or directory, a PLINK or
 /// PGEN fileset with this prefix, or a remote location, which only its reader
 /// can check.

@@ -17,9 +17,8 @@ Required arguments:
 Optional arguments:
 - `--keep <path>`: optional file that lists individual IDs to include in the
   calculation.
-- `--out <PREFIX>`: write the scores to `PREFIX.sscore`. The resume checkpoint
-  and the score-file caches (`gnomon_score_cache/`) go under PREFIX's directory
-  instead of beside the inputs. Without it, `<GENOTYPE>_<SCORE>.sscore` lands
+- `--out <PREFIX>`: write the scores to `PREFIX.sscore`. The score-file caches
+  (`gnomon_score_cache/`) go under PREFIX's directory instead of beside the inputs. Without it, `<GENOTYPE>_<SCORE>.sscore` lands
   beside the genotype data. See [`score/README.md`](../score/README.md).
 
 ### `terms`

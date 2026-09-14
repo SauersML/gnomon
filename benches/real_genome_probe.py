@@ -59,8 +59,6 @@ if task == 'score':
     command = [str(binary), str(weights), str(prefix)]
     suffix = weights.stem
     outputs = [work/('panel_' + suffix + '.sscore')]
-    for checkpoint in work.glob('panel_' + suffix + '.sscore.gnomon-checkpoint*'):
-        checkpoint.unlink()
 else:
     command = [str(binary), 'project', str(prefix)]
     outputs = [work/'panel.projection_scores.bin', work/'panel.projection_scores.metadata.json']

@@ -1,5 +1,4 @@
 pub mod batch;
-pub mod checkpoint;
 pub mod complex;
 pub mod decide;
 pub mod download;

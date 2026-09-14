@@ -46,9 +46,8 @@ By default the results land beside the genotypes as `<genotypes>_<score stem>.ss
 the score file. gnomon refuses to overwrite an existing `.sscore`.
 
 `--out PREFIX` writes the results to `PREFIX.sscore` instead. Everything else the run
-keeps goes under PREFIX's directory: the resume checkpoint
-(`PREFIX.sscore.gnomon-checkpoint.bin`, removed once the run succeeds), downloaded PGS
-Catalog files, and the score-file caches (`gnomon_score_cache/`).
+keeps goes under PREFIX's directory: downloaded PGS Catalog files and the score-file
+caches (`gnomon_score_cache/`).
 ```
 ./gnomon/target/release/gnomon score "PGS003725" arrays --out results/arrays_pgs003725
 ```
@@ -75,7 +74,7 @@ file in a directory gnomon cannot write is cached under the user cache directory
 instead: `$XDG_CACHE_HOME/gnomon/score_cache`, which defaults to
 `~/.cache/gnomon/score_cache` on Linux.
 
-Results and checkpoints are written to a temporary file in their destination directory
+Results are written to a temporary file in their destination directory
 and renamed into place once complete, so another process never reads a partial
 `.sscore`.
 

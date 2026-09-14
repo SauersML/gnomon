@@ -82,7 +82,7 @@ struct ScoreArgs {
     input_path: PathBuf,
 
     /// Output prefix (for example, results/eur writes results/eur.sscore).
-    /// Checkpoints and score-file caches stay under the prefix's directory.
+    /// Score-file caches stay under the prefix's directory.
     /// Defaults to <GENOTYPE>_<SCORE>.sscore beside the genotype data.
     #[arg(long, value_name = "PREFIX")]
     out: Option<PathBuf>,

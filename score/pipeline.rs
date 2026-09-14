@@ -1,7 +1,6 @@
 use crate::adapt_plink2::GenomeBuild;
 use crate::pipeline_error::PipelineError;
 use crate::score::batch;
-use crate::score::checkpoint::ScoreCheckpoint;
 use crate::score::complex::{ComplexVariantResolver, resolve_complex_variants};
 use crate::score::decide::{self, DecisionContext, RunStrategy};
 use crate::score::io;
@@ -558,9 +557,6 @@ pub fn make_bed_buffer_pool(
 pub struct PipelineContext {
     pub prep_result: Arc<PreparationResult>,
     pub tile_pool: Arc<ArrayQueue<Vec<EffectAlleleDosage>>>,
-    pub checkpoint: Option<ScoreCheckpoint>,
-    pub checkpoint_path: Option<PathBuf>,
-    pub checkpoint_fingerprint: Option<[u8; 32]>,
     pub memory_budget: MemoryBudget,
     pub genome_build: Option<GenomeBuild>,
 }
@@ -571,39 +567,22 @@ impl PipelineContext {
         Self {
             prep_result,
             tile_pool: Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 4)),
-            checkpoint: None,
-            checkpoint_path: None,
-            checkpoint_fingerprint: None,
             memory_budget: MemoryBudget::default(),
             genome_build: None,
         }
     }
 
-    pub fn with_checkpoint(
+    pub fn with_budget(
         prep_result: Arc<PreparationResult>,
-        checkpoint: Option<ScoreCheckpoint>,
-        checkpoint_path: PathBuf,
-        checkpoint_fingerprint: [u8; 32],
         memory_budget: MemoryBudget,
         genome_build: Option<GenomeBuild>,
     ) -> Self {
         Self {
             prep_result,
             tile_pool: Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 4)),
-            checkpoint,
-            checkpoint_path: Some(checkpoint_path),
-            checkpoint_fingerprint: Some(checkpoint_fingerprint),
             memory_budget,
             genome_build,
         }
-    }
-
-    #[inline]
-    pub fn checkpoint_completed_variants(&self) -> usize {
-        self.checkpoint
-            .as_ref()
-            .map(|checkpoint| checkpoint.completed_variants)
-            .unwrap_or(0)
     }
 
     pub fn io_buffer_count(&self) -> Result<usize, PipelineError> {
@@ -660,13 +639,7 @@ fn run_single_file_pipeline(
 
     // Progress Reporting Setup
     let variants_to_process = context.prep_result.num_reconciled_variants as u64;
-    let resume_from = context.checkpoint_completed_variants();
-    if resume_from > 0 {
-        eprintln!(
-            "> Resuming score computation from checkpoint at {resume_from}/{variants_to_process} variants."
-        );
-    }
-    let variants_processed_count = Arc::new(AtomicU64::new(resume_from as u64));
+    let variants_processed_count = Arc::new(AtomicU64::new(0));
     let pb = create_progress_bar(variants_to_process, "Computing scores...");
 
     // --- 2. Pre-computation & STRATEGY SELECTION ---
@@ -689,12 +662,11 @@ fn run_single_file_pipeline(
         );
     }
     let mut shared_accumulator = if use_bounded_accumulator {
-        let (mut final_scores, mut final_counts) = initialize_final_output(
+        let (final_scores, final_counts) = initialize_final_output(
             prep_result.num_people_to_score,
             prep_result.score_names.len(),
             &master_baseline,
         )?;
-        apply_checkpoint_initial_state(context, &mut final_scores, &mut final_counts)?;
         Some(Arc::new(Mutex::new((final_scores, final_counts))))
     } else {
         None
@@ -798,7 +770,6 @@ fn run_single_file_pipeline(
                                 buffer_pool,
                                 producer_thread_count,
                                 path_decider,
-                                resume_from,
                                 spool_plan,
                             );
                         }
@@ -830,7 +801,6 @@ fn run_single_file_pipeline(
                                 buffer_pool,
                                 producer_thread_count,
                                 path_decider,
-                                resume_from,
                                 spool_plan,
                             );
                         }
@@ -884,7 +854,6 @@ fn run_single_file_pipeline(
                 let num_scores = prep_result.score_names.len();
                 let (mut final_scores, mut final_counts) =
                     initialize_final_output(num_people, num_scores, &master_baseline)?;
-                apply_checkpoint_initial_state(context, &mut final_scores, &mut final_counts)?;
                 final_counts
                     .par_iter_mut()
                     .zip(sparse_counts)
@@ -1031,13 +1000,7 @@ fn run_multi_file_pipeline(
 
     // Progress Reporting Setup
     let variants_to_process = context.prep_result.num_reconciled_variants as u64;
-    let resume_from = context.checkpoint_completed_variants();
-    if resume_from > 0 {
-        eprintln!(
-            "> Resuming score computation from checkpoint at {resume_from}/{variants_to_process} variants."
-        );
-    }
-    let variants_processed_count = Arc::new(AtomicU64::new(resume_from as u64));
+    let variants_processed_count = Arc::new(AtomicU64::new(0));
     let pb = create_progress_bar(variants_to_process, "Computing scores...");
 
     // --- 2. Pre-computation (same as single-file) ---
@@ -1059,12 +1022,11 @@ fn run_multi_file_pipeline(
         );
     }
     let mut shared_accumulator = if use_bounded_accumulator {
-        let (mut final_scores, mut final_counts) = initialize_final_output(
+        let (final_scores, final_counts) = initialize_final_output(
             prep_result.num_people_to_score,
             prep_result.score_names.len(),
             &master_baseline,
         )?;
-        apply_checkpoint_initial_state(context, &mut final_scores, &mut final_counts)?;
         Some(Arc::new(Mutex::new((final_scores, final_counts))))
     } else {
         None
@@ -1168,7 +1130,6 @@ fn run_multi_file_pipeline(
                                 buffer_pool,
                                 producer_thread_count,
                                 path_decider,
-                                resume_from,
                                 spool_plan,
                             );
                         }
@@ -1201,7 +1162,6 @@ fn run_multi_file_pipeline(
                                 buffer_pool,
                                 producer_thread_count,
                                 path_decider,
-                                resume_from,
                                 spool_plan,
                             );
                         }
@@ -1255,7 +1215,6 @@ fn run_multi_file_pipeline(
                 let num_scores = prep_result.score_names.len();
                 let (mut final_scores, mut final_counts) =
                     initialize_final_output(num_people, num_scores, &master_baseline)?;
-                apply_checkpoint_initial_state(context, &mut final_scores, &mut final_counts)?;
                 final_counts
                     .par_iter_mut()
                     .zip(sparse_counts)
@@ -1395,15 +1354,9 @@ fn run_small_keep_direct_single_file(
         prep_result.score_names.len(),
         &master_baseline,
     )?;
-    apply_checkpoint_initial_state(context, &mut final_scores, &mut final_counts)?;
 
     let total = prep_result.num_reconciled_variants as u64;
-    let resume_from = context.checkpoint_completed_variants();
-    if resume_from > 0 {
-        eprintln!("> Resuming direct score computation from {resume_from}/{total} variants.");
-    }
     let pb = create_progress_bar(total, "Computing scores...");
-    pb.set_position(resume_from as u64);
     let mut scratch = [0u8; 1];
     let mut processed_since_update = 0u64;
     // One handle on the map for the whole loop: cloning it per genotype costs an
@@ -1412,9 +1365,6 @@ fn run_small_keep_direct_single_file(
     let mapped = mmap.as_deref();
 
     for (i, &bim_row_idx) in prep_result.required_bim_indices.iter().enumerate() {
-        if i < resume_from {
-            continue;
-        }
         let reconciled_idx = reconciled_index_from_usize(i)?;
         let row_base = 3u64
             .checked_add(
@@ -1496,15 +1446,9 @@ fn run_small_keep_direct_multi_file(
         prep_result.score_names.len(),
         &master_baseline,
     )?;
-    apply_checkpoint_initial_state(context, &mut final_scores, &mut final_counts)?;
 
     let total = prep_result.num_reconciled_variants as u64;
-    let resume_from = context.checkpoint_completed_variants();
-    if resume_from > 0 {
-        eprintln!("> Resuming direct score computation from {resume_from}/{total} variants.");
-    }
     let pb = create_progress_bar(total, "Computing scores...");
-    pb.set_position(resume_from as u64);
     let mut scratch = [0u8; 1];
     let mut processed_since_update = 0u64;
     let mut current_fileset_idx = 0usize;
@@ -1522,9 +1466,6 @@ fn run_small_keep_direct_multi_file(
             } else {
                 u64::MAX
             };
-        }
-        if i < resume_from {
-            continue;
         }
 
         let reconciled_idx = reconciled_index_from_usize(i)?;
@@ -2038,30 +1979,6 @@ fn initialize_final_output(
     Ok((final_scores, final_counts))
 }
 
-fn apply_checkpoint_initial_state(
-    context: &PipelineContext,
-    final_scores: &mut [f64],
-    final_counts: &mut [u32],
-) -> Result<(), PipelineError> {
-    let Some(checkpoint) = context.checkpoint.as_ref() else {
-        return Ok(());
-    };
-    if checkpoint.sum_scores.len() != final_scores.len()
-        || checkpoint.missing_counts.len() != final_counts.len()
-    {
-        return Err(PipelineError::Compute(format!(
-            "Checkpoint accumulator shape mismatch: scores {} vs {}, counts {} vs {}.",
-            checkpoint.sum_scores.len(),
-            final_scores.len(),
-            checkpoint.missing_counts.len(),
-            final_counts.len()
-        )));
-    }
-    final_scores.copy_from_slice(&checkpoint.sum_scores);
-    final_counts.copy_from_slice(&checkpoint.missing_counts);
-    Ok(())
-}
-
 #[inline]
 fn choose_consumer_threads(result_size: usize, memory_budget: MemoryBudget) -> usize {
     let cpu_cap = num_cpus::get().max(1);
@@ -2476,9 +2393,9 @@ fn ensure_memory_floor(
     } else {
         dense_scratch_bytes(prep, bounded_dense_batch_size(prep, budget)?)?
     };
-    let required = output
-        .checked_mul(2) // live output plus a resumed checkpoint
-        .and_then(|v| v.checked_add(csr_bytes(prep).ok()?))
+    let required = csr_bytes(prep)
+        .ok()
+        .and_then(|csr| output.checked_add(csr))
         .and_then(|v| v.checked_add(row.checked_mul(buffers)?))
         .and_then(|v| v.checked_add(scratch))
         .and_then(|v| v.checked_add(io::local_prefetch_budget(prep, budget)))

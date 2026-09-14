@@ -300,7 +300,6 @@ pub fn producer_thread<'a, F>(
     buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
     variants_processed_count: Arc<AtomicU64>,
     path_decider: F,
-    skip_reconciled_before: usize,
     mut spool: Option<SpoolPlan<'a>>,
 ) where
     F: Fn(&[u8]) -> ComputePath,
@@ -320,11 +319,6 @@ pub fn producer_thread<'a, F>(
         Some(sp) => {
             let sp = sp;
             for (i, &bim_row_idx) in prep_result.required_bim_indices.iter().enumerate() {
-                // A resumed run re-reads only the rows the complex pass still
-                // needs; already-scored simple rows are never downloaded again.
-                if i < skip_reconciled_before && !sp.spools(i) {
-                    continue;
-                }
                 let mut buffer =
                     match prepare_pooled_buffer(pop_pooled_buffer(&buffer_pool), bytes_per_variant)
                     {
@@ -355,10 +349,6 @@ pub fn producer_thread<'a, F>(
                 if let Err(err) = sp.write_variant(i, bim_row_idx, &buffer) {
                     send_error(err);
                     break;
-                }
-                if i < skip_reconciled_before {
-                    let _ = buffer_pool.push(buffer);
-                    continue;
                 }
 
                 let path = choose_score_path(&buffer, &prep_result, i, &path_decider);
@@ -395,9 +385,6 @@ pub fn producer_thread<'a, F>(
         }
         None => {
             for (i, &bim_row_idx) in prep_result.required_bim_indices.iter().enumerate() {
-                if i < skip_reconciled_before {
-                    continue;
-                }
                 let mut buffer =
                     match prepare_pooled_buffer(pop_pooled_buffer(&buffer_pool), bytes_per_variant)
                     {
@@ -475,7 +462,6 @@ pub fn multi_file_producer_thread<'a, F>(
     buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
     variants_processed_count: Arc<AtomicU64>,
     path_decider: F,
-    skip_reconciled_before: usize,
     mut spool: Option<SpoolPlan<'a>>,
 ) where
     F: Fn(&[u8]) -> ComputePath,
@@ -514,12 +500,6 @@ pub fn multi_file_producer_thread<'a, F>(
                     };
                 }
 
-                // A resumed run re-reads only the rows the complex pass still
-                // needs; already-scored simple rows are never downloaded again.
-                if i < skip_reconciled_before && !sp.spools(i) {
-                    continue;
-                }
-
                 let local_index =
                     global_bim_row_index.0 - boundaries[current_fileset_idx].starting_global_index;
                 let offset = 3 + local_index * bytes_per_variant;
@@ -554,10 +534,6 @@ pub fn multi_file_producer_thread<'a, F>(
                 if let Err(err) = sp.write_variant(i, global_bim_row_index, &buffer) {
                     send_error(err);
                     return;
-                }
-                if i < skip_reconciled_before {
-                    let _ = buffer_pool.push(buffer);
-                    continue;
                 }
 
                 let path = choose_score_path(&buffer, &prep_result, i, &path_decider);
@@ -604,9 +580,6 @@ pub fn multi_file_producer_thread<'a, F>(
 
                 let local_index =
                     global_bim_row_index.0 - boundaries[current_fileset_idx].starting_global_index;
-                if i < skip_reconciled_before {
-                    continue;
-                }
                 let offset = 3 + local_index * bytes_per_variant;
                 let end = offset + bytes_per_variant;
 

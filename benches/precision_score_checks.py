@@ -48,7 +48,7 @@ else:
     modules = ['batch', 'io', 'pipeline', 'prepare', 'kernel']
     for name in modules:
         source += '#[path="%s"] pub mod candidate_%s;\n' % (root / ('src/score/' + name + '.rs'), name)
-    source += 'pub mod score { pub use gnomon::score::{types, checkpoint, complex, decide, reformat};\n'
+    source += 'pub mod score { pub use gnomon::score::{types, complex, decide, reformat};\n'
     for name in modules:
         source += 'pub use crate::candidate_%s as %s;\n' % (name, name)
     source += '}\n'
