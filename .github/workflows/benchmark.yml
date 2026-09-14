@@ -23,6 +23,6 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
       - name: Build benchmark target
-        run: cargo +nightly build --release --bench path_benchmark
+        run: cargo +nightly build --release --bench path_benchmark --features bench-path
       - name: Run benchmark and print results
-        run: cargo +nightly bench --bench path_benchmark -- --nocapture
+        run: cargo +nightly bench --bench path_benchmark --features bench-path -- --nocapture
