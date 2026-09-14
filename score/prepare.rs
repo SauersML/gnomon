@@ -630,6 +630,7 @@ fn join_streams<B, S>(
     diagnostics: &mut MergeDiagnosticInfo,
     seen_invalid_bim_chrs: &mut AHashSet<String>,
     seen_invalid_score_chrs: &mut AHashSet<String>,
+    effect_only_matches: &mut EffectOnlyMatches,
 ) -> Result<(), PrepError>
 where
     B: Iterator<Item = Result<KeyedBimRecord, PrepError>>,
@@ -733,6 +734,17 @@ where
                 }
                 diagnostics.total_score_records_processed += score_group.len() as u64;
 
+                if score_group
+                    .iter()
+                    .any(|record| names_no_single_other_allele(record.other_allele.as_str()))
+                {
+                    resolve_effect_only_records(
+                        key,
+                        &bim_group,
+                        &mut score_group,
+                        effect_only_matches,
+                    );
+                }
                 outputs.reconcile_locus(key, &bim_group, &score_group)?;
             }
         }
@@ -765,7 +777,10 @@ fn join_sorted_slices(
     bim: &[KeyedBimRecord],
     scores: &[KeyedScoreRecord],
     outputs: &mut JoinOutputs,
+    effect_only_matches: &mut EffectOnlyMatches,
 ) -> Result<(), PrepError> {
+    // Records are borrowed; only a locus with a record to resolve is copied.
+    let mut resolved = Vec::new();
     let (mut b, mut s) = (0, 0);
     while b < bim.len() && s < scores.len() {
         let (bim_key, score_key) = (bim[b].key, scores[s].key);
@@ -775,12 +790,62 @@ fn join_sorted_slices(
             Ordering::Equal => {
                 let bim_end = b + leading_count(&bim[b..], |row| row.key == bim_key);
                 let score_end = s + leading_count(&scores[s..], |record| record.key == bim_key);
-                outputs.reconcile_locus(bim_key, &bim[b..bim_end], &scores[s..score_end])?;
+                let (bim_group, score_group) = (&bim[b..bim_end], &scores[s..score_end]);
+                if score_group
+                    .iter()
+                    .any(|record| names_no_single_other_allele(record.other_allele.as_str()))
+                {
+                    resolved.clear();
+                    resolved.extend_from_slice(score_group);
+                    resolve_effect_only_records(
+                        bim_key,
+                        bim_group,
+                        &mut resolved,
+                        effect_only_matches,
+                    );
+                    outputs.reconcile_locus(bim_key, bim_group, &resolved)?;
+                } else {
+                    outputs.reconcile_locus(bim_key, bim_group, score_group)?;
+                }
                 (b, s) = (bim_end, score_end);
             }
         }
     }
     Ok(())
+}
+
+/// A record that names no single other allele becomes the pair of the one variant
+/// carrying its effect allele, or is counted and dropped. Records naming their other
+/// allele go on unchanged.
+fn resolve_effect_only_records(
+    key: VariantKey,
+    bim_group: &[KeyedBimRecord],
+    score_group: &mut Vec<KeyedScoreRecord>,
+    effect_only_matches: &mut EffectOnlyMatches,
+) {
+    score_group.retain_mut(|record| {
+        let decision = resolve_other_allele(
+            record.effect_allele.as_str(),
+            record.other_allele.as_str(),
+            bim_group
+                .iter()
+                .map(|bim| (bim.allele1.as_str(), bim.allele2.as_str())),
+        );
+        effect_only_matches.record(decision, key);
+        match decision {
+            OtherAlleleMatch::Pair => true,
+            OtherAlleleMatch::EffectOnly(row) => {
+                let bim = &bim_group[row];
+                record.other_allele = if bim.allele1.as_str() == record.effect_allele.as_str() {
+                    bim.allele2.clone()
+                } else {
+                    bim.allele1.clone()
+                };
+                true
+            }
+            OtherAlleleMatch::SeveralRows | OtherAlleleMatch::NoRow => false,
+        }
+    });
 }
 
 /// How many leading `items` satisfy `before`, given that it holds for the first item
@@ -849,6 +914,124 @@ fn allele_pair_matches(
 ) -> bool {
     (effect_allele == bim_a1 && other_allele == bim_a2)
         || (effect_allele == bim_a2 && other_allele == bim_a1)
+}
+
+/// How a score record's other allele pins down which variant at its locus it scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OtherAlleleMatch {
+    /// The record names one other allele, so the allele pair decides, as always.
+    Pair,
+    /// The record names no other allele ("."), or several candidates ("A/G"), and only
+    /// this `.bim` row carries its effect allele with a listed other allele.
+    EffectOnly(usize),
+    /// Several rows carry the effect allele, so which variant the score meant is unknown.
+    SeveralRows,
+    /// No row carries the effect allele with a listed other allele.
+    NoRow,
+}
+
+/// Other-allele text that names no single allele: "." where the score file gave none,
+/// or candidates separated by '/', as harmonized PGS Catalog files infer them.
+fn names_no_single_other_allele(other_allele: &str) -> bool {
+    other_allele == "." || other_allele.contains('/')
+}
+
+/// Decides how a score record matches the `.bim` rows at its locus, given as
+/// `(allele1, allele2)` pairs in row order.
+fn resolve_other_allele<'a>(
+    effect_allele: &str,
+    other_allele: &str,
+    rows: impl Iterator<Item = (&'a str, &'a str)>,
+) -> OtherAlleleMatch {
+    if !names_no_single_other_allele(other_allele) {
+        return OtherAlleleMatch::Pair;
+    }
+    let listed = |allele: &str| other_allele == "." || other_allele.split('/').any(|c| c == allele);
+    let mut found = None;
+    for (index, (allele1, allele2)) in rows.enumerate() {
+        let row_other = if allele1 == effect_allele {
+            allele2
+        } else if allele2 == effect_allele {
+            allele1
+        } else {
+            continue;
+        };
+        if !listed(row_other) {
+            continue;
+        }
+        if found.replace(index).is_some() {
+            return OtherAlleleMatch::SeveralRows;
+        }
+    }
+    found.map_or(OtherAlleleMatch::NoRow, OtherAlleleMatch::EffectOnly)
+}
+
+/// Weights from score rows that name no single other allele, by how Stage 3 matched
+/// them. Each weight is one score column of one score file row.
+#[derive(Debug, Default)]
+struct EffectOnlyMatches {
+    matched: u64,
+    several_rows: u64,
+    no_row: u64,
+    /// The first skipped loci, with why each was skipped.
+    examples: Vec<(VariantKey, OtherAlleleMatch)>,
+}
+
+impl EffectOnlyMatches {
+    const EXAMPLES: usize = 5;
+
+    fn record(&mut self, decision: OtherAlleleMatch, key: VariantKey) {
+        match decision {
+            OtherAlleleMatch::Pair => return,
+            OtherAlleleMatch::EffectOnly(_) => {
+                self.matched += 1;
+                return;
+            }
+            OtherAlleleMatch::SeveralRows => self.several_rows += 1,
+            OtherAlleleMatch::NoRow => self.no_row += 1,
+        }
+        if self.examples.len() < Self::EXAMPLES {
+            self.examples.push((key, decision));
+        }
+    }
+
+    /// Whether no row needed its other allele resolved. A plan built otherwise is not
+    /// cached, so every run reports these counts again.
+    fn is_empty(&self) -> bool {
+        self.matched + self.several_rows + self.no_row == 0
+    }
+
+    fn report(&self) {
+        if self.matched > 0 {
+            eprintln!(
+                "> Matched {} weight(s) from score rows that name no single other allele on their effect allele, at loci where one variant carries it.",
+                self.matched
+            );
+        }
+        let skipped = self.several_rows + self.no_row;
+        if skipped == 0 {
+            return;
+        }
+        eprintln!(
+            "> Warning: Skipped {skipped} weight(s) from score rows that name no single other allele: {} at loci where several variants carry the effect allele, {} where no variant carries it with a listed other allele. They contribute nothing to any score.",
+            self.several_rows, self.no_row
+        );
+        eprintln!("> Examples (first {}):", self.examples.len());
+        for ((chr, pos), decision) in &self.examples {
+            let chr = match chr {
+                23 => "X".to_string(),
+                24 => "Y".to_string(),
+                25 => "MT".to_string(),
+                n => n.to_string(),
+            };
+            let reason = if *decision == OtherAlleleMatch::SeveralRows {
+                "several variants carry the effect allele"
+            } else {
+                "no variant carries the effect allele"
+            };
+            eprintln!(">   - {chr}:{pos}: {reason}");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1073,6 +1256,7 @@ fn prepare_for_computation_with_retry(
     let overall_start_time = Instant::now();
 
     let mut diagnostics = MergeDiagnosticInfo::default();
+    let mut effect_only_matches = EffectOnlyMatches::default();
     if let Some(regions) = score_regions {
         diagnostics.record_region_filters(regions);
     }
@@ -1163,11 +1347,13 @@ fn prepare_for_computation_with_retry(
         )
     };
     if let Some((bim, scores)) = plain_rows {
-        join_sorted_slices(bim, scores, &mut outputs)?;
+        join_sorted_slices(bim, scores, &mut outputs, &mut effect_only_matches)?;
         if outputs.required_bim_indices.is_empty() {
             // Only a join that matched nothing reports what it walked past, so
-            // walk the same rows the streaming way to describe them.
+            // walk the same rows the streaming way to describe them, counting
+            // resolved score rows afresh.
             outputs = JoinOutputs::new(score_names.len())?;
+            effect_only_matches = EffectOnlyMatches::default();
             join_streams(
                 &mut bim.iter().cloned().map(Ok::<_, PrepError>).peekable(),
                 &mut scores.iter().cloned().map(Ok::<_, PrepError>).peekable(),
@@ -1175,6 +1361,7 @@ fn prepare_for_computation_with_retry(
                 &mut diagnostics,
                 &mut seen_invalid_bim_chrs,
                 &mut seen_invalid_score_chrs,
+                &mut effect_only_matches,
             )?;
         }
         if rows_sorted_by_key {
@@ -1191,6 +1378,7 @@ fn prepare_for_computation_with_retry(
             &mut diagnostics,
             &mut seen_invalid_bim_chrs,
             &mut seen_invalid_score_chrs,
+            &mut effect_only_matches,
         )?;
         drop(bim_iter);
         if let Some(unsorted_bim) = bim_rows.descended_in() {
@@ -1273,6 +1461,7 @@ fn prepare_for_computation_with_retry(
         );
     }
     rejected_score_rows.report();
+    effect_only_matches.report();
 
     // --- Stage 4: Verifying data and finalizing matrix metadata ---
     eprintln!("> Stage 4: Verifying data and building final matrices...");
@@ -1341,6 +1530,7 @@ fn prepare_for_computation_with_retry(
 
     let clean = total_malformed_lines == 0
         && rejected_score_rows.total() == 0
+        && effect_only_matches.is_empty()
         && seen_invalid_bim_chrs.is_empty()
         && seen_invalid_score_chrs.is_empty()
         && region_filters
@@ -1773,7 +1963,19 @@ mod tests {
             2:900\tA\tG\t1\t1\n\
             X:700\tG\tC\t2.5\t-2.5\n";
         let unsorted_rows = ["1 b 0 200 A G\n", "1 a 0 100 A G\n", "1 c 0 300 A G\n"];
-        let cases: [(&str, &[&str], &str); 5] = [
+        // Rows naming no single other allele: a simple locus, a split locus where one
+        // row carries the effect allele, a candidate list picking one of two rows, a
+        // locus several rows carry, one no row carries, and a written pair.
+        let effect_only_rows = [
+            "1 k 0 100 A G\n",
+            "1 m 0 300 C T\n",
+            "1 n 0 300 G A\n",
+            "1 p 0 400 A G\n",
+            "1 q 0 400 A AT\n",
+            "1 r 0 500 G C\n",
+            "1 s 0 600 A G\n",
+        ];
+        let cases: [(&str, &[&str], &str); 6] = [
             ("mixed", &mixed_rows, mixed_weights),
             (
                 "disjoint",
@@ -1794,6 +1996,11 @@ mod tests {
                 "descending_scores",
                 &mixed_rows,
                 "variant_id\teffect_allele\tother_allele\tS1\n1:300\tA\tC\t1\n1:100\tA\tG\t2\n2:100\tAT\tA\t3\n",
+            ),
+            (
+                "effect_only",
+                &effect_only_rows,
+                "variant_id\teffect_allele\tother_allele\tS1\n1:100\tA\t.\t1\n1:300\tA\t.\t2\n1:400\tA\tAT/C\t3\n1:400\tA\t.\t4\n1:500\tT\t.\t5\n1:600\tG\tA\t6\n",
             ),
         ];
         for (name, rows, weights_text) in cases {
@@ -1819,7 +2026,10 @@ mod tests {
             };
             let sliced = describe(false);
             assert_eq!(sliced, describe(true), "{name}");
-            let expect_plan = matches!(name, "mixed" | "unsorted_bim" | "descending_scores");
+            let expect_plan = matches!(
+                name,
+                "mixed" | "unsorted_bim" | "descending_scores" | "effect_only"
+            );
             assert_eq!(
                 !sliced.starts_with("error"),
                 expect_plan,
@@ -1992,6 +2202,118 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn explicit_other_alleles_are_left_to_the_pair_rule() {
+        let rows = [("A", "G")];
+        assert_eq!(
+            resolve_other_allele("A", "T", rows.iter().copied()),
+            OtherAlleleMatch::Pair
+        );
+        assert_eq!(
+            resolve_other_allele("A", "G", rows.iter().copied()),
+            OtherAlleleMatch::Pair
+        );
+    }
+
+    #[test]
+    fn a_missing_other_allele_resolves_to_the_one_row_carrying_the_effect_allele() {
+        // A split multiallelic locus where only the second row carries the effect allele.
+        let rows = [("C", "T"), ("G", "A")];
+        assert_eq!(
+            resolve_other_allele("A", ".", rows.iter().copied()),
+            OtherAlleleMatch::EffectOnly(1)
+        );
+        assert_eq!(
+            resolve_other_allele("A", "G/T", rows.iter().copied()),
+            OtherAlleleMatch::EffectOnly(1)
+        );
+        assert_eq!(
+            resolve_other_allele("A", "C/T", rows.iter().copied()),
+            OtherAlleleMatch::NoRow
+        );
+        assert_eq!(
+            resolve_other_allele("G", ".", [("C", "T")].iter().copied()),
+            OtherAlleleMatch::NoRow
+        );
+
+        // Two rows carry the effect allele: ambiguous, unless the candidates pick one.
+        let rows = [("A", "G"), ("A", "AT")];
+        assert_eq!(
+            resolve_other_allele("A", ".", rows.iter().copied()),
+            OtherAlleleMatch::SeveralRows
+        );
+        assert_eq!(
+            resolve_other_allele("A", "AT/C", rows.iter().copied()),
+            OtherAlleleMatch::EffectOnly(1)
+        );
+    }
+
+    #[test]
+    fn rows_naming_no_single_other_allele_plan_like_their_written_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        // A simple locus, a flip, a split multiallelic locus where both rows carry A,
+        // one where only the second row carries T, and one more simple locus.
+        let rows = [
+            "1 rs100 0 100 A G\n",
+            "1 rs200 0 200 C T\n",
+            "1 rs300a 0 300 A C\n",
+            "1 rs300b 0 300 A T\n",
+            "1 rs400a 0 400 G C\n",
+            "1 rs400b 0 400 T C\n",
+            "1 rs500 0 500 G A\n",
+        ];
+        let prefix = dir.path().join("effect_only_panel");
+        write_bim_fileset(&prefix, &rows, 4);
+        let prepare = |name: &str, body: &str| {
+            let weights = dir.path().join(name);
+            std::fs::write(
+                &weights,
+                format!("variant_id\teffect_allele\tother_allele\tS\n{body}"),
+            )
+            .unwrap();
+            prepare_for_computation(
+                std::slice::from_ref(&prefix),
+                std::slice::from_ref(&weights),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        let pairs = prepare(
+            "pairs.tsv",
+            "1:100\tA\tG\t0.5\n1:200\tT\tC\t-0.25\n1:400\tT\tC\t2\n1:500\tA\tG\t0.125\n",
+        );
+        // The same weights with the other allele unknown or listed as candidates, plus an
+        // ambiguous locus and one the genotypes lack.
+        let effect_only = prepare(
+            "effect_only.tsv",
+            "1:100\tA\t.\t0.5\n1:200\tT\t.\t-0.25\n1:300\tA\t.\t9\n1:400\tT\tC/G\t2\n1:500\tA\tG/T\t0.125\n1:600\tA\t.\t7\n",
+        );
+        assert_eq!(
+            plan_by_row_text(&effect_only, &rows),
+            plan_by_row_text(&pairs, &rows)
+        );
+        assert_eq!(effect_only.score_variant_counts, pairs.score_variant_counts);
+
+        // No variant carries C at 1:100, two carry A at 1:300, and at 1:400 the only row
+        // carrying T pairs it with an unlisted allele: all dropped; the explicit pair stays.
+        let skipped = prepare(
+            "skipped.tsv",
+            "1:100\tC\t.\t1\n1:300\tA\t.\t1\n1:400\tT\tA/G\t1\n1:500\tA\tG\t1\n",
+        );
+        let (matched, rules) = plan_by_row_text(&skipped, &rows);
+        assert_eq!(
+            matched
+                .iter()
+                .map(|(text, _, _)| text.as_str())
+                .collect::<Vec<_>>(),
+            vec![rows[6]]
+        );
+        assert!(rules.is_empty());
+        assert_eq!(skipped.score_variant_counts, vec![1]);
     }
 
     #[test]

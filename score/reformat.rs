@@ -715,8 +715,7 @@ pub fn reformat_pgs_file(
             Some(value) => value,
             // Some catalog rows leave other_allele/hm_inferOtherAllele blank but still
             // spell the pair out in variant_description (e.g. `1:100:G:A`). Recover it
-            // when unambiguous; a row we cannot pin down is skipped, not fatal, so one
-            // bad row does not take down a whole score file.
+            // when unambiguous.
             None => match column_indices
                 .variant_description
                 .and_then(|i| fields.get(i))
@@ -726,12 +725,10 @@ pub fn reformat_pgs_file(
                     recovered_oa = recovered;
                     recovered_oa.as_str()
                 }
-                None => {
-                    return Err(make_skip(
-                        "Missing other_allele, and variant_description did not yield an unambiguous non-effect allele"
-                            .to_string(),
-                    ));
-                }
+                // No allele pair is known, as in author-reported files that give only the
+                // effect allele. The row keeps "." and Stage 3 matches it on the effect
+                // allele where exactly one variant at the locus carries it.
+                None => ".",
             },
         };
 
@@ -1443,14 +1440,51 @@ chr_name\tchr_position\teffect_allele\tother_allele\tvariant_description\teffect
         .expect("write input");
 
         let outcome = reformat_pgs_file(&input_path, &output_path).expect("reformat outcome");
-        assert!(outcome.wrote_output, "recoverable row should be written");
+        assert!(outcome.wrote_output, "both rows should be written");
 
         let written = fs::read_to_string(&output_path).expect("read output");
         let lines: Vec<_> = written.lines().collect();
-        assert_eq!(lines[lines.len() - 1], "1:100\tA\tG\t0.5");
+        assert_eq!(lines[1], "1:100\tA\tG\t0.5");
+        // No pair can be recovered, so the row keeps "." for Stage 3 to match on its
+        // effect allele instead of being skipped here.
+        assert_eq!(lines[2], "1:200\tT\t.\t0.7");
+        assert!(outcome.skip_summary.is_none());
+    }
 
-        let summary = outcome.skip_summary.expect("unrecoverable row is skipped");
-        assert_eq!(summary.skipped_count, 1);
+    #[test]
+    fn catalog_rows_without_an_allele_pair_keep_what_they_have() {
+        let tmp = tempdir().expect("tempdir");
+        let input_path = tmp.path().join("PGS_EFFECT_ONLY.txt");
+        let output_path = tmp.path().join("PGS_EFFECT_ONLY.gnomon.tsv");
+        // Author-reported rows with only an effect allele, and harmonized inferences
+        // that list one or several other alleles.
+        fs::write(
+            &input_path,
+            "###PGS CATALOG SCORING FILE - test\n\
+#format_version=2.0\n\
+#pgs_id=PGS_EFFECT_ONLY\n\
+#genome_build=GRCh38\n\
+#HmPOS_build=GRCh38\n\
+chr_name\tchr_position\teffect_allele\teffect_weight\thm_source\thm_rsID\thm_chr\thm_pos\thm_inferOtherAllele\n\
+1\t300\tC\t-0.25\tAuthor-reported\t\t1\t300\t\n\
+1\t100\tA\t0.5\tAuthor-reported\t\t1\t100\tG/T\n\
+1\t200\tT\t0.75\tAuthor-reported\t\t1\t200\tC\n",
+        )
+        .expect("write input");
+
+        let outcome = reformat_pgs_file(&input_path, &output_path).expect("reformat outcome");
+        assert!(outcome.wrote_output);
+        assert!(
+            outcome.skip_summary.is_none(),
+            "no row is skipped for lacking an allele pair"
+        );
+        assert_eq!(
+            fs::read_to_string(&output_path).expect("read output"),
+            "variant_id\teffect_allele\tother_allele\tPGS_EFFECT_ONLY\n\
+1:100\tA\tG/T\t0.5\n\
+1:200\tT\tC\t0.75\n\
+1:300\tC\t.\t-0.25\n"
+        );
     }
 
     /// A catalog file whose rows run in descending position, so conversion must sort.

@@ -626,6 +626,18 @@ mod tests {
                   1:8\tA\tN\t1\t1\n\
                   2:1\tA\tG\t\t4\n",
             ],
+            // Rows naming no single other allele are kept as written, for Stage 3 to
+            // resolve on the effect allele; an 'N' among them is still skipped.
+            vec![
+                b"variant_id\teffect_allele\tother_allele\tA\n\
+                  1:1\tA\t.\t1\n\
+                  1:2\tA\tG/T\t2\n\
+                  1:3\tA\tN\t3\n\
+                  1:4\tAT\t.\t4\n",
+                b"variant_id\teffect_allele\tother_allele\tB\n\
+                  1:2\tC\t.\t5\n\
+                  2:1\tA\tC/G/T\t6\n",
+            ],
             // A weight that is not a finite number fails the run wherever it sits.
             vec![
                 b"variant_id\teffect_allele\tother_allele\tA\tB\n1:1\tA\tG\t1\t2\n1:4\tA\tG\t3\tnan\n1:5\tA\tG\t1\t1\n",
