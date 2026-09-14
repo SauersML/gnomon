@@ -487,6 +487,12 @@ where
         )
     })?;
     fs::create_dir_all(cache_dir)?;
+    sweep_abandoned_staging(
+        cache_dir,
+        &host_key(),
+        process_alive,
+        STAGING_ABANDONED_AFTER,
+    );
     let staging = create_staging_dir(cache_dir, generation)?;
     let staged = (|| -> Result<(), Box<dyn Error + Send + Sync>> {
         convert(&staging)?;
@@ -509,7 +515,7 @@ where
         let _ = fs::remove_dir_all(&staging);
         return Err(err);
     }
-    if let Err(first_err) = fs::rename(&staging, generation) {
+    if let Err(first_err) = crate::output::rename_replacing(&staging, generation) {
         if is_generation_valid(generation, fingerprint) {
             // Another run published this generation first.
             let _ = fs::remove_dir_all(&staging);
@@ -522,8 +528,8 @@ where
             // open files on Unix.
             create_staging_dir(cache_dir, generation).and_then(|aside| {
                 fs::remove_dir(&aside)?;
-                fs::rename(generation, &aside)?;
-                let published = fs::rename(&staging, generation);
+                crate::output::rename_replacing(generation, &aside)?;
+                let published = crate::output::rename_replacing(&staging, generation);
                 let _ = fs::remove_dir_all(&aside);
                 published
             })
@@ -542,19 +548,23 @@ where
     Ok(())
 }
 
-/// Creates `.{generation}.{pid}.{nanos}.tmp` in `cache_dir` exclusively, so concurrent
-/// conversions never share a staging directory.
+/// Creates `.{generation}.{host}.{pid}.{nanos}.tmp` in `cache_dir` exclusively, so
+/// concurrent conversions never share a staging directory. The host key and pid let a
+/// later conversion tell an abandoned staging directory from a live one.
 fn create_staging_dir(cache_dir: &Path, generation: &Path) -> io::Result<PathBuf> {
     let name = generation
         .file_name()
         .map_or_else(|| "generation".into(), |name| name.to_string_lossy());
+    let host = host_key();
     let pid = std::process::id();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos());
     for attempt in 0..STAGING_NAME_ATTEMPTS {
-        let candidate =
-            cache_dir.join(format!(".{name}.{pid}.{}.tmp", nanos + u128::from(attempt)));
+        let candidate = cache_dir.join(format!(
+            ".{name}.{host}.{pid}.{}.tmp",
+            nanos + u128::from(attempt)
+        ));
         match fs::create_dir(&candidate) {
             Ok(()) => return Ok(candidate),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -568,6 +578,92 @@ fn create_staging_dir(cache_dir: &Path, generation: &Path) -> io::Result<PathBuf
             cache_dir.display()
         ),
     ))
+}
+
+/// How long a staging directory whose owner cannot be checked may go without a change
+/// before it counts as abandoned. A conversion keeps writing its files, so a day of
+/// silence means its process is gone.
+const STAGING_ABANDONED_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// A short key for this host in staging directory names: a pid means something only on
+/// the host that issued it.
+fn host_key() -> String {
+    let name = sysinfo::System::host_name().unwrap_or_default();
+    hex::encode(&Sha256::digest(name.as_bytes())[..4])
+}
+
+/// Whether a process with this pid is running on this host, or `None` when that cannot
+/// be checked here. The check first has to find this process itself.
+fn process_alive(pid: u32) -> Option<bool> {
+    let mut system = sysinfo::System::new();
+    if !system.refresh_process(sysinfo::Pid::from_u32(std::process::id())) {
+        return None;
+    }
+    Some(system.refresh_process(sysinfo::Pid::from_u32(pid)))
+}
+
+/// The host key and pid in a staging directory name, `.{generation}.{host}.{pid}.{nanos}.tmp`
+/// or the earlier `.{generation}.{pid}.{nanos}.tmp`, which carries no host. `None` for
+/// anything else.
+fn parse_staging_name(name: &str) -> Option<(Option<&str>, u32)> {
+    let body = name.strip_prefix(".g-")?.strip_suffix(".tmp")?;
+    let fields: Vec<&str> = body.split('.').collect();
+    let (host, pid, nanos) = match fields.as_slice() {
+        [_generation, host, pid, nanos] => (Some(*host), *pid, *nanos),
+        [_generation, pid, nanos] => (None, *pid, *nanos),
+        _ => return None,
+    };
+    nanos.parse::<u128>().ok()?;
+    Some((host, pid.parse().ok()?))
+}
+
+/// The latest modification time of a directory and of the entries directly in it.
+fn last_change(dir: &Path) -> Option<SystemTime> {
+    let mut latest = fs::metadata(dir).and_then(|metadata| metadata.modified()).ok()?;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) {
+                latest = latest.max(modified);
+            }
+        }
+    }
+    Some(latest)
+}
+
+/// Removes staging directories left in `cache_dir` by conversions that died before
+/// publishing. A directory made on this host is abandoned exactly when its pid is not
+/// running. One made on another host, or named before staging names carried a host, is
+/// abandoned only after `abandoned_after` without a change, since its owner cannot be
+/// checked from here. A directory whose owner may still be running is never touched.
+/// Best effort.
+fn sweep_abandoned_staging(
+    cache_dir: &Path,
+    this_host: &str,
+    process_alive: impl Fn(u32) -> Option<bool>,
+    abandoned_after: std::time::Duration,
+) {
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some((host, pid)) = parse_staging_name(&name) else {
+            continue;
+        };
+        let path = entry.path();
+        let alive = match host {
+            Some(host) if host == this_host => process_alive(pid),
+            _ => None,
+        };
+        let abandoned = match alive {
+            Some(alive) => !alive,
+            None => last_change(&path)
+                .is_some_and(|changed| changed.elapsed().is_ok_and(|idle| idle >= abandoned_after)),
+        };
+        if abandoned {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
 }
 
 /// Removes the generations in `cache_dir` made under `fingerprint`, other than
@@ -1106,5 +1202,86 @@ mod tests {
             Some(PathBuf::from("/data/sample.gnomon_cache/genotypes"))
         );
         assert_eq!(default_output_prefix(Path::new("/data/arrays.bed")), None);
+    }
+
+    fn staging_dir(cache_dir: &Path, name: &str) -> PathBuf {
+        let dir = cache_dir.join(name);
+        fs::create_dir_all(&dir).expect("mkdir staging");
+        fs::write(dir.join("genotypes.bed"), b"partial").expect("partial file");
+        dir
+    }
+
+    #[test]
+    fn staging_names_carry_this_host_and_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staging = create_staging_dir(dir.path(), &dir.path().join("g-0123456789abcdef"))
+            .expect("staging directory");
+        let name = staging.file_name().expect("name").to_string_lossy().into_owned();
+        let host = host_key();
+        assert_eq!(
+            parse_staging_name(&name),
+            Some((Some(host.as_str()), std::process::id()))
+        );
+    }
+
+    #[test]
+    fn legacy_staging_names_parse_without_a_host_and_others_not_at_all() {
+        assert_eq!(
+            parse_staging_name(".g-0123456789abcdef.4242.1789355857001456691.tmp"),
+            Some((None, 4242))
+        );
+        assert_eq!(parse_staging_name("g-0123456789abcdef"), None);
+        assert_eq!(parse_staging_name(".other.0a1b2c3d.4242.1.tmp"), None);
+        assert_eq!(parse_staging_name(".g-0123.0a1b2c3d.notapid.1.tmp"), None);
+    }
+
+    #[test]
+    fn sweeping_removes_only_abandoned_staging_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = dir.path().join("sample.gnomon_cache");
+        let this_host = "0a1b2c3d";
+        let dead_here = staging_dir(&cache_dir, &format!(".g-aaaa.{this_host}.101.1.tmp"));
+        let live_here = staging_dir(&cache_dir, &format!(".g-bbbb.{this_host}.202.2.tmp"));
+        let elsewhere = staging_dir(&cache_dir, ".g-cccc.ffffffff.303.3.tmp");
+        let legacy = staging_dir(&cache_dir, ".g-dddd.404.4.tmp");
+        let generation = staging_dir(&cache_dir, "g-eeee");
+        fs::write(cache_dir.join("genotypes.bed"), b"legacy layout").expect("legacy file");
+        let alive = |pid: u32| Some(pid == 202);
+
+        // Under a long idle limit only the same-host directory with a dead owner goes.
+        sweep_abandoned_staging(
+            &cache_dir,
+            this_host,
+            alive,
+            std::time::Duration::from_secs(u64::MAX / 4),
+        );
+        assert!(!dead_here.exists());
+        assert!(live_here.exists() && elsewhere.exists() && legacy.exists());
+
+        // Once idle long enough, directories whose owner cannot be checked go too, while
+        // a running owner keeps its directory.
+        sweep_abandoned_staging(&cache_dir, this_host, alive, std::time::Duration::ZERO);
+        assert!(live_here.exists());
+        assert!(!elsewhere.exists() && !legacy.exists());
+        assert!(generation.is_dir(), "a published generation was removed");
+        assert!(cache_dir.join("genotypes.bed").is_file(), "a legacy file was removed");
+    }
+
+    #[test]
+    fn unknown_liveness_falls_back_to_idle_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = dir.path().join("sample.gnomon_cache");
+        let this_host = "0a1b2c3d";
+        let staging = staging_dir(&cache_dir, &format!(".g-aaaa.{this_host}.101.1.tmp"));
+        let unknown = |_: u32| None;
+        sweep_abandoned_staging(
+            &cache_dir,
+            this_host,
+            unknown,
+            std::time::Duration::from_secs(u64::MAX / 4),
+        );
+        assert!(staging.exists(), "an owner that cannot be checked counted as dead");
+        sweep_abandoned_staging(&cache_dir, this_host, unknown, std::time::Duration::ZERO);
+        assert!(!staging.exists());
     }
 }
