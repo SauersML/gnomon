@@ -558,6 +558,8 @@ mod tests {
             .map(|(i, name)| (name.to_string(), ScoreColumnIndex(i)))
             .collect();
         let cases: Vec<Vec<&[u8]>> = vec![
+            vec![b"variant_id\teffect_allele\tother_allele\tA\tB\n1:1\tA\tG\t1.0000000000000002\t1e-200\n1:2\tA\tG\t1e200\t-0\n1:3\tA\tG\t2\tNaN\n"],
+            vec![b"variant_id\teffect_allele\tother_allele\tA\n1:1\tA\tG\t1\n1:2\tA\tG\t1e999\n"],
             vec![
                 b"#meta\n\nvariant_id\teffect_allele\tother_allele\tA\tB\n\
                   1:100\tG\tA\t0.5\t1.5\n\

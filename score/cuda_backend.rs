@@ -139,8 +139,8 @@ extern "C" __global__ void zero_batch_mats(
 }
 
 extern "C" __global__ void scatter_batch_mats(
-    const float* sparse_weights,
-    const float* sparse_missing_corrections,
+    const double* sparse_weights,
+    const double* sparse_missing_corrections,
     const unsigned int* sparse_columns,
     const unsigned long long* sparse_row_offsets,
     const unsigned int* reconciled_indices,
@@ -262,8 +262,8 @@ struct CudaRuntime {
     // Set by on-device calibration at init: true only when the split-fp16
     // tensor-core score GEMM was proven to equal fp32 on this device.
     use_fp16: bool,
-    sparse_weights: CudaSlice<f32>,
-    sparse_missing_corrections: CudaSlice<f32>,
+    sparse_weights: CudaSlice<f64>,
+    sparse_missing_corrections: CudaSlice<f64>,
     sparse_columns: CudaSlice<u32>,
     sparse_row_offsets: CudaSlice<u64>,
     output_map: CudaSlice<u32>,
@@ -725,12 +725,12 @@ fn preflight_cuda_dynamic_libraries() -> Result<(), String> {
 fn estimate_static_cuda_bytes(prep: &PreparationResult) -> Result<usize, String> {
     prep.sparse_weights()
         .len()
-        .checked_mul(std::mem::size_of::<f32>())
+        .checked_mul(std::mem::size_of::<f64>())
         .and_then(|v| {
             v.checked_add(
                 prep.sparse_missing_corrections()
                     .len()
-                    .checked_mul(std::mem::size_of::<f32>())?,
+                    .checked_mul(std::mem::size_of::<f64>())?,
             )
         })
         .and_then(|v| {
@@ -2892,7 +2892,7 @@ mod tests {
             .find("unpack_kernel: CudaFunction")
             .expect("kernel field");
         let slice_pos = body
-            .find("sparse_weights: CudaSlice<f32>")
+            .find("sparse_weights: CudaSlice<f64>")
             .expect("first CudaSlice field");
         let pinned_pos = body
             .find("pinned_staging: Vec<PinnedHostSlice<u8>>")

@@ -61,8 +61,8 @@ fn setup_benchmark_context(
     let stride = (num_scores + kernel::LANE_COUNT - 1) / kernel::LANE_COUNT * kernel::LANE_COUNT;
 
     let matrix_size = num_variants * num_scores;
-    let sparse_weights = vec![1.0f32; matrix_size];
-    let sparse_missing_corrections = vec![0.0f32; matrix_size];
+    let sparse_weights = vec![1.0f64; matrix_size];
+    let sparse_missing_corrections = vec![0.0f64; matrix_size];
     let sparse_score_columns: Vec<u32> = (0..num_variants)
         .flat_map(|_| 0..num_scores as u32)
         .collect();
@@ -272,9 +272,9 @@ fn benchmark_the_works(c: &mut Criterion) {
                         .map(ReconciledVariantIndex)
                         .collect();
                     let weights_for_batch =
-                        vec![1.0f32; PIVOT_PATH_BATCH_SIZE * prep_result.stride()];
+                        vec![1.0f64; PIVOT_PATH_BATCH_SIZE * prep_result.stride()];
                     let missing_corrections_for_batch =
-                        vec![0.0f32; PIVOT_PATH_BATCH_SIZE * prep_result.stride()];
+                        vec![0.0f64; PIVOT_PATH_BATCH_SIZE * prep_result.stride()];
 
                     group.bench_function(
                         BenchmarkId::new(format!("Pivot__{}", id_str), freq),

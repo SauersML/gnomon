@@ -117,6 +117,9 @@ sha2 = "0.10"
 hex = "0.4"
 zstd = "0.13"
 dirs = "6.0"
+# Content-addressed score plans: parallel content identities, free-space ceilings
+blake3 = "1.8.4"
+fs4 = "0.13.1"
 
 infer_sex = "0.1.0"
 convert_genome = { version = "0.3.3", git = "https://github.com/SauersML/convert_genome", rev = "f34824e7ee0d5fe1f3a09fe39fcbe265e2b6d297" }

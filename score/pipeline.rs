@@ -457,12 +457,12 @@ fn csr_bytes(prep_result: &PreparationResult) -> Result<usize, PipelineError> {
     let weights = prep_result
         .sparse_weights()
         .len()
-        .checked_mul(std::mem::size_of::<f32>())
+        .checked_mul(std::mem::size_of::<f64>())
         .ok_or_else(|| PipelineError::Compute("CSR weight byte estimate overflow.".to_string()))?;
     let missing = prep_result
         .sparse_missing_corrections()
         .len()
-        .checked_mul(std::mem::size_of::<f32>())
+        .checked_mul(std::mem::size_of::<f64>())
         .ok_or_else(|| {
             PipelineError::Compute("CSR missing-correction byte estimate overflow.".to_string())
         })?;
@@ -1931,14 +1931,14 @@ struct BufferGuard<'a> {
 }
 
 struct DenseMiniBatchCanvas<'a> {
-    weights: &'a mut [f32],
-    missing_corrections: &'a mut [f32],
+    weights: &'a mut [f64],
+    missing_corrections: &'a mut [f64],
     stride: usize,
 }
 
 impl<'a> DenseMiniBatchCanvas<'a> {
     #[inline(always)]
-    fn set(&mut self, batch_row: usize, score_col: usize, weight: f32, missing_correction: f32) {
+    fn set(&mut self, batch_row: usize, score_col: usize, weight: f64, missing_correction: f64) {
         let idx = batch_row * self.stride + score_col;
         self.weights[idx] = weight;
         self.missing_corrections[idx] = missing_correction;
@@ -2232,8 +2232,8 @@ fn process_dense_stream(
                         Vec::with_capacity(
                             DENSE_BATCH_SIZE * (prep_result.bytes_per_variant as usize),
                         ),
-                        Vec::<f32>::new(),
-                        Vec::<f32>::new(),
+                        Vec::<f64>::new(),
+                        Vec::<f64>::new(),
                         Vec::<ReconciledVariantIndex>::with_capacity(DENSE_BATCH_SIZE),
                     )
                 },
@@ -2266,9 +2266,9 @@ fn process_dense_stream(
 
                         let stride = prep_result.stride();
                         let matrix_len = acc.5.len() * stride;
-                        acc.3.resize(matrix_len, 0.0f32);
+                        acc.3.resize(matrix_len, 0.0f64);
                         acc.3.fill(0.0);
-                        acc.4.resize(matrix_len, 0.0f32);
+                        acc.4.resize(matrix_len, 0.0f64);
                         acc.4.fill(0.0);
                         let mut canvas = DenseMiniBatchCanvas {
                             weights: &mut acc.3,
@@ -2399,7 +2399,7 @@ fn process_dense_stream_bounded(
                         ))
                     })?;
             }
-            weights_for_batch.resize(matrix_len, 0.0f32);
+            weights_for_batch.resize(matrix_len, 0.0f64);
             weights_for_batch.fill(0.0);
             if missing_corrections_for_batch.capacity() < matrix_len {
                 missing_corrections_for_batch
@@ -2410,7 +2410,7 @@ fn process_dense_stream_bounded(
                         ))
                     })?;
             }
-            missing_corrections_for_batch.resize(matrix_len, 0.0f32);
+            missing_corrections_for_batch.resize(matrix_len, 0.0f64);
             missing_corrections_for_batch.fill(0.0);
             let mut canvas = DenseMiniBatchCanvas {
                 weights: &mut weights_for_batch,
@@ -2462,11 +2462,11 @@ fn bounded_dense_batch_size(
 
 fn dense_scratch_bytes(prep: &PreparationResult, variants: usize) -> Result<usize, PipelineError> {
     let row = usize::try_from(prep.bytes_per_variant).ok();
-    // Packed calls, two padded f32 weight matrices, the dosage tile, and
+    // Packed calls, two padded f64 weight matrices, the dosage tile, and
     // batched work descriptors coexist. Score width matters as much as N.
     row.and_then(|row| {
         prep.stride()
-            .checked_mul(2 * std::mem::size_of::<f32>())
+            .checked_mul(2 * std::mem::size_of::<f64>())
             .and_then(|weights| row.checked_add(weights))
     })
     .and_then(|row| row.checked_add(prep.num_people_to_score.min(batch::PERSON_BLOCK_SIZE)))

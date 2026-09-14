@@ -9,11 +9,11 @@
 // It functions as a "Virtual Machine" that executes a pre-compiled plan, containing
 // zero scientific logic, branches, or decisions.
 
-use std::simd::f32x8;
+use std::simd::f64x8;
 
 // --- Type Aliases for Readability ---
 // These types are part of the public API of the kernel.
-pub type SimdVec = f32x8;
+pub type SimdVec = f64x8;
 pub const LANE_COUNT: usize = SimdVec::LEN;
 pub const MAX_KERNEL_ACCUMULATOR_LANES: usize = 8;
 
@@ -22,11 +22,11 @@ pub const MAX_KERNEL_ACCUMULATOR_LANES: usize = 8;
 /// `2*w` is exact in IEEE-754 (it only bumps the exponent), so for all finite,
 /// non-overflowing values `fma(w, 2, acc)` rounds identically to `acc + (w + w)`
 /// — the results are bit-for-bit equal. On targets with FMA this collapses the
-/// doubling and the accumulate into a single `vfmadd231ps` with a folded memory
+/// doubling and the accumulate into a single `vfmadd231pd` with a folded memory
 /// operand, halving the FP-add port pressure of the hot dosage-2 loop.
 ///
 /// The `cfg` gate is mandatory on x86: `mul_add` without the `fma` target
-/// feature lowers to a per-lane `fmaf` libm call (catastrophic in the hot loop).
+/// feature lowers to a per-lane `fma` libm call (catastrophic in the hot loop).
 /// Published x86 wheels and performance binaries target x86-64-v3 and take this
 /// path; portable baseline builds use the two-add implementation. AArch64 has
 /// fused scalar/vector FP in the baseline ISA and always takes the fused path.
@@ -56,7 +56,7 @@ fn accumulate_dosage_two(acc: SimdVec, w: SimdVec) -> SimdVec {
 /// and memory errors in the hot loops. It is used for both the aligned weights
 /// and the correction constants matrices.
 pub struct PaddedInterleavedWeights<'a> {
-    slice: &'a [f32],
+    slice: &'a [f64],
     num_rows: usize,
     num_scores: usize,
     stride: usize,
@@ -68,7 +68,7 @@ impl<'a> PaddedInterleavedWeights<'a> {
     /// upfront check to ensure the slice length matches the provided dimensions
     /// and the implied padding.
     #[inline]
-    pub fn new(slice: &'a [f32], num_rows: usize, num_scores: usize) -> Result<Self, &'static str> {
+    pub fn new(slice: &'a [f64], num_rows: usize, num_scores: usize) -> Result<Self, &'static str> {
         // The stride is the width of a single row's data, rounded up to the
         // nearest multiple of the SIMD vector width. This padding is the
         // key to enabling branch-free, "no scalar fallback" SIMD.
@@ -240,35 +240,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn adjustments_do_not_round_weights_or_partial_sums_to_f32() {
+        let mut data = [16_777_216.0f64; 16];
+        data[8..].fill(1.0 + f64::EPSILON);
+        let weights = PaddedInterleavedWeights::new(&data, 2, 8).unwrap();
+        let lone = accumulate_adjustments_for_person_lanes(&weights, &[1], &[], 0, 1);
+        assert_eq!(lone[0].to_array(), [1.0 + f64::EPSILON; 8]);
+        let combined = accumulate_adjustments_for_person_lanes(&weights, &[0, 1], &[], 0, 1);
+        assert_eq!(combined[0].to_array(), [16_777_217.0; 8]);
+    }
+
+    #[test]
     fn padded_matrix_rejects_overflowing_dimensions() {
         assert!(PaddedInterleavedWeights::new(&[], 0, usize::MAX).is_err());
         assert!(PaddedInterleavedWeights::new(&[], usize::MAX / LANE_COUNT + 1, 1).is_err());
     }
 
-    #[test]
-    fn safe_kernels_reject_invalid_genotype_rows() {
-        let data = [1.0; 64];
-        let weights = PaddedInterleavedWeights::new(&data, 1, 64).expect("matrix");
-        for (g1, g2) in [(&[1u16][..], &[][..]), (&[][..], &[1u16][..])] {
-            assert!(
-                std::panic::catch_unwind(|| {
-                    accumulate_adjustments_for_person(&weights, g1, g2, 0)
-                })
-                .is_err()
-            );
-            assert!(
-                std::panic::catch_unwind(|| {
-                    accumulate_adjustments_for_person_lanes(&weights, g1, g2, 0, 1)
-                })
-                .is_err()
-            );
-        }
+    macro_rules! invalid_row_test {
+        ($name:ident, $full:expr, $g1:expr, $g2:expr) => {
+            #[test]
+            #[should_panic(expected = "Genotype row index out of bounds")]
+            fn $name() {
+                let data = [1.0; 64];
+                let weights = PaddedInterleavedWeights::new(&data, 1, 64).expect("matrix");
+                if $full {
+                    accumulate_adjustments_for_person(&weights, $g1, $g2, 0);
+                } else {
+                    accumulate_adjustments_for_person_lanes(&weights, $g1, $g2, 0, 1);
+                }
+            }
+        };
     }
+    invalid_row_test!(fixed_kernel_rejects_invalid_dosage_one_row, true, &[1], &[]);
+    invalid_row_test!(fixed_kernel_rejects_invalid_dosage_two_row, true, &[], &[1]);
+    invalid_row_test!(tail_kernel_rejects_invalid_dosage_one_row, false, &[1], &[]);
+    invalid_row_test!(tail_kernel_rejects_invalid_dosage_two_row, false, &[], &[1]);
 
     #[test]
     fn all_score_stripe_widths_preserve_accumulation_order() {
-        let data: Vec<f32> = (0..256 * 136)
-            .map(|i| ((i * 37 % 1021) as f32 - 511.0) / 17.0)
+        let data: Vec<f64> = (0..256 * 136)
+            .map(|i| ((i * 37 % 1021) as f64 - 511.0) / 17.0)
             .collect();
         let weights = PaddedInterleavedWeights::new(&data, 256, 131).expect("matrix");
         let g1: Vec<u16> = (0..256).filter(|i| i % 3 == 0).collect();
@@ -278,7 +289,7 @@ mod tests {
                 let actual =
                     accumulate_adjustments_for_person_lanes(&weights, &g1, &g2, start, lanes);
                 for score in 0..64 {
-                    let mut expected = 0.0f32;
+                    let mut expected = 0.0f64;
                     if score < lanes * LANE_COUNT {
                         for &row in &g1 {
                             expected += data[row as usize * 136 + start + score];
@@ -295,7 +306,7 @@ mod tests {
 
     #[test]
     fn checked_kernels_preserve_fixed_and_tail_accumulations() {
-        let data: Vec<f32> = (0..3 * 72).map(|value| value as f32 / 4.0).collect();
+        let data: Vec<f64> = (0..3 * 72).map(|value| value as f64 / 4.0).collect();
         let weights = PaddedInterleavedWeights::new(&data, 3, 67).expect("matrix");
         let fixed = accumulate_adjustments_for_person(&weights, &[0, 2], &[1], 0);
         let tail = accumulate_adjustments_for_person_lanes(&weights, &[0, 2], &[1], 64, 1);

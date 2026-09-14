@@ -134,7 +134,7 @@ pub struct ScoreInfo {
     /// The other (non-effect) allele for the variant, used for disambiguation.
     pub other_allele: String,
     /// The effect weight for this specific score.
-    pub weight: f32,
+    pub weight: f64,
     /// The global column index for the score this rule applies to.
     pub score_column_index: ScoreColumnIndex,
 }
@@ -178,8 +178,8 @@ pub struct PreparationResult {
     // --- Private, compiled data matrices ---
     // These fields are private to guarantee their invariants. They are created once
     // by the `prepare` module and can only be read by downstream modules.
-    sparse_weights: Vec<f32>,
-    sparse_missing_corrections: Vec<f32>,
+    sparse_weights: Vec<f64>,
+    sparse_missing_corrections: Vec<f64>,
     sparse_score_columns: Vec<u32>,
     sparse_row_offsets: Vec<u64>,
     stride: usize,
@@ -239,8 +239,8 @@ impl PreparationResult {
     /// The constructor is crate-private, enforcing the "Airlock" pattern.
     /// Only the `prepare` module can construct this "proof token".
     pub fn new(
-        sparse_weights: Vec<f32>,
-        sparse_missing_corrections: Vec<f32>,
+        sparse_weights: Vec<f64>,
+        sparse_missing_corrections: Vec<f64>,
         sparse_score_columns: Vec<u32>,
         sparse_row_offsets: Vec<u64>,
         stride: usize,
@@ -295,12 +295,12 @@ impl PreparationResult {
     // --- Public Getters for Private Data ---
 
     #[inline(always)]
-    pub fn sparse_weights(&self) -> &[f32] {
+    pub fn sparse_weights(&self) -> &[f64] {
         &self.sparse_weights
     }
 
     #[inline(always)]
-    pub fn sparse_missing_corrections(&self) -> &[f32] {
+    pub fn sparse_missing_corrections(&self) -> &[f64] {
         &self.sparse_missing_corrections
     }
 
@@ -418,16 +418,16 @@ pub struct CsrEntryIndex(pub usize);
 #[derive(Debug, Clone, Copy)]
 pub struct CsrContribution {
     pub score_column: ScoreColumnIndex,
-    pub weight: f32,
-    pub missing_correction: f32,
+    pub weight: f64,
+    pub missing_correction: f64,
 }
 
 /// A read-only view over one variant's CSR contributions.
 #[derive(Debug, Clone, Copy)]
 pub struct VariantCsrView<'a> {
     score_columns: &'a [u32],
-    weights: &'a [f32],
-    missing_corrections: &'a [f32],
+    weights: &'a [f64],
+    missing_corrections: &'a [f64],
 }
 
 impl<'a> VariantCsrView<'a> {

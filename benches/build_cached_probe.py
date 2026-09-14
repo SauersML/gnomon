@@ -3,6 +3,8 @@ from pathlib import Path
 import os
 import shlex
 import subprocess
+import json
+import re
 
 root = Path('/projects/standard/hsiehph/sauer354/gnomon/target/score-map')
 commands = []
@@ -16,7 +18,7 @@ for assignment in command[:index]:
     key, value = assignment.split('=', 1)
     environment[key] = value
 args = command[index:]
-def build(source, output, extra):
+def build(source, output, extra, library_log=None):
     selected = [args[0]]
     i = 1
     while i < len(args):
@@ -33,4 +35,39 @@ def build(source, output, extra):
             selected.append(arg)
             i += 1
     selected += ['--crate-name', output.replace('-', '_'), str(source), '-o', str(root/output), '-C', 'codegen-units=64'] + extra
-    subprocess.run(selected, env=environment, cwd=root/'src', check=True, timeout=45)
+    if library_log is not None:
+        artifacts = {}
+        finished = False
+        for line in Path(library_log).read_text().splitlines():
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get('reason') == 'build-finished':
+                finished = message['success']
+            if message.get('reason') == 'build-script-executed' and 'gnomon-pgs' in message['package_id']:
+                environment.update(message['env'])
+            if message.get('reason') == 'compiler-artifact':
+                metadata = [path for path in message['filenames'] if path.endswith('.rmeta')]
+                if metadata:
+                    assert len(metadata) == 1 and Path(metadata[0]).is_file(), metadata
+                    artifacts[message['target']['name']] = metadata[0]
+        if not finished or 'gnomon' not in artifacts:
+            raise RuntimeError('A successful Cargo JSON library build is required')
+        environment['CARGO_PKG_VERSION'] = re.search(
+            r'^version = "([^"]+)"', (root / 'src/Cargo.toml').read_text(), re.MULTILINE
+        ).group(1)
+        assert 'GNOMON_BUILD_TIMESTAMP' in environment
+        for i, arg in enumerate(selected[:-1]):
+            if arg == '--extern':
+                name, path = selected[i + 1].split('=', 1)
+                if name == 'gnomon':
+                    selected[i + 1] = name + '=' + str(Path(artifacts[name]).with_suffix(Path(path).suffix))
+        for name in ['blake3', 'fs4']:
+            for suffix in ['.rlib', '.rmeta']:
+                selected += ['--extern', name + '=' + str(Path(artifacts[name]).with_suffix(suffix))]
+        for directory in sorted({str(Path(path).parent) for path in artifacts.values()}):
+            selected += ['-L', 'dependency=' + directory]
+    result = subprocess.run(selected, env=environment, cwd=root/'src', timeout=45)
+    if result.returncode:
+        raise SystemExit(result.returncode)

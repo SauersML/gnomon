@@ -1,5 +1,32 @@
 # Score and packed projection performance
 
+## Retaining source-weight precision throughout CPU scoring
+
+Weights, CSR corrections, dense CPU canvases, and SIMD accumulators now use
+f64. The compiled plan cache stores f64 arrays under format `GNPLAN03` and
+checks content digests. Nonfinite input weights fail preparation through the
+shared parser, including errors beyond the last matching genotype row.
+Memory estimates include the wider arrays: the three CSR contribution arrays
+now require 20 bytes per entry, before capacity slack and row metadata.
+
+The complete 1,799,239-marker BED with 512 people and 32 real PGS files has
+1,188,880 matched rows and 5,385,268 contributions. Its maximum AVG difference
+from the independent gscore reference fell from 2.67028808e-8 to
+6.41486864e-13, about 41,600 times smaller. Missing percentages still agreed.
+This is **not exact summation**: 52 of 16,384 cells exceed relative tolerance
+1e-12 plus absolute tolerance 1e-15. The largest absolute error is PGS002724;
+near-zero PGS000026 values still make relative error alone uninformative.
+
+One four-core Milan run took 3,199 ms to prepare and 424 ms to compute, with
+1.24 GiB peak process RSS including preparation. This is a measured run, not
+a paired speedup claim. Wider storage trades memory for source precision;
+the earlier f32 CSR allocation measurements below are historical.
+All 84 focused kernel, preparation, cache, scoring, and memory tests passed
+after incorporating concurrent main's invalid-row handling. Logs and outputs
+use `round17-` in the MSI iteration directory. `precision_score_checks.py`
+builds its probes against a successful Cargo JSON library build and preserves
+the separate rlib/rmeta arguments required by the warm nightly cache.
+
 ## Sparse row reordering without duplicating the complete plan
 
 Preparation now skips CSR reordering when matched BIM indices already strictly

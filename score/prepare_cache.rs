@@ -1,65 +1,41 @@
 //! Content-addressed variant plans. Person selection and genotype calls are
 //! deliberately absent: the same BIM/weights can serve any cohort layout.
+//!
+//! A plan is named by a BLAKE3 digest of the bytes of every `.bim` and score file
+//! it was compiled from, the region filters and this build. File metadata never
+//! stands in for bytes: timestamps can be set by anyone who can write the file, are
+//! coarse on some filesystems, lag behind writes through a shared mapping and are
+//! cached by NFS clients, so an unchanged size and modification time prove nothing
+//! about content.
 use super::FilesetPaths;
 use crate::score::types::{
     BimRowIndex, GenomicRegion, GroupedComplexRule, PipelineKind, PreparationResult,
     ScoreColumnIndex, ScoreInfo,
 };
-use memmap2::MmapOptions;
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::HashMap,
-    fs::File,
+    fs::{self, File},
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 
-const MAGIC: &[u8] = b"GNOMON_VARIANT_PLAN_1\n";
-const MAX_CACHE_BYTES: usize = 256 * 1024 * 1024;
-const HASH_CHUNK_BYTES: usize = 256 * 1024;
-const MAX_HASH_CHUNKS: usize = 4;
-
-// Fixed chunk boundaries make the identity independent of worker count, read
-// sizes, and the memory budget. Read a bounded window, hash its chunks in
-// parallel, then incorporate their digests in input order.
-fn hash_contents(
-    reader: &mut impl Read,
-    len: u64,
-    buffer: &mut [u8],
-    hash: &mut Sha256,
-) -> io::Result<()> {
-    debug_assert!(!buffer.is_empty() && buffer.len() % HASH_CHUNK_BYTES == 0);
-    debug_assert!(buffer.len() <= HASH_CHUNK_BYTES * MAX_HASH_CHUNKS);
-    hash.update(len.to_le_bytes());
-    let mut remaining = len;
-    let mut digests = [[0u8; 32]; MAX_HASH_CHUNKS];
-    while remaining != 0 {
-        let count = remaining.min(buffer.len() as u64) as usize;
-        reader.read_exact(&mut buffer[..count])?;
-        let chunks = count.div_ceil(HASH_CHUNK_BYTES);
-        if chunks == 1 {
-            digests[0] = Sha256::digest(&buffer[..count]).into();
-        } else {
-            digests[..chunks]
-                .par_iter_mut()
-                .zip(buffer[..count].par_chunks(HASH_CHUNK_BYTES))
-                .for_each(|(digest, bytes)| *digest = Sha256::digest(bytes).into());
-        }
-        for digest in &digests[..chunks] {
-            hash.update(digest);
-        }
-        remaining -= count as u64;
-    }
-    if reader.read(&mut [0u8; 1])? != 0 {
-        return Err(invalid("Variant input grew during content hashing"));
-    }
-    Ok(())
-}
+/// Plan format 3 retains f64 weights: a header holding the key and one BLAKE3
+/// digest per section, then little-endian arrays padded to multiples of 8 bytes.
+const MAGIC: [u8; 8] = *b"GNPLAN03";
+/// Inputs are hashed in leaves of this many bytes, so a key depends only on the
+/// bytes, never on thread count, read sizes or available memory.
+const LEAF_BYTES: u64 = 4 << 20;
+const SECTIONS: usize = 18;
+const HEADER_BYTES: usize = MAGIC.len() + 32 + SECTIONS * (8 + 32) + 32;
+/// A temporary plan file younger than this may belong to a writer still running.
+const STALE_TEMPORARY_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub(super) struct VariantPlan {
-    pub weights: Vec<f32>,
-    pub corrections: Vec<f32>,
+    pub weights: Vec<f64>,
+    pub corrections: Vec<f64>,
     pub columns: Vec<u32>,
     pub offsets: Vec<u64>,
     pub baseline: Vec<f64>,
@@ -83,6 +59,10 @@ impl PlanCache {
         scores: &[PathBuf],
         regions: Option<&HashMap<String, GenomicRegion>>,
     ) -> io::Result<Option<Self>> {
+        // Plans hold arrays in their little-endian memory form.
+        if cfg!(target_endian = "big") {
+            return Ok(None);
+        }
         // Remote text and PVAR adapters retain their streaming compiler. This
         // cache represents local BIM rows, whose numbering is content-defined.
         if filesets
@@ -91,62 +71,12 @@ impl PlanCache {
         {
             return Ok(None);
         }
-        // Very wide input collections keep the streaming compiler: hashing
-        // gigabytes only to exceed the bounded plan cache would waste a pass.
-        let mut input_bytes = 0u64;
-        for path in filesets.iter().map(|f| &f.bim).chain(scores) {
-            input_bytes = input_bytes.saturating_add(std::fs::metadata(path)?.len());
-            if input_bytes > 1024 * 1024 * 1024 {
-                return Ok(None);
-            }
-        }
-        let Some(directory) = dirs::cache_dir() else {
+        let Some(directory) = plan_directory() else {
             return Ok(None);
         };
-        let (_, available) = crate::memory::memory_bytes();
-        let chunks = rayon::current_num_threads()
-            .min(MAX_HASH_CHUNKS)
-            .min((available / 64 / HASH_CHUNK_BYTES as u64).min(MAX_HASH_CHUNKS as u64) as usize)
-            .min(input_bytes.div_ceil(HASH_CHUNK_BYTES as u64).max(1) as usize);
-        if chunks == 0 {
-            return Ok(None);
-        }
-        let mut buffer = Vec::new();
-        buffer
-            .try_reserve_exact(chunks * HASH_CHUNK_BYTES)
-            .map_err(|_| invalid("Cannot allocate content hash window"))?;
-        buffer.resize(chunks * HASH_CHUNK_BYTES, 0);
-        let mut hash = Sha256::new();
-        hash.update(MAGIC);
-        // Compiler changes invalidate plans automatically, including changes
-        // to chromosome parsing and shared representation invariants.
-        hash.update(Sha256::digest(include_bytes!("prepare.rs")));
-        hash.update(Sha256::digest(include_bytes!("prepare_cache.rs")));
-        hash.update(Sha256::digest(include_bytes!("types.rs")));
-        for paths in [
-            filesets.iter().map(|f| f.bim.as_path()).collect::<Vec<_>>(),
-            scores.iter().map(PathBuf::as_path).collect(),
-        ] {
-            hash.update((paths.len() as u64).to_le_bytes());
-            for path in paths {
-                let mut file = File::open(path)?;
-                let len = file.metadata()?.len();
-                hash_contents(&mut file, len, &mut buffer, &mut hash)?;
-            }
-        }
-        let mut filters: Vec<_> = regions.into_iter().flat_map(|r| r.iter()).collect();
-        filters.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        for (name, region) in filters {
-            hash.update((name.len() as u64).to_le_bytes());
-            hash.update(name.as_bytes());
-            hash.update([region.chromosome]);
-            hash.update(region.start.to_le_bytes());
-            hash.update(region.end.to_le_bytes());
-        }
-        let key: [u8; 32] = hash.finalize().into();
-        let name: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+        let key = content_key(filesets, scores, regions)?;
         Ok(Some(Self {
-            path: directory.join("gnomon/variant-plans").join(name),
+            path: directory.join(hex::encode(key)),
             key,
         }))
     }
@@ -161,154 +91,706 @@ impl PlanCache {
     }
 
     pub fn load(&self) -> io::Result<Option<VariantPlan>> {
-        let file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let budget = allocation_budget();
-        let len = usize::try_from(file.metadata()?.len())
-            .map_err(|_| invalid("Cache length overflow"))?;
-        if len < MAGIC.len() + 64 || len > budget {
-            return Err(invalid(
-                "Variant plan exceeds the cache memory budget or is truncated",
-            ));
-        }
-        // Writers publish with atomic rename; this mapping stays attached to
-        // one complete inode even when another process replaces the cache.
-        let mapped = unsafe { MmapOptions::new().map(&file)? };
-        let (payload, digest) = mapped.split_at(len - 32);
-        if Sha256::digest(payload).as_slice() != digest {
-            return Err(invalid("Variant plan checksum mismatch"));
-        }
-        let mut reader = Decoder {
-            bytes: payload,
-            budget,
-        };
-        if reader.take(MAGIC.len())? != MAGIC || reader.take(32)? != self.key {
-            return Err(invalid("Variant plan identity mismatch"));
-        }
-        let total_variants = reader.number::<u64>()?;
-        let starts = reader.vector::<u64>()?;
-        let weights = reader.vector::<f32>()?;
-        let corrections = reader.vector::<f32>()?;
-        let columns = reader.vector::<u32>()?;
-        let offsets = reader.vector::<u64>()?;
-        let baseline = reader.vector::<f64>()?;
-        let required = reader.items(8, |r| Ok(BimRowIndex(r.number::<u64>()?)))?;
-        let flags = reader.vector::<u8>()?;
-        let counts = reader.vector::<u32>()?;
-        let names = reader.items(8, Decoder::string)?;
-        let complex = reader.items(28, |r| {
-            let locus_chr_pos = (r.string()?, r.number::<u32>()?);
-            let possible_contexts = r.items(24, |r| {
-                Ok((BimRowIndex(r.number::<u64>()?), r.string()?, r.string()?))
-            })?;
-            let score_applications = r.items(24, |r| {
-                Ok(ScoreInfo {
-                    effect_allele: r.string()?,
-                    other_allele: r.string()?,
-                    weight: r.number::<f32>()?,
-                    score_column_index: ScoreColumnIndex(
-                        usize::try_from(r.number::<u64>()?)
-                            .map_err(|_| invalid("Score column overflow"))?,
-                    ),
-                })
-            })?;
-            Ok(GroupedComplexRule {
-                locus_chr_pos,
-                possible_contexts,
-                score_applications,
-            })
-        })?;
-        if !reader.bytes.is_empty() {
-            return Err(invalid("Trailing variant plan data"));
-        }
-        let plan = VariantPlan {
-            weights,
-            corrections,
-            columns,
-            offsets,
-            baseline,
-            required,
-            complex,
-            names,
-            counts,
-            flags,
-            starts,
-            total_variants,
-        };
-        plan.validate()?;
-        Ok(Some(plan))
+        read_plan(&self.path, &self.key)?
+            .map(Sections::into_plan)
+            .transpose()
     }
 
     pub fn save(&self, prep: &PreparationResult) -> io::Result<()> {
-        crate::output::write_atomically(&self.path, |writer| {
-            let mut out = Encoder {
-                writer,
-                hash: Sha256::new(),
-                remaining: allocation_budget().saturating_sub(32),
-            };
-            out.bytes(MAGIC)?;
-            out.bytes(&self.key)?;
-            out.number(prep.total_variants_in_bim)?;
-            match &prep.pipeline_kind {
-                PipelineKind::SingleFile(_) => out.vector(&[0u64])?,
-                PipelineKind::MultiFile(boundaries) => {
-                    out.number(boundaries.len() as u64)?;
-                    for boundary in boundaries {
-                        out.number(boundary.starting_global_index)?;
-                    }
-                }
-            }
-            out.vector(prep.sparse_weights())?;
-            out.vector(prep.sparse_missing_corrections())?;
-            out.vector(prep.sparse_score_columns())?;
-            out.vector(prep.sparse_row_offsets())?;
-            out.vector(prep.baseline_missing_sum_by_score())?;
-            out.number(prep.required_bim_indices.len() as u64)?;
-            for row in &prep.required_bim_indices {
-                out.number(row.0)?;
-            }
-            out.vector(prep.required_is_complex())?;
-            out.vector(&prep.score_variant_counts)?;
-            out.number(prep.score_names.len() as u64)?;
-            for name in &prep.score_names {
-                out.string(name)?;
-            }
-            out.number(prep.complex_rules.len() as u64)?;
-            for rule in &prep.complex_rules {
-                out.string(&rule.locus_chr_pos.0)?;
-                out.number(rule.locus_chr_pos.1)?;
-                out.number(rule.possible_contexts.len() as u64)?;
-                for (row, a, b) in &rule.possible_contexts {
-                    out.number(row.0)?;
-                    out.string(a)?;
-                    out.string(b)?;
-                }
-                out.number(rule.score_applications.len() as u64)?;
-                for score in &rule.score_applications {
-                    out.string(&score.effect_allele)?;
-                    out.string(&score.other_allele)?;
-                    out.number(score.weight)?;
-                    out.number(score.score_column_index.0 as u64)?;
-                }
-            }
-            let digest = out.hash.finalize();
-            out.writer.write_all(&digest)
-        })
+        let sections = Sections::from_preparation(prep);
+        let directory = self
+            .path
+            .parent()
+            .ok_or_else(|| invalid("Variant plan path has no directory"))?;
+        fs::create_dir_all(directory)?;
+        make_room(directory, &self.path, sections.file_len())?;
+        write_plan(&self.path, &self.key, &sections)
     }
 }
 
-fn allocation_budget() -> usize {
-    let (_, available) = crate::memory::memory_bytes();
-    usize::try_from(available / 8)
-        .unwrap_or(usize::MAX)
-        .min(MAX_CACHE_BYTES)
+/// Where plans live: `variant-plans` under `$GNOMON_CACHE_DIR` when that is set, else
+/// `gnomon/variant-plans` under the platform cache directory (`$XDG_CACHE_HOME` or
+/// `~/.cache` on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows).
+fn plan_directory() -> Option<PathBuf> {
+    match std::env::var_os("GNOMON_CACHE_DIR") {
+        Some(root) if !root.is_empty() => Some(PathBuf::from(root).join("variant-plans")),
+        _ => dirs::cache_dir().map(|root| root.join("gnomon").join("variant-plans")),
+    }
+}
+
+/// The digest naming a plan compiled from these inputs by this build.
+fn content_key(
+    filesets: &[FilesetPaths],
+    scores: &[PathBuf],
+    regions: Option<&HashMap<String, GenomicRegion>>,
+) -> io::Result<[u8; 32]> {
+    let inputs: Vec<&Path> = filesets
+        .iter()
+        .map(|f| f.bim.as_path())
+        .chain(scores.iter().map(PathBuf::as_path))
+        .collect();
+    let digests = content_digests(&inputs)?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(&MAGIC);
+    for field in [env!("CARGO_PKG_VERSION"), env!("GNOMON_BUILD_TIMESTAMP")] {
+        hash.update(&(field.len() as u64).to_le_bytes());
+        hash.update(field.as_bytes());
+    }
+    // Compiler changes invalidate plans automatically, including changes
+    // to chromosome parsing and shared representation invariants.
+    for source in [
+        &include_bytes!("prepare.rs")[..],
+        include_bytes!("prepare_cache.rs"),
+        include_bytes!("types.rs"),
+    ] {
+        hash.update(blake3::hash(source).as_bytes());
+    }
+    for count in [filesets.len(), scores.len()] {
+        hash.update(&(count as u64).to_le_bytes());
+    }
+    for digest in &digests {
+        hash.update(digest);
+    }
+    let mut filters: Vec<_> = regions.into_iter().flat_map(|r| r.iter()).collect();
+    filters.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    hash.update(&(filters.len() as u64).to_le_bytes());
+    for (name, region) in filters {
+        hash.update(&(name.len() as u64).to_le_bytes());
+        hash.update(name.as_bytes());
+        hash.update(&[region.chromosome]);
+        hash.update(&region.start.to_le_bytes());
+        hash.update(&region.end.to_le_bytes());
+    }
+    Ok(*hash.finalize().as_bytes())
+}
+
+/// One digest per file: its length and the BLAKE3 digests of its fixed-size leaves,
+/// which are read and hashed in parallel. Leaves are read with positioned reads, not
+/// a mapping, so a file truncated underneath this process is an error, not a SIGBUS.
+fn content_digests(paths: &[&Path]) -> io::Result<Vec<[u8; 32]>> {
+    let files: Vec<(File, u64)> = paths
+        .par_iter()
+        .map(|path| -> io::Result<(File, u64)> {
+            let file = File::open(path)?;
+            let len = file.metadata()?.len();
+            Ok((file, len))
+        })
+        .collect::<io::Result<_>>()?;
+    let leaf_counts: Vec<u64> = files
+        .iter()
+        .map(|(_, len)| len.div_ceil(LEAF_BYTES).max(1))
+        .collect();
+    let leaves: Vec<(usize, u64)> = leaf_counts
+        .iter()
+        .enumerate()
+        .flat_map(|(index, &count)| (0..count).map(move |leaf| (index, leaf * LEAF_BYTES)))
+        .collect();
+    let leaf_digests: Vec<[u8; 32]> = leaves
+        .par_iter()
+        .map_init(
+            Vec::<u8>::new,
+            |buffer, &(index, offset)| -> io::Result<[u8; 32]> {
+                let (file, len) = &files[index];
+                let count = (len - offset).min(LEAF_BYTES) as usize;
+                buffer.resize(count, 0);
+                read_exact_at(file, &mut buffer[..count], offset)?;
+                Ok(*blake3::hash(&buffer[..count]).as_bytes())
+            },
+        )
+        .collect::<io::Result<_>>()?;
+    files
+        .par_iter()
+        .try_for_each(|(file, len)| -> io::Result<()> {
+            if read_at(file, &mut [0u8; 1], *len)? != 0 {
+                return Err(invalid("Variant input grew during content hashing"));
+            }
+            Ok(())
+        })?;
+    let mut next = 0;
+    Ok(files
+        .iter()
+        .zip(&leaf_counts)
+        .map(|((_, len), &count)| {
+            let mut hash = blake3::Hasher::new();
+            hash.update(&len.to_le_bytes());
+            for digest in &leaf_digests[next..next + count as usize] {
+                hash.update(digest);
+            }
+            next += count as usize;
+            *hash.finalize().as_bytes()
+        })
+        .collect())
+}
+
+#[cfg(unix)]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::read_at(file, buffer, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_at(_: &File, _: &mut [u8], _: u64) -> io::Result<usize> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buffer.is_empty() {
+        match read_at(file, buffer, offset) {
+            Ok(0) => return Err(invalid("Variant input shrank during content hashing")),
+            Ok(count) => {
+                buffer = &mut buffer[count..];
+                offset += count as u64;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// A saved plan: an entry in the plan cache directory.
+struct SavedPlan {
+    path: PathBuf,
+    bytes: u64,
+    modified: SystemTime,
+}
+
+/// Deletes the oldest saved plans until a plan of `needed` bytes fits. A plan larger
+/// than this machine's memory could not be loaded again and is refused.
+fn make_room(directory: &Path, destination: &Path, needed: u64) -> io::Result<()> {
+    let (memory, _) = crate::memory::memory_bytes();
+    if needed > memory {
+        return Err(invalid("Variant plan is larger than this machine's memory"));
+    }
+    let available = fs4::available_space(directory)?;
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path == destination {
+            continue;
+        }
+        if let Ok(metadata) = entry.metadata()
+            && metadata.is_file()
+        {
+            entries.push(SavedPlan {
+                path,
+                bytes: metadata.len(),
+                modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            });
+        }
+    }
+    for path in evictions(needed, available, entries, SystemTime::now())? {
+        // Another run may have removed it first.
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
+}
+
+/// Which saved plans to delete, oldest first, so that a plan of `needed` bytes fits.
+/// The cache may occupy at most an eighth of the space its filesystem would have
+/// free without it, so the ceiling follows the disk this machine actually has.
+fn evictions(
+    needed: u64,
+    available: u64,
+    mut entries: Vec<SavedPlan>,
+    now: SystemTime,
+) -> io::Result<Vec<PathBuf>> {
+    let mut usage = entries.iter().map(|e| e.bytes).fold(0, u64::saturating_add);
+    let ceiling = available.saturating_add(usage) / 8;
+    if needed > ceiling {
+        return Err(invalid(&format!(
+            "Variant plan of {needed} bytes exceeds the plan cache ceiling of {ceiling} bytes, an eighth of the disk space the cache could use"
+        )));
+    }
+    entries.sort_by_key(|e| e.modified);
+    let mut evicted = Vec::new();
+    for entry in entries {
+        if usage.saturating_add(needed) <= ceiling {
+            break;
+        }
+        let temporary = entry
+            .path
+            .file_name()
+            .is_some_and(|name| name.as_encoded_bytes().starts_with(b"."));
+        if temporary
+            && now
+                .duration_since(entry.modified)
+                .is_ok_and(|age| age < STALE_TEMPORARY_AGE)
+        {
+            continue;
+        }
+        usage = usage.saturating_sub(entry.bytes);
+        evicted.push(entry.path);
+    }
+    Ok(evicted)
+}
+
+/// Writes `sections` under `key`. Every section carries its own digest, and the
+/// header carries one over itself, so a torn or altered file is refused on load.
+fn write_plan(path: &Path, key: &[u8; 32], sections: &Sections<'_>) -> io::Result<()> {
+    let stored = sections.stored();
+    let digests: Vec<[u8; 32]> = stored.par_iter().map(Column::digest).collect();
+    let mut header = Vec::with_capacity(HEADER_BYTES);
+    header.extend_from_slice(&MAGIC);
+    header.extend_from_slice(key);
+    for (column, digest) in stored.iter().zip(&digests) {
+        header.extend_from_slice(&(column.bytes().len() as u64).to_le_bytes());
+        header.extend_from_slice(digest);
+    }
+    let digest = blake3::hash(&header);
+    header.extend_from_slice(digest.as_bytes());
+    crate::output::write_atomically(path, |writer| {
+        writer.write_all(&header)?;
+        for column in &stored {
+            let bytes = column.bytes();
+            writer.write_all(bytes)?;
+            writer.write_all(&[0u8; 8][..padding(bytes.len() as u64)])?;
+        }
+        Ok(())
+    })
+}
+
+/// Reads the plan saved under `key`, verifying every digest before returning it.
+fn read_plan(path: &Path, key: &[u8; 32]) -> io::Result<Option<Sections<'static>>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let file_len = file.metadata()?.len();
+    if file_len < HEADER_BYTES as u64 {
+        return Err(invalid("Truncated variant plan"));
+    }
+    let mut header = [0u8; HEADER_BYTES];
+    file.read_exact(&mut header)?;
+    let (lengths, digests) = parse_header(&header, key, file_len)?;
+    let sections = Sections::read(file, lengths)?;
+    if sections
+        .stored()
+        .par_iter()
+        .zip(digests.par_iter())
+        .any(|(column, digest)| column.digest() != *digest)
+    {
+        return Err(invalid("Variant plan checksum mismatch"));
+    }
+    Ok(Some(sections))
+}
+
+/// Section lengths and digests from a header that belongs to `key` and describes a
+/// file of exactly `file_len` bytes.
+fn parse_header(
+    header: &[u8; HEADER_BYTES],
+    key: &[u8; 32],
+    file_len: u64,
+) -> io::Result<([u64; SECTIONS], [[u8; 32]; SECTIONS])> {
+    let (body, digest) = header.split_at(HEADER_BYTES - 32);
+    if body[..MAGIC.len()] != MAGIC {
+        return Err(invalid("Variant plan was written in another plan format"));
+    }
+    if blake3::hash(body).as_bytes() != digest {
+        return Err(invalid("Variant plan header checksum mismatch"));
+    }
+    if body[MAGIC.len()..MAGIC.len() + 32] != key[..] {
+        return Err(invalid("Variant plan identity mismatch"));
+    }
+    let mut lengths = [0u64; SECTIONS];
+    let mut digests = [[0u8; 32]; SECTIONS];
+    let mut expected = HEADER_BYTES as u64;
+    for (index, entry) in body[MAGIC.len() + 32..].chunks_exact(8 + 32).enumerate() {
+        lengths[index] = u64::from_le_bytes(entry[..8].try_into().unwrap());
+        digests[index].copy_from_slice(&entry[8..]);
+        expected = lengths[index]
+            .checked_add(padding(lengths[index]) as u64)
+            .and_then(|len| expected.checked_add(len))
+            .ok_or_else(|| invalid("Variant plan length overflow"))?;
+    }
+    if expected != file_len {
+        return Err(invalid("Truncated variant plan or trailing data"));
+    }
+    Ok((lengths, digests))
+}
+
+fn padding(len: u64) -> usize {
+    ((8 - len % 8) % 8) as usize
 }
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+/// Numeric types with no padding and no invalid bit patterns, so a slice of them may
+/// be viewed, and filled, as bytes.
+unsafe trait Plain: Copy + Default {}
+unsafe impl Plain for u8 {}
+unsafe impl Plain for u32 {}
+unsafe impl Plain for u64 {}
+unsafe impl Plain for f64 {}
+
+fn as_bytes<T: Plain>(values: &[T]) -> &[u8] {
+    // SAFETY: `Plain` types have no padding, so every byte is initialized.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
+}
+
+fn as_bytes_mut<T: Plain>(values: &mut [T]) -> &mut [u8] {
+    // SAFETY: as in `as_bytes`, and any bytes written form a valid `T`.
+    unsafe {
+        std::slice::from_raw_parts_mut(values.as_mut_ptr().cast(), std::mem::size_of_val(values))
+    }
+}
+
+/// One stored array. Plans are used only on little-endian hosts, where an array's
+/// memory is its stored form.
+#[derive(Clone, Copy)]
+enum Column<'a> {
+    U8(&'a [u8]),
+    U32(&'a [u32]),
+    U64(&'a [u64]),
+    F64(&'a [f64]),
+}
+
+impl Column<'_> {
+    fn bytes(&self) -> &[u8] {
+        match *self {
+            Column::U8(values) => values,
+            Column::U32(values) => as_bytes(values),
+            Column::U64(values) => as_bytes(values),
+            Column::F64(values) => as_bytes(values),
+        }
+    }
+
+    fn digest(&self) -> [u8; 32] {
+        *blake3::hash(self.bytes()).as_bytes()
+    }
+}
+
+/// A plan's arrays in file order. A loaded plan owns them; saving borrows the large
+/// ones from the compiled result. Strings are one byte blob and the end offset of
+/// each string: the score names, then for each complex rule its chromosome, both
+/// alleles of each context and the effect and other allele of each application.
+#[derive(Default)]
+struct Sections<'a> {
+    /// `[total_variants, score_count]`.
+    scalars: Cow<'a, [u64]>,
+    starts: Cow<'a, [u64]>,
+    weights: Cow<'a, [f64]>,
+    corrections: Cow<'a, [f64]>,
+    columns: Cow<'a, [u32]>,
+    offsets: Cow<'a, [u64]>,
+    baseline: Cow<'a, [f64]>,
+    required: Cow<'a, [u64]>,
+    flags: Cow<'a, [u8]>,
+    counts: Cow<'a, [u32]>,
+    string_ends: Cow<'a, [u64]>,
+    string_bytes: Cow<'a, [u8]>,
+    rule_positions: Cow<'a, [u32]>,
+    rule_context_ends: Cow<'a, [u64]>,
+    context_rows: Cow<'a, [u64]>,
+    rule_application_ends: Cow<'a, [u64]>,
+    application_weights: Cow<'a, [f64]>,
+    application_columns: Cow<'a, [u64]>,
+}
+
+impl Sections<'_> {
+    fn stored(&self) -> [Column<'_>; SECTIONS] {
+        [
+            Column::U64(&self.scalars),
+            Column::U64(&self.starts),
+            Column::F64(&self.weights),
+            Column::F64(&self.corrections),
+            Column::U32(&self.columns),
+            Column::U64(&self.offsets),
+            Column::F64(&self.baseline),
+            Column::U64(&self.required),
+            Column::U8(&self.flags),
+            Column::U32(&self.counts),
+            Column::U64(&self.string_ends),
+            Column::U8(&self.string_bytes),
+            Column::U32(&self.rule_positions),
+            Column::U64(&self.rule_context_ends),
+            Column::U64(&self.context_rows),
+            Column::U64(&self.rule_application_ends),
+            Column::F64(&self.application_weights),
+            Column::U64(&self.application_columns),
+        ]
+    }
+
+    fn file_len(&self) -> u64 {
+        self.stored()
+            .iter()
+            .map(|column| column.bytes().len() as u64)
+            .map(|len| len + padding(len) as u64)
+            .fold(HEADER_BYTES as u64, u64::saturating_add)
+    }
+
+    fn read(file: File, lengths: [u64; SECTIONS]) -> io::Result<Sections<'static>> {
+        let mut reader = SectionReader {
+            file,
+            lengths,
+            next: 0,
+        };
+        Ok(Sections {
+            scalars: Cow::Owned(reader.read()?),
+            starts: Cow::Owned(reader.read()?),
+            weights: Cow::Owned(reader.read()?),
+            corrections: Cow::Owned(reader.read()?),
+            columns: Cow::Owned(reader.read()?),
+            offsets: Cow::Owned(reader.read()?),
+            baseline: Cow::Owned(reader.read()?),
+            required: Cow::Owned(reader.read()?),
+            flags: Cow::Owned(reader.read()?),
+            counts: Cow::Owned(reader.read()?),
+            string_ends: Cow::Owned(reader.read()?),
+            string_bytes: Cow::Owned(reader.read()?),
+            rule_positions: Cow::Owned(reader.read()?),
+            rule_context_ends: Cow::Owned(reader.read()?),
+            context_rows: Cow::Owned(reader.read()?),
+            rule_application_ends: Cow::Owned(reader.read()?),
+            application_weights: Cow::Owned(reader.read()?),
+            application_columns: Cow::Owned(reader.read()?),
+        })
+    }
+}
+
+impl<'a> Sections<'a> {
+    fn from_preparation(prep: &'a PreparationResult) -> Self {
+        let starts = match &prep.pipeline_kind {
+            PipelineKind::SingleFile(_) => vec![0],
+            PipelineKind::MultiFile(boundaries) => boundaries
+                .iter()
+                .map(|boundary| boundary.starting_global_index)
+                .collect(),
+        };
+        let mut strings = StringTable::default();
+        for name in &prep.score_names {
+            strings.push(name);
+        }
+        let rules = prep.complex_rules.len();
+        let mut rule_positions = Vec::with_capacity(rules);
+        let mut rule_context_ends = Vec::with_capacity(rules);
+        let mut rule_application_ends = Vec::with_capacity(rules);
+        let mut context_rows = Vec::new();
+        let mut application_weights = Vec::new();
+        let mut application_columns = Vec::new();
+        for rule in &prep.complex_rules {
+            strings.push(&rule.locus_chr_pos.0);
+            rule_positions.push(rule.locus_chr_pos.1);
+            for (row, allele1, allele2) in &rule.possible_contexts {
+                context_rows.push(row.0);
+                strings.push(allele1);
+                strings.push(allele2);
+            }
+            rule_context_ends.push(context_rows.len() as u64);
+            for score in &rule.score_applications {
+                application_weights.push(score.weight);
+                application_columns.push(score.score_column_index.0 as u64);
+                strings.push(&score.effect_allele);
+                strings.push(&score.other_allele);
+            }
+            rule_application_ends.push(application_weights.len() as u64);
+        }
+        Sections {
+            scalars: Cow::Owned(vec![
+                prep.total_variants_in_bim,
+                prep.score_names.len() as u64,
+            ]),
+            starts: Cow::Owned(starts),
+            weights: Cow::Borrowed(prep.sparse_weights()),
+            corrections: Cow::Borrowed(prep.sparse_missing_corrections()),
+            columns: Cow::Borrowed(prep.sparse_score_columns()),
+            offsets: Cow::Borrowed(prep.sparse_row_offsets()),
+            baseline: Cow::Borrowed(prep.baseline_missing_sum_by_score()),
+            required: Cow::Owned(prep.required_bim_indices.iter().map(|r| r.0).collect()),
+            flags: Cow::Borrowed(prep.required_is_complex()),
+            counts: Cow::Borrowed(&prep.score_variant_counts),
+            string_ends: Cow::Owned(strings.ends),
+            string_bytes: Cow::Owned(strings.bytes),
+            rule_positions: Cow::Owned(rule_positions),
+            rule_context_ends: Cow::Owned(rule_context_ends),
+            context_rows: Cow::Owned(context_rows),
+            rule_application_ends: Cow::Owned(rule_application_ends),
+            application_weights: Cow::Owned(application_weights),
+            application_columns: Cow::Owned(application_columns),
+        }
+    }
+
+    fn into_plan(self) -> io::Result<VariantPlan> {
+        let &[total_variants, score_count] = &self.scalars[..] else {
+            return Err(invalid("Invalid variant plan scalars"));
+        };
+        let score_count = usize::try_from(score_count)
+            .ok()
+            .filter(|&count| count <= self.string_ends.len())
+            .ok_or_else(|| invalid("Invalid variant plan score count"))?;
+        if self.rule_context_ends.len() != self.rule_positions.len()
+            || self.rule_application_ends.len() != self.rule_positions.len()
+            || self.application_columns.len() != self.application_weights.len()
+        {
+            return Err(invalid("Invalid variant plan complex rule tables"));
+        }
+        check_ends(&self.rule_context_ends, self.context_rows.len())?;
+        check_ends(&self.rule_application_ends, self.application_weights.len())?;
+
+        let mut strings = StringReader {
+            ends: &self.string_ends,
+            bytes: &self.string_bytes,
+            next: 0,
+            start: 0,
+        };
+        let names = (0..score_count)
+            .map(|_| strings.next())
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut complex = Vec::with_capacity(self.rule_positions.len());
+        let (mut context, mut application) = (0, 0);
+        for ((&position, &context_end), &application_end) in self
+            .rule_positions
+            .iter()
+            .zip(self.rule_context_ends.iter())
+            .zip(self.rule_application_ends.iter())
+        {
+            let chromosome = strings.next()?;
+            let (context_end, application_end) = (context_end as usize, application_end as usize);
+            let possible_contexts = self.context_rows[context..context_end]
+                .iter()
+                .map(|&row| -> io::Result<_> {
+                    Ok((BimRowIndex(row), strings.next()?, strings.next()?))
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let score_applications = (application..application_end)
+                .map(|index| -> io::Result<ScoreInfo> {
+                    Ok(ScoreInfo {
+                        effect_allele: strings.next()?,
+                        other_allele: strings.next()?,
+                        weight: self.application_weights[index],
+                        score_column_index: ScoreColumnIndex(
+                            usize::try_from(self.application_columns[index])
+                                .map_err(|_| invalid("Score column overflow"))?,
+                        ),
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            complex.push(GroupedComplexRule {
+                locus_chr_pos: (chromosome, position),
+                possible_contexts,
+                score_applications,
+            });
+            (context, application) = (context_end, application_end);
+        }
+        if strings.next != self.string_ends.len() || strings.start != self.string_bytes.len() {
+            return Err(invalid("Trailing variant plan strings"));
+        }
+
+        let plan = VariantPlan {
+            weights: self.weights.into_owned(),
+            corrections: self.corrections.into_owned(),
+            columns: self.columns.into_owned(),
+            offsets: self.offsets.into_owned(),
+            baseline: self.baseline.into_owned(),
+            required: self
+                .required
+                .into_owned()
+                .into_iter()
+                .map(BimRowIndex)
+                .collect(),
+            complex,
+            names,
+            counts: self.counts.into_owned(),
+            flags: self.flags.into_owned(),
+            starts: self.starts.into_owned(),
+            total_variants,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+}
+
+/// Reads the sections of a plan file in order, each followed by its zero padding.
+struct SectionReader {
+    file: File,
+    lengths: [u64; SECTIONS],
+    next: usize,
+}
+
+impl SectionReader {
+    fn read<T: Plain>(&mut self) -> io::Result<Vec<T>> {
+        let len = self.lengths[self.next];
+        self.next += 1;
+        let width = std::mem::size_of::<T>() as u64;
+        if len % width != 0 {
+            return Err(invalid("Misaligned variant plan section"));
+        }
+        let count =
+            usize::try_from(len / width).map_err(|_| invalid("Variant plan section overflow"))?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|e| invalid(&format!("Variant plan allocation failed: {e}")))?;
+        values.resize(count, T::default());
+        self.file.read_exact(as_bytes_mut(&mut values))?;
+        let mut pad = [0u8; 8];
+        let pad = &mut pad[..padding(len)];
+        self.file.read_exact(pad)?;
+        if pad.iter().any(|&byte| byte != 0) {
+            return Err(invalid("Nonzero variant plan padding"));
+        }
+        Ok(values)
+    }
+}
+
+#[derive(Default)]
+struct StringTable {
+    ends: Vec<u64>,
+    bytes: Vec<u8>,
+}
+
+impl StringTable {
+    fn push(&mut self, text: &str) {
+        self.bytes.extend_from_slice(text.as_bytes());
+        self.ends.push(self.bytes.len() as u64);
+    }
+}
+
+struct StringReader<'a> {
+    ends: &'a [u64],
+    bytes: &'a [u8],
+    next: usize,
+    start: usize,
+}
+
+impl StringReader<'_> {
+    fn next(&mut self) -> io::Result<String> {
+        let end = self
+            .ends
+            .get(self.next)
+            .and_then(|&end| usize::try_from(end).ok())
+            .filter(|&end| end >= self.start && end <= self.bytes.len())
+            .ok_or_else(|| invalid("Invalid variant plan string table"))?;
+        let text = std::str::from_utf8(&self.bytes[self.start..end])
+            .map_err(|_| invalid("Invalid UTF-8 in variant plan"))?;
+        self.next += 1;
+        self.start = end;
+        Ok(text.to_owned())
+    }
+}
+
+/// `ends` must be the non-decreasing end offsets of consecutive ranges covering
+/// exactly `total` items.
+fn check_ends(ends: &[u64], total: usize) -> io::Result<()> {
+    let mut previous = 0;
+    for &end in ends {
+        if end < previous || end > total as u64 {
+            return Err(invalid("Invalid variant plan range table"));
+        }
+        previous = end;
+    }
+    if previous != total as u64 {
+        return Err(invalid("Invalid variant plan range table"));
+    }
+    Ok(())
 }
 
 impl VariantPlan {
@@ -325,11 +807,11 @@ impl VariantPlan {
             || self.baseline.len() != scores
             || self.offsets.first() != Some(&0)
             || self.offsets.last() != Some(&(self.weights.len() as u64))
-            || self.offsets.windows(2).any(|w| w[0] > w[1])
-            || self.columns.iter().any(|&c| c as usize >= scores)
-            || self.required.windows(2).any(|w| w[0].0 >= w[1].0)
+            || self.offsets.par_windows(2).any(|w| w[0] > w[1])
+            || self.columns.par_iter().any(|&c| c as usize >= scores)
+            || self.required.par_windows(2).any(|w| w[0].0 >= w[1].0)
             || self.required.last().unwrap().0 >= self.total_variants
-            || self.flags.iter().any(|&f| f > 1)
+            || self.flags.par_iter().any(|&f| f > 1)
             || self.starts.first() != Some(&0)
             || self.starts.windows(2).any(|w| w[0] > w[1])
             || self.starts.last().is_some_and(|&s| s > self.total_variants)
@@ -357,111 +839,6 @@ impl VariantPlan {
     }
 }
 
-trait Wire: Copy {
-    const WIDTH: usize;
-    fn encode(self, bytes: &mut [u8]);
-    fn decode(bytes: &[u8]) -> Self;
-}
-macro_rules! wire {
-    ($($ty:ty),*) => { $(impl Wire for $ty {
-        const WIDTH: usize = std::mem::size_of::<Self>();
-        fn encode(self, bytes: &mut [u8]) { bytes.copy_from_slice(&self.to_le_bytes()); }
-        fn decode(bytes: &[u8]) -> Self { Self::from_le_bytes(bytes.try_into().unwrap()) }
-    })* };
-}
-wire!(u8, u32, u64, f32, f64);
-
-struct Encoder<'a, W> {
-    writer: &'a mut W,
-    hash: Sha256,
-    remaining: usize,
-}
-impl<W: Write> Encoder<'_, W> {
-    fn bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.remaining = self
-            .remaining
-            .checked_sub(bytes.len())
-            .ok_or_else(|| invalid("Variant plan exceeds cache size ceiling"))?;
-        self.hash.update(bytes);
-        self.writer.write_all(bytes)
-    }
-    fn number<T: Wire>(&mut self, value: T) -> io::Result<()> {
-        let mut bytes = [0u8; 8];
-        value.encode(&mut bytes[..T::WIDTH]);
-        self.bytes(&bytes[..T::WIDTH])
-    }
-    fn vector<T: Wire>(&mut self, values: &[T]) -> io::Result<()> {
-        self.number(values.len() as u64)?;
-        let mut bytes = [0u8; 64 * 1024];
-        for chunk in values.chunks(bytes.len() / T::WIDTH) {
-            for (value, slot) in chunk.iter().zip(bytes.chunks_exact_mut(T::WIDTH)) {
-                value.encode(slot);
-            }
-            self.bytes(&bytes[..chunk.len() * T::WIDTH])?;
-        }
-        Ok(())
-    }
-    fn string(&mut self, text: &str) -> io::Result<()> {
-        self.number(text.len() as u64)?;
-        self.bytes(text.as_bytes())
-    }
-}
-
-struct Decoder<'a> {
-    bytes: &'a [u8],
-    budget: usize,
-}
-impl<'a> Decoder<'a> {
-    fn take(&mut self, count: usize) -> io::Result<&'a [u8]> {
-        let (head, tail) = self
-            .bytes
-            .split_at_checked(count)
-            .ok_or_else(|| invalid("Truncated variant plan"))?;
-        self.bytes = tail;
-        Ok(head)
-    }
-    fn number<T: Wire>(&mut self) -> io::Result<T> {
-        Ok(T::decode(self.take(T::WIDTH)?))
-    }
-    fn length(&mut self, minimum_wire_bytes: usize, heap_bytes: usize) -> io::Result<usize> {
-        let count = usize::try_from(self.number::<u64>()?)
-            .map_err(|_| invalid("Variant plan count overflow"))?;
-        if count > self.bytes.len() / minimum_wire_bytes {
-            return Err(invalid("Impossible variant plan count"));
-        }
-        let charge = count
-            .checked_mul(heap_bytes)
-            .ok_or_else(|| invalid("Variant plan allocation overflow"))?;
-        self.budget = self
-            .budget
-            .checked_sub(charge)
-            .ok_or_else(|| invalid("Variant plan allocation exceeds memory ceiling"))?;
-        Ok(count)
-    }
-    fn vector<T: Wire>(&mut self) -> io::Result<Vec<T>> {
-        self.items(T::WIDTH, Self::number::<T>)
-    }
-    fn items<T>(
-        &mut self,
-        minimum_wire_bytes: usize,
-        mut parse: impl FnMut(&mut Self) -> io::Result<T>,
-    ) -> io::Result<Vec<T>> {
-        let count = self.length(minimum_wire_bytes, std::mem::size_of::<T>())?;
-        let mut result = Vec::new();
-        result
-            .try_reserve_exact(count)
-            .map_err(|e| invalid(&format!("Variant plan allocation failed: {e}")))?;
-        for _ in 0..count {
-            result.push(parse(self)?);
-        }
-        Ok(result)
-    }
-    fn string(&mut self) -> io::Result<String> {
-        let bytes = self.vector::<u8>()?;
-        String::from_utf8(bytes).map_err(|_| invalid("Invalid UTF-8 in variant plan"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,95 +862,117 @@ mod tests {
         (vec![files], vec![score])
     }
 
-    use std::path::Path;
+    /// A panel whose one position carries two alleles, so the plan holds a complex rule.
+    fn complex_fixture(dir: &Path) -> (Vec<FilesetPaths>, Vec<PathBuf>) {
+        let (files, scores) = fixture(dir);
+        std::fs::write(
+            &files[0].bim,
+            "1 a 0 100 A G\n1 b 0 100 A T\n1 c 0 200 C T\n",
+        )
+        .unwrap();
+        std::fs::write(&files[0].bed, [0x6c, 0x1b, 0x01, 2, 2, 2]).unwrap();
+        std::fs::write(
+            &scores[0],
+            "variant_id\teffect_allele\tother_allele\tS\tR\n\
+             1:100\tG\tA\t0.25\t-0.0\n\
+             1:100\tT\tA\t1e-40\t3\n\
+             1:200\tT\tC\t-2.5\t0.125\n",
+        )
+        .unwrap();
+        (files, scores)
+    }
+
+    fn compile(dir: &Path, scores: &[PathBuf]) -> PreparationResult {
+        super::super::prepare_for_computation_with_retry(
+            &[dir.join("panel")],
+            scores,
+            None,
+            None,
+            super::super::BimRowOrder::Streamed,
+        )
+        .unwrap()
+        .0
+    }
+
+    fn cache_in(dir: &Path, files: &[FilesetPaths], scores: &[PathBuf]) -> PlanCache {
+        PlanCache {
+            path: dir.join("plans").join("plan"),
+            key: content_key(files, scores, None).unwrap(),
+        }
+    }
+
+    fn bits(values: &[f64]) -> Vec<u64> {
+        values.iter().map(|v| v.to_bits()).collect()
+    }
 
     #[test]
-    fn chunk_hash_is_independent_of_window_and_short_reads() {
-        struct ShortReads<'a>(&'a [u8]);
-        impl Read for ShortReads<'_> {
-            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-                let count = buffer.len().min(1237);
-                self.0.read(&mut buffer[..count])
-            }
-        }
-        let mut data = vec![0u8; HASH_CHUNK_BYTES * 5 + 37];
+    fn key_is_independent_of_thread_count_and_covers_every_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let (files, _) = fixture(dir.path());
+        let score = dir.path().join("wide.tsv");
+        let mut data = vec![0u8; LEAF_BYTES as usize * 2 + 37];
         for (index, byte) in data.iter_mut().enumerate() {
             *byte = (index % 251) as u8;
         }
-        let mut expected = Sha256::new();
-        expected.update((data.len() as u64).to_le_bytes());
-        for chunk in data.chunks(HASH_CHUNK_BYTES) {
-            expected.update(Sha256::digest(chunk));
+        std::fs::write(&score, &data).unwrap();
+        let scores = vec![score.clone()];
+        let key_with = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| content_key(&files, &scores, None).unwrap())
+        };
+        let expected = key_with(1);
+        for threads in [2, 3, 8] {
+            assert_eq!(key_with(threads), expected);
         }
-        let expected = expected.finalize();
-        for chunks in 1..=MAX_HASH_CHUNKS {
-            let mut buffer = vec![0; chunks * HASH_CHUNK_BYTES];
-            let mut hash = Sha256::new();
-            hash_contents(
-                &mut ShortReads(&data),
-                data.len() as u64,
-                &mut buffer,
-                &mut hash,
-            )
-            .unwrap();
-            assert_eq!(hash.finalize(), expected);
-        }
-        let mut buffer = vec![0; HASH_CHUNK_BYTES];
-        for index in [0, HASH_CHUNK_BYTES - 1, HASH_CHUNK_BYTES, data.len() - 1] {
+        for index in [
+            0,
+            LEAF_BYTES as usize - 1,
+            LEAF_BYTES as usize,
+            data.len() - 1,
+        ] {
             data[index] ^= 1;
-            let mut hash = Sha256::new();
-            hash_contents(
-                &mut data.as_slice(),
-                data.len() as u64,
-                &mut buffer,
-                &mut hash,
-            )
-            .unwrap();
-            assert_ne!(hash.finalize(), expected);
+            std::fs::write(&score, &data).unwrap();
+            assert_ne!(key_with(3), expected, "byte {index}");
             data[index] ^= 1;
         }
+        std::fs::write(&score, &data).unwrap();
+        assert_eq!(key_with(3), expected);
         for len in [data.len() - 1, data.len() + 1] {
-            assert!(
-                hash_contents(
-                    &mut data.as_slice(),
-                    len as u64,
-                    &mut buffer,
-                    &mut Sha256::new()
-                )
-                .is_err()
-            );
+            let mut resized = data.clone();
+            resized.resize(len, 0);
+            std::fs::write(&score, &resized).unwrap();
+            assert_ne!(key_with(3), expected, "length {len}");
         }
     }
 
     #[test]
-    fn content_key_detects_same_size_same_timestamp_edits_and_regions() {
+    fn same_size_edits_under_a_restored_timestamp_change_the_key() {
         let dir = tempfile::tempdir().unwrap();
         let (files, scores) = fixture(dir.path());
-        let original = PlanCache::discover(&files, &scores, None).unwrap().unwrap();
-        let modified = std::fs::metadata(&files[0].bim)
-            .unwrap()
-            .modified()
-            .unwrap();
-        std::fs::write(&files[0].bim, "1 a 0 100 A C\n").unwrap();
-        File::options()
-            .write(true)
-            .open(&files[0].bim)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(modified))
-            .unwrap();
-        let changed = PlanCache::discover(&files, &scores, None).unwrap().unwrap();
-        assert!(!original.same_inputs(&changed));
-        std::fs::write(&files[0].bim, "1 a 0 100 A G\n").unwrap();
-        assert!(
-            original.same_inputs(&PlanCache::discover(&files, &scores, None).unwrap().unwrap())
-        );
-        let text = std::fs::read_to_string(&scores[0])
-            .unwrap()
-            .replace("0.25", "0.75");
-        std::fs::write(&scores[0], text).unwrap();
-        assert!(
-            !original.same_inputs(&PlanCache::discover(&files, &scores, None).unwrap().unwrap())
-        );
+        let original = content_key(&files, &scores, None).unwrap();
+        for (path, from, to) in [(&files[0].bim, "A G", "A C"), (&scores[0], "0.25", "0.75")] {
+            let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+            let text = std::fs::read_to_string(path).unwrap();
+            let edited = text.replace(from, to);
+            assert_eq!(edited.len(), text.len());
+            std::fs::write(path, &edited).unwrap();
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            assert_eq!(
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+                modified
+            );
+            assert_ne!(content_key(&files, &scores, None).unwrap(), original);
+            std::fs::write(path, &text).unwrap();
+            assert_eq!(content_key(&files, &scores, None).unwrap(), original);
+        }
         let filtered = HashMap::from([(
             "S".into(),
             GenomicRegion {
@@ -582,92 +981,322 @@ mod tests {
                 end: 110,
             },
         )]);
-        assert!(
-            !PlanCache::discover(&files, &scores, None)
-                .unwrap()
-                .unwrap()
-                .same_inputs(
-                    &PlanCache::discover(&files, &scores, Some(&filtered))
-                        .unwrap()
-                        .unwrap()
-                )
+        assert_ne!(
+            content_key(&files, &scores, Some(&filtered)).unwrap(),
+            original
         );
     }
 
     #[test]
-    fn binary_numbers_preserve_bits_including_signed_zero_and_subnormals() {
-        let values =
-            [0u32, 0x8000_0000, 1, 0x7f80_0000, 0x7fc0_1234, 0xff7f_ffff].map(f32::from_bits);
-        let mut bytes = Vec::new();
-        Encoder {
-            writer: &mut bytes,
-            hash: Sha256::new(),
-            remaining: 1024,
-        }
-        .vector(&values)
-        .unwrap();
-        let decoded = Decoder {
-            bytes: &bytes,
-            budget: 1024,
-        }
-        .vector::<f32>()
-        .unwrap();
-        assert_eq!(
-            values.map(f32::to_bits).as_slice(),
-            decoded.iter().map(|f| f.to_bits()).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn hostile_counts_and_heap_expansion_are_rejected_before_allocation() {
-        let bytes = u64::MAX.to_le_bytes();
-        assert!(
-            Decoder {
-                bytes: &bytes,
-                budget: 64
-            }
-            .vector::<u64>()
-            .is_err()
-        );
-        let mut bytes = 4u64.to_le_bytes().to_vec();
-        bytes.extend_from_slice(&[0; 32]);
-        // Four empty strings occupy only 32 wire bytes, but 96 heap bytes.
-        assert!(
-            Decoder {
-                bytes: &bytes,
-                budget: 64
-            }
-            .items(8, Decoder::string)
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn cache_roundtrip_rejects_corruption_and_truncation() {
+    fn saved_plans_load_back_bit_for_bit_with_complex_rules() {
         let dir = tempfile::tempdir().unwrap();
-        let (files, scores) = fixture(dir.path());
-        let (prep, _) = super::super::prepare_for_computation_with_retry(
-            &[dir.path().join("panel")],
-            &scores,
-            None,
-            None,
-            super::super::BimRowOrder::Streamed,
-        )
-        .unwrap();
-        let mut cache = PlanCache::discover(&files, &scores, None).unwrap().unwrap();
-        cache.path = dir.path().join("plan");
+        let (files, scores) = complex_fixture(dir.path());
+        let prep = compile(dir.path(), &scores);
+        assert!(!prep.complex_rules.is_empty());
+        let cache = cache_in(dir.path(), &files, &scores);
+        assert!(cache.load().unwrap().is_none());
         cache.save(&prep).unwrap();
         let plan = cache.load().unwrap().unwrap();
+        assert_eq!(bits(&plan.weights), bits(prep.sparse_weights()));
+        assert_eq!(
+            bits(&plan.corrections),
+            bits(prep.sparse_missing_corrections())
+        );
+        assert_eq!(plan.columns, prep.sparse_score_columns());
+        assert_eq!(plan.offsets, prep.sparse_row_offsets());
+        assert_eq!(
+            plan.baseline
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            prep.baseline_missing_sum_by_score()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(plan.required, prep.required_bim_indices);
-        assert_eq!(plan.weights, prep.sparse_weights());
-        assert_eq!(plan.corrections, prep.sparse_missing_corrections());
-        assert_eq!(plan.baseline, prep.baseline_missing_sum_by_score());
+        assert_eq!(plan.flags, prep.required_is_complex());
         assert_eq!(plan.counts, prep.score_variant_counts);
-        let mut bytes = std::fs::read(&cache.path).unwrap();
-        bytes[MAGIC.len() + 40] ^= 1;
+        assert_eq!(plan.names, prep.score_names);
+        assert_eq!(plan.total_variants, prep.total_variants_in_bim);
+        assert_eq!(plan.starts, vec![0]);
+        assert_eq!(plan.complex.len(), prep.complex_rules.len());
+        for (loaded, compiled) in plan.complex.iter().zip(&prep.complex_rules) {
+            assert_eq!(loaded.locus_chr_pos, compiled.locus_chr_pos);
+            assert_eq!(loaded.possible_contexts, compiled.possible_contexts);
+            assert_eq!(
+                loaded.score_applications.len(),
+                compiled.score_applications.len()
+            );
+            for (a, b) in loaded
+                .score_applications
+                .iter()
+                .zip(&compiled.score_applications)
+            {
+                assert_eq!(a.effect_allele, b.effect_allele);
+                assert_eq!(a.other_allele, b.other_allele);
+                assert_eq!(a.weight.to_bits(), b.weight.to_bits());
+                assert_eq!(a.score_column_index, b.score_column_index);
+            }
+        }
+    }
+
+    #[test]
+    fn stored_arrays_keep_signed_zero_nan_payloads_and_subnormals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan");
+        let key = [9u8; 32];
+        let floats = [
+            0u64,
+            0x8000_0000_0000_0000,
+            1,
+            0x7ff0_0000_0000_0000,
+            0x7ff8_0000_0000_1234,
+            0xffef_ffff_ffff_ffff,
+        ]
+        .map(f64::from_bits);
+        let doubles = [0u64, 1 << 63, 1, 0x7ff8_0000_0000_1234].map(f64::from_bits);
+        let sections = Sections {
+            weights: Cow::Borrowed(&floats),
+            baseline: Cow::Borrowed(&doubles),
+            string_bytes: Cow::Borrowed(b"abc"),
+            ..Sections::default()
+        };
+        write_plan(&path, &key, &sections).unwrap();
+        let read = read_plan(&path, &key).unwrap().unwrap();
+        assert_eq!(bits(&read.weights), bits(&floats));
+        assert_eq!(
+            read.baseline
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            doubles.map(f64::to_bits)
+        );
+        assert_eq!(&read.string_bytes[..], b"abc");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), sections.file_len());
+    }
+
+    #[test]
+    fn corrupt_truncated_extended_and_foreign_plans_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (files, scores) = complex_fixture(dir.path());
+        let prep = compile(dir.path(), &scores);
+        let cache = cache_in(dir.path(), &files, &scores);
+        cache.save(&prep).unwrap();
+        let bytes = std::fs::read(&cache.path).unwrap();
+        assert!(bytes.len() > HEADER_BYTES + 64);
+        let refused = |contents: &[u8], why: &str| {
+            std::fs::write(&cache.path, contents).unwrap();
+            assert!(cache.load().is_err(), "{why}");
+        };
+        for offset in [
+            0,
+            MAGIC.len(),
+            MAGIC.len() + 32,
+            HEADER_BYTES - 1,
+            HEADER_BYTES,
+            bytes.len() / 2,
+            bytes.len() - 1,
+        ] {
+            let mut flipped = bytes.clone();
+            flipped[offset] ^= 0x10;
+            refused(&flipped, &format!("bit flip at {offset}"));
+        }
+        for len in [
+            0,
+            7,
+            HEADER_BYTES - 1,
+            HEADER_BYTES,
+            HEADER_BYTES + 1,
+            bytes.len() - 1,
+        ] {
+            refused(&bytes[..len], &format!("truncated to {len}"));
+        }
+        let mut extended = bytes.clone();
+        extended.push(0);
+        refused(&extended, "one trailing byte");
+        let mut first_format = b"GNOMON_VARIANT_PLAN_1\n".to_vec();
+        first_format.extend_from_slice(&bytes);
+        refused(&first_format, "first plan format");
+
+        // A complete plan saved for other inputs or by another build.
         std::fs::write(&cache.path, &bytes).unwrap();
-        assert!(cache.load().is_err());
-        std::fs::write(&cache.path, &bytes[..20]).unwrap();
-        assert!(cache.load().is_err());
+        let other = PlanCache {
+            path: cache.path.clone(),
+            key: [7; 32],
+        };
+        assert!(other.load().is_err());
+        assert!(cache.load().unwrap().is_some());
+    }
+
+    #[test]
+    fn headers_describing_another_length_are_refused_before_allocating() {
+        let key = [3u8; 32];
+        let empty = Sections::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan");
+        write_plan(&path, &key, &empty).unwrap();
+        let mut header: [u8; HEADER_BYTES] = std::fs::read(&path).unwrap()[..HEADER_BYTES]
+            .try_into()
+            .unwrap();
+        assert!(parse_header(&header, &key, HEADER_BYTES as u64).is_ok());
+        for claim in [1u64 << 40, u64::MAX] {
+            header[MAGIC.len() + 32..MAGIC.len() + 40].copy_from_slice(&claim.to_le_bytes());
+            let body = HEADER_BYTES - 32;
+            let digest = blake3::hash(&header[..body]);
+            header[body..].copy_from_slice(digest.as_bytes());
+            assert!(parse_header(&header, &key, HEADER_BYTES as u64).is_err());
+        }
+    }
+
+    #[test]
+    fn checksummed_but_inconsistent_tables_are_refused() {
+        let scalars = [1u64, 1];
+        let valid = || Sections {
+            scalars: Cow::Borrowed(&scalars),
+            starts: Cow::Borrowed(&[0]),
+            weights: Cow::Borrowed(&[0.5]),
+            corrections: Cow::Borrowed(&[0.0]),
+            columns: Cow::Borrowed(&[0]),
+            offsets: Cow::Borrowed(&[0, 1]),
+            baseline: Cow::Borrowed(&[0.0]),
+            required: Cow::Borrowed(&[0]),
+            flags: Cow::Borrowed(&[0]),
+            counts: Cow::Borrowed(&[1]),
+            string_ends: Cow::Borrowed(&[1]),
+            string_bytes: Cow::Borrowed(b"S"),
+            ..Sections::default()
+        };
+        assert!(valid().into_plan().is_ok());
+        let broken = [
+            Sections {
+                string_ends: Cow::Borrowed(&[2]),
+                ..valid()
+            },
+            Sections {
+                string_bytes: Cow::Borrowed(b"SS"),
+                ..valid()
+            },
+            Sections {
+                scalars: Cow::Borrowed(&[1, 2]),
+                ..valid()
+            },
+            Sections {
+                rule_positions: Cow::Borrowed(&[100]),
+                rule_context_ends: Cow::Borrowed(&[1]),
+                rule_application_ends: Cow::Borrowed(&[0]),
+                ..valid()
+            },
+            Sections {
+                columns: Cow::Borrowed(&[1]),
+                ..valid()
+            },
+            Sections {
+                required: Cow::Borrowed(&[1]),
+                ..valid()
+            },
+        ];
+        for (index, sections) in broken.into_iter().enumerate() {
+            assert!(sections.into_plan().is_err(), "case {index}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_writers_never_expose_a_partial_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (files, scores) = complex_fixture(dir.path());
+        let prep = compile(dir.path(), &scores);
+        let cache = cache_in(dir.path(), &files, &scores);
+        let expected = bits(prep.sparse_weights());
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..20 {
+                        cache.save(&prep).unwrap();
+                    }
+                });
+            }
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..100 {
+                        if let Some(plan) = cache.load().unwrap() {
+                            assert_eq!(bits(&plan.weights), expected);
+                        }
+                    }
+                });
+            }
+        });
+        assert!(cache.load().unwrap().is_some());
+    }
+
+    #[test]
+    fn ceiling_follows_free_space_and_evicts_the_oldest_plans_first() {
+        let at = |secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let now = at(10 * 24 * 60 * 60);
+        let saved = |name: &str, bytes, modified| SavedPlan {
+            path: PathBuf::from(name),
+            bytes,
+            modified,
+        };
+        assert!(evictions(101, 800, Vec::new(), now).is_err());
+        assert!(evictions(100, 800, Vec::new(), now).unwrap().is_empty());
+        // 700 bytes free and 100 held: the cache may hold 100 bytes.
+        let entries = vec![
+            saved("new", 30, at(300)),
+            saved("old", 40, at(100)),
+            saved("mid", 30, at(200)),
+        ];
+        assert_eq!(
+            evictions(60, 700, entries, now).unwrap(),
+            vec![PathBuf::from("old"), PathBuf::from("mid")]
+        );
+        // A young temporary file may belong to a live writer; a day-old one does not.
+        let entries = vec![
+            saved(".plan.1.2.tmp", 50, now - Duration::from_secs(60)),
+            saved(".plan.3.4.tmp", 50, at(0)),
+        ];
+        assert_eq!(
+            evictions(50, 700, entries, now).unwrap(),
+            vec![PathBuf::from(".plan.3.4.tmp")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_cache_directory_saves_and_serves_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (files, scores) = fixture(dir.path());
+        let prep = compile(dir.path(), &scores);
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores permission bits, so there is nothing to observe then.
+        if File::create(locked.join("probe")).is_err() {
+            let cache = PlanCache {
+                path: locked.join("variant-plans").join("plan"),
+                key: content_key(&files, &scores, None).unwrap(),
+            };
+            assert!(cache.save(&prep).is_err());
+            assert!(cache.load().unwrap().is_none());
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn saving_evicts_older_plans_and_keeps_the_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (files, scores) = fixture(dir.path());
+        let prep = compile(dir.path(), &scores);
+        let cache = cache_in(dir.path(), &files, &scores);
+        let directory = cache.path.parent().unwrap();
+        std::fs::create_dir_all(directory).unwrap();
+        let stale = directory.join("0".repeat(64));
+        std::fs::write(&stale, b"old plan").unwrap();
+        cache.save(&prep).unwrap();
+        // Plenty of disk: nothing needed to go.
+        assert!(stale.exists());
+        assert!(cache.load().unwrap().is_some());
     }
 }

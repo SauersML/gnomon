@@ -75,7 +75,7 @@ struct KeyedScoreRecord {
     effect_allele: Allele,
     other_allele: Allele,
     score_column_index: ScoreColumnIndex,
-    weight: f32,
+    weight: f64,
 }
 
 /// Most genome rows contain one of a handful of literal alleles. Borrow those
@@ -130,7 +130,7 @@ impl Display for Allele {
     }
 }
 
-// Manual implementation to handle f32 comparison correctly.
+// Manual implementation to handle f64 comparison correctly.
 impl PartialEq for KeyedScoreRecord {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key && self.weight.to_bits() == other.weight.to_bits()
@@ -175,7 +175,7 @@ impl Ord for HeapItem {
 struct FileStream {
     reader: BufReader<File>,
     /// A buffer for weights and column indices from the current line being processed.
-    line_buffer: std::collections::VecDeque<(f32, ScoreColumnIndex)>,
+    line_buffer: std::collections::VecDeque<(f64, ScoreColumnIndex)>,
     /// The key and alleles for the current buffered line.
     current_line_info: Option<(VariantKey, Allele, Allele)>,
     // Temporary buffer reused for reading raw line data from the file.
@@ -195,15 +195,15 @@ struct FileStream {
 #[derive(Debug, Copy, Clone)]
 struct SimpleScoreAssignment {
     // Weight applied to effect-allele dosage in canonical (BIM allele2) space.
-    dosage_weight: f32,
+    dosage_weight: f64,
     // Correction to subtract for missing calls at this variant/score cell.
-    missing_correction: f32,
+    missing_correction: f64,
 }
 
 /// Lock-step CSR builder that guarantees aligned sparse vectors and valid row offsets.
 struct CsrBuilder {
-    sparse_weights: Vec<f32>,
-    sparse_missing_corrections: Vec<f32>,
+    sparse_weights: Vec<f64>,
+    sparse_missing_corrections: Vec<f64>,
     sparse_score_columns: Vec<u32>,
     sparse_row_offsets: Vec<u64>,
 }
@@ -296,7 +296,7 @@ impl CsrBuilder {
         Ok(())
     }
 
-    fn into_parts(self) -> (Vec<f32>, Vec<f32>, Vec<u32>, Vec<u64>) {
+    fn into_parts(self) -> (Vec<f64>, Vec<f64>, Vec<u32>, Vec<u64>) {
         (
             self.sparse_weights,
             self.sparse_missing_corrections,
@@ -391,7 +391,7 @@ impl CsrBuilder {
 }
 
 #[inline(always)]
-fn apply_simple_score_assignment(entry: &mut SimpleScoreAssignment, weight: f32, is_flipped: bool) {
+fn apply_simple_score_assignment(entry: &mut SimpleScoreAssignment, weight: f64, is_flipped: bool) {
     // Canonicalize every match into allele2-dosage space.
     // If the score effect allele matches BIM allele1, the row contributes:
     //   weight * (2 - dosage_allele2)
@@ -880,7 +880,7 @@ fn prepare_for_computation_with_retry(
                                 missing_correction: 0.0,
                             }
                         });
-                        // Input order matters for duplicate f32 additions.
+                        // Input order matters for duplicate f64 additions.
                         apply_simple_score_assignment(
                             assignment,
                             score.weight,
@@ -905,7 +905,7 @@ fn prepare_for_computation_with_retry(
 
                 let mut complex_for_key: BTreeMap<
                     Vec<(BimRowIndex, String, String)>,
-                    Vec<(ScoreColumnIndex, f32, String, String)>,
+                    Vec<(ScoreColumnIndex, f64, String, String)>,
                 > = BTreeMap::new();
 
                 for score_record in score_group.drain(..) {
@@ -1284,7 +1284,7 @@ fn build_fileset_paths(prefixes: &[PathBuf]) -> Result<Vec<FilesetPaths>, PrepEr
             // PLINK 2 one (.pgen/.pvar/.psam). Everything downstream consumes
             // the PLINK 1.9 shape; the PLINK 2 files are adapted on read.
             let bed = apply_extension(prefix, "bed")?;
-            if uses_pgen_fileset(prefix, &bed) {
+            if uses_pgen_fileset(prefix, &bed)? {
                 return Ok(FilesetPaths {
                     bed: apply_extension(prefix, "pgen")?,
                     bim: apply_extension(prefix, "pvar")?,
@@ -1304,14 +1304,18 @@ fn build_fileset_paths(prefixes: &[PathBuf]) -> Result<Vec<FilesetPaths>, PrepEr
 /// before and PLINK 2 is selected only when there is no `.bed` to read.
 /// Remote prefixes are probed by opening the `.bim`, which is metadata-only for
 /// the object stores we support — one request per fileset, not a download.
-fn uses_pgen_fileset(prefix: &Path, bed: &Path) -> bool {
+fn uses_pgen_fileset(prefix: &Path, bed: &Path) -> Result<bool, PrepError> {
     if is_remote_path(prefix) {
-        let Ok(bim) = apply_extension(prefix, "bim") else {
-            return false;
+        let bim = apply_extension(prefix, "bim")?;
+        let Err(bim_error) = open_text_source(&bim) else {
+            return Ok(false);
         };
-        return open_text_source(&bim).is_err();
+        if open_text_source(&apply_extension(prefix, "pvar")?).is_ok() {
+            return Ok(true);
+        }
+        return Err(map_pipeline_error(bim_error, bim));
     }
-    !bed.is_file() && apply_extension(prefix, "pgen").is_ok_and(|p| p.is_file())
+    Ok(!bed.is_file() && apply_extension(prefix, "pgen").is_ok_and(|p| p.is_file()))
 }
 
 fn is_remote_path(path: &Path) -> bool {
@@ -1370,12 +1374,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn score_weights_retain_f64_precision_and_require_finite_values() {
+        for (text, expected) in [
+            ("1.0000000000000002", 1.0 + f64::EPSILON),
+            ("1e-200", 1e-200f64),
+            ("1e200", 1e200f64),
+            ("-0", -0.0f64),
+        ] {
+            assert_eq!(
+                parse_weight(text).unwrap().to_bits(),
+                expected.to_bits()
+            );
+        }
+        for text in ["NaN", "inf", "-inf", "1e999", "not-a-weight"] {
+            let error = parse_weight(text).unwrap_err().to_string();
+            assert!(!error.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_remote_prefix_without_a_bim_names_the_bim() {
+        // Nothing listens on this port once the listener is dropped, so the .bim and
+        // the .pvar probes both fail at once.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let prefix = PathBuf::from(format!("http://{}/cohort", listener.local_addr().unwrap()));
+        drop(listener);
+        let error = build_fileset_paths(std::slice::from_ref(&prefix))
+            .err()
+            .expect("no fileset behind the prefix")
+            .to_string();
+        assert!(error.contains("cohort.bim"), "{error}");
+        assert!(!error.contains("psam"), "{error}");
+    }
+
+
+    #[test]
     fn csr_reordering_preserves_empty_rows_and_weight_bits() {
         let mut csr = CsrBuilder::new().unwrap();
         for entries in [
-            vec![(2, -0.0f32, 2.0f32)],
+            vec![(2, -0.0f64, 2.0f64)],
             vec![],
-            vec![(0, 0.1f32, -0.0f32), (3, 0.2f32, 3.0f32)],
+            vec![(0, 0.1f64, -0.0f64), (3, 0.2f64, 3.0f64)],
         ] {
             for (column, dosage_weight, missing_correction) in entries {
                 csr.push_contribution(
@@ -1401,14 +1440,14 @@ mod tests {
                 .iter()
                 .map(|v| v.to_bits())
                 .collect::<Vec<_>>(),
-            [0.1f32, 0.2, -0.0].map(f32::to_bits),
+            [0.1f64, 0.2, -0.0].map(f64::to_bits),
         );
         assert_eq!(
             csr.sparse_missing_corrections
                 .iter()
                 .map(|v| v.to_bits())
                 .collect::<Vec<_>>(),
-            [-0.0f32, 3.0, 2.0].map(f32::to_bits),
+            [-0.0f64, 3.0, 2.0].map(f64::to_bits),
         );
     }
 
@@ -1421,11 +1460,11 @@ mod tests {
         std::fs::write(prefix.with_extension("bed"), bed).unwrap();
     }
 
-    type RowPlan = (String, u8, Vec<(u32, u32, u32)>);
+    type RowPlan = (String, u8, Vec<(u32, u64, u64)>);
     type RulePlan = (
         (String, u32),
         Vec<(String, String, String)>,
-        Vec<(String, String, u32, usize)>,
+        Vec<(String, String, u64, usize)>,
     );
 
     /// What a plan says about each matched row and complex rule, keyed by `.bim`
@@ -1909,7 +1948,8 @@ mod tests {
         assert_eq!(prep.sparse_row_offsets(), &[0, 3, 4, 6]);
         for (row, expected) in [
             vec![
-                (columns[0], 0.0f32, 0.0f32),
+                // f64 retains the middle 1 in 2^24 + 1 - 2^24.
+                (columns[0], 1.0f64, 0.0f64),
                 (columns[1], 0.5, 1.0),
                 (columns[2], -0.25, 0.5),
             ],
@@ -2069,7 +2109,7 @@ mod tests {
 
     #[test]
     fn duplicate_aggregation_matches_row_by_row_for_all_dosages() {
-        let rows = [(0.35f32, false), (0.10f32, true), (-0.05f32, false)];
+        let rows = [(0.35f64, false), (0.10f64, true), (-0.05f64, false)];
         let mut agg = SimpleScoreAssignment {
             dosage_weight: 0.0,
             missing_correction: 0.0,
@@ -2078,7 +2118,7 @@ mod tests {
             apply_simple_score_assignment(&mut agg, w, is_flipped);
         }
 
-        for dosage in [0.0f32, 1.0, 2.0] {
+        for dosage in [0.0f64, 1.0, 2.0] {
             let row_by_row = rows
                 .iter()
                 .map(|(w, is_flipped)| {
@@ -2088,7 +2128,7 @@ mod tests {
                         w * dosage
                     }
                 })
-                .sum::<f32>();
+                .sum::<f64>();
             let aggregated = agg.missing_correction + (agg.dosage_weight * dosage);
             assert!(
                 (row_by_row - aggregated).abs() < 1e-6,
@@ -2145,8 +2185,8 @@ fn is_unkeyable_contig(error: &PrepError) -> bool {
 }
 
 /// Parses a non-empty weight field. Only a finite decimal is usable.
-fn parse_weight(text: &str) -> Result<f32, String> {
-    match text.parse::<f32>() {
+fn parse_weight(text: &str) -> Result<f64, String> {
+    match text.parse::<f64>() {
         Ok(weight) if weight.is_finite() => Ok(weight),
         Ok(_) => Err("not a finite number".to_string()),
         Err(err) => Err(err.to_string()),

@@ -50,7 +50,7 @@ fn main() {
             .map(|i| ReconciledVariantIndex(i as u32))
             .collect();
         let mut data = vec![0; row_bytes * 256];
-        let mut weights = vec![0.0f32; prep.stride() * 256];
+        let mut weights = vec![0.0f64; prep.stride() * 256];
         let mut corrections = weights.clone();
         let mut nnz = 0;
         for (row, &index) in indices.iter().enumerate() {

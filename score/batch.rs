@@ -18,7 +18,7 @@ use crate::score::types::{
 };
 use crossbeam_queue::ArrayQueue;
 use std::error::Error;
-use std::simd::{Select, Simd, cmp::SimdPartialEq, num::SimdFloat, num::SimdUint};
+use std::simd::{Select, Simd, cmp::SimdPartialEq, num::SimdUint};
 
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
@@ -29,9 +29,8 @@ type U8xN = Simd<u8, SIMD_LANES>;
 /// This value is tuned to ensure the tile fits comfortably within the L3 cache.
 pub(crate) const PERSON_BLOCK_SIZE: usize = 4096;
 
-/// The number of variants to process in a single call to the compute kernel. This value
-/// controls the frequency of flushing the `f32` accumulators to the `f64` master
-/// buffer, which is the primary mechanism for guaranteeing numerical accuracy.
+/// The number of variants per kernel call bounds its working set. Both its
+/// accumulators and the master score buffer retain f64 precision.
 const KERNEL_MINI_BATCH_SIZE: usize = 256;
 /// Number of scores to process per inner CPU stripe.
 /// Must be a multiple of SIMD lanes so each stripe can read full vectors safely.
@@ -62,8 +61,8 @@ fn append_dosage_indices(
 /// parallelism deadlocks and maximize cache efficiency.
 pub fn run_person_major_path(
     variant_major_data: &[u8],
-    weights_for_batch: &[f32],
-    missing_corrections_for_batch: &[f32],
+    weights_for_batch: &[f64],
+    missing_corrections_for_batch: &[f64],
     reconciled_variant_indices_for_batch: &[ReconciledVariantIndex],
     prep_result: &PreparationResult,
     partial_scores_out: &mut [f64],
@@ -214,8 +213,8 @@ pub fn run_person_major_path(
 pub fn process_tile<'a>(
     tile: &'a [EffectAlleleDosage],
     prep_result: &'a PreparationResult,
-    weights_for_batch: &'a [f32],
-    missing_corrections_for_batch: &'a [f32],
+    weights_for_batch: &'a [f64],
+    missing_corrections_for_batch: &'a [f64],
     reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
@@ -241,8 +240,8 @@ fn process_block<'a>(
     person_indices_in_block: &'a [OriginalPersonIndex],
     prep_result: &'a PreparationResult,
     variant_major_data: &'a [u8],
-    weights: &'a [f32],
-    missing_corrections: &'a [f32],
+    weights: &'a [f64],
+    missing_corrections: &'a [f64],
     reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
@@ -281,7 +280,7 @@ fn process_block<'a>(
     let _ = tile_pool.push(tile);
 }
 
-/// Accumulates a SIMD lane of `f32` adjustments into a `f64` score slice.
+/// Accumulates a SIMD lane of adjustments into the score slice.
 ///
 /// This function handles both full 8-element lanes and partial tail lanes.
 /// After benchmarking, the unrolled scalar loop has been
@@ -290,27 +289,22 @@ fn process_block<'a>(
 #[inline(always)]
 fn accumulate_simd_lane(
     scores_out_slice: &mut [f64],
-    adjustments_f32x8: Simd<f32, 8>,
+    adjustments_f64x8: Simd<f64, 8>,
     scores_offset: usize,
     num_scores: usize,
 ) {
-    // Fast path for full 8-element chunks. Slicing once does a single range
-    // check, after which the 8 lanes are statically in bounds — so the widen +
-    // add vectorizes to 2x vcvtps2pd + 2x vaddpd instead of 8 scalar converts
-    // behind 8 separate bounds-check branches (the old unrolled scalar form
-    // re-checked every index against the slice length). Bit-identical: f32->f64
-    // widening is exact and the f64 adds are unchanged.
+    // Check the full lane once, then add without per-element bounds checks or
+    // precision conversions.
     if scores_offset + SIMD_LANES <= num_scores {
         let chunk = &mut scores_out_slice[scores_offset..scores_offset + SIMD_LANES];
         let current = Simd::<f64, SIMD_LANES>::from_slice(chunk);
-        let widened: Simd<f64, SIMD_LANES> = adjustments_f32x8.cast();
-        (current + widened).copy_to_slice(chunk);
+        (current + adjustments_f64x8).copy_to_slice(chunk);
     } else {
         // Scalar fallback for the 1-7 element tail.
-        let adj = adjustments_f32x8.to_array();
+        let adj = adjustments_f64x8.to_array();
         let end = num_scores;
         for j in 0..(end - scores_offset) {
-            scores_out_slice[scores_offset + j] += adj[j] as f64;
+            scores_out_slice[scores_offset + j] += adj[j];
         }
     }
 }
@@ -321,8 +315,8 @@ fn accumulate_simd_lane(
 pub(crate) fn process_tile_impl<'a>(
     tile: &'a [EffectAlleleDosage],
     prep_result: &'a PreparationResult,
-    weights_for_batch: &'a [f32],
-    missing_corrections_for_batch: &'a [f32],
+    weights_for_batch: &'a [f64],
+    missing_corrections_for_batch: &'a [f64],
     reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
@@ -503,10 +497,10 @@ pub(crate) fn process_tile_impl<'a>(
                 let score_chunk_out = &mut scores_out_slice[score_chunk_start..score_chunk_end];
                 for i in 0..score_chunk_lanes {
                     let scores_offset = i * SIMD_LANES;
-                    let adjustments_f32x8 = kernel_result_buffer[i];
+                    let adjustments_f64x8 = kernel_result_buffer[i];
                     accumulate_simd_lane(
                         score_chunk_out,
-                        adjustments_f32x8,
+                        adjustments_f64x8,
                         scores_offset,
                         score_chunk_len,
                     );
@@ -647,8 +641,8 @@ fn pivot_tile(
 /// no genotype pivot, dosage index lists, or cohort-sized scratch is needed.
 fn run_narrow_scores_packed<const COLUMNS: usize>(
     data: &[u8],
-    weights: &[f32],
-    corrections: &[f32],
+    weights: &[f64],
+    corrections: &[f64],
     reconciled: &[ReconciledVariantIndex],
     prep: &PreparationResult,
     scores: &mut [f64],
@@ -722,8 +716,8 @@ fn run_narrow_scores_packed<const COLUMNS: usize>(
 /// accumulators in registers. Sparse columns never expand into a dosage tile.
 fn run_sparse_scores_packed<const SELECTED: bool>(
     data: &[u8],
-    weights: &[f32],
-    corrections: &[f32],
+    weights: &[f64],
+    corrections: &[f64],
     reconciled: &[ReconciledVariantIndex],
     prep: &PreparationResult,
     scores: &mut [f64],
@@ -1265,19 +1259,19 @@ mod tests {
                         let data: Vec<u8> = (0..row_bytes * variants)
                             .map(|i| (i * 73 + i / row_bytes * 19) as u8)
                             .collect();
-                        let weights: Vec<f32> = (0..stride * variants)
+                        let weights: Vec<f64> = (0..stride * variants)
                             .map(|i| {
                                 if i % stride < active {
-                                    (i % 73) as f32 / 173.0 - 0.21
+                                    (i % 73) as f64 / 173.0 - 0.21
                                 } else {
                                     0.0
                                 }
                             })
                             .collect();
-                        let corrections: Vec<f32> = (0..weights.len())
+                        let corrections: Vec<f64> = (0..weights.len())
                             .map(|i| {
                                 if i % stride < active {
-                                    (i % 43) as f32 / 137.0
+                                    (i % 43) as f64 / 137.0
                                 } else {
                                     0.0
                                 }
@@ -1329,8 +1323,8 @@ mod tests {
     }
 
     fn make_single_variant_prep_result(
-        weight: f32,
-        missing_correction: f32,
+        weight: f64,
+        missing_correction: f64,
         num_people: usize,
     ) -> PreparationResult {
         let score_names = vec!["S0".to_string()];
@@ -1392,8 +1386,8 @@ mod tests {
     ) -> PreparationResult {
         let score_names: Vec<String> = (0..num_scores).map(|i| format!("S{i}")).collect();
         let stride = num_scores.div_ceil(SIMD_LANES) * SIMD_LANES;
-        let sparse_weights = vec![1.0f32; active.len()];
-        let sparse_missing_correction = vec![0.0f32; active.len()];
+        let sparse_weights = vec![1.0f64; active.len()];
+        let sparse_missing_correction = vec![0.0f64; active.len()];
         let sparse_score_columns: Vec<u32> = active.iter().map(|&i| i as u32).collect();
         let sparse_row_offsets = vec![0u64, active.len() as u64];
 
@@ -1448,13 +1442,13 @@ mod tests {
                     let data: Vec<u8> = (0..row_bytes * variants)
                         .map(|i| (i * 73 + i / row_bytes * 19) as u8)
                         .collect();
-                    let mut weights = vec![0.0f32; stride * variants];
+                    let mut weights = vec![0.0f64; stride * variants];
                     let mut corrections = weights.clone();
                     for variant in 0..variants {
                         for column in active {
                             weights[variant * stride + column] =
-                                (variant % 73) as f32 / 173.0 - 0.21;
-                            corrections[variant * stride + column] = (variant % 43) as f32 / 137.0;
+                                (variant % 73) as f64 / 173.0 - 0.21;
+                            corrections[variant * stride + column] = (variant % 43) as f64 / 137.0;
                         }
                     }
                     let reconciled = vec![ReconciledVariantIndex(0); variants];
@@ -1524,13 +1518,13 @@ mod tests {
                     let data: Vec<u8> = (0..row_bytes * variants)
                         .map(|i| (i * 73 + i / row_bytes * 19) as u8)
                         .collect();
-                    let mut weights = vec![0.0f32; stride * variants];
+                    let mut weights = vec![0.0f64; stride * variants];
                     let mut corrections = weights.clone();
                     for variant in 0..variants {
                         for &column in &active {
                             weights[variant * stride + column] =
-                                (variant % 73) as f32 / 173.0 - 0.21;
-                            corrections[variant * stride + column] = (variant % 43) as f32 / 137.0;
+                                (variant % 73) as f64 / 173.0 - 0.21;
+                            corrections[variant * stride + column] = (variant % 43) as f64 / 137.0;
                         }
                     }
                     let reconciled = vec![ReconciledVariantIndex(0); variants];
@@ -1698,10 +1692,10 @@ mod tests {
             let prep = make_single_variant_multi_score_prep_result(num_people, num_scores);
             let stride = prep.stride();
             for variants in [31, 32, 33, 255, 256, 257, 513] {
-                let weights: Vec<f32> = (0..variants * stride)
-                    .map(|i| (i % 29) as f32 / 8.0 - 1.0)
+                let weights: Vec<f64> = (0..variants * stride)
+                    .map(|i| (i % 29) as f64 / 8.0 - 1.0)
                     .collect();
-                let corrections = vec![0.25f32; variants * stride];
+                let corrections = vec![0.25f64; variants * stride];
                 let reconciled = vec![ReconciledVariantIndex(0); variants];
                 let tile: Vec<EffectAlleleDosage> = (0..num_people)
                     .flat_map(|person| {
@@ -1754,11 +1748,11 @@ mod tests {
         let prep = make_single_variant_multi_score_prep_result(num_people, num_scores);
         let stride = prep.stride();
 
-        let mut weights_for_batch = vec![0.0f32; stride];
+        let mut weights_for_batch = vec![0.0f64; stride];
         for w in weights_for_batch.iter_mut().take(num_scores) {
             *w = 1.0;
         }
-        let missing_for_batch = vec![0.0f32; stride];
+        let missing_for_batch = vec![0.0f64; stride];
         let reconciled = vec![ReconciledVariantIndex(0)];
         let tile = vec![
             EffectAlleleDosage(1), // person 0, dosage=1

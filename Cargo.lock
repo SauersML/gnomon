@@ -3995,6 +3995,7 @@ version = "0.1.5"
 dependencies = [
  "ahash",
  "approx",
+ "blake3",
  "bumpalo",
  "burn 0.19.1",
  "clap",
@@ -4008,6 +4009,7 @@ dependencies = [
  "dyn-stack 0.13.2",
  "faer 0.23.2",
  "flate2",
+ "fs4",
  "gam",
  "general-mcmc 0.8.0",
  "google-cloud-auth",

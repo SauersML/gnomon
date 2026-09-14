@@ -651,7 +651,7 @@ mod tests {
                         ScoreInfo {
                             effect_allele,
                             other_allele,
-                            weight: (rng.unit() * 3.0 - 1.5) as f32,
+                            weight: (rng.unit() * 3.0 - 1.5) as f64,
                             score_column_index: ScoreColumnIndex(rng.below(num_scores)),
                         }
                     })

@@ -90,10 +90,10 @@ fn main() {
                 b
             })
             .collect();
-        let weights: Vec<f32> = (0..m * prep.stride())
-            .map(|i| (i % 31) as f32 / 128.0 - 0.125)
+        let weights: Vec<f64> = (0..m * prep.stride())
+            .map(|i| (i % 31) as f64 / 128.0 - 0.125)
             .collect();
-        let corrections: Vec<f32> = (0..weights.len()).map(|i| (i % 17) as f32 / 64.0).collect();
+        let corrections: Vec<f64> = (0..weights.len()).map(|i| (i % 17) as f64 / 64.0).collect();
         let variants = vec![ReconciledVariantIndex(0); m];
         let pool = crossbeam_queue::ArrayQueue::new(1);
         let mut reference = None;
