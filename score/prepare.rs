@@ -38,6 +38,9 @@ mod cache;
 #[path = "prepare_parse.rs"]
 mod parse;
 
+#[path = "prepare_scores.rs"]
+mod scores;
+
 // ========================================================================================
 //              Type-driven domain model for streaming
 // ========================================================================================
@@ -584,11 +587,20 @@ fn prepare_for_computation_with_retry(
         has_any.then_some(filters)
     });
 
-    let mut score_iterator = KWayMergeIterator::new(
-        sorted_score_files,
-        &score_name_to_col_index,
-        region_filters.clone(),
-    )?;
+    // Score files within the budget are parsed whole on the pool as well. Region
+    // filters, and files the streaming merge would refuse, stream as before.
+    let parsed_scores = match region_filters {
+        None => scores::parse_score_files(sorted_score_files, &score_name_to_col_index),
+        Some(_) => None,
+    };
+    let mut score_iterator = match parsed_scores {
+        Some(parsed) => ScoreRows::Parsed(parsed),
+        None => ScoreRows::Streamed(KWayMergeIterator::new(
+            sorted_score_files,
+            &score_name_to_col_index,
+            region_filters.clone(),
+        )?),
+    };
 
     let rows_sorted_by_key = matches!(bim_rows, BimRows::Sorted(_));
     let mut bim_iter = bim_rows.by_ref().peekable();
@@ -949,11 +961,7 @@ fn prepare_for_computation_with_retry(
     );
 
     // After iterating, sum malformed line counts from all streams
-    let total_malformed_lines: usize = score_iterator
-        .streams
-        .iter()
-        .map(|s| s.malformed_lines_count)
-        .sum();
+    let total_malformed_lines = score_iterator.malformed_lines();
 
     if total_malformed_lines > 0 {
         eprintln!(
@@ -2519,6 +2527,42 @@ impl Iterator for KWayMergeIterator {
         }
 
         Some(Ok(record_to_return))
+    }
+}
+
+/// Score records in merged order for the merge-join: parsed whole on the pool,
+/// or streamed by the k-way merge.
+enum ScoreRows {
+    Streamed(KWayMergeIterator),
+    Parsed(scores::ParsedScores),
+}
+
+impl ScoreRows {
+    /// Lines skipped for missing columns among those read so far.
+    fn malformed_lines(&self) -> usize {
+        match self {
+            Self::Streamed(merge) => merge.streams.iter().map(|s| s.malformed_lines_count).sum(),
+            Self::Parsed(parsed) => parsed.malformed_lines(),
+        }
+    }
+
+    fn take_region_filter_hits(&mut self) -> Option<Vec<bool>> {
+        match self {
+            Self::Streamed(merge) => merge.take_region_filter_hits(),
+            // Parsed only without region filters, which record no hits.
+            Self::Parsed(_) => None,
+        }
+    }
+}
+
+impl Iterator for ScoreRows {
+    type Item = Result<KeyedScoreRecord, PrepError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Streamed(merge) => merge.next(),
+            Self::Parsed(parsed) => parsed.next(),
+        }
     }
 }
 
