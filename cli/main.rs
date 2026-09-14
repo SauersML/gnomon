@@ -496,14 +496,14 @@ enum CalibrateCommands {
 /// handlers.
 ///
 /// Background: every meaningful artifact has already been flushed to disk
-/// by the time `main` returns, and the CUDA runtime / cuBLAS handle has
-/// been explicitly torn down at the end of the GPU pipeline stage. What's
+/// by the time `main` returns, and map projection's CUDA runtime and cuBLAS
+/// handle have been explicitly torn down at the end of its GPU stage. What's
 /// left is the libcudart / cuBLAS / cudarc dlopen-based at-exit teardown,
 /// which on Linux occasionally interleaves with glibc and aborts the
 /// process with "double free or corruption (!prev)" *after* the run
 /// succeeded. Any wrapper using `subprocess.run(..., check=True)` or
-/// `set -e` sees that abort and reports a failure even though no scoring
-/// work was lost.
+/// `set -e` sees that abort and reports a failure even though no work was
+/// lost.
 ///
 /// `std::process::exit` does NOT solve this: it calls libc `exit()`,
 /// which runs every `__attribute__((destructor))` and C++ static

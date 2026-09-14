@@ -16,7 +16,7 @@ build = "shared/build.rs"
 include = [
     "Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "rust-toolchain.toml",
     "cli/**", "shared/**", "score/**", "map/**", "terms/**", "calibrate/**",
-    "benches/**", "tests/**", "data/testdata/**", "examples/repro_cudarc_teardown.rs",
+    "benches/**", "tests/**", "data/testdata/**",
 ]
 
 [lib]
@@ -182,11 +182,6 @@ required-features = ["bench-path"]
 [[test]]
 name = "score"
 path = "score/tests/mod.rs"
-required-features = ["score"]
-
-[[example]]
-name = "repro_cudarc_teardown"
-path = "examples/repro_cudarc_teardown.rs"
 required-features = ["score"]
 
 # Run tests at release optimization level for maximum speed

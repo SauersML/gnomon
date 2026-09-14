@@ -1,7 +1,6 @@
 pub mod batch;
 pub mod checkpoint;
 pub mod complex;
-pub mod cuda_backend;
 pub mod decide;
 pub mod download;
 pub mod genotype_convert;

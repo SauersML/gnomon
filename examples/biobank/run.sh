@@ -603,7 +603,7 @@ for pkg in ("gam", "gam-solver", "gam_solver"):
 # /usr/local/cuda*/lib64, or (b) NVIDIA pip wheels (nvidia-*-cu12) inside
 # the uv env. Mixing both can split cuBLAS handle state across two
 # implementations and crash with "double free or corruption (!prev)" at
-# cublasDestroy_v2 — score/cuda_backend.rs::detect_cuda_library_conflicts
+# cublasDestroy_v2 — shared/cuda_utils.rs::detect_cuda_library_conflicts
 # guards against this in-process. To avoid that path entirely we pick
 # exactly one source per run: prefer the system toolkit if it actually
 # ships libcublas.so.12, otherwise fall back to pip wheels.
