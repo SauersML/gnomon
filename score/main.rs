@@ -526,15 +526,14 @@ fn resolve_score_files(
         let mut final_files = Vec::with_capacity(source_files.len() + cache_files.len());
         let mut covered_stems = std::collections::HashSet::new();
 
-        // A previous run left each native file's sorted copy beside it, and that
-        // copy also ends in `.gnomon.tsv`. It is gnomon's own derivative, not a
-        // second score: counting it made every repeat run over a directory fail
-        // with a duplicate score ID.
-        let derived_sorted_copies: std::collections::HashSet<PathBuf> = cache_files
-            .iter()
-            .map(|(path, _, _)| sorted_native_score_path(path, None))
-            .collect();
-        cache_files.retain(|(path, _, _)| !derived_sorted_copies.contains(path));
+        // A previous run left each score file's sorted copy beside it as
+        // `<stem>.sorted.gnomon.tsv`, which also ends in `.gnomon.tsv`. Only
+        // `sorted_native_score_path` writes that name, so every such entry is
+        // gnomon's own derivative, of a native `<stem>.tsv` as much as of a
+        // `<stem>.gnomon.tsv` conversion, and the scorer derives it again from
+        // the source it belongs to. Counting it as a score file made every repeat
+        // run over a directory of native files fail with a duplicate score ID.
+        cache_files.retain(|(_, stem, _)| !stem.ends_with(".sorted"));
 
         for (path, stem, cache_metadata) in cache_files {
             let keep_cache = match source_metadata.get(&stem) {
@@ -1841,6 +1840,36 @@ fn format_score_rows<A: Fn(usize, f64, u32) -> f64>(
 mod output_tests {
     use super::{GenomicRegion, HashMap, SscoreSink, write_score_rows, write_scores_to_file};
     use std::fs;
+
+    /// A directory scored once holds each file's `<stem>.sorted.gnomon.tsv`
+    /// beside it. Scoring it again must see the same score files as the first
+    /// run: the sorted copies are derivatives, whether their source is a native
+    /// `.tsv` or an earlier `.gnomon.tsv` conversion, and a fresh conversion
+    /// still stands in for its source.
+    #[test]
+    fn repeat_directory_discovery_skips_sorted_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = "variant_id\teffect_allele\tother_allele\tSCORE\n";
+        for name in [
+            "a.tsv",
+            "a.sorted.gnomon.tsv",
+            "b.gnomon.tsv",
+            "b.sorted.gnomon.tsv",
+            "c.txt",
+        ] {
+            fs::write(dir.path().join(name), header).unwrap();
+        }
+        let (files, regions) =
+            super::resolve_score_files(dir.path(), &dir.path().to_string_lossy(), dir.path())
+                .unwrap();
+        let mut names: Vec<String> = files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.tsv", "b.gnomon.tsv", "c.txt"]);
+        assert!(regions.is_empty());
+    }
 
     /// The one-row-at-a-time writer that `write_score_rows` replaced, kept verbatim as
     /// the byte-identity reference.
