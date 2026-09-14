@@ -1200,7 +1200,8 @@ fn resolve_keep_indices(
     for line in BufReader::new(file).lines() {
         let line = line?;
         let iid = line.trim();
-        if iid.is_empty() {
+        // plink2 writes a `#FID IID` or `#IID` header above sample lists.
+        if iid.is_empty() || iid.starts_with("#FID") || iid.starts_with("#IID") {
             continue;
         }
         if seen.insert(iid.to_string()) {
@@ -1231,14 +1232,21 @@ fn resolve_keep_indices(
     let mut indices = Vec::with_capacity(requested.len());
     let mut missing: Vec<&str> = Vec::new();
     let mut duplicated: Vec<&str> = Vec::new();
-    for iid in &requested {
-        if ambiguous.contains(iid.as_str()) {
-            duplicated.push(iid.as_str());
+    for line in &requested {
+        // A line that is itself an IID is taken as always. Any other line of two or
+        // more fields is plink2's `FID IID ...` and is matched by its IID.
+        let iid = if position.contains_key(line.as_str()) {
+            line.as_str()
+        } else {
+            line.split_whitespace().nth(1).unwrap_or(line.as_str())
+        };
+        if ambiguous.contains(iid) {
+            duplicated.push(iid);
             continue;
         }
-        match position.get(iid.as_str()) {
+        match position.get(iid) {
             Some(&idx) => indices.push(idx),
-            None => missing.push(iid.as_str()),
+            None => missing.push(line.as_str()),
         }
     }
 
@@ -1261,6 +1269,8 @@ fn resolve_keep_indices(
     }
 
     indices.sort_unstable();
+    // Someone listed both by IID and as `FID IID` is still one row.
+    indices.dedup();
     Ok(indices)
 }
 
@@ -2396,6 +2406,26 @@ mod tests {
             "an IID that names two dataset rows is ambiguous, not a coin flip"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn keep_file_accepts_plink_fid_iid_rows() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        let samples = sample_records(&["s0", "s1", "s2", "s3"]);
+        let keep_path = dir.path().join("keep.txt");
+        // plink2's header, tab- and space-separated FID IID rows, and one person twice.
+        fs::write(&keep_path, "#FID\tIID\nf3\ts3\nf1 s1\ns3\n")?;
+        assert_eq!(resolve_keep_indices(&keep_path, &samples)?, vec![1, 3]);
+
+        let unknown_path = dir.path().join("unknown.txt");
+        fs::write(&unknown_path, "f9\ts9\n")?;
+        let err = resolve_keep_indices(&unknown_path, &samples)
+            .expect_err("a row naming no sample by either field must fail");
+        assert!(
+            err.to_string().contains("s9"),
+            "error should name the row: {err}"
+        );
         Ok(())
     }
     const HGDP_REMOTE_VARIANT_LIST: &str =

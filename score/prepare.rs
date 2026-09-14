@@ -1467,6 +1467,38 @@ mod tests {
     }
 
     #[test]
+    fn keep_files_name_people_by_iid_or_by_plink_fid_iid_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let iids: Vec<String> = ["I0", "I1", "I2", "I3"].map(String::from).to_vec();
+        let lookup: AHashMap<String, u32> = iids
+            .iter()
+            .enumerate()
+            .map(|(idx, iid)| (iid.clone(), idx as u32))
+            .collect();
+        let keep = |text: &str| {
+            let path = dir.path().join("keep.txt");
+            std::fs::write(&path, text).unwrap();
+            resolve_person_subset(Some(&path), &iids, &lookup)
+        };
+        let indices = |subset: PersonSubset| match subset {
+            PersonSubset::Indices(indices) => indices,
+            PersonSubset::All => panic!("a keep file selects a subset"),
+        };
+
+        let (by_iid, by_iid_names) = keep("I2\nI0\n").unwrap();
+        assert_eq!(indices(by_iid), vec![0, 2]);
+        assert_eq!(by_iid_names, vec!["I0", "I2"]);
+
+        // plink2's header, tab- and space-separated FID IID rows, and one person twice.
+        let (plink, plink_names) = keep("#FID\tIID\nF2\tI2\nF0 I0\nI2\n").unwrap();
+        assert_eq!(indices(plink), vec![0, 2]);
+        assert_eq!(plink_names, vec!["I0", "I2"]);
+
+        let error = keep("F9\tI9\n").unwrap_err().to_string();
+        assert!(error.contains("I9"), "the unmatched row is named: {error}");
+    }
+
+    #[test]
     fn cached_variants_rebind_people_paths_and_keep_layout() {
         let dir = tempfile::tempdir().unwrap();
         let weights = dir.path().join("weights.tsv");
@@ -2445,21 +2477,20 @@ fn resolve_person_subset(
         );
         let file = File::open(path).map_err(|e| PrepError::Io(e, path.to_path_buf()))?;
         let reader = BufReader::new(file);
-        let iids_to_keep: AHashSet<String> = reader
+        let lines_to_keep: AHashSet<String> = reader
             .lines()
             .filter_map(Result::ok)
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && !is_keep_header(s))
             .collect();
 
-        let mut found_people = Vec::with_capacity(iids_to_keep.len());
+        let mut found_people = Vec::with_capacity(lines_to_keep.len());
         let mut missing_ids = Vec::new();
 
-        for iid in iids_to_keep {
-            if let Some(&original_idx) = iid_to_original_idx.get(&iid) {
-                found_people.push((original_idx, iid));
-            } else {
-                missing_ids.push(iid);
+        for line in lines_to_keep {
+            match resolve_keep_line(&line, iid_to_original_idx) {
+                Some((original_idx, iid)) => found_people.push((original_idx, iid.to_string())),
+                None => missing_ids.push(line),
             }
         }
 
@@ -2470,12 +2501,35 @@ fn resolve_person_subset(
         }
 
         found_people.sort_unstable_by_key(|(idx, _)| *idx);
+        // Someone listed both by IID and as `FID IID` is still one person.
+        found_people.dedup_by_key(|(idx, _)| *idx);
         let final_person_iids = found_people.iter().map(|(_, iid)| iid.clone()).collect();
         let subset_indices = found_people.into_iter().map(|(idx, _)| idx).collect();
         Ok((PersonSubset::Indices(subset_indices), final_person_iids))
     } else {
         Ok((PersonSubset::All, all_person_iids.to_vec()))
     }
+}
+
+/// Resolves one keep-file line to a person. A line that is itself an IID is taken
+/// as always. Any other line of two or more fields is read as PLINK's
+/// `FID IID ...`, the layout `plink2 --keep` files use, and matched by its IID.
+fn resolve_keep_line<'a>(
+    line: &'a str,
+    iid_to_original_idx: &AHashMap<String, u32>,
+) -> Option<(u32, &'a str)> {
+    if let Some(&idx) = iid_to_original_idx.get(line) {
+        return Some((idx, line));
+    }
+    let mut fields = line.split_whitespace();
+    fields.next()?;
+    let iid = fields.next()?;
+    iid_to_original_idx.get(iid).map(|&idx| (idx, iid))
+}
+
+/// The `#FID IID` or `#IID` header line plink2 writes above sample lists.
+fn is_keep_header(line: &str) -> bool {
+    line.starts_with("#FID") || line.starts_with("#IID")
 }
 
 fn parse_fam_and_build_lookup(
