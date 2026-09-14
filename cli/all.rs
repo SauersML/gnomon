@@ -14,12 +14,14 @@
 //! Only compiled when all four of `map`, `score`, `calibrate`, and `terms`
 //! are active (the same cfg as the full `gnomon` binary entry point).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::thread::{self, ScopedJoinHandle};
 use std::time::Instant;
 
 use gnomon::adapt_plink2::GenomeBuild;
 use gnomon::map::io::derive_local_output_path;
 use gnomon::map::main::run_project_with_output;
+use gnomon::map::prefit;
 use gnomon::score::genotype_convert::{
     EnsurePlinkOptions, InputFormat, detect_input_format, ensure_plink_format_with_options,
 };
@@ -61,6 +63,9 @@ pub struct AllOptions {
 ///      VCF-keyed path.
 ///   4. `terms --sex` against the cached PLINK, sex.tsv at the VCF-keyed
 ///      path.
+///
+/// Phases 2-4 run concurrently when [`phase_overlap`] allows it, and in order
+/// otherwise.
 pub fn run(opts: AllOptions) -> Result<(), Box<dyn std::error::Error>> {
     let overall = Instant::now();
     let vcf_path = opts.input_path.clone();
@@ -118,61 +123,98 @@ pub fn run(opts: AllOptions) -> Result<(), Box<dyn std::error::Error>> {
     // naming logic (derived from the VCF file stem) is unchanged. Internally
     // it calls ensure_plink_format again, which hits the cache produced in
     // phase 1 and short-circuits.
-    let score_start = Instant::now();
-    super::score_main::run_gnomon_with_args(
-        vcf_path.clone(),
-        opts.score.clone(),
-        opts.keep.clone(),
-        opts.reference.clone(),
-        opts.build.clone(),
-        opts.panel.clone(),
-        // We don't carry a caller-provided sex in `gnomon all`; phase 4
-        // recomputes the real per-sample sex from the cached PLINK.
-        None,
-        false,
-        // Outputs stay beside the original input, like every other phase.
-        None,
-    )
-    .map_err(|err| err as Box<dyn std::error::Error>)?;
-    println!(
-        "[all] score phase: {:.2}s",
-        score_start.elapsed().as_secs_f64()
-    );
+    let score_phase = || -> Result<(), String> {
+        let score_start = Instant::now();
+        super::score_main::run_gnomon_with_args(
+            vcf_path.clone(),
+            opts.score.clone(),
+            opts.keep.clone(),
+            opts.reference.clone(),
+            opts.build.clone(),
+            opts.panel.clone(),
+            // We don't carry a caller-provided sex in `gnomon all`; phase 4
+            // recomputes the real per-sample sex from the cached PLINK.
+            None,
+            false,
+            // Outputs stay beside the original input, like every other phase.
+            None,
+        )
+        .map_err(|err| err.to_string())?;
+        println!(
+            "[all] score phase: {:.2}s",
+            score_start.elapsed().as_secs_f64()
+        );
+        Ok(())
+    };
 
     // --- Phase 3: project (against cached PLINK, outputs keyed to VCF) ---
-    let project_start = Instant::now();
-    let projection_scores_path = if input_is_vcf_like {
-        derive_local_output_path(&vcf_path, "projection_scores.bin")
-    } else {
-        derive_local_output_path(&plink_prefix, "projection_scores.bin")
+    let project_phase = || -> Result<(), String> {
+        let project_start = Instant::now();
+        let projection_scores_path = if input_is_vcf_like {
+            derive_local_output_path(&vcf_path, "projection_scores.bin")
+        } else {
+            derive_local_output_path(&plink_prefix, "projection_scores.bin")
+        };
+        let build = opts
+            .build
+            .as_deref()
+            .map(GenomeBuild::parse)
+            .transpose()
+            .map_err(|err| err.to_string())?;
+        run_project_with_output(
+            &plink_prefix,
+            build,
+            Some(&opts.model),
+            opts.output_manifest.as_deref(),
+            &projection_scores_path,
+        )
+        .map_err(|err| err.to_string())?;
+        println!(
+            "[all] project phase: {:.2}s",
+            project_start.elapsed().as_secs_f64()
+        );
+        Ok(())
     };
-    run_project_with_output(
-        &plink_prefix,
-        opts.build.as_deref().map(GenomeBuild::parse).transpose()?,
-        Some(&opts.model),
-        opts.output_manifest.as_deref(),
-        &projection_scores_path,
-    )
-    .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
-    println!(
-        "[all] project phase: {:.2}s",
-        project_start.elapsed().as_secs_f64()
-    );
 
     // --- Phase 4: terms (sex inference against cached PLINK, sex.tsv keyed to VCF) ---
-    let terms_start = Instant::now();
-    let sex_tsv_path = if input_is_vcf_like {
-        derive_local_output_path(&vcf_path, "sex.tsv")
-    } else {
-        derive_local_output_path(&plink_prefix, "sex.tsv")
+    let terms_phase = || -> Result<(), String> {
+        let terms_start = Instant::now();
+        let sex_tsv_path = if input_is_vcf_like {
+            derive_local_output_path(&vcf_path, "sex.tsv")
+        } else {
+            derive_local_output_path(&plink_prefix, "sex.tsv")
+        };
+        let written = infer_sex_to_tsv_at(&plink_prefix, None, &sex_tsv_path)
+            .map_err(|err| err.to_string())?;
+        println!(
+            "[all] terms phase: {:.2}s (sex.tsv = {})",
+            terms_start.elapsed().as_secs_f64(),
+            written.display()
+        );
+        Ok(())
     };
-    let written = infer_sex_to_tsv_at(&plink_prefix, None, &sex_tsv_path)
-        .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
-    println!(
-        "[all] terms phase: {:.2}s (sex.tsv = {})",
-        terms_start.elapsed().as_secs_f64(),
-        written.display()
-    );
+
+    // The phases read the same fileset and write disjoint outputs. Either way
+    // every phase that starts runs to completion, as its subcommand would, and
+    // the first failure in phase order is reported.
+    let outcome = match phase_overlap(&plink_prefix, &opts.model) {
+        Ok(threads) => {
+            println!("[all] running score, project and terms concurrently on {threads} threads");
+            thread::scope(|scope| {
+                let project = scope.spawn(&project_phase);
+                let terms = scope.spawn(&terms_phase);
+                let score = score_phase();
+                score.and(join_phase(project)).and(join_phase(terms))
+            })
+        }
+        Err(reason) => {
+            println!("[all] running score, project and terms in order: {reason}");
+            score_phase()
+                .and_then(|()| project_phase())
+                .and_then(|()| terms_phase())
+        }
+    };
+    outcome?;
 
     println!(
         "[all] total wall time: {:.2}s",
@@ -180,4 +222,58 @@ pub fn run(opts: AllOptions) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+/// Whether score, project and terms may run at the same time: the number of
+/// threads they would share, or why they run in order.
+///
+/// None of the three fills the pool by itself on small inputs (score file
+/// preparation and model loading are mostly serial, sex inference accumulates
+/// on one thread), so overlapping them saves their fixed costs. On a large
+/// fileset projection uses every core and overlapping gains nothing, so the
+/// question is memory. Measured from 1 to 51,200 samples, a run in order peaked
+/// within 3% of the fileset plus the projection model on disk, and overlapping
+/// peaked at 1.44 times that sum at most, so the phases overlap only when
+/// available memory covers twice the sum. A fileset or model this process cannot
+/// size locally (a remote input, a model that has not been downloaded yet) runs
+/// in order.
+fn phase_overlap(plink_prefix: &Path, model: &str) -> Result<usize, String> {
+    let threads = rayon::current_num_threads();
+    if threads < 2 {
+        return Err("one thread".to_string());
+    }
+    let mut bed = plink_prefix.as_os_str().to_owned();
+    bed.push(".bed");
+    let genotype_bytes = std::fs::metadata(&bed)
+        .map_err(|_| format!("{} is not a local file", Path::new(&bed).display()))?
+        .len();
+    let model_info =
+        prefit::lookup_model(model).ok_or_else(|| format!("unknown model '{model}'"))?;
+    let model_json = prefit::cached_model_path(model_info).map_err(|err| err.to_string())?;
+    let model_bytes = std::fs::metadata(&model_json)
+        .map_err(|_| format!("model '{model}' is not downloaded yet"))?
+        .len()
+        + std::fs::metadata(model_json.with_extension("project.bin")).map_or(0, |meta| meta.len());
+    let needed = genotype_bytes.saturating_add(model_bytes).saturating_mul(2);
+    let (_, available) = gnomon::memory::memory_bytes();
+    if available < needed {
+        return Err(format!(
+            "{} available, {} needed to overlap them",
+            gib(available),
+            gib(needed)
+        ));
+    }
+    Ok(threads)
+}
+
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / f64::from(1u32 << 30))
+}
+
+/// Wait for a phase thread, re-raising its panic here so that a phase which
+/// crashes fails `gnomon all` the same way it fails its own subcommand.
+fn join_phase(handle: ScopedJoinHandle<'_, Result<(), String>>) -> Result<(), String> {
+    handle
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
 }
