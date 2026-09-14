@@ -128,14 +128,17 @@ jobs:
           remote_out=$(sscore remote)
           local_1thread=$(sscore local-1thread)
           remote_1thread=$(sscore remote-1thread)
+          # Evaluate both properties before failing, so one run says which of them broke.
+          broken=0
           if ! cmp "$local_1thread" "$remote_1thread"; then
             echo "::error::Reader parity broke: one-thread .sscore bytes differ between local and remote reads."
-            exit 1
+            broken=1
           fi
           if ! python3 scripts/compare_sscore.py "$local_out" "$remote_out"; then
             echo "::error::Default-thread scores broke: local and remote differ in an id or count, or beyond 1e-10 relative."
-            exit 1
+            broken=1
           fi
+          test "$broken" -eq 0
           test "$(grep -vc '^#' "$remote_out")" -eq 40
           echo "Remote reads reproduce local scores for 40 kept samples: exact bytes at one thread, within 1e-10 at default threads."
       - uses: actions/upload-artifact@v4
