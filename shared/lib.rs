@@ -30,7 +30,7 @@ pub(crate) mod genotype_table;
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod files;
 
-/// Atomic publication of results, checkpoints and caches, so a concurrent
+/// Atomic publication of results and caches, so a concurrent
 /// reader never observes a partially written file.
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod output;

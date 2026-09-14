@@ -405,10 +405,7 @@ fn concurrent_score_runs_with_different_out_prefixes_agree() -> TestResult {
     }
     let leftovers: Vec<PathBuf> = snapshot(&tmp.path().join("results"))
         .into_keys()
-        .filter(|path| {
-            let name = path.to_string_lossy();
-            name.ends_with(".tmp") || name.contains("gnomon-checkpoint")
-        })
+        .filter(|path| path.to_string_lossy().ends_with(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
     Ok(())

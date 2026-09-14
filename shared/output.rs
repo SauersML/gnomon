@@ -1,10 +1,10 @@
 //! Publishing output files that other processes may already be reading.
 //!
-//! gnomon's results, checkpoints and caches are read by whatever runs next: a
-//! pipeline step waiting for the file, a second gnomon run on the same inputs,
-//! or a rerun resuming from a checkpoint. A file written in place is visible
-//! while it is still being written, and a run that is killed or runs out of disk
-//! leaves a truncated file behind that looks exactly like a finished one.
+//! gnomon's results and caches are read by whatever runs next: a pipeline step
+//! waiting for the file, or a second gnomon run on the same inputs. A file
+//! written in place is visible while it is still being written, and a run that
+//! is killed or runs out of disk leaves a truncated file behind that looks
+//! exactly like a finished one.
 //! [`write_atomically`] exposes neither: the content goes to a temporary file in
 //! the destination directory, is flushed and fsynced, and only then is renamed
 //! over the destination, so a reader sees the previous file or the complete new
