@@ -63,10 +63,21 @@ struct SelectedVariant {
     chrom: Chromosome,
 }
 
+/// How sex inference reads a variant's chromosome label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocusChromosome {
+    Autosome,
+    X,
+    Y,
+    /// The X pseudoautosomal regions under a code of their own: PLINK's `25` or
+    /// `XY`, or plink2's `PAR1` and `PAR2` contigs. Positions are X coordinates.
+    XPar,
+}
+
 /// Chromosome class and position of every variant, in file order.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct VariantLoci {
-    chroms: Vec<Option<Chromosome>>,
+    chroms: Vec<Option<LocusChromosome>>,
     positions: Vec<u64>,
 }
 
@@ -113,16 +124,21 @@ impl SexVariantSelection {
         let mut autosome_indices = Vec::new();
 
         for (index, (&chrom, &position)) in loci.chroms.iter().zip(&loci.positions).enumerate() {
-            let Some(chrom) = chrom else {
-                continue;
-            };
-
-            match chrom {
-                Chromosome::Autosome => autosome_indices.push(index),
-                Chromosome::X | Chromosome::Y => {
-                    selected.push((index, SelectedVariant { position, chrom }));
+            let chrom = match chrom {
+                Some(LocusChromosome::Autosome) => {
+                    autosome_indices.push(index);
+                    continue;
                 }
-            }
+                Some(LocusChromosome::X) => Chromosome::X,
+                Some(LocusChromosome::Y) => Chromosome::Y,
+                // A row coded pseudoautosomal is read as X only inside the build's PAR
+                // intervals. Elsewhere its label and position disagree, and filing it
+                // under non-PAR X would read a male's diploid calls as heterozygous
+                // X evidence.
+                Some(LocusChromosome::XPar) if build.is_in_x_par(position) => Chromosome::X,
+                Some(LocusChromosome::XPar) | None => continue,
+            };
+            selected.push((index, SelectedVariant { position, chrom }));
         }
 
         let autosome_sample_count = AUTOSOME_SAMPLE_TARGET.min(autosome_indices.len());
@@ -542,7 +558,7 @@ fn infer_build(loci: &VariantLoci) -> GenomeBuild {
         .chroms
         .iter()
         .zip(&loci.positions)
-        .filter(|&(&chrom, _)| chrom == Some(Chromosome::X))
+        .filter(|&(&chrom, _)| matches!(chrom, Some(LocusChromosome::X | LocusChromosome::XPar)))
         .map(|(_, &position)| position)
         .max();
 
@@ -554,7 +570,7 @@ fn infer_build(loci: &VariantLoci) -> GenomeBuild {
     }
 }
 
-fn classify_chromosome(label: &str) -> Option<Chromosome> {
+fn classify_chromosome(label: &str) -> Option<LocusChromosome> {
     let trimmed = label.trim();
     let bytes = trimmed.as_bytes();
     let stripped = if bytes.len() >= 3
@@ -567,18 +583,23 @@ fn classify_chromosome(label: &str) -> Option<Chromosome> {
         trimmed
     };
 
-    if stripped.len() == 1 {
-        match stripped.as_bytes()[0] {
-            b'X' | b'x' => return Some(Chromosome::X),
-            b'Y' | b'y' => return Some(Chromosome::Y),
-            _ => {}
+    for (name, chrom) in [
+        ("X", LocusChromosome::X),
+        ("Y", LocusChromosome::Y),
+        ("XY", LocusChromosome::XPar),
+        ("PAR1", LocusChromosome::XPar),
+        ("PAR2", LocusChromosome::XPar),
+    ] {
+        if stripped.eq_ignore_ascii_case(name) {
+            return Some(chrom);
         }
     }
 
     match stripped.parse::<u8>().ok()? {
-        23 => Some(Chromosome::X),
-        24 => Some(Chromosome::Y),
-        chrom if (1..=22).contains(&chrom) => Some(Chromosome::Autosome),
+        23 => Some(LocusChromosome::X),
+        24 => Some(LocusChromosome::Y),
+        25 => Some(LocusChromosome::XPar),
+        chrom if (1..=22).contains(&chrom) => Some(LocusChromosome::Autosome),
         _ => None,
     }
 }
@@ -622,13 +643,25 @@ mod tests {
 
     #[test]
     fn classify_chromosome_recognizes_common_labels() {
-        assert_eq!(classify_chromosome("X"), Some(Chromosome::X));
-        assert_eq!(classify_chromosome("chrX"), Some(Chromosome::X));
-        assert_eq!(classify_chromosome("Y"), Some(Chromosome::Y));
-        assert_eq!(classify_chromosome("chrY"), Some(Chromosome::Y));
-        assert_eq!(classify_chromosome("1"), Some(Chromosome::Autosome));
-        assert_eq!(classify_chromosome("chr22"), Some(Chromosome::Autosome));
+        assert_eq!(classify_chromosome("X"), Some(LocusChromosome::X));
+        assert_eq!(classify_chromosome("chrX"), Some(LocusChromosome::X));
+        assert_eq!(classify_chromosome("Y"), Some(LocusChromosome::Y));
+        assert_eq!(classify_chromosome("chrY"), Some(LocusChromosome::Y));
+        assert_eq!(classify_chromosome("1"), Some(LocusChromosome::Autosome));
+        assert_eq!(
+            classify_chromosome("chr22"),
+            Some(LocusChromosome::Autosome)
+        );
+        for label in ["25", "XY", "xy", "chrXY", "PAR1", "PAR2", "chrPAR2", "par1"] {
+            assert_eq!(
+                classify_chromosome(label),
+                Some(LocusChromosome::XPar),
+                "{label}"
+            );
+        }
         assert_eq!(classify_chromosome("MT"), None);
+        assert_eq!(classify_chromosome("26"), None);
+        assert_eq!(classify_chromosome("PAR3"), None);
     }
 
     #[test]
@@ -640,6 +673,31 @@ mod tests {
         assert_eq!(infer_build(&loci), GenomeBuild::Build37);
 
         assert_eq!(infer_build(&VariantLoci::default()), GenomeBuild::Build38);
+    }
+
+    /// hg38 non-PAR X ends below the Build38 threshold, so with PAR2 coded apart
+    /// from X the build is only visible in the PAR-coded rows. Those rows count as
+    /// X PAR inside the PAR intervals and nowhere else.
+    #[test]
+    fn par_coded_rows_set_the_build_and_count_only_inside_the_par() {
+        let keys = [
+            VariantKey::new("1", 1_000),
+            VariantKey::new("X", 3_000_000),
+            VariantKey::new("X", 155_000_000),
+            VariantKey::new("XY", 1_000_000),
+            VariantKey::new("25", 3_000_000),
+            VariantKey::new("PAR2", 155_800_000),
+        ];
+        let loci = VariantLoci::from_keys(&keys);
+        assert_eq!(infer_build(&loci), GenomeBuild::Build38);
+
+        let selection = SexVariantSelection::from_loci(&loci, GenomeBuild::Build38);
+        assert_eq!(selection.indices, vec![0, 1, 2, 3, 5]);
+        assert!(
+            selection.keys[1..]
+                .iter()
+                .all(|selected| selected.chrom == Chromosome::X)
+        );
     }
 
     #[test]
@@ -1186,10 +1244,61 @@ mod tests {
         let keys = dataset.variant_keys_for_plan(&SelectionPlan::All)?;
         let from_bim = VariantLoci::from_bim(plink)?;
         assert_eq!(from_bim, VariantLoci::from_keys(&keys));
-        assert_eq!(from_bim.chroms[2], Some(Chromosome::Autosome));
-        assert_eq!(from_bim.chroms[5], Some(Chromosome::Autosome));
-        assert_eq!(from_bim.chroms[14], Some(Chromosome::X));
-        assert_eq!(from_bim.chroms[19], None);
+        assert_eq!(from_bim.chroms[2], Some(LocusChromosome::Autosome));
+        assert_eq!(from_bim.chroms[5], Some(LocusChromosome::Autosome));
+        assert_eq!(from_bim.chroms[14], Some(LocusChromosome::X));
+        assert_eq!(from_bim.chroms[18], Some(LocusChromosome::XPar));
+        assert_eq!(from_bim.chroms[19], Some(LocusChromosome::XPar));
+        assert_eq!(from_bim.chroms[20], Some(LocusChromosome::XPar));
+        assert_eq!(from_bim.chroms[21], None);
+        Ok(())
+    }
+
+    /// PAR rows under a code of their own -- PLINK's `25` and `XY`, plink2's
+    /// `PAR1` and `PAR2` -- must infer exactly what the same rows coded `X` do.
+    #[test]
+    fn par_coded_rows_infer_what_the_rows_coded_x_infer() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let reference_dir = tempdir()?;
+        let (_, expected_build, expected) = infer_records(
+            &write_sex_fixture(reference_dir.path(), 64, 3)?,
+            None,
+            false,
+        )?;
+        let constants = expected_build.algorithm_constants();
+        for par_label in ["25", "XY", "chrXY", "PAR1/PAR2"] {
+            let dir = tempdir()?;
+            let bed = write_sex_fixture(dir.path(), 64, 3)?;
+            let bim_path = bed.with_extension("bim");
+            let mut relabelled = String::new();
+            for line in std::fs::read_to_string(&bim_path)?.lines() {
+                let mut fields: Vec<&str> = line.split('\t').collect();
+                let position: u64 = fields[3].parse()?;
+                // plink --split-x: everything outside the non-PAR interval moves to the PAR code.
+                if fields[0] == "X" && !constants.is_in_x_non_par(position) {
+                    fields[0] = match par_label {
+                        "PAR1/PAR2" if position < constants.non_par_x.0 => "PAR1",
+                        "PAR1/PAR2" => "PAR2",
+                        label => label,
+                    };
+                }
+                relabelled.push_str(&fields.join("\t"));
+                relabelled.push('\n');
+            }
+            std::fs::write(&bim_path, relabelled)?;
+
+            let (_, build, records) = infer_records(&bed, None, false)?;
+            assert_eq!(build, expected_build, "{par_label}");
+            assert_eq!(records.len(), expected.len());
+            for (record, expected) in records.iter().zip(&expected) {
+                assert_eq!(record.individual_id, expected.individual_id);
+                assert_eq!(record.inference, expected.inference, "{par_label}");
+                assert_eq!(
+                    metric_bits(&record.inference),
+                    metric_bits(&expected.inference)
+                );
+            }
+        }
         Ok(())
     }
 }
