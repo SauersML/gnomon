@@ -28,6 +28,43 @@ Source and reusable scripts live in the normal checkout. MSI build artifacts
 and raw measurements now live under
 `/projects/standard/hsiehph/sauer354/gnomon/target/score-map`.
 
+Full-marker command measurements (four pinned cores, shared MSI storage):
+
+| Workload | Baseline | Current | Current peak RSS |
+| --- | ---: | ---: | ---: |
+| Score: 1 person, 1,799,239 input markers, PGS000018 | 1.734 s | 1.830 s | 24.4 MiB |
+| Score: 3,200 people, same input and score | 4.015 s | 2.442–2.604 s | 1.33 GiB |
+| Project: 1 person, 562,259 input markers, 20 PCs | 3.992 s | 2.102 s | 664.2 MiB |
+| Score: 51,200 people, 1,799,239 input markers, PGS000018 | stopped at 35 s | 24.934 s | 251.2 MiB |
+
+PGS000018 matches 330,861 markers, including 2,527 complex-rule loci. The
+51,200-person dataset repeats the 3,200-person reference cohort sixteen times.
+All 51,200 results agree with the baseline seed scores within `1.251e-12`
+absolute error; missing percentages are identical. The packed narrow kernel
+uses f64 accumulation, so last-bit changes from the former f32 minibatch
+sums are expected. Single-person score and projection outputs are byte-identical.
+Single-person scoring remains preparation-bound; this revision does not speed
+that command up. Projection marker selection fell from 1.951 to 0.636 seconds;
+model loading also varied with filesystem cache state.
+
+The large baseline was deliberately terminated rather than extended into a
+long job. Its incomplete timing is not an exact speedup denominator. Before
+the local I/O change, the new compute kernels reached 36% of matched rows in
+35 seconds. Planned positional reads reached every matched row within the
+same limit, then entered complex-rule resolution. A subsequent warm run
+completed in the 24.934 seconds above; cache state affects these shared-storage
+measurements. The completed run's 45-second cap was not reached.
+
+Large local BED inputs now reuse the existing range-prefetch engine, merging
+nearby required rows into ranges of at most 2 MiB and using at most two I/O
+workers per active reader. Prefetch storage is capped at the smaller of
+16 MiB and 1/32 of the memory budget, divided across filesets and included in
+preflight accounting. Smaller inputs retain mapped reads. Three additional
+checks cover coalesced range bounds, cross-range byte reassembly, truncation,
+backward reads, and the prefetch window's outstanding-byte bound. No tested
+run ran out of memory. These measurements do not establish performance for
+every input format, score width, missingness pattern, or cohort size.
+
 The next projection revision compiles four variants into one 256-row lookup,
 with at most 256 KiB of table scratch plus 8 KiB for construction and 1 KiB
 per active sample tile. Cohorts below 1,024 people and panels above 64 PCs

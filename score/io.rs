@@ -34,6 +34,7 @@ pub fn open_bed_source_for_scoring(
     path: &std::path::Path,
     genome_build: Option<crate::adapt_plink2::GenomeBuild>,
     prep: &PreparationResult,
+    memory_budget: crate::score::pipeline::MemoryBudget,
 ) -> Result<BedSource, PipelineError> {
     let (start, end) = match &prep.pipeline_kind {
         PipelineKind::SingleFile(_) => (0, prep.total_variants_in_bim),
@@ -41,9 +42,7 @@ pub fn open_bed_source_for_scoring(
             let index = boundaries
                 .iter()
                 .position(|boundary| boundary.bed_path == path)
-                .ok_or_else(|| {
-                    PipelineError::Io("Scoring path has no fileset boundary".into())
-                })?;
+                .ok_or_else(|| PipelineError::Io("Scoring path has no fileset boundary".into()))?;
             let next = boundaries
                 .get(index + 1)
                 .map_or(prep.total_variants_in_bim, |boundary| {
@@ -65,7 +64,24 @@ pub fn open_bed_source_for_scoring(
         &rows,
         prep.bytes_per_variant,
         end - start,
+        local_prefetch_budget(prep, memory_budget)
+            / match &prep.pipeline_kind {
+                PipelineKind::SingleFile(_) => 1,
+                PipelineKind::MultiFile(boundaries) => boundaries.len().max(1),
+            },
     )
+}
+
+/// A cohort-wide cap, shared across filesets, included in RAM preflight.
+pub fn local_prefetch_budget(
+    prep: &PreparationResult,
+    memory_budget: crate::score::pipeline::MemoryBudget,
+) -> usize {
+    if prep.bytes_per_variant >= 4096 && prep.required_bim_indices.len() >= 4096 {
+        (memory_budget.max_ram_bytes() / 32).min(16 * 1024 * 1024)
+    } else {
+        0
+    }
 }
 
 #[inline]

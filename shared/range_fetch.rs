@@ -32,6 +32,32 @@ impl BedReadPlan {
     /// Longest single request. Consecutive rows are merged up to this size.
     pub(crate) const MAX_RANGE: usize = 2 * 1024 * 1024;
 
+    /// Local shared filesystems benefit from large positional reads instead of
+    /// one blocking page fault per marker. Coalesce nearby requests, retaining
+    /// the same 2 MiB range bound and never reading beyond the file.
+    #[cfg(unix)]
+    pub(crate) fn local(
+        rows: &[u64],
+        row_bytes: u64,
+        file_len: u64,
+    ) -> Result<Self, PipelineError> {
+        let exact = Self::new(rows, row_bytes, file_len)?;
+        let mut ranges = vec![(0, 3usize)];
+        for (start, length) in exact.ranges.into_iter().skip(1) {
+            let last = ranges.last_mut().expect("header range");
+            let end = start + length as u64;
+            if last.0 != 0
+                && start - (last.0 + last.1 as u64) <= 256 * 1024
+                && end - last.0 <= Self::MAX_RANGE as u64
+            {
+                last.1 = (end - last.0) as usize;
+            } else {
+                ranges.push((start, length));
+            }
+        }
+        Ok(Self { ranges })
+    }
+
     pub(crate) fn new(rows: &[u64], row_bytes: u64, file_len: u64) -> Result<Self, PipelineError> {
         if row_bytes == 0 || file_len < 3 || (file_len - 3) % row_bytes != 0 {
             return Err(PipelineError::Io(
@@ -148,7 +174,7 @@ impl PlannedReader {
         Self::with_limits(plan, fetch, LIMITS)
     }
 
-    fn with_limits(plan: BedReadPlan, fetch: SegmentFetch, limits: Limits) -> Self {
+    pub(crate) fn with_limits(plan: BedReadPlan, fetch: SegmentFetch, limits: Limits) -> Self {
         Self {
             plan: Arc::new(plan),
             fetch,
@@ -303,7 +329,11 @@ fn fetch_exact(fetch: &SegmentFetch, start: u64, length: usize) -> Result<Vec<u8
 /// Fill one cache block with at most four concurrent range requests. Dense
 /// sweeps need the entire block; issuing its parts together overlaps network
 /// waits without increasing the cache budget or fetching additional bytes.
-pub(crate) fn fetch_cache_block<F>(start: u64, length: usize, fetch: F) -> Result<Arc<Vec<u8>>, PipelineError>
+pub(crate) fn fetch_cache_block<F>(
+    start: u64,
+    length: usize,
+    fetch: F,
+) -> Result<Arc<Vec<u8>>, PipelineError>
 where
     F: Fn(u64, usize) -> Result<Vec<u8>, PipelineError> + Sync,
 {
@@ -314,20 +344,29 @@ where
     let mut data = vec![0; length];
     std::thread::scope(|scope| {
         let fetch = &fetch;
-        let handles: Vec<_> = data.chunks_mut(chunk_size).enumerate().map(|(index, target)| {
-            scope.spawn(move || {
-                let offset = start.checked_add((index * chunk_size) as u64)
-                    .ok_or_else(|| PipelineError::Io("Remote range offset overflow".into()))?;
-                let bytes = fetch(offset, target.len())?;
-                if bytes.len() != target.len() {
-                    return Err(PipelineError::Io("Remote range returned an incorrect length".into()));
-                }
-                target.copy_from_slice(&bytes);
-                Ok(())
+        let handles: Vec<_> = data
+            .chunks_mut(chunk_size)
+            .enumerate()
+            .map(|(index, target)| {
+                scope.spawn(move || {
+                    let offset = start
+                        .checked_add((index * chunk_size) as u64)
+                        .ok_or_else(|| PipelineError::Io("Remote range offset overflow".into()))?;
+                    let bytes = fetch(offset, target.len())?;
+                    if bytes.len() != target.len() {
+                        return Err(PipelineError::Io(
+                            "Remote range returned an incorrect length".into(),
+                        ));
+                    }
+                    target.copy_from_slice(&bytes);
+                    Ok(())
+                })
             })
-        }).collect();
+            .collect();
         for handle in handles {
-            handle.join().map_err(|_| PipelineError::Io("Remote range worker panicked".into()))??;
+            handle
+                .join()
+                .map_err(|_| PipelineError::Io("Remote range worker panicked".into()))??;
         }
         Ok::<(), PipelineError>(())
     })?;
@@ -337,13 +376,34 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn local_plan_bounds_ranges_and_covers_requested_bytes() {
+        let rows: Vec<u64> = (0..2048).map(|i| i * 5).chain([20000]).collect();
+        let plan = BedReadPlan::local(&rows, 12800, 3 + 20001 * 12800).unwrap();
+        assert!(plan.ranges.len() < rows.len() / 10);
+        assert_eq!(plan.ranges[0], (0, 3));
+        for &(start, length) in &plan.ranges {
+            assert!(length <= BedReadPlan::MAX_RANGE);
+            assert!(start + length as u64 <= 3 + 20001 * 12800);
+        }
+        for row in rows {
+            let start = 3 + row * 12800;
+            assert!(plan.index_of(start).is_ok());
+            assert!(plan.index_of(start + 12799).is_ok());
+        }
+        assert!(plan.index_of(3 + 15000 * 12800).is_err());
+    }
 
     /// Byte value that identifies its own offset, so reassembly errors show.
     fn pattern(offset: u64, length: usize) -> Vec<u8> {
-        (offset..offset + length as u64).map(|o| (o % 251) as u8).collect()
+        (offset..offset + length as u64)
+            .map(|o| (o % 251) as u8)
+            .collect()
     }
 
     fn fetcher<F>(f: F) -> SegmentFetch
@@ -390,14 +450,32 @@ mod tests {
 
     #[test]
     fn worker_count_tracks_range_size_within_bounds() {
-        let dense = BedReadPlan::new(&(0..64).collect::<Vec<_>>(), BedReadPlan::MAX_RANGE as u64,
-            3 + 64 * BedReadPlan::MAX_RANGE as u64).unwrap();
-        assert_eq!(PlannedReader::worker_count(&dense, &LIMITS), LIMITS.in_flight_bytes / BedReadPlan::MAX_RANGE);
-        let scattered = BedReadPlan::new(&(0..2000).map(|r| r * 2).collect::<Vec<_>>(), 8, 3 + 4000 * 8).unwrap();
-        assert_eq!(PlannedReader::worker_count(&scattered, &LIMITS), LIMITS.max_workers);
+        let dense = BedReadPlan::new(
+            &(0..64).collect::<Vec<_>>(),
+            BedReadPlan::MAX_RANGE as u64,
+            3 + 64 * BedReadPlan::MAX_RANGE as u64,
+        )
+        .unwrap();
+        assert_eq!(
+            PlannedReader::worker_count(&dense, &LIMITS),
+            LIMITS.in_flight_bytes / BedReadPlan::MAX_RANGE
+        );
+        let scattered = BedReadPlan::new(
+            &(0..2000).map(|r| r * 2).collect::<Vec<_>>(),
+            8,
+            3 + 4000 * 8,
+        )
+        .unwrap();
+        assert_eq!(
+            PlannedReader::worker_count(&scattered, &LIMITS),
+            LIMITS.max_workers
+        );
         let tiny = BedReadPlan::new(&[0, 2], 8, 27).unwrap();
         assert_eq!(PlannedReader::worker_count(&tiny, &LIMITS), 2);
-        assert_eq!(PlannedReader::worker_count(&BedReadPlan::new(&[], 8, 27).unwrap(), &LIMITS), 0);
+        assert_eq!(
+            PlannedReader::worker_count(&BedReadPlan::new(&[], 8, 27).unwrap(), &LIMITS),
+            0
+        );
     }
 
     #[test]
@@ -411,17 +489,20 @@ mod tests {
         let in_flight = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let bytes = Arc::new(AtomicUsize::new(0));
-        let reader = PlannedReader::new(plan, fetcher({
-            let (in_flight, peak, bytes) = (in_flight.clone(), peak.clone(), bytes.clone());
-            move |offset, length| {
-                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(now, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(100));
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-                bytes.fetch_add(length, Ordering::SeqCst);
-                Ok(pattern(offset, length))
-            }
-        }));
+        let reader = PlannedReader::new(
+            plan,
+            fetcher({
+                let (in_flight, peak, bytes) = (in_flight.clone(), peak.clone(), bytes.clone());
+                move |offset, length| {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(100));
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    bytes.fetch_add(length, Ordering::SeqCst);
+                    Ok(pattern(offset, length))
+                }
+            }),
+        );
         let (start, header) = reader.range_at(0).unwrap();
         assert_eq!((start, header.len()), (0, 3));
         for &row in &rows {
@@ -439,13 +520,16 @@ mod tests {
     fn header_read_does_not_start_prefetching() {
         let plan = BedReadPlan::new(&(0..50).collect::<Vec<_>>(), 16, 3 + 50 * 16).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let reader = PlannedReader::new(plan, fetcher({
-            let calls = calls.clone();
-            move |offset, length| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Ok(pattern(offset, length))
-            }
-        }));
+        let reader = PlannedReader::new(
+            plan,
+            fetcher({
+                let calls = calls.clone();
+                move |offset, length| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(pattern(offset, length))
+                }
+            }),
+        );
         reader.range_at(1).unwrap();
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -460,14 +544,20 @@ mod tests {
         let plan = BedReadPlan::new(&rows, 64, 3 + 8000 * 64).unwrap();
         let resume_offset = 3 + rows[2500] * 64;
         let fetched = Arc::new(AtomicUsize::new(0));
-        let reader = PlannedReader::new(plan, fetcher({
-            let fetched = fetched.clone();
-            move |offset, length| {
-                assert!(offset >= resume_offset, "fetched {offset} before the resume point");
-                fetched.fetch_add(1, Ordering::SeqCst);
-                Ok(pattern(offset, length))
-            }
-        }));
+        let reader = PlannedReader::new(
+            plan,
+            fetcher({
+                let fetched = fetched.clone();
+                move |offset, length| {
+                    assert!(
+                        offset >= resume_offset,
+                        "fetched {offset} before the resume point"
+                    );
+                    fetched.fetch_add(1, Ordering::SeqCst);
+                    Ok(pattern(offset, length))
+                }
+            }),
+        );
         for &row in &rows[2500..] {
             let offset = 3 + row * 64;
             let (start, data) = reader.range_at(offset + 7).unwrap();
@@ -482,18 +572,27 @@ mod tests {
     fn window_bounds_outstanding_bytes_and_is_fully_used() {
         let rows: Vec<u64> = (0..64).map(|r| r * 2).collect();
         let plan = BedReadPlan::new(&rows, 1024, 3 + 128 * 1024).unwrap();
-        let limits = Limits { window_bytes: 4096, in_flight_bytes: 1 << 20, min_workers: 8, max_workers: 8 };
+        let limits = Limits {
+            window_bytes: 4096,
+            in_flight_bytes: 1 << 20,
+            min_workers: 8,
+            max_workers: 8,
+        };
         let outstanding = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
-        let reader = PlannedReader::with_limits(plan, fetcher({
-            let (outstanding, peak) = (outstanding.clone(), peak.clone());
-            move |offset, length| {
-                let now = outstanding.fetch_add(length, Ordering::SeqCst) + length;
-                peak.fetch_max(now, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(3));
-                Ok(pattern(offset, length))
-            }
-        }), limits);
+        let reader = PlannedReader::with_limits(
+            plan,
+            fetcher({
+                let (outstanding, peak) = (outstanding.clone(), peak.clone());
+                move |offset, length| {
+                    let now = outstanding.fetch_add(length, Ordering::SeqCst) + length;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(3));
+                    Ok(pattern(offset, length))
+                }
+            }),
+            limits,
+        );
         for &row in &rows {
             let offset = 3 + row * 1024;
             let (_, data) = reader.range_at(offset).unwrap();
@@ -512,16 +611,19 @@ mod tests {
         let workers = PlannedReader::worker_count(&plan, &LIMITS);
         assert_eq!(workers, rows.len());
         let barrier = Arc::new(Barrier::new(workers));
-        let reader = PlannedReader::new(plan, fetcher({
-            let barrier = barrier.clone();
-            move |offset, length| {
-                if offset != 0 {
-                    // Deadlocks unless every worker has a request in flight.
-                    barrier.wait();
+        let reader = PlannedReader::new(
+            plan,
+            fetcher({
+                let barrier = barrier.clone();
+                move |offset, length| {
+                    if offset != 0 {
+                        // Deadlocks unless every worker has a request in flight.
+                        barrier.wait();
+                    }
+                    Ok(pattern(offset, length))
                 }
-                Ok(pattern(offset, length))
-            }
-        }));
+            }),
+        );
         for &row in &rows {
             let offset = 3 + row * 8;
             assert_eq!(*reader.range_at(offset).unwrap().1, pattern(offset, 8));
@@ -548,13 +650,16 @@ mod tests {
         let rows: Vec<u64> = (0..30).map(|r| r * 2).collect();
         let plan = BedReadPlan::new(&rows, 8, 3 + 60 * 8).unwrap();
         let failing = 3 + rows[20] * 8;
-        let reader = PlannedReader::new(plan, fetcher(move |offset, length| {
-            if offset == failing {
-                Err(PipelineError::Io("segment failed".into()))
-            } else {
-                Ok(pattern(offset, length))
-            }
-        }));
+        let reader = PlannedReader::new(
+            plan,
+            fetcher(move |offset, length| {
+                if offset == failing {
+                    Err(PipelineError::Io("segment failed".into()))
+                } else {
+                    Ok(pattern(offset, length))
+                }
+            }),
+        );
         for &row in &rows[..20] {
             reader.range_at(3 + row * 8).unwrap();
         }
@@ -594,12 +699,18 @@ mod tests {
     #[test]
     fn cache_fetch_propagates_part_failure_and_rejects_truncation() {
         let failure = fetch_cache_block(0, REMOTE_TRANSFER_CHUNK + 1, |offset, size| {
-            if offset > 0 { Err(PipelineError::Io("failed segment".into())) }
-            else { Ok(vec![0; size]) }
-        }).unwrap_err();
+            if offset > 0 {
+                Err(PipelineError::Io("failed segment".into()))
+            } else {
+                Ok(vec![0; size])
+            }
+        })
+        .unwrap_err();
         assert!(failure.to_string().contains("failed segment"));
-        let truncated = fetch_cache_block(0, REMOTE_TRANSFER_CHUNK + 1, |_, size|
-            Ok(vec![0; size - 1])).unwrap_err();
+        let truncated = fetch_cache_block(0, REMOTE_TRANSFER_CHUNK + 1, |_, size| {
+            Ok(vec![0; size - 1])
+        })
+        .unwrap_err();
         assert!(truncated.to_string().contains("incorrect length"));
     }
 

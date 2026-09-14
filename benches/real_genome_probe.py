@@ -4,8 +4,11 @@ python3 benches/real_genome_probe.py {score,project} N {before,after} [SCORESET]
 Use taskset externally. Inputs are existing public-reference/PGS fixtures.
 """
 from pathlib import Path
+import array
 import hashlib
+import itertools
 import json
+import math
 import mmap
 import shutil
 import subprocess
@@ -66,14 +69,44 @@ for output in outputs:
 log_path, rss_path = work/(label+'.log'), work/(label+'.rss')
 start = time.monotonic()
 with log_path.open('wb') as log:
-    result = subprocess.run(['timeout','--kill-after=2','35','/usr/bin/time','-f','%M','-o',str(rss_path)]+command, cwd=work, stdout=log, stderr=subprocess.STDOUT)
+    result = subprocess.run(['/usr/bin/time','-f','%M','-o',str(rss_path),'timeout','--kill-after=2','45']+command, cwd=work, stdout=log, stderr=subprocess.STDOUT)
 record = dict(task=task, samples=n, variants=variants, scoreset=scoreset, label=label,
               wall_s=time.monotonic()-start, returncode=result.returncode,
-              rss_kib=rss_path.read_text().strip() if rss_path.exists() else None)
+              rss_kib=rss_path.read_text().strip().splitlines()[-1] if rss_path.exists() else None)
 if result.returncode == 0:
     primary = outputs[0]
     record['sha256'] = hashlib.sha256(primary.read_bytes()).hexdigest()
     shutil.copyfile(primary, work/(label + primary.suffix))
+    reference = work/('before' + primary.suffix)
+    if label == 'after' and reference.exists():
+        maximum_error = 0.0
+        if task == 'score':
+            with reference.open() as before, primary.open() as after:
+                header = before.readline().rstrip().split('\t')
+                assert header == after.readline().rstrip().split('\t')
+                for left, right in itertools.zip_longest(before, after):
+                    assert left is not None and right is not None
+                    left, right = left.rstrip().split('\t'), right.rstrip().split('\t')
+                    assert len(left) == len(right) == len(header) and left[0] == right[0]
+                    for name, x, y in zip(header[1:], left[1:], right[1:]):
+                        if name.endswith('_MISSING_PCT'):
+                            assert x == y
+                        else:
+                            x, y = float(x), float(y)
+                            assert math.isfinite(x) and math.isfinite(y)
+                            maximum_error = max(maximum_error, abs(x-y))
+                            assert abs(x-y) <= 2e-6*max(1e-6, abs(x), abs(y)), (name, x, y)
+        else:
+            left, right = reference.read_bytes(), primary.read_bytes()
+            extent = 32 + n*20*8
+            assert len(left) == len(right) and left[:32] == right[:32] and left[extent:] == right[extent:]
+            x, y = array.array('d'), array.array('d')
+            x.frombytes(left[32:extent]); y.frombytes(right[32:extent])
+            for a, b in zip(x, y):
+                assert math.isfinite(a) and math.isfinite(b)
+                maximum_error = max(maximum_error, abs(a-b))
+                assert abs(a-b) <= 1e-10*(1+abs(a))
+        record['max_abs_difference'] = maximum_error
 log = log_path.read_text()
 record['stages'] = [line for line in log.splitlines() if any(s in line.lower() for s in ['time:', 'took ', 'complete in', 'backend', 'storage:', 'overlapping', 'principal components'])]
 (work/(label+'.json')).write_text(json.dumps(record, indent=2)+'\n')

@@ -329,11 +329,14 @@ pub fn preflight_memory(
     } else {
         io_buffer_count(prep_result, memory_budget)?
     };
-    let io_bytes = row_bytes.checked_mul(buffer_count).ok_or_else(|| {
-        PipelineError::Compute(format!(
-            "I/O buffer estimate overflow: row_bytes={row_bytes}, buffers={buffer_count}"
-        ))
-    })?;
+    let io_bytes = row_bytes
+        .checked_mul(buffer_count)
+        .and_then(|bytes| bytes.checked_add(io::local_prefetch_budget(prep_result, memory_budget)))
+        .ok_or_else(|| {
+            PipelineError::Compute(format!(
+                "I/O buffer estimate overflow: row_bytes={row_bytes}, buffers={buffer_count}"
+            ))
+        })?;
 
     let consumer_threads = if should_use_small_keep_direct_for_prep(prep_result) {
         0
@@ -390,11 +393,19 @@ fn should_use_bounded_accumulator(context: &PipelineContext) -> Result<bool, Pip
         ))
     })?;
     let buffer_count = context.io_buffer_count()?;
-    let io_bytes = row_bytes.checked_mul(buffer_count).ok_or_else(|| {
-        PipelineError::Compute(format!(
-            "I/O buffer estimate overflow: row_bytes={row_bytes}, buffers={buffer_count}"
-        ))
-    })?;
+    let io_bytes = row_bytes
+        .checked_mul(buffer_count)
+        .and_then(|bytes| {
+            bytes.checked_add(io::local_prefetch_budget(
+                prep_result,
+                context.memory_budget,
+            ))
+        })
+        .ok_or_else(|| {
+            PipelineError::Compute(format!(
+                "I/O buffer estimate overflow: row_bytes={row_bytes}, buffers={buffer_count}"
+            ))
+        })?;
     let fast_threads = choose_consumer_threads(result_size, context.memory_budget);
     let fast_copies = fast_threads
         .checked_mul(2)
@@ -422,7 +433,12 @@ fn open_scoring_bed_source(
     context: &PipelineContext,
     path: &Path,
 ) -> Result<io::BedSource, PipelineError> {
-    io::open_bed_source_for_scoring(path, context.genome_build, &context.prep_result)
+    io::open_bed_source_for_scoring(
+        path,
+        context.genome_build,
+        &context.prep_result,
+        context.memory_budget,
+    )
 }
 
 fn result_bytes(result_size: usize) -> Result<usize, PipelineError> {

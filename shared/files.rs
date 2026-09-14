@@ -362,9 +362,26 @@ pub fn open_bed_source_for_scoring(
     required_rows: &[u64],
     bytes_per_variant: u64,
     total_variants: u64,
+    _local_prefetch_bytes: usize,
 ) -> Result<BedSource, PipelineError> {
     if !is_gcs_path(path) && !is_http_path(path) {
-        return open_bed_source(path, genome_build);
+        let source = open_bed_source(path, genome_build)?;
+        #[cfg(unix)]
+        if !is_pgen_path(path)
+            && bytes_per_variant >= 4096
+            && required_rows.len() >= 4096
+            && source.len() >= 1024 * 1024 * 1024
+            && _local_prefetch_bytes >= 2 * BedReadPlan::MAX_RANGE
+        {
+            return open_planned_local_bed(
+                path,
+                source,
+                required_rows,
+                bytes_per_variant,
+                _local_prefetch_bytes,
+            );
+        }
+        return Ok(source);
     }
     if !is_pgen_path(path) {
         let uri = path
@@ -410,6 +427,78 @@ pub fn open_bed_source_for_scoring(
         block_size / 1024
     );
     open_pgen_as_bed_source(path, genome_build, block_size)
+}
+
+#[cfg(unix)]
+fn open_planned_local_bed(
+    path: &Path,
+    mut source: BedSource,
+    rows: &[u64],
+    row_bytes: u64,
+    window_bytes: usize,
+) -> Result<BedSource, PipelineError> {
+    use std::os::unix::fs::FileExt;
+    let file = File::open(path).map_err(|error| PipelineError::Io(error.to_string()))?;
+    let plan = BedReadPlan::local(rows, row_bytes, source.len())?;
+    let reader = PlannedReader::with_limits(
+        plan,
+        Arc::new(move |start, length| {
+            let mut bytes = vec![0; length];
+            file.read_exact_at(&mut bytes, start)
+                .map_err(|error| PipelineError::Io(error.to_string()))?;
+            Ok(bytes)
+        }),
+        crate::range_fetch::Limits {
+            window_bytes,
+            in_flight_bytes: 4 * 1024 * 1024,
+            min_workers: 1,
+            max_workers: 2,
+        },
+    );
+    eprintln!(
+        "> Local BED read plan: {} ranges, {} I/O workers, {} MiB prefetch window.",
+        reader.ranges(),
+        reader.workers(),
+        window_bytes / (1024 * 1024)
+    );
+    source.byte_source = Arc::new(PlannedLocalSource {
+        len: source.len(),
+        reader,
+    });
+    Ok(source)
+}
+
+#[cfg(unix)]
+struct PlannedLocalSource {
+    len: u64,
+    reader: PlannedReader,
+}
+
+#[cfg(unix)]
+impl ByteRangeSource for PlannedLocalSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn read_at(&self, offset: u64, mut dst: &mut [u8]) -> Result<(), PipelineError> {
+        if offset
+            .checked_add(dst.len() as u64)
+            .is_none_or(|end| end > self.len)
+        {
+            return Err(PipelineError::Io(
+                "Local BED read exceeds file length".into(),
+            ));
+        }
+        let mut offset = offset;
+        while !dst.is_empty() {
+            let (start, bytes) = self.reader.range_at(offset)?;
+            let within = (offset - start) as usize;
+            let count = dst.len().min(bytes.len() - within);
+            dst[..count].copy_from_slice(&bytes[within..within + count]);
+            dst = &mut dst[count..];
+            offset += count as u64;
+        }
+        Ok(())
+    }
 }
 
 fn remote_pgen_block_size(matched_variants: usize, total_variants: u64) -> usize {
@@ -1877,7 +1966,9 @@ impl RemoteByteRangeSource {
     }
 
     fn fetch_block(&self, start: u64, length: usize) -> Result<Arc<Vec<u8>>, PipelineError> {
-        fetch_cache_block(start, length, |offset, size| self.fetch_segment(offset, size))
+        fetch_cache_block(start, length, |offset, size| {
+            self.fetch_segment(offset, size)
+        })
     }
 
     fn fetch_segment(&self, start: u64, length: usize) -> Result<Vec<u8>, PipelineError> {
@@ -1930,13 +2021,16 @@ impl GcsSegmentFetcher {
                             response.status()
                         ));
                     }
-                    if HttpByteRangeSource::parse_byte_content_range(response.headers().get(CONTENT_RANGE))
-                        != Some((start, end, self.len))
+                    if HttpByteRangeSource::parse_byte_content_range(
+                        response.headers().get(CONTENT_RANGE),
+                    ) != Some((start, end, self.len))
                     {
                         return Err("Cloud Storage returned inconsistent Content-Range".into());
                     }
                     let mut bytes = Vec::with_capacity(length);
-                    response.take(length as u64 + 1).read_to_end(&mut bytes)
+                    response
+                        .take(length as u64 + 1)
+                        .read_to_end(&mut bytes)
                         .map_err(|error| error.to_string())?;
                     if bytes.len() != length {
                         return Err("Cloud Storage returned an incorrect range length".into());
@@ -2162,7 +2256,11 @@ impl HttpByteRangeSource {
         let client = range_clients(1)?.remove(0);
         let len = fetch_http_length(&client, url)?;
         Ok(Self {
-            fetcher: Arc::new(HttpSegmentFetcher { client, url: url.to_string(), len }),
+            fetcher: Arc::new(HttpSegmentFetcher {
+                client,
+                url: url.to_string(),
+                len,
+            }),
             cache: Mutex::new(RemoteCache::new(cache_capacity_for(block_size))),
             block_size,
             planned: None,
@@ -2220,7 +2318,9 @@ impl HttpByteRangeSource {
     }
 
     fn fetch_block(&self, start: u64, length: usize) -> Result<Arc<Vec<u8>>, PipelineError> {
-        fetch_cache_block(start, length, |offset, size| self.fetch_segment(offset, size))
+        fetch_cache_block(start, length, |offset, size| {
+            self.fetch_segment(offset, size)
+        })
     }
 
     fn fetch_segment(&self, start: u64, length: usize) -> Result<Vec<u8>, PipelineError> {
@@ -2480,6 +2580,40 @@ impl RemoteCache {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn planned_local_reads_reassemble_ranges_and_reject_truncation() {
+        use super::*;
+        let row_bytes = 1024 * 1024;
+        let len = 3 + 5 * row_bytes;
+        let reader = PlannedReader::with_limits(
+            BedReadPlan::local(&[0, 1, 2, 4], row_bytes, len).unwrap(),
+            Arc::new(|start, length| {
+                Ok((start..start + length as u64)
+                    .map(|i| (i % 251) as u8)
+                    .collect())
+            }),
+            crate::range_fetch::Limits {
+                window_bytes: 4 * 1024 * 1024,
+                in_flight_bytes: 2 * 1024 * 1024,
+                min_workers: 1,
+                max_workers: 2,
+            },
+        );
+        let source = PlannedLocalSource { len, reader };
+        for (offset, length) in [(0, 3), (3 + 2 * row_bytes - 7, 19), (len - 11, 11), (3, 17)] {
+            let mut bytes = vec![0; length];
+            source.read_at(offset, &mut bytes).unwrap();
+            assert_eq!(
+                bytes,
+                (offset..offset + length as u64)
+                    .map(|i| (i % 251) as u8)
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(source.read_at(len, &mut [0]).is_err());
+        assert!(source.read_at(u64::MAX, &mut [0]).is_err());
+    }
     use super::*;
     use std::io::Write;
     use std::net::TcpListener;
@@ -2524,10 +2658,15 @@ mod tests {
         let length = 10_003;
         let (url, server) = serve_http_responses(vec![
             format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"),
-            format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/{length}\r\nContent-Length: 3\r\nConnection: close\r\n\r\n\u{006c}\u{001b}\u{0001}"),
-            format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 9903-10002/{length}\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}", "a".repeat(100)),
+            format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/{length}\r\nContent-Length: 3\r\nConnection: close\r\n\r\n\u{006c}\u{001b}\u{0001}"
+            ),
+            format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 9903-10002/{length}\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}",
+                "a".repeat(100)
+            ),
         ]);
-        let source = open_bed_source_for_scoring(Path::new(&url), None, &[99], 100, 100)
+        let source = open_bed_source_for_scoring(Path::new(&url), None, &[99], 100, 100, 0)
             .expect("planned remote BED source");
         let mut bytes = [0; 4];
         source.read_at(9999, &mut bytes).expect("required row tail");
@@ -2807,18 +2946,24 @@ wgs%2Fpgen%2Fchr22%2Fsample.pgen?alt=media&userProject=wb-amiable-carrot-1173"
         if env::var_os(CHILD_MARKER).is_none() {
             let adc_file = NamedTempFile::new().expect("create ADC fixture");
             write_stub_adc_file(adc_file.path());
-            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-                .args([
-                    "--exact",
-                    "files::tests::load_adc_credentials_without_runtime_supports_storage_client",
-                    "--nocapture",
-                ])
-                .env(CHILD_MARKER, "1")
-                .env("GOOGLE_APPLICATION_CREDENTIALS", adc_file.path())
-                .output()
-                .expect("run isolated ADC regression");
-            assert!(output.status.success(), "ADC regression failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("test executable"),
+            )
+            .args([
+                "--exact",
+                "files::tests::load_adc_credentials_without_runtime_supports_storage_client",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env("GOOGLE_APPLICATION_CREDENTIALS", adc_file.path())
+            .output()
+            .expect("run isolated ADC regression");
+            assert!(
+                output.status.success(),
+                "ADC regression failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return Ok(());
         }
 
