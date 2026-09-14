@@ -173,13 +173,29 @@ def _downsample_dataframe(df: pd.DataFrame, factor: int) -> pd.DataFrame:
 
 
 def _load_model_scores(model_path: Path) -> pd.DataFrame:
+    """Sample scores of a fit, as a samples x components frame.
+
+    A fit writes its scores beside the model as `<stem>_scores.bin`: a 32-byte
+    header (magic `GNPRJ001`, u32 version, u64 rows, u64 cols, u32 element kind
+    1 = little-endian f64) followed by the matrix in column-major order, then
+    embedded row ids that the sample manifest already supplies. Older models
+    carried the scores inside the JSON as `sample_scores`.
+    """
     if not model_path.exists():
         raise FileNotFoundError(f"Expected model at {model_path} from gnomon fit run")
+
+    scores_path = model_path.with_name(model_path.name.removesuffix(".json") + "_scores.bin")
+    if scores_path.exists():
+        return _read_scores_bin(scores_path)
 
     with model_path.open("r", encoding="utf-8") as fh:
         model = json.load(fh)
 
-    scores_meta = model["sample_scores"]
+    scores_meta = model.get("sample_scores")
+    if scores_meta is None:
+        raise FileNotFoundError(
+            f"Expected sample scores at {scores_path} beside {model_path}, and the model carries none"
+        )
     rows = scores_meta["nrows"]
     cols = scores_meta["ncols"]
     values = scores_meta["data"]
@@ -188,6 +204,22 @@ def _load_model_scores(model_path: Path) -> pd.DataFrame:
         raise ValueError("sample_scores data length mismatch")
 
     scores = np.array(values, dtype=float).reshape((cols, rows)).T
+    return pd.DataFrame(scores, columns=[f"PC{i + 1}" for i in range(cols)])
+
+
+def _read_scores_bin(scores_path: Path) -> pd.DataFrame:
+    header = np.fromfile(scores_path, dtype=np.uint8, count=32)
+    if len(header) < 32 or bytes(header[:8]) != b"GNPRJ001":
+        raise ValueError(f"{scores_path} is not a gnomon projection matrix (bad magic)")
+    rows = int(np.frombuffer(bytes(header[12:20]), dtype="<u8")[0])
+    cols = int(np.frombuffer(bytes(header[20:28]), dtype="<u8")[0])
+    element_kind = int(np.frombuffer(bytes(header[28:32]), dtype="<u4")[0])
+    if element_kind != 1:
+        raise ValueError(f"{scores_path}: unsupported element kind {element_kind} (expected 1 = f64)")
+    values = np.fromfile(scores_path, dtype="<f8", count=rows * cols, offset=32)
+    if len(values) != rows * cols:
+        raise ValueError(f"{scores_path}: expected {rows * cols} values, found {len(values)}")
+    scores = values.reshape((cols, rows)).T
     return pd.DataFrame(scores, columns=[f"PC{i + 1}" for i in range(cols)])
 
 
