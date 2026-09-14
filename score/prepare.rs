@@ -390,6 +390,426 @@ impl CsrBuilder {
     }
 }
 
+/// Everything the merge-join builds, locus by locus in key order.
+struct JoinOutputs {
+    required_bim_indices: Vec<BimRowIndex>,
+    required_is_complex: Vec<u8>,
+    csr_builder: CsrBuilder,
+    baseline_missing_sum_by_score: Vec<f64>,
+    baseline_errors: Vec<f64>,
+    score_variant_counts: Vec<u32>,
+    final_complex_rules: Vec<GroupedComplexRule>,
+    // Reuse score slots across singleton loci. Only touched columns are visited
+    // or cleared, so sparse panels do not incur a full score-panel scan per locus.
+    simple_assignments: Vec<Option<SimpleScoreAssignment>>,
+    touched_columns: Vec<ScoreColumnIndex>,
+}
+
+impl JoinOutputs {
+    fn new(num_scores: usize) -> Result<Self, PrepError> {
+        let csr_builder = CsrBuilder::new()?;
+        let mut baseline_missing_sum_by_score = Vec::new();
+        baseline_missing_sum_by_score
+            .try_reserve_exact(num_scores)
+            .map_err(|e| PrepError::Invariant(format!("Cannot allocate score baselines: {e}")))?;
+        baseline_missing_sum_by_score.resize(num_scores, 0.0f64);
+        let mut baseline_errors = Vec::new();
+        baseline_errors.try_reserve_exact(num_scores).map_err(|e| {
+            PrepError::Invariant(format!("Cannot allocate baseline compensation: {e}"))
+        })?;
+        baseline_errors.resize(num_scores, 0.0f64);
+        let mut simple_assignments = Vec::new();
+        simple_assignments
+            .try_reserve_exact(num_scores)
+            .map_err(|e| {
+                PrepError::Invariant(format!("Cannot allocate score reconciliation slots: {e}"))
+            })?;
+        simple_assignments.resize(num_scores, None::<SimpleScoreAssignment>);
+        let mut touched_columns = Vec::new();
+        touched_columns.try_reserve_exact(num_scores).map_err(|e| {
+            PrepError::Invariant(format!("Cannot allocate score reconciliation columns: {e}"))
+        })?;
+        Ok(Self {
+            required_bim_indices: Vec::new(),
+            required_is_complex: Vec::new(),
+            csr_builder,
+            baseline_missing_sum_by_score,
+            baseline_errors,
+            score_variant_counts: vec![0u32; num_scores],
+            final_complex_rules: Vec::new(),
+            simple_assignments,
+            touched_columns,
+        })
+    }
+
+    /// Builds the plan rows of one locus from the `.bim` rows and score records
+    /// that share `key`, each group in input order.
+    fn reconcile_locus(
+        &mut self,
+        key: VariantKey,
+        bim_group: &[KeyedBimRecord],
+        score_group: &[KeyedScoreRecord],
+    ) -> Result<(), PrepError> {
+        // A single marker and a single weight need no temporary trees,
+        // sets, context vectors, or match lists. Emit their CSR row in
+        // exactly the same arithmetic and record order as grouped loci.
+        if let ([bim], [score]) = (bim_group, score_group) {
+            if allele_pair_matches(
+                score.effect_allele.as_str(),
+                score.other_allele.as_str(),
+                bim.allele1.as_str(),
+                bim.allele2.as_str(),
+            ) {
+                let mut assignment = SimpleScoreAssignment {
+                    dosage_weight: 0.0,
+                    missing_correction: 0.0,
+                };
+                apply_simple_score_assignment(
+                    &mut assignment,
+                    score.weight,
+                    score.effect_allele.as_str() == bim.allele1.as_str(),
+                );
+                self.required_bim_indices.push(bim.bim_row_index);
+                self.required_is_complex.push(0);
+                self.csr_builder
+                    .push_contribution(score.score_column_index, assignment)?;
+                self.csr_builder.finish_variant()?;
+                accumulate_baseline(
+                    &mut self.baseline_missing_sum_by_score[score.score_column_index.0],
+                    &mut self.baseline_errors[score.score_column_index.0],
+                    assignment.missing_correction,
+                );
+                self.score_variant_counts[score.score_column_index.0] += 1;
+            }
+            return Ok(());
+        }
+
+        if let [bim] = bim_group {
+            for score in score_group {
+                if !allele_pair_matches(
+                    score.effect_allele.as_str(),
+                    score.other_allele.as_str(),
+                    bim.allele1.as_str(),
+                    bim.allele2.as_str(),
+                ) {
+                    continue;
+                }
+                let touched_columns = &mut self.touched_columns;
+                let assignment = self.simple_assignments[score.score_column_index.0]
+                    .get_or_insert_with(|| {
+                        touched_columns.push(score.score_column_index);
+                        SimpleScoreAssignment {
+                            dosage_weight: 0.0,
+                            missing_correction: 0.0,
+                        }
+                    });
+                // Input order matters for duplicate f64 additions.
+                apply_simple_score_assignment(
+                    assignment,
+                    score.weight,
+                    score.effect_allele.as_str() == bim.allele1.as_str(),
+                );
+            }
+            if !self.touched_columns.is_empty() {
+                self.touched_columns.sort_unstable();
+                self.required_bim_indices.push(bim.bim_row_index);
+                self.required_is_complex.push(0);
+                for column in self.touched_columns.drain(..) {
+                    let assignment = self.simple_assignments[column.0].take().unwrap();
+                    self.csr_builder.push_contribution(column, assignment)?;
+                    accumulate_baseline(
+                        &mut self.baseline_missing_sum_by_score[column.0],
+                        &mut self.baseline_errors[column.0],
+                        assignment.missing_correction,
+                    );
+                    self.score_variant_counts[column.0] += 1;
+                }
+                self.csr_builder.finish_variant()?;
+            }
+            return Ok(());
+        }
+
+        let mut complex_for_key: BTreeMap<
+            Vec<(BimRowIndex, String, String)>,
+            Vec<(ScoreColumnIndex, f64, String, String)>,
+        > = BTreeMap::new();
+
+        for score_record in score_group {
+            let possible_contexts: Vec<_> = bim_group
+                .iter()
+                .filter(|rec| {
+                    allele_pair_matches(
+                        score_record.effect_allele.as_str(),
+                        score_record.other_allele.as_str(),
+                        rec.allele1.as_str(),
+                        rec.allele2.as_str(),
+                    )
+                })
+                .map(|rec| {
+                    (
+                        rec.bim_row_index,
+                        rec.allele1.to_string(),
+                        rec.allele2.to_string(),
+                    )
+                })
+                .collect();
+            if possible_contexts.is_empty() {
+                continue;
+            }
+            let score_info = (
+                score_record.score_column_index,
+                score_record.weight,
+                score_record.effect_allele.to_string(),
+                score_record.other_allele.to_string(),
+            );
+            complex_for_key
+                .entry(possible_contexts)
+                .or_default()
+                .push(score_info);
+        }
+
+        // Finalize complex rules for this key immediately.
+        let mut key_complex_indices: BTreeSet<BimRowIndex> = BTreeSet::new();
+        for (contexts, scores) in complex_for_key {
+            for (bim_idx, _, _) in &contexts {
+                key_complex_indices.insert(*bim_idx);
+            }
+
+            for (score_col_idx, _, _, _) in &scores {
+                self.score_variant_counts[score_col_idx.0] += 1;
+            }
+
+            let chr_str = match key.0 {
+                23 => "X".to_string(),
+                24 => "Y".to_string(),
+                25 => "MT".to_string(),
+                n => n.to_string(),
+            };
+
+            self.final_complex_rules.push(GroupedComplexRule {
+                locus_chr_pos: (chr_str, key.1),
+                possible_contexts: contexts,
+                score_applications: scores
+                    .into_iter()
+                    .map(|(sc_idx, weight, ea, oa)| ScoreInfo {
+                        effect_allele: ea,
+                        other_allele: oa,
+                        weight,
+                        score_column_index: sc_idx,
+                    })
+                    .collect(),
+            });
+        }
+
+        // Emit CSR rows and required variant metadata for this key in sorted order.
+        // This preserves global row ordering while avoiding a global index set.
+        for bim_row_index in key_complex_indices {
+            self.required_bim_indices.push(bim_row_index);
+            self.required_is_complex.push(1);
+            self.csr_builder.finish_variant()?;
+        }
+        Ok(())
+    }
+
+    /// Reorders the plan's rows so their `.bim` indices ascend.
+    fn sort_rows_by_bim_index(&mut self) -> Result<(), PrepError> {
+        self.csr_builder.sort_rows_by_bim_index(
+            &mut self.required_bim_indices,
+            &mut self.required_is_complex,
+        )
+    }
+}
+
+/// The merge-join over rows streamed in key order. Unparsable rows are reported as
+/// the join meets them, and what it walks past is kept for the diagnostics of a
+/// join that matches nothing.
+fn join_streams<B, S>(
+    bim_iter: &mut std::iter::Peekable<B>,
+    score_iter: &mut std::iter::Peekable<S>,
+    outputs: &mut JoinOutputs,
+    diagnostics: &mut MergeDiagnosticInfo,
+    seen_invalid_bim_chrs: &mut AHashSet<String>,
+    seen_invalid_score_chrs: &mut AHashSet<String>,
+) -> Result<(), PrepError>
+where
+    B: Iterator<Item = Result<KeyedBimRecord, PrepError>>,
+    S: Iterator<Item = Result<KeyedScoreRecord, PrepError>>,
+{
+    let mut bim_group = Vec::new();
+    let mut score_group = Vec::new();
+    while bim_iter.peek().is_some() && score_iter.peek().is_some() {
+        let bim_key = match bim_iter.peek().unwrap() {
+            Ok(rec) => rec.key,
+            Err(_) => match bim_iter.next().unwrap().unwrap_err() {
+                PrepError::Parse(msg) => {
+                    if let Some(chr_name) = extract_chr_from_parse_error(&msg)
+                        && seen_invalid_bim_chrs.insert(chr_name.to_string())
+                    {
+                        eprintln!(
+                            "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{chr_name}'."
+                        );
+                    }
+                    continue;
+                }
+                e => return Err(e),
+            },
+        };
+
+        let score_key = match score_iter.peek().unwrap() {
+            Ok(rec) => rec.key,
+            Err(_) => match score_iter.next().unwrap().unwrap_err() {
+                PrepError::Parse(msg) => {
+                    // Only a row on a contig gnomon cannot key is skipped here; any
+                    // other unusable score row fails the run.
+                    let Some(chr_name) = extract_chr_from_parse_error(&msg) else {
+                        return Err(PrepError::Parse(msg));
+                    };
+                    if seen_invalid_score_chrs.insert(chr_name.to_string()) {
+                        eprintln!(
+                            "Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{chr_name}'."
+                        );
+                    }
+                    continue;
+                }
+                e => return Err(e),
+            },
+        };
+
+        match bim_key.cmp(&score_key) {
+            Ordering::Less => {
+                diagnostics.add_bim_key(bim_key);
+                diagnostics.total_bim_variants_processed += 1;
+                bim_iter.next();
+            }
+            Ordering::Greater => {
+                diagnostics.add_score_key(score_key);
+                diagnostics.total_score_records_processed += 1;
+                score_iter.next();
+            }
+            Ordering::Equal => {
+                let key = bim_key;
+                diagnostics.add_bim_key(key);
+                diagnostics.add_score_key(key);
+
+                bim_group.clear();
+                while let Some(Ok(peek_item)) = bim_iter.peek() {
+                    if peek_item.key != key {
+                        break;
+                    }
+                    match bim_iter.next().unwrap() {
+                        Ok(item) => bim_group.push(item),
+                        Err(PrepError::Parse(msg)) => {
+                            if let Some(chr_name) = extract_chr_from_parse_error(&msg)
+                                && seen_invalid_bim_chrs.insert(chr_name.to_string())
+                            {
+                                eprintln!(
+                                    "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{chr_name}'."
+                                );
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                diagnostics.total_bim_variants_processed += bim_group.len() as u64;
+
+                score_group.clear();
+                while let Some(Ok(peek_item)) = score_iter.peek() {
+                    if peek_item.key != key {
+                        break;
+                    }
+                    match score_iter.next().unwrap() {
+                        Ok(item) => score_group.push(item),
+                        Err(PrepError::Parse(msg)) => {
+                            if let Some(chr_name) = extract_chr_from_parse_error(&msg)
+                                && seen_invalid_score_chrs.insert(chr_name.to_string())
+                            {
+                                eprintln!(
+                                    "Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{chr_name}'."
+                                );
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                diagnostics.total_score_records_processed += score_group.len() as u64;
+
+                outputs.reconcile_locus(key, &bim_group, &score_group)?;
+            }
+        }
+    }
+    for result in bim_iter.by_ref() {
+        match result {
+            Ok(record) => {
+                diagnostics.add_bim_key(record.key);
+                diagnostics.total_bim_variants_processed += 1;
+            }
+            Err(PrepError::Parse(msg)) => {
+                if let Some(chr_name) = extract_chr_from_parse_error(&msg)
+                    && seen_invalid_bim_chrs.insert(chr_name.to_string())
+                {
+                    eprintln!(
+                        "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{chr_name}'."
+                    );
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// The merge-join over rows already in memory, each side sorted by key with no row
+/// errors between: the loci `join_streams` reconciles, in the same order, without
+/// stepping through non-matching rows one at a time or recording diagnostics.
+fn join_sorted_slices(
+    bim: &[KeyedBimRecord],
+    scores: &[KeyedScoreRecord],
+    outputs: &mut JoinOutputs,
+) -> Result<(), PrepError> {
+    let (mut b, mut s) = (0, 0);
+    while b < bim.len() && s < scores.len() {
+        let (bim_key, score_key) = (bim[b].key, scores[s].key);
+        match bim_key.cmp(&score_key) {
+            Ordering::Less => b += leading_count(&bim[b..], |row| row.key < score_key),
+            Ordering::Greater => s += leading_count(&scores[s..], |record| record.key < bim_key),
+            Ordering::Equal => {
+                let bim_end = b + leading_count(&bim[b..], |row| row.key == bim_key);
+                let score_end = s + leading_count(&scores[s..], |record| record.key == bim_key);
+                outputs.reconcile_locus(bim_key, &bim[b..bim_end], &scores[s..score_end])?;
+                (b, s) = (bim_end, score_end);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How many leading `items` satisfy `before`, given that it holds for the first item
+/// and for a prefix only. Steps double first, so a short run costs about a scan.
+fn leading_count<T>(items: &[T], before: impl Fn(&T) -> bool) -> usize {
+    let mut step = 1;
+    while step < items.len() && before(&items[step]) {
+        step *= 2;
+    }
+    let low = step / 2;
+    low + items[low..step.min(items.len())].partition_point(|item| before(item))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by tests to run the streaming join over rows the slice join would take.
+    static FORCE_STREAMING_JOIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn streaming_join_forced() -> bool {
+    FORCE_STREAMING_JOIN.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn streaming_join_forced() -> bool {
+    false
+}
+
 #[inline(always)]
 fn apply_simple_score_assignment(entry: &mut SimpleScoreAssignment, weight: f64, is_flipped: bool) {
     // Canonicalize every match into allele2-dosage space.
@@ -711,8 +1131,6 @@ fn prepare_for_computation_with_retry(
     };
 
     let rows_sorted_by_key = matches!(bim_rows, BimRows::Sorted(_));
-    let mut bim_iter = bim_rows.by_ref().peekable();
-    let mut score_iter = score_iterator.by_ref().peekable();
 
     let score_lane_groups = score_names.len().div_ceil(LANE_COUNT);
     let stride = score_lane_groups.checked_mul(LANE_COUNT).ok_or_else(|| {
@@ -729,340 +1147,91 @@ fn prepare_for_computation_with_retry(
 
     // Build final artifacts incrementally during Stage 3 to avoid materializing
     // genome-scale intermediate maps that duplicate the final CSR/rule structures.
-    let mut required_bim_indices: Vec<BimRowIndex> = Vec::new();
-    let mut required_is_complex: Vec<u8> = Vec::new();
-    let mut csr_builder = CsrBuilder::new()?;
-    let mut baseline_missing_sum_by_score = Vec::new();
-    baseline_missing_sum_by_score
-        .try_reserve_exact(score_names.len())
-        .map_err(|e| PrepError::Invariant(format!("Cannot allocate score baselines: {e}")))?;
-    baseline_missing_sum_by_score.resize(score_names.len(), 0.0f64);
-    let mut baseline_errors = Vec::new();
-    baseline_errors
-        .try_reserve_exact(score_names.len())
-        .map_err(|e| PrepError::Invariant(format!("Cannot allocate baseline compensation: {e}")))?;
-    baseline_errors.resize(score_names.len(), 0.0f64);
-    let mut score_variant_counts = vec![0u32; score_names.len()];
-    let mut final_complex_rules: Vec<GroupedComplexRule> = Vec::new();
-    let mut bim_group = Vec::new();
-    let mut score_group = Vec::new();
-    // Reuse score slots across singleton loci. Only touched columns are visited
-    // or cleared, so sparse panels do not incur a full score-panel scan per locus.
-    let mut simple_assignments = Vec::new();
-    simple_assignments
-        .try_reserve_exact(score_names.len())
-        .map_err(|e| {
-            PrepError::Invariant(format!("Cannot allocate score reconciliation slots: {e}"))
-        })?;
-    simple_assignments.resize(score_names.len(), None::<SimpleScoreAssignment>);
-    let mut touched_columns = Vec::new();
-    touched_columns
-        .try_reserve_exact(score_names.len())
-        .map_err(|e| {
-            PrepError::Invariant(format!("Cannot allocate score reconciliation columns: {e}"))
-        })?;
+    let mut outputs = JoinOutputs::new(score_names.len())?;
 
-    while bim_iter.peek().is_some() && score_iter.peek().is_some() {
-        let bim_key = match bim_iter.peek().unwrap() {
-            Ok(rec) => rec.key,
-            Err(_) => match bim_iter.next().unwrap().unwrap_err() {
-                PrepError::Parse(msg) => {
-                    if let Some(chr_name) = extract_chr_from_parse_error(&msg)
-                        && seen_invalid_bim_chrs.insert(chr_name.to_string())
-                    {
-                        eprintln!(
-                            "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{chr_name}'."
-                        );
-                    }
-                    continue;
-                }
-                e => return Err(e),
-            },
-        };
-
-        let score_key = match score_iter.peek().unwrap() {
-            Ok(rec) => rec.key,
-            Err(_) => match score_iter.next().unwrap().unwrap_err() {
-                PrepError::Parse(msg) => {
-                    // Only a row on a contig gnomon cannot key is skipped here; any
-                    // other unusable score row fails the run.
-                    let Some(chr_name) = extract_chr_from_parse_error(&msg) else {
-                        return Err(PrepError::Parse(msg));
-                    };
-                    if seen_invalid_score_chrs.insert(chr_name.to_string()) {
-                        eprintln!(
-                            "Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{chr_name}'."
-                        );
-                    }
-                    continue;
-                }
-                e => return Err(e),
-            },
-        };
-
-        match bim_key.cmp(&score_key) {
-            Ordering::Less => {
-                diagnostics.add_bim_key(bim_key);
-                diagnostics.total_bim_variants_processed += 1;
-                bim_iter.next();
-            }
-            Ordering::Greater => {
-                diagnostics.add_score_key(score_key);
-                diagnostics.total_score_records_processed += 1;
-                score_iter.next();
-            }
-            Ordering::Equal => {
-                let key = bim_key;
-                diagnostics.add_bim_key(key);
-                diagnostics.add_score_key(key);
-
-                bim_group.clear();
-                while let Some(Ok(peek_item)) = bim_iter.peek() {
-                    if peek_item.key != key {
-                        break;
-                    }
-                    match bim_iter.next().unwrap() {
-                        Ok(item) => bim_group.push(item),
-                        Err(PrepError::Parse(msg)) => {
-                            if let Some(chr_name) = extract_chr_from_parse_error(&msg)
-                                && seen_invalid_bim_chrs.insert(chr_name.to_string())
-                            {
-                                eprintln!(
-                                    "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{chr_name}'."
-                                );
-                            }
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                diagnostics.total_bim_variants_processed += bim_group.len() as u64;
-
-                score_group.clear();
-                while let Some(Ok(peek_item)) = score_iter.peek() {
-                    if peek_item.key != key {
-                        break;
-                    }
-                    match score_iter.next().unwrap() {
-                        Ok(item) => score_group.push(item),
-                        Err(PrepError::Parse(msg)) => {
-                            if let Some(chr_name) = extract_chr_from_parse_error(&msg)
-                                && seen_invalid_score_chrs.insert(chr_name.to_string())
-                            {
-                                eprintln!(
-                                    "Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{chr_name}'."
-                                );
-                            }
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                diagnostics.total_score_records_processed += score_group.len() as u64;
-
-                // A single marker and a single weight need no temporary trees,
-                // sets, context vectors, or match lists. Emit their CSR row in
-                // exactly the same arithmetic and record order as grouped loci.
-                if let ([bim], [score]) = (bim_group.as_slice(), score_group.as_slice()) {
-                    if allele_pair_matches(
-                        score.effect_allele.as_str(),
-                        score.other_allele.as_str(),
-                        bim.allele1.as_str(),
-                        bim.allele2.as_str(),
-                    ) {
-                        let mut assignment = SimpleScoreAssignment {
-                            dosage_weight: 0.0,
-                            missing_correction: 0.0,
-                        };
-                        apply_simple_score_assignment(
-                            &mut assignment,
-                            score.weight,
-                            score.effect_allele.as_str() == bim.allele1.as_str(),
-                        );
-                        required_bim_indices.push(bim.bim_row_index);
-                        required_is_complex.push(0);
-                        csr_builder.push_contribution(score.score_column_index, assignment)?;
-                        csr_builder.finish_variant()?;
-                        accumulate_baseline(
-                            &mut baseline_missing_sum_by_score[score.score_column_index.0],
-                            &mut baseline_errors[score.score_column_index.0],
-                            assignment.missing_correction,
-                        );
-                        score_variant_counts[score.score_column_index.0] += 1;
-                    }
-                    continue;
-                }
-
-                if let [bim] = bim_group.as_slice() {
-                    for score in &score_group {
-                        if !allele_pair_matches(
-                            score.effect_allele.as_str(),
-                            score.other_allele.as_str(),
-                            bim.allele1.as_str(),
-                            bim.allele2.as_str(),
-                        ) {
-                            continue;
-                        }
-                        let slot = &mut simple_assignments[score.score_column_index.0];
-                        let assignment = slot.get_or_insert_with(|| {
-                            touched_columns.push(score.score_column_index);
-                            SimpleScoreAssignment {
-                                dosage_weight: 0.0,
-                                missing_correction: 0.0,
-                            }
-                        });
-                        // Input order matters for duplicate f64 additions.
-                        apply_simple_score_assignment(
-                            assignment,
-                            score.weight,
-                            score.effect_allele.as_str() == bim.allele1.as_str(),
-                        );
-                    }
-                    if !touched_columns.is_empty() {
-                        touched_columns.sort_unstable();
-                        required_bim_indices.push(bim.bim_row_index);
-                        required_is_complex.push(0);
-                        for column in touched_columns.drain(..) {
-                            let assignment = simple_assignments[column.0].take().unwrap();
-                            csr_builder.push_contribution(column, assignment)?;
-                            accumulate_baseline(
-                                &mut baseline_missing_sum_by_score[column.0],
-                                &mut baseline_errors[column.0],
-                                assignment.missing_correction,
-                            );
-                            score_variant_counts[column.0] += 1;
-                        }
-                        csr_builder.finish_variant()?;
-                    }
-                    continue;
-                }
-
-                let mut complex_for_key: BTreeMap<
-                    Vec<(BimRowIndex, String, String)>,
-                    Vec<(ScoreColumnIndex, f64, String, String)>,
-                > = BTreeMap::new();
-
-                for score_record in score_group.drain(..) {
-                    let possible_contexts: Vec<_> = bim_group
-                        .iter()
-                        .filter(|rec| {
-                            allele_pair_matches(
-                                score_record.effect_allele.as_str(),
-                                score_record.other_allele.as_str(),
-                                rec.allele1.as_str(),
-                                rec.allele2.as_str(),
-                            )
-                        })
-                        .map(|rec| {
-                            (
-                                rec.bim_row_index,
-                                rec.allele1.to_string(),
-                                rec.allele2.to_string(),
-                            )
-                        })
-                        .collect();
-                    if possible_contexts.is_empty() {
-                        continue;
-                    }
-                    let score_info = (
-                        score_record.score_column_index,
-                        score_record.weight,
-                        score_record.effect_allele.to_string(),
-                        score_record.other_allele.to_string(),
-                    );
-                    complex_for_key
-                        .entry(possible_contexts)
-                        .or_default()
-                        .push(score_info);
-                }
-
-                // Finalize complex rules for this key immediately.
-                let mut key_complex_indices: BTreeSet<BimRowIndex> = BTreeSet::new();
-                for (contexts, scores) in complex_for_key {
-                    for (bim_idx, _, _) in &contexts {
-                        key_complex_indices.insert(*bim_idx);
-                    }
-
-                    for (score_col_idx, _, _, _) in &scores {
-                        score_variant_counts[score_col_idx.0] += 1;
-                    }
-
-                    let chr_str = match key.0 {
-                        23 => "X".to_string(),
-                        24 => "Y".to_string(),
-                        25 => "MT".to_string(),
-                        n => n.to_string(),
-                    };
-
-                    final_complex_rules.push(GroupedComplexRule {
-                        locus_chr_pos: (chr_str, key.1),
-                        possible_contexts: contexts,
-                        score_applications: scores
-                            .into_iter()
-                            .map(|(sc_idx, weight, ea, oa)| ScoreInfo {
-                                effect_allele: ea,
-                                other_allele: oa,
-                                weight,
-                                score_column_index: sc_idx,
-                            })
-                            .collect(),
-                    });
-                }
-
-                // Emit CSR rows and required variant metadata for this key in sorted order.
-                // This preserves global row ordering while avoiding a global index set.
-                for bim_row_index in key_complex_indices {
-                    required_bim_indices.push(bim_row_index);
-                    required_is_complex.push(1);
-                    csr_builder.finish_variant()?;
-                }
-            }
+    // Rows already in memory, in key order and with nothing to report between
+    // them, are joined as slices. Anything else walks the streams. Nothing checks
+    // that a score file ascends, so the slice join checks it for itself: over a
+    // descending file the streaming join's one-row steps decide what matches.
+    let plain_rows = if streaming_join_forced() {
+        None
+    } else {
+        bim_rows.plain_records().zip(
+            score_iterator
+                .plain_records()
+                .filter(|records| records.windows(2).all(|pair| pair[0].key <= pair[1].key)),
+        )
+    };
+    if let Some((bim, scores)) = plain_rows {
+        join_sorted_slices(bim, scores, &mut outputs)?;
+        if outputs.required_bim_indices.is_empty() {
+            // Only a join that matched nothing reports what it walked past, so
+            // walk the same rows the streaming way to describe them.
+            outputs = JoinOutputs::new(score_names.len())?;
+            join_streams(
+                &mut bim.iter().cloned().map(Ok::<_, PrepError>).peekable(),
+                &mut scores.iter().cloned().map(Ok::<_, PrepError>).peekable(),
+                &mut outputs,
+                &mut diagnostics,
+                &mut seen_invalid_bim_chrs,
+                &mut seen_invalid_score_chrs,
+            )?;
+        }
+        if rows_sorted_by_key {
+            // Rows were emitted in key order; readers visit them in file order.
+            outputs.sort_rows_by_bim_index()?;
+        }
+    } else {
+        let mut bim_iter = bim_rows.by_ref().peekable();
+        let mut score_iter = score_iterator.by_ref().peekable();
+        join_streams(
+            &mut bim_iter,
+            &mut score_iter,
+            &mut outputs,
+            &mut diagnostics,
+            &mut seen_invalid_bim_chrs,
+            &mut seen_invalid_score_chrs,
+        )?;
+        drop(bim_iter);
+        if let Some(unsorted_bim) = bim_rows.descended_in() {
+            // The merge-join may already have walked past rows it should have
+            // matched. Redo it over every row sorted by key; the genotype files
+            // stay as they are.
+            eprintln!(
+                "> Variants in {} are not sorted by chromosome and position. Matching them in sorted order...",
+                unsorted_bim.display()
+            );
+            return prepare_for_computation_with_retry(
+                fileset_prefixes,
+                sorted_score_files,
+                keep_file,
+                score_regions,
+                BimRowOrder::Sorted,
+            );
+        }
+        if rows_sorted_by_key {
+            // Rows were emitted in key order; readers visit them in file order.
+            outputs.sort_rows_by_bim_index()?;
+        }
+        // A score row the join peeked at but never took can still be one that fails
+        // the run; finish() below reads the rows beyond it the same way.
+        if let Some(Err(_)) = score_iter.peek()
+            && let Some(Err(error)) = score_iter.next()
+            && !is_unkeyable_contig(&error)
+        {
+            return Err(error);
         }
     }
-    for result in bim_iter.by_ref() {
-        match result {
-            Ok(record) => {
-                diagnostics.add_bim_key(record.key);
-                diagnostics.total_bim_variants_processed += 1;
-            }
-            Err(PrepError::Parse(msg)) => {
-                if let Some(chr_name) = extract_chr_from_parse_error(&msg)
-                    && seen_invalid_bim_chrs.insert(chr_name.to_string())
-                {
-                    eprintln!(
-                        "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{chr_name}'."
-                    );
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    if let Some(unsorted_bim) = bim_rows.descended_in() {
-        // The merge-join may already have walked past rows it should have
-        // matched. Redo it over every row sorted by key; the genotype files
-        // stay as they are.
-        eprintln!(
-            "> Variants in {} are not sorted by chromosome and position. Matching them in sorted order...",
-            unsorted_bim.display()
-        );
-        return prepare_for_computation_with_retry(
-            fileset_prefixes,
-            sorted_score_files,
-            keep_file,
-            score_regions,
-            BimRowOrder::Sorted,
-        );
-    }
-    if rows_sorted_by_key {
-        // Rows were emitted in key order; readers visit them in file order.
-        csr_builder.sort_rows_by_bim_index(&mut required_bim_indices, &mut required_is_complex)?;
-    }
-    // A score row the join peeked at but never took can still be one that fails
-    // the run; finish() below reads the rows beyond it the same way.
-    if let Some(Err(_)) = score_iter.peek()
-        && let Some(Err(error)) = score_iter.next()
-        && !is_unkeyable_contig(&error)
-    {
-        return Err(error);
-    }
+    let JoinOutputs {
+        required_bim_indices,
+        required_is_complex,
+        csr_builder,
+        mut baseline_missing_sum_by_score,
+        baseline_errors,
+        score_variant_counts,
+        final_complex_rules,
+        ..
+    } = outputs;
 
     let region_filter_hits = score_iterator.take_region_filter_hits();
     let mut rejected_score_rows = score_iterator.finish()?;
@@ -1571,6 +1740,106 @@ mod tests {
             .collect();
         rule_plans.sort();
         (row_plans, rule_plans)
+    }
+
+    #[test]
+    fn slice_join_builds_what_the_streaming_join_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        // A locus before any score, a flip, one row weighted twice in one column, a
+        // split multiallelic locus, a mismatch, runs of rows on either side alone,
+        // an indel, and three chromosomes.
+        let mixed_rows = [
+            "1 a 0 50 C T\n",
+            "1 b 0 100 A G\n",
+            "1 c 0 200 A G\n",
+            "1 d 0 300 A C\n",
+            "1 e 0 300 A T\n",
+            "1 f 0 400 G T\n",
+            "1 g 0 450 G T\n",
+            "1 h 0 460 G T\n",
+            "2 i 0 100 AT A\n",
+            "X j 0 700 C G\n",
+        ];
+        let mixed_weights = "variant_id\teffect_allele\tother_allele\tS1\tS2\n\
+            1:10\tA\tG\t9\t9\n\
+            1:100\tA\tG\t0.5\t\n\
+            1:200\tG\tA\t-1.25\t2\n\
+            1:200\tA\tG\t\t0.125\n\
+            1:300\tA\tC\t3\t\n\
+            1:300\tA\tT\t\t4\n\
+            1:400\tC\tA\t1\t1\n\
+            1:470\tG\tT\t5\t5\n\
+            2:100\tAT\tA\t0.75\t\n\
+            2:900\tA\tG\t1\t1\n\
+            X:700\tG\tC\t2.5\t-2.5\n";
+        let unsorted_rows = ["1 b 0 200 A G\n", "1 a 0 100 A G\n", "1 c 0 300 A G\n"];
+        let cases: [(&str, &[&str], &str); 5] = [
+            ("mixed", &mixed_rows, mixed_weights),
+            (
+                "disjoint",
+                &mixed_rows,
+                "variant_id\teffect_allele\tother_allele\tS1\n1:999\tA\tG\t1\n3:5\tA\tG\t1\n",
+            ),
+            (
+                "no_allele_matches",
+                &mixed_rows,
+                "variant_id\teffect_allele\tother_allele\tS1\n1:100\tC\tT\t1\n1:300\tG\tC\t1\n",
+            ),
+            (
+                "unsorted_bim",
+                &unsorted_rows,
+                "variant_id\teffect_allele\tother_allele\tS1\n1:100\tA\tG\t1\n1:200\tG\tA\t2\n1:300\tA\tG\t3\n",
+            ),
+            (
+                "descending_scores",
+                &mixed_rows,
+                "variant_id\teffect_allele\tother_allele\tS1\n1:300\tA\tC\t1\n1:100\tA\tG\t2\n2:100\tAT\tA\t3\n",
+            ),
+        ];
+        for (name, rows, weights_text) in cases {
+            let prefix = dir.path().join(name);
+            write_bim_fileset(&prefix, rows, 4);
+            let weights = dir.path().join(format!("{name}.tsv"));
+            std::fs::write(&weights, weights_text).unwrap();
+            // The retry entry point compiles without the plan cache.
+            let describe = |forced: bool| {
+                FORCE_STREAMING_JOIN.with(|force| force.set(forced));
+                let result = prepare_for_computation_with_retry(
+                    std::slice::from_ref(&prefix),
+                    std::slice::from_ref(&weights),
+                    None,
+                    None,
+                    BimRowOrder::Streamed,
+                );
+                FORCE_STREAMING_JOIN.with(|force| force.set(false));
+                match result {
+                    Ok(prep) => format!("{prep:?}"),
+                    Err(error) => format!("error {error}"),
+                }
+            };
+            let sliced = describe(false);
+            assert_eq!(sliced, describe(true), "{name}");
+            let expect_plan = matches!(name, "mixed" | "unsorted_bim" | "descending_scores");
+            assert_eq!(
+                !sliced.starts_with("error"),
+                expect_plan,
+                "{name}: {sliced}"
+            );
+        }
+    }
+
+    #[test]
+    fn leading_count_finds_every_prefix_length() {
+        for len in 1..40usize {
+            let items: Vec<usize> = (0..len).collect();
+            for prefix in 1..=len {
+                assert_eq!(
+                    leading_count(&items, |&i| i < prefix),
+                    prefix,
+                    "{len} {prefix}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2657,6 +2926,18 @@ impl<'i, 'a> BimRows<'i, 'a> {
         Self::Sorted(records.into_iter())
     }
 
+    /// Every row still to come, when all of them are in memory in key order with no
+    /// row error between them.
+    fn plain_records(&self) -> Option<&[KeyedBimRecord]> {
+        match self {
+            Self::Sorted(records) => Some(records.as_slice()),
+            Self::Parsed {
+                records, errors, ..
+            } if errors.len() == 0 => Some(records.as_slice()),
+            Self::Streamed { .. } | Self::Parsed { .. } => None,
+        }
+    }
+
     /// The `.bim` file in which streamed rows stopped ascending, if they did.
     fn descended_in(&self) -> Option<&Path> {
         match self {
@@ -3020,6 +3301,15 @@ enum ScoreRows {
 }
 
 impl ScoreRows {
+    /// Every record still to come, when all of them are in memory in merge order
+    /// with nothing to report between them.
+    fn plain_records(&self) -> Option<&[KeyedScoreRecord]> {
+        match self {
+            Self::Parsed(parsed) => parsed.plain_records(),
+            Self::Streamed(_) => None,
+        }
+    }
+
     /// Lines skipped for missing columns among those read so far.
     fn malformed_lines(&self) -> usize {
         match self {

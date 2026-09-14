@@ -245,6 +245,24 @@ pub(super) fn parse_score_contents(
 }
 
 impl ParsedScores {
+    /// Every record still to come, in merge order, when merging and reporting would
+    /// add nothing between them: one file, nothing yielded yet, and no malformed
+    /// line, unkeyable row or error anywhere in it.
+    pub(super) fn plain_records(&self) -> Option<&[KeyedScoreRecord]> {
+        match self.files.as_slice() {
+            [file]
+                if self.pending.is_empty()
+                    && file.popped == 0
+                    && file.malformed_at_end == 0
+                    && file.rejections.is_empty()
+                    && file.error.is_none() =>
+            {
+                Some(file.records.as_slice())
+            }
+            _ => None,
+        }
+    }
+
     /// Lines skipped for missing columns among those the streaming merge would
     /// have read by now.
     pub(super) fn malformed_lines(&self) -> usize {
