@@ -161,7 +161,7 @@ used:
 The launcher requires an explicitly configured isolated context and the exact
 locally configured human account in both CLIs. It refuses **any email containing
 `user`**, case-insensitively, including in `AOU_EXPECTED_ACCOUNT`.
-It repeats the checks before every upload or workflow mutation. The runtime
+It repeats the checks before every staging batch or workflow mutation. The runtime
 also checks its VM service-account email before querying the CDR.
 
 Refresh the dedicated Workbench login when necessary:
@@ -189,9 +189,33 @@ credentials. Refresh resource values there when changing workspaces or CDRs.
 
 `--check` verifies both identities, workspace/CDR/bucket resolution, and the
 existence of the staged objects without uploading or submitting. Submission
-uses unique source/config-hashed paths and writes a submission receipt under
-`examples/biobank/.aou-workflow/`. It submits exactly one task and does not
-start a local polling process. Use Workbench's job UI to inspect/cancel it.
+uses unique source/config-hashed paths and writes its inputs, workflow record and
+receipt to one folder under `examples/biobank/.aou-workflow/`. It submits exactly
+one task and does not start a local polling process. Use Workbench's job UI to
+inspect/cancel it.
+
+The pilot's other runs are submitted with `submit_runs.py`: `score-training`,
+`benchmark`, `scoring-diagnostic`, `fit-diagnostic`, `stderr-diagnostic URI` and
+`results-digest URI`. Deployment state for them (the portable scorer, analysis
+configurations, the current checkpoint URI) stays in `.aou-workflow/`.
+
+Every launcher stages files with one Cloud Storage media upload per file and
+compares the stored MD5 and size with the local bytes; `wb gsutil cp` has stalled
+indefinitely on a 12 MB archive that a single upload finished in 18 seconds.
+Workbench has also hung after it had already created a workflow or a run, so
+neither step is judged by its exit status. A failed create is accepted once the
+workflow can be described, a run is started only while the workflow lists no
+run, and a failed run step is confirmed by listing. If no run appears, rerun
+the submission from its folder, which starts the run once and never starts a
+second:
+
+```bash
+python examples/biobank/submit_runs.py finish examples/biobank/.aou-workflow/<submission>
+```
+
+Do not wrap a launcher in a short outer `timeout`, and never resubmit under a
+new name after a reported failure without listing the workspace's runs first:
+two runs of one analysis race on the same checkpoint.
 `--endpoint` narrows execution after the existing selector; it never overrides
 eligibility. Run endpoints separately when a combined run would exceed its
 wall budget. Resume a checkpoint only for the same endpoint, score scope,
@@ -242,12 +266,19 @@ the same outcome-blind hash order and seed; it does not balance events or relax
 the minimum event count. Resource and wall limits are unchanged.
 
 Run static and synthetic contract validation on MSI using the existing warm
-Python dependencies; no participant data needs to leave AoU:
+Python dependencies; no participant data needs to leave AoU. Run every test
+module and every WDL, on a compute node pinned to your own cores rather than
+the login node, whose CPU watchdog kills sustained work:
 
 ```bash
-miniwdl check examples/biobank/aou_survival.wdl
-python -m unittest discover -s examples/biobank -p test_aou_survival.py
+cd examples/biobank
+taskset -c <cores> env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 RAYON_NUM_THREADS=2 \
+  TMPDIR=<scratch dir> python -m pytest -q -p no:cacheprovider test_*.py
+for wdl in *.wdl; do miniwdl check "$wdl"; done
 ```
+
+The suite takes under a minute (93 tests on MSI acl42). GitHub Actions runs the
+same commands on every push that touches `examples/biobank`.
 
 The native acceptance check applies the saved external CTN to real public
 reference predictors and fits synthetic survival outcomes. It checks a
