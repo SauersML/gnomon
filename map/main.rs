@@ -2068,8 +2068,22 @@ fn projection_present_mask(
         return Ok(vec![true; requested_keys.len()]);
     }
 
-    let missing_lookup: HashSet<_> = missing_keys.iter().collect();
+    // Model-key selection lists absent keys in model order, a subsequence of the
+    // requested keys, so one merge finds them without hashing every model key.
+    // Absent keys in any other order fall back to the lookup below.
     let mut present_mask = Vec::with_capacity(requested_keys.len());
+    let mut next_missing = 0usize;
+    for key in requested_keys {
+        let is_missing = missing_keys.get(next_missing) == Some(key);
+        next_missing += usize::from(is_missing);
+        present_mask.push(!is_missing);
+    }
+    if next_missing == missing_keys.len() {
+        return Ok(present_mask);
+    }
+    present_mask.clear();
+
+    let missing_lookup: HashSet<_> = missing_keys.iter().collect();
     let mut matched_missing = 0usize;
     for key in requested_keys {
         let is_missing = missing_lookup.contains(key);
@@ -2748,6 +2762,23 @@ mod tests {
 
         let mask = projection_present_mask(&requested, &missing)?;
         assert_eq!(mask, vec![false, true, true, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn projection_present_mask_agrees_with_the_lookup_for_ordered_and_partial_merges()
+    -> Result<(), Box<dyn Error>> {
+        let requested: Vec<_> = (1..=6).map(|i| VariantKey::new("1", i * 100)).collect();
+        let key = |position| VariantKey::new("1", position);
+        // In model order: the merge alone decides.
+        let ordered = projection_present_mask(&requested, &[key(100), key(400), key(600)])?;
+        assert_eq!(ordered, vec![false, true, true, false, true, false]);
+        // A merge that consumes some absent keys before meeting one out of order
+        // must not leave its partial answer behind.
+        let partial = projection_present_mask(&requested, &[key(300), key(500), key(200)])?;
+        assert_eq!(partial, vec![true, false, false, true, false, true]);
+        // An absent key the model does not hold is still refused.
+        assert!(projection_present_mask(&requested, &[key(300), key(700)]).is_err());
         Ok(())
     }
 
