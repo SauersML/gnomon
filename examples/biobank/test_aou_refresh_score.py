@@ -1,6 +1,5 @@
 """Exact component handoff from the native scorer, without participant data."""
 import pytest
-import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
@@ -66,15 +65,41 @@ def test_runtime_requires_spot_amd(spot, vendor, rejection):
 
 
 def test_running_child_publishes_checkpoint_before_completion(tmp_path):
-    child = MagicMock()
-    child.wait.side_effect = [subprocess.TimeoutExpired(["scorer"], 30), 0]
+    clock = {"now": 0.}
+    child = MagicMock(pid=2**22, returncode=None)
+
+    def poll():
+        # Still running at the 30-second checkpoint; exits cleanly at 40 s.
+        if clock["now"] >= 40:
+            child.returncode = 0
+        return child.returncode
+
+    def sleep(seconds):
+        clock["now"] += seconds
+
+    child.poll.side_effect = poll
     published = MagicMock()
     with patch("aou_survival.subprocess.Popen", return_value=child), \
-         patch("aou_survival.time.monotonic", side_effect=[0., 0., 30., 30., 31.]):
+         patch("aou_survival.os.killpg") as killpg, \
+         patch("aou_survival.time.monotonic", side_effect=lambda: clock["now"]), \
+         patch("aou_survival.time.sleep", side_effect=sleep):
         bounded_fit(["scorer"], 60, tmp_path / "fit.log", checkpoint_callback=published)
     published.assert_called_once_with()
-    assert child.wait.call_count == 2
+    killpg.assert_not_called()
     assert (tmp_path / "fit.resources.json").is_file()
+
+
+def test_worker_cleanup_never_signals_a_process_group_a_child_could_not_have():
+    # A MagicMock pid converts to 1, and killpg(1) is kill(-1): every process
+    # this account owns. An earlier version of the test above did exactly that.
+    from aou_survival import signal_session
+    with patch("aou_survival.os.killpg") as killpg:
+        for pid in (MagicMock(), 0, 1):
+            with pytest.raises(ValueError, match="refusing to signal"):
+                signal_session(SimpleNamespace(pid=pid), 9)
+        killpg.assert_not_called()
+        signal_session(SimpleNamespace(pid=4242), 15)
+        killpg.assert_called_once_with(4242, 15)
 
 
 def test_query_budget_is_cumulative_and_cached_queries_are_free():

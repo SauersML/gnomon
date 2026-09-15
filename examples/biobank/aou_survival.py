@@ -668,6 +668,18 @@ def solver_threads():
     return int(os.environ.get("RAYON_NUM_THREADS") or os.cpu_count() or 1)
 
 
+def signal_session(child, signum):
+    """Signal the session a worker leads; its pid is also its process group id.
+
+    killpg(1) is kill(-1), which reaches every process this account owns on
+    the node, so refuse any id a real child could not have.
+    """
+    pid = int(child.pid)
+    if pid <= 1:
+        raise ValueError(f"refusing to signal process group {pid}")
+    os.killpg(pid, signum)
+
+
 def bounded_fits(jobs, timeout_seconds, checkpoint_callback=None, threads=None):
     """Run fit workers side by side under one wall bound; every child is reaped.
 
@@ -722,12 +734,12 @@ def bounded_fits(jobs, timeout_seconds, checkpoint_callback=None, threads=None):
     except BaseException:
         for child in children:
             if child.poll() is None:
-                os.killpg(child.pid, signal.SIGTERM)
+                signal_session(child, signal.SIGTERM)
         for child in children:
             try:
                 child.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
+                signal_session(child, signal.SIGKILL)
                 child.wait()
         raise
     finally:
