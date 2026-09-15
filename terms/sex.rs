@@ -15,9 +15,11 @@ use thiserror::Error;
 use crate::adapt_plink2::GenomeBuild as PgenGenomeBuild;
 use crate::map::fit::VariantBlockSource;
 use crate::map::io::{
-    DatasetBlockSource, GenotypeDataset, GenotypeIoError, PlinkDataset, PlinkIoError, SelectionPlan,
+    DatasetBlockSource, GenotypeDataset, GenotypeIoError, PgenDataset, PlinkDataset, PlinkIoError,
+    SampleRecord, SelectionPlan,
 };
 use crate::map::variant_filter::VariantKey;
+use crate::shared::files::BedSource;
 use crate::terms::sex_counts::{
     BedRows, EvidenceCounts, LocusClass, count_evidence, finish_counts,
 };
@@ -492,10 +494,19 @@ fn infer_dataset_records(
     let build = resolve_build(force_build, &loci)?;
     let selection = SexVariantSelection::from_loci(&loci, build);
     let records = match dataset {
-        GenotypeDataset::Plink(plink) => {
-            collect_packed_inference(&[(plink, 0)], &selection, show_progress)?
-        }
-        _ => collect_inference(dataset, &selection, show_progress)?,
+        GenotypeDataset::Plink(plink) => collect_packed_inference(
+            plink.samples(),
+            &[PackedPart::bed(plink, 0)],
+            &selection,
+            show_progress,
+        )?,
+        GenotypeDataset::Pgen(pgen) => collect_packed_inference(
+            pgen.samples(),
+            &[PackedPart::pgen(pgen)],
+            &selection,
+            show_progress,
+        )?,
+        GenotypeDataset::Variants(_) => collect_inference(dataset, &selection, show_progress)?,
     };
     Ok((build, records))
 }
@@ -511,14 +522,15 @@ fn infer_directory_records(
     let mut loci = VariantLoci::default();
     let mut parts = Vec::with_capacity(filesets.len());
     for fileset in filesets {
-        parts.push((fileset, loci.positions.len()));
+        parts.push(PackedPart::bed(fileset, loci.positions.len()));
         let fileset_loci = VariantLoci::from_bim(fileset).map_err(GenotypeIoError::from)?;
         loci.chroms.extend(fileset_loci.chroms);
         loci.positions.extend(fileset_loci.positions);
     }
     let build = resolve_build(force_build, &loci)?;
     let selection = SexVariantSelection::from_loci(&loci, build);
-    let records = collect_packed_inference(&parts, &selection, show_progress)?;
+    let samples = filesets.first().map_or(&[][..], PlinkDataset::samples);
+    let records = collect_packed_inference(samples, &parts, &selection, show_progress)?;
     Ok((build, records))
 }
 
@@ -722,12 +734,43 @@ fn hard_call(dosage: f64) -> Option<f64> {
     ((dosage - call).abs() <= HARD_CALL_THRESHOLD).then_some(call)
 }
 
-/// [`collect_inference`] for PLINK 1 filesets: one, or several read as one, each
-/// paired with the number of rows numbered before it. The calls are counted
-/// directly on the packed `.bed` rows, and only the rows that feed a counter are
-/// read; see `sex_counts`.
+/// The packed PLINK 1 rows [`collect_packed_inference`] counts, and the number of
+/// rows numbered before them.
+struct PackedPart {
+    bed: BedSource,
+    bytes_per_variant: usize,
+    n_variants: usize,
+    first_row: usize,
+}
+
+impl PackedPart {
+    fn bed(dataset: &PlinkDataset, first_row: usize) -> Self {
+        Self {
+            bed: dataset.bed_source().clone(),
+            bytes_per_variant: dataset.bytes_per_variant(),
+            n_variants: dataset.n_variants(),
+            first_row,
+        }
+    }
+
+    /// A `.pgen`'s rows, as the PLINK 1 bytes they decode to, which
+    /// [`collect_inference`] decodes to the same calls.
+    fn pgen(dataset: &PgenDataset) -> Self {
+        Self {
+            bed: dataset.bed_source(),
+            bytes_per_variant: dataset.bytes_per_variant(),
+            n_variants: dataset.n_variants(),
+            first_row: 0,
+        }
+    }
+}
+
+/// [`collect_inference`] for PLINK 1 filesets, one or several read as one, and
+/// for a `.pgen`. The calls are counted directly on the packed rows, and only
+/// the rows that feed a counter are read; see `sex_counts`.
 fn collect_packed_inference(
-    parts: &[(&PlinkDataset, usize)],
+    samples: &[SampleRecord],
+    parts: &[PackedPart],
     selection: &SexVariantSelection,
     show_progress: bool,
 ) -> Result<Vec<SexInferenceRecord>, SexInferenceError> {
@@ -751,28 +794,28 @@ fn collect_packed_inference(
         })
         .collect();
 
-    let Some(&(first, _)) = parts.first() else {
+    if parts.is_empty() {
         return Ok(Vec::new());
-    };
+    }
     let total_variants = selection.keys.len();
     let mut progress = TermsProgress::new(total_variants, show_progress);
-    let mut evidence = vec![EvidenceCounts::default(); first.n_samples()];
+    let mut evidence = vec![EvidenceCounts::default(); samples.len()];
     let mut counted_before = 0;
-    for &(dataset, first_row) in parts {
-        let end_row = first_row + dataset.n_variants();
+    for part in parts {
+        let end_row = part.first_row + part.n_variants;
         let part_loci: Vec<(usize, LocusClass)> = loci
             .iter()
-            .filter(|&&(index, _)| (first_row..end_row).contains(&index))
-            .map(|&(index, class)| (index - first_row, class))
+            .filter(|&&(index, _)| (part.first_row..end_row).contains(&index))
+            .map(|&(index, class)| (index - part.first_row, class))
             .collect();
         if part_loci.is_empty() {
             continue;
         }
         let rows = BedRows::new(
-            dataset.bed_source(),
-            dataset.bytes_per_variant(),
-            dataset.n_variants(),
-            dataset.n_samples(),
+            &part.bed,
+            part.bytes_per_variant,
+            part.n_variants,
+            samples.len(),
         );
         let part_evidence = count_evidence(&rows, &part_loci, |counted| {
             progress.update(counted_before + counted, total_variants)
@@ -794,16 +837,12 @@ fn collect_packed_inference(
     progress.finish(total_variants);
 
     finalize_records(
-        first
-            .samples()
-            .iter()
-            .zip(&evidence)
-            .map(|(sample, counts)| {
-                Ok(SexInferenceRecord {
-                    individual_id: sample.individual_id.clone(),
-                    inference: finish_counts(&config, counts)?,
-                })
-            }),
+        samples.iter().zip(&evidence).map(|(sample, counts)| {
+            Ok(SexInferenceRecord {
+                individual_id: sample.individual_id.clone(),
+                inference: finish_counts(&config, counts)?,
+            })
+        }),
         &platform,
     )
 }
@@ -1889,7 +1928,12 @@ mod tests {
             assert_eq!(build, GenomeBuild::Build38);
             let selection = SexVariantSelection::from_loci(&loci, build);
             let expected = collect_inference(&dataset, &selection, false)?;
-            let packed = collect_packed_inference(&[(plink, 0)], &selection, false)?;
+            let packed = collect_packed_inference(
+                plink.samples(),
+                &[PackedPart::bed(plink, 0)],
+                &selection,
+                false,
+            )?;
 
             assert_eq!(packed.len(), n_samples);
             assert_eq!(expected.len(), n_samples);
@@ -1912,6 +1956,34 @@ mod tests {
             if n_samples > 1 {
                 assert_eq!(calls, HashSet::from(["male", "female"]));
             }
+        }
+        Ok(())
+    }
+
+    /// A `.pgen` counted on the PLINK 1 rows it decodes to must reproduce the
+    /// accumulator path over the same decoded calls, down to the metric bits.
+    #[test]
+    fn packed_pgen_counts_reproduce_the_accumulator_path() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/testdata/xy_sex.pgen");
+        let dataset = GenotypeDataset::open(&path, Some(PgenGenomeBuild::Grch38))?;
+        let GenotypeDataset::Pgen(pgen) = &dataset else {
+            panic!("the fixture is a .pgen");
+        };
+        let loci = VariantLoci::from_keys(&dataset.variant_keys_for_plan(&SelectionPlan::All)?);
+        let selection = SexVariantSelection::from_loci(&loci, GenomeBuild::Build38);
+        let expected = collect_inference(&dataset, &selection, false)?;
+        let packed =
+            collect_packed_inference(pgen.samples(), &[PackedPart::pgen(pgen)], &selection, false)?;
+        assert_eq!(packed.len(), 8);
+        assert_eq!(expected.len(), 8);
+        for (packed, expected) in packed.iter().zip(&expected) {
+            assert_eq!(packed.individual_id, expected.individual_id);
+            assert_eq!(packed.inference, expected.inference);
+            assert_eq!(
+                metric_bits(&packed.inference),
+                metric_bits(&expected.inference)
+            );
         }
         Ok(())
     }

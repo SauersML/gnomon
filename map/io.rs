@@ -2250,6 +2250,16 @@ impl PgenDataset {
         self.n_variants
     }
 
+    /// The rows as the PLINK 1 `.bed` bytes they decode to.
+    pub fn bed_source(&self) -> BedSource {
+        BedSource::from_byte_source(Arc::clone(&self.virtual_plink.bed))
+    }
+
+    /// Packed bytes per decoded row, `ceil(n_samples / 4)`.
+    pub fn bytes_per_variant(&self) -> usize {
+        self.bytes_per_variant
+    }
+
     pub fn pgen_path(&self) -> &Path {
         &self.pgen_path
     }
