@@ -100,3 +100,16 @@ def test_failure_class_reports_only_the_exception_class_name():
         log = Path(tmp, "fit.log")
         log.write_text("gnomon_fit_started\nTraceback...\ngamfit._exceptions.IntegrationError: participant 123 did x\n")
         assert bench.failure_class(log) == "integrationerror"
+
+
+def test_failure_class_names_the_fixed_category_of_a_solver_message():
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp, "fit.log")
+        log.write_text("Traceback...\ngamfit._exceptions.GamError: gam error: exact two-block spatial "
+                       "optimization failed: no candidate seeds passed outer startup validation\n")
+        assert bench.failure_class(log) == "gamerror_startup_seeds"
+        log.write_text("Traceback...\ngamfit._exceptions.GamError: resource policy refused: "
+                       "refusing to densify operator-backed design\n")
+        assert bench.failure_class(log) == "gamerror_resource_policy"
+        log.write_text("Traceback...\ngamfit._exceptions.GamError: something new entirely\n")
+        assert bench.failure_class(log) == "gamerror"

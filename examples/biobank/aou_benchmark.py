@@ -328,11 +328,37 @@ def run_bounded(jobs, timeout_seconds, threads):
     return results
 
 
+# Fixed categories for the first recognizable phrase of a solver failure, so a
+# generic exception class (gamfit raises GamError for every solver outcome) still
+# separates a startup-seed rejection from a resource refusal. Vocabulary, never
+# data: a message that matches none stays at the class name alone.
+FAILURE_PHRASES = (
+    ("no candidate seeds passed", "startup_seeds"),
+    ("non-finite cost", "nonfinite_cost"),
+    ("failed to converge", "nonconvergence"),
+    ("did not converge", "nonconvergence"),
+    ("resource policy", "resource_policy"),
+    ("refusing to densify", "resource_policy"),
+    ("identifiab", "identifiability"),
+    ("singular", "singular"),
+    ("timed out", "timeout"),
+)
+
+
 def failure_class(log):
-    """The exception class a failed worker raised: a code name, never data."""
+    """The exception class a failed worker raised, with the fixed category of
+    its message when one applies: a code name, never data."""
     text = Path(log).read_bytes()[-65536:].decode("utf-8", errors="replace")
-    found = re.findall(r"^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\b", text, re.MULTILINE)
-    return re.sub(r"[^a-z0-9]+", "_", found[-1].rsplit(".", 1)[-1].lower()) if found else "unclassified"
+    found = re.findall(r"^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\b(.*) , text, re.MULTILINE)
+    if not found:
+        return "unclassified"
+    exception, message = found[-1]
+    label = re.sub(r"[^a-z0-9]+", "_", exception.rsplit(".", 1)[-1].lower())
+    lowered = message.lower()
+    for phrase, category in FAILURE_PHRASES:
+        if phrase in lowered:
+            return f"{label}_{category}"
+    return label
 
 
 # --------------------------------------------------------------------------- #
