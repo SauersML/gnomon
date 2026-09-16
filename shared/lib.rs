@@ -29,6 +29,8 @@ pub(crate) mod genotype_table;
 
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod files;
+pub mod bcf_genotypes;
+pub mod variant_header;
 
 /// Atomic publication of results and caches, so a concurrent
 /// reader never observes a partially written file.

@@ -12,6 +12,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::bcf_genotypes::{Allele, GenotypeSeries, MalformedSamples};
 use crate::adapt_plink2::{GenomeBuild, VirtualPlink19, open_virtual_plink19_from_paths};
 use crate::map::fit::{HwePcaModel, LdWeights, VariantBlockSource, for_each_packed_masked_code};
 use crate::map::project::ProjectionResult;
@@ -28,7 +29,6 @@ use noodles_bgzf::io::Reader as BgzfReader;
 use noodles_vcf::io::Reader as VcfReader;
 use noodles_vcf::{
     self as vcf, Record as VcfRecord,
-    variant::RecordBuf,
     variant::record::AlternateBases,
     variant::record::samples::{
         keys::key,
@@ -54,23 +54,16 @@ enum VariantStreamReader {
 }
 
 impl VariantStreamReader {
-    fn read_header(&mut self) -> io::Result<vcf::Header> {
-        match self {
-            Self::Bcf(reader) => reader.read_header(),
-            Self::Vcf(reader) => reader.read_header(),
-        }
+    /// Reads the header, saying so on stderr when a reserved key's declaration
+    /// had to be read past (see `crate::variant_header`).
+    fn read_header(&mut self, path: &Path) -> io::Result<vcf::Header> {
+        let read = match self {
+            Self::Bcf(reader) => crate::variant_header::read_bcf_header(reader)?,
+            Self::Vcf(reader) => crate::variant_header::read_vcf_header(reader)?,
+        };
+        Ok(read.warned(path))
     }
 
-    fn read_record_buf(
-        &mut self,
-        header: &vcf::Header,
-        record: &mut RecordBuf,
-    ) -> io::Result<usize> {
-        match self {
-            Self::Bcf(reader) => reader.read_record_buf(header, record),
-            Self::Vcf(reader) => reader.read_record_buf(header, record),
-        }
-    }
 }
 
 #[derive(Debug, Error)]
@@ -3550,7 +3543,7 @@ impl VcfLikeDataset {
                 .inspect_err(|err| {
                     print_variant_diagnostics(part, None, None, "initializing variant reader", err);
                 })?;
-            let header = reader.read_header().map_err(|err| {
+            let header = reader.read_header(part).map_err(|err| {
                 print_variant_diagnostics(
                     part,
                     Some(compression),
@@ -3657,7 +3650,7 @@ impl VcfLikeDataset {
                         err,
                     );
                 })?;
-            let header = reader.read_header().map_err(|err| {
+            let header = reader.read_header(part).map_err(|err| {
                 print_variant_diagnostics(
                     part,
                     Some(compression),
@@ -3754,7 +3747,7 @@ impl VcfLikeDataset {
                         err,
                     );
                 })?;
-            let header = reader.read_header().map_err(|err| {
+            let header = reader.read_header(part).map_err(|err| {
                 print_variant_diagnostics(
                     part,
                     Some(compression),
@@ -3858,17 +3851,28 @@ struct ScannedRecordKey {
 }
 
 impl ScannedRecordKey {
-    fn from_record_buf(record: &RecordBuf) -> Self {
-        Self {
-            chromosome: record.reference_sequence_name().to_string(),
-            position: record.variant_start().map(|position| position.get()),
-            reference_bases: record.reference_bases().to_string(),
+    /// Takes the key fields of a BCF record without parsing its samples.
+    fn from_bcf_record(record: &BcfRecord, header: &vcf::Header) -> Result<Self, VariantIoError> {
+        let decode = |what: &str, err: io::Error| {
+            VariantIoError::Decode(format!("failed to read BCF {what}: {err}"))
+        };
+        Ok(Self {
+            chromosome: record
+                .reference_sequence_name(header.string_maps())
+                .map_err(|err| decode("reference sequence", err))?
+                .to_string(),
+            position: record
+                .variant_start()
+                .transpose()
+                .map_err(|err| decode("position", err))?
+                .map(|position| position.get()),
+            reference_bases: String::from_utf8_lossy(record.reference_bases().as_ref()).to_string(),
             alternate_bases: record
                 .alternate_bases()
                 .iter()
                 .map(|allele| allele.map(str::to_string))
                 .collect(),
-        }
+        })
     }
 
     /// Takes the key fields of a VCF record without parsing its samples.
@@ -3893,9 +3897,8 @@ impl ScannedRecordKey {
 /// to `visit` in file order. `on_error` sees a read or parse error before it is
 /// returned.
 ///
-/// A BCF record goes through noodles' full record parser, as `read_record_buf`
-/// does. A VCF record is read lazily: its key fields are parsed and its samples
-/// stay text, so a malformed FORMAT value surfaces where genotypes are decoded,
+/// Records are read lazily: their key fields are parsed and their samples stay
+/// undecoded, so a malformed FORMAT value surfaces where genotypes are decoded,
 /// if anything decodes that field, and not here. VCF record lines are read in
 /// order, parsed in parallel by per-worker readers over the same bytes, and
 /// visited in order, so the records and the first error are those of a
@@ -3910,20 +3913,30 @@ where
     E: FnMut(&io::Error),
     F: FnMut(ScannedRecordKey) -> Result<(), VariantIoError>,
 {
-    if let VariantStreamReader::Vcf(vcf_reader) = reader {
-        return scan_vcf_record_keys(vcf_reader, &mut on_error, &mut visit);
-    }
+    let bcf_reader = match reader {
+        VariantStreamReader::Vcf(vcf_reader) => {
+            return scan_vcf_record_keys(vcf_reader, &mut on_error, &mut visit);
+        }
+        VariantStreamReader::Bcf(bcf_reader) => bcf_reader,
+    };
 
-    let mut record = RecordBuf::default();
+    // Lazily, as the block source reads them: the key fields decode from the
+    // record's site block alone, and noodles' full parse of the sample block
+    // is both the scan's whole cost and the one decoder that panics on 16- and
+    // 32-bit genotype codes. The sample count is still checked per record, so
+    // a malformed record is refused whether or not anything decodes it.
+    let n_samples = header.sample_names().len();
+    let mut record = BcfRecord::default();
     loop {
-        let bytes = reader.read_record_buf(header, &mut record).map_err(|err| {
+        let bytes = bcf_reader.read_record(&mut record).map_err(|err| {
             on_error(&err);
             VariantIoError::Io(err)
         })?;
         if bytes == 0 {
             return Ok(());
         }
-        visit(ScannedRecordKey::from_record_buf(&record))?;
+        validate_bcf_record_sample_count(&record, n_samples)?;
+        visit(ScannedRecordKey::from_bcf_record(&record, header)?)?;
     }
 }
 
@@ -4041,6 +4054,9 @@ pub struct VcfLikeVariantBlockSource {
     input_records: usize,
     stream_exhausted: bool,
     selection_finalized: bool,
+    /// The stream has been read to its end once with every record checked for
+    /// order, so later passes that stop early may skip the tail.
+    tail_order_verified: bool,
     sorted_positions: ChromPositionSortState,
     metrics_per_part: Vec<Arc<ReadMetrics>>,
     emitted: usize,
@@ -4714,6 +4730,7 @@ impl VcfLikeVariantBlockSource {
             input_records: 0,
             stream_exhausted: false,
             selection_finalized: false,
+            tail_order_verified: false,
             sorted_positions: ChromPositionSortState::default(),
             metrics_per_part: Vec::new(),
             emitted: 0,
@@ -4750,7 +4767,7 @@ impl VcfLikeVariantBlockSource {
                 let path = &self.parts[idx];
                 print_variant_diagnostics(path, None, None, "initializing variant reader", err);
             })?;
-        let header = reader.read_header().map_err(|err| {
+        let header = reader.read_header(&self.parts[idx]).map_err(|err| {
             print_variant_diagnostics(
                 &self.parts[idx],
                 Some(compression),
@@ -4809,12 +4826,37 @@ impl VcfLikeVariantBlockSource {
                 return Ok(None);
             }
 
-            let reader = match self.reader.as_mut() {
-                Some(reader) => reader,
-                None => {
-                    self.stream_exhausted = true;
-                    return Ok(None);
-                }
+            if !self.read_next_record()? {
+                self.stream_exhausted = true;
+                return Ok(None);
+            }
+            self.current_alt_count = if cache_alt_alleles {
+                self.load_current_alt_alleles()?;
+                self.current_alt_alleles.len()
+            } else {
+                self.current_alt_alleles.clear();
+                self.count_current_alt_alleles()?
+            };
+            if self.current_alt_count == 0 {
+                continue;
+            }
+            self.pending_alt_index = 1;
+        }
+    }
+
+    /// Read the next record of the stream into the current record buffer,
+    /// moving on to the next part at the end of each one. Returns `false` once
+    /// every part is spent.
+    ///
+    /// Every record that passes through here is checked for position order and,
+    /// for BCF, for carrying the header's sample count, whether or not its
+    /// values are later decoded. A record's sample count comes from the record
+    /// itself; one that disagrees with the header is malformed, and decoding it
+    /// would assign values to samples by an undefined pairing.
+    fn read_next_record(&mut self) -> Result<bool, VariantIoError> {
+        loop {
+            let Some(reader) = self.reader.as_mut() else {
+                return Ok(false);
             };
 
             let compression = self.compression;
@@ -4859,19 +4901,49 @@ impl VcfLikeVariantBlockSource {
 
             self.input_records = self.input_records.saturating_add(1);
             self.validate_current_variant_sorted()?;
-            self.current_alt_count = if cache_alt_alleles {
-                self.load_current_alt_alleles()?;
-                self.current_alt_alleles.len()
-            } else {
-                self.current_alt_alleles.clear();
-                self.count_current_alt_alleles()?
-            };
-            if self.current_alt_count == 0 {
-                continue;
+            if matches!(self.format, Some(VariantFormat::Bcf)) {
+                validate_bcf_record_sample_count(&self.bcf_record, self.n_samples)?;
             }
-            self.pending_alt_index = 1;
+            return Ok(true);
         }
     }
+
+    /// Read the rest of the stream for its record order alone.
+    ///
+    /// Once every requested key has matched, the remaining records carry
+    /// nothing the fit needs, but the file is still certified by the model
+    /// written from it: `project` on that same file walks every record and
+    /// refuses an unsorted one. Whether a file is accepted must not depend on
+    /// which sites a list happens to name, so the scan runs to the end, parsing
+    /// only what the order check reads and decoding nothing.
+    fn finish_scan_for_order(&mut self) -> Result<(), VariantIoError> {
+        if self.tail_order_verified {
+            return Ok(());
+        }
+        while self.header.is_some() && self.read_next_record()? {}
+        self.tail_order_verified = true;
+        Ok(())
+    }
+}
+
+/// A BCF record states its own sample count. The header's is the only valid
+/// value: fewer would leave samples without values, and more would leave
+/// values without samples, so which group belongs to which sample is undefined.
+fn validate_bcf_record_sample_count(
+    record: &BcfRecord,
+    n_samples: usize,
+) -> Result<(), VariantIoError> {
+    use vcf::variant::record::Samples as _;
+    let samples = record
+        .samples()
+        .map_err(|err| VariantIoError::Decode(format!("failed to access BCF samples: {err}")))?;
+    let recorded = samples.len();
+    if recorded != n_samples {
+        return Err(VariantIoError::Decode(format!(
+            "BCF record carries {recorded} samples; the header lists {n_samples}"
+        )));
+    }
+    Ok(())
 }
 
 impl VariantBlockSource for VcfLikeVariantBlockSource {
@@ -5629,6 +5701,7 @@ impl VcfLikeVariantBlockSource {
                     }
                     filled += 1;
                     if target_total > 0 && self.emitted + filled >= target_total {
+                        self.finish_scan_for_order()?;
                         self.stream_exhausted = true;
                         break;
                     }
@@ -5865,6 +5938,11 @@ fn print_variant_diagnostics(
     }
     eprintln!("  • Stage       : {stage}");
     eprintln!("  • Underlying error: {err}");
+    let mut source = err.source();
+    while let Some(cause) = source {
+        eprintln!("  • Caused by   : {cause}");
+        source = cause.source();
+    }
 
     if let Some(VariantCompression::Bgzf) = compression
         && err
@@ -5884,7 +5962,7 @@ fn parse_vcf_dosage_field(
     alt_count: usize,
     ploidy: usize,
 ) -> Result<Option<f64>, VariantIoError> {
-    if field == "." {
+    if field.is_empty() || field == "." {
         return Ok(None);
     }
     if alt_index == 0 {
@@ -5971,7 +6049,7 @@ fn parse_vcf_gp(
     alt_index: usize,
     alt_count: usize,
 ) -> Result<Option<f64>, VariantIoError> {
-    if field == "." {
+    if field.is_empty() || field == "." {
         return Ok(None);
     }
     if alt_index > alt_count {
@@ -6188,7 +6266,16 @@ fn decode_bcf_record(
         return Ok(true);
     }
 
-    let mut gt_series = None;
+    // GT is read from the sample block's own bytes: noodles decodes only 8-bit
+    // allele codes and panics on the 16- and 32-bit widths BCF also allows.
+    let gt_series = match header.string_maps().strings().get_index_of(key::GENOTYPE) {
+        Some(gt_key) => {
+            use vcf::variant::record::Samples as _;
+            GenotypeSeries::find(samples.as_ref(), samples.format_count(), samples.len(), gt_key)
+                .map_err(|err| VariantIoError::Decode(err.to_string()))?
+        }
+        None => None,
+    };
     let mut ds_series = None;
     let mut gp_series = None;
 
@@ -6203,8 +6290,6 @@ fn decode_bcf_record(
             ds_series = Some(series);
         } else if prefer_ds && name == "GP" {
             gp_series = Some(series);
-        } else if name == key::GENOTYPE {
-            gt_series = Some(series);
         }
     }
 
@@ -6218,7 +6303,7 @@ fn decode_bcf_record(
         gp_series = None;
     }
     if let Some(series) = &gt_series {
-        decode_bcf_genotype_series(series, header, alt_index, alt_count, dest)?;
+        decode_bcf_genotype_series(series, alt_index, dest)?;
     }
     if let Some(series) = gp_series {
         decode_bcf_gp_series(series, header, alt_index, alt_count, dest)?;
@@ -6235,7 +6320,7 @@ fn decode_bcf_record(
     }
     if haploid_calls_as_homozygous && let Some(series) = &gt_series {
         for (sample_idx, value) in dest[..n_samples].iter_mut().enumerate() {
-            if !value.is_nan() && bcf_genotype_ploidy(Some(series), header, sample_idx)? == 1 {
+            if !value.is_nan() && bcf_genotype_ploidy(Some(series), sample_idx)? == 1 {
                 *value *= 2.0;
             }
         }
@@ -6249,7 +6334,7 @@ fn decode_bcf_numeric_series(
     header: &vcf::Header,
     alt_index: usize,
     alt_count: usize,
-    gt_series: Option<&noodles_bcf::record::samples::Series<'_>>,
+    gt_series: Option<&GenotypeSeries<'_>>,
     dest: &mut [f64],
 ) -> Result<(), VariantIoError> {
     for (sample_idx, slot) in dest.iter_mut().enumerate() {
@@ -6257,7 +6342,7 @@ fn decode_bcf_numeric_series(
             match value {
                 Some(Ok(series_value)) => {
                     let ploidy = if alt_index == 0 {
-                        bcf_genotype_ploidy(gt_series, header, sample_idx)?
+                        bcf_genotype_ploidy(gt_series, sample_idx)?
                     } else {
                         2
                     };
@@ -6284,10 +6369,8 @@ fn decode_bcf_numeric_series(
 }
 
 fn decode_bcf_genotype_series(
-    series: &noodles_bcf::record::samples::Series<'_>,
-    header: &vcf::Header,
+    series: &GenotypeSeries<'_>,
     alt_index: usize,
-    alt_count: usize,
     dest: &mut [f64],
 ) -> Result<(), VariantIoError> {
     for (sample_idx, slot) in dest.iter_mut().enumerate() {
@@ -6295,33 +6378,37 @@ fn decode_bcf_genotype_series(
             continue;
         }
 
-        let Some(value) = series.get(header, sample_idx) else {
+        let Some(alleles) = series.alleles(sample_idx) else {
             return Err(VariantIoError::Decode(
                 "BCF FORMAT series shorter than expected".to_string(),
             ));
         };
-
-        match value {
-            Some(Ok(series_value)) => {
-                let parsed = match series_value {
-                    SeriesValue::Genotype(genotype) => {
-                        dosage_from_series_genotype(genotype.as_ref(), alt_index)?
-                    }
-                    other => numeric_from_series_value(other, alt_index, alt_count, 2)?,
-                };
-                if let Some(value) = parsed {
-                    *slot = value;
-                }
-            }
-            Some(Err(err)) => {
-                return Err(VariantIoError::Decode(format!(
-                    "failed to decode BCF genotype value: {err}"
-                )));
-            }
-            None => {}
+        if let Some(value) = dosage_from_alleles(alleles, alt_index)? {
+            *slot = value;
         }
     }
     Ok(())
+}
+
+/// The ALT-`alt_index` dosage of one genotype: a count over its alleles, or
+/// missing when any allele is `.` or the genotype is empty.
+fn dosage_from_alleles(
+    alleles: impl Iterator<Item = Result<Allele, MalformedSamples>>,
+    alt_index: usize,
+) -> Result<Option<f64>, VariantIoError> {
+    let mut dosage = 0.0f64;
+    let mut seen = false;
+    for allele in alleles {
+        match allele.map_err(|err| VariantIoError::Decode(err.to_string()))? {
+            Some(position) if position == alt_index => {
+                dosage += 1.0;
+                seen = true;
+            }
+            Some(_) => seen = true,
+            None => return Ok(None),
+        }
+    }
+    Ok(seen.then_some(dosage))
 }
 
 fn numeric_from_series_value(
@@ -6439,34 +6526,26 @@ fn numeric_from_series_array(
 }
 
 fn bcf_genotype_ploidy(
-    series: Option<&noodles_bcf::record::samples::Series<'_>>,
-    header: &vcf::Header,
+    series: Option<&GenotypeSeries<'_>>,
     sample_idx: usize,
 ) -> Result<usize, VariantIoError> {
     let Some(series) = series else {
         return Ok(2);
     };
-    let Some(value) = series.get(header, sample_idx) else {
+    let Some(alleles) = series.alleles(sample_idx) else {
         return Err(VariantIoError::Decode(
             "BCF GT series shorter than expected".into(),
         ));
     };
-    match value.transpose().map_err(VariantIoError::Io)? {
-        Some(SeriesValue::Genotype(genotype)) => {
-            let mut ploidy = 0;
-            for allele in genotype.iter() {
-                allele.map_err(VariantIoError::Io)?;
-                ploidy += 1;
-            }
-            if ploidy == 0 {
-                return Err(VariantIoError::Decode("empty BCF genotype".into()));
-            }
-            Ok(ploidy)
-        }
-        Some(SeriesValue::String(value)) => Ok(vcf_genotype_ploidy(Some(value.as_ref()))),
-        None => Ok(2),
-        Some(_) => Err(VariantIoError::Decode("invalid BCF GT value".into())),
+    let mut ploidy = 0;
+    for allele in alleles {
+        allele.map_err(|err| VariantIoError::Decode(err.to_string()))?;
+        ploidy += 1;
     }
+    if ploidy == 0 {
+        return Err(VariantIoError::Decode("empty BCF genotype".into()));
+    }
+    Ok(ploidy)
 }
 
 fn dosage_from_series_genotype(
@@ -6496,12 +6575,15 @@ fn dosage_from_series_genotype(
 fn parse_numeric_str(text: &str) -> Result<Option<f64>, VariantIoError> {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed == "." {
-        Ok(None)
-    } else {
-        trimmed.parse::<f64>().map(Some).map_err(|err| {
-            VariantIoError::Decode(format!("failed to parse numeric string '{trimmed}': {err}"))
-        })
+        return Ok(None);
     }
+    let value = trimmed.parse::<f64>().map_err(|err| {
+        VariantIoError::Decode(format!("failed to parse numeric string '{trimmed}': {err}"))
+    })?;
+    // `inf`, `-inf` and `nan` parse, but none of them is a call: a value that
+    // is not a finite number carries no genotype information, so it is missing,
+    // as `project` already reads it.
+    Ok(value.is_finite().then_some(value))
 }
 
 fn parse_vcf_genotype(field: &str, alt_index: usize) -> Result<Option<f64>, VariantIoError> {
@@ -7073,6 +7155,7 @@ fn decode_bcf_gp_series(
 
 #[cfg(test)]
 mod tests {
+    use noodles_vcf::variant::RecordBuf;
     /// A plink2 .bim lists an insertion T>TA as TA,T and the deletion as T,TA.
     /// Against a model fit on a VCF, whose insertion is (T,TA), both rows match
     /// that one model variant, one swapped and one exactly. The row in the

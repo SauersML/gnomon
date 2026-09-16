@@ -1,6 +1,7 @@
 use crate::score::prepare::{
     EffectOnlyMatches, OtherAlleleMatch, names_no_single_other_allele, resolve_other_allele,
 };
+use crate::bcf_genotypes::GenotypeSeries;
 use crate::score::types::{GenomicRegion, parse_chromosome_label};
 use crate::shared::files::{VariantCompression, VariantFormat, VariantSource, open_variant_source};
 use ahash::{AHashMap, AHashSet};
@@ -180,7 +181,7 @@ pub fn score_vcf_streaming(
                     VcfReader::new(reader)
                 }
             };
-            let header = reader.read_header()?;
+            let header = crate::variant_header::read_vcf_header(&mut reader)?.warned(input_path);
             score_records(
                 &header,
                 "VCF",
@@ -203,7 +204,7 @@ pub fn score_vcf_streaming(
                 VariantCompression::Bgzf => Box::new(PrefilteredBgzfReader::spawn(source, None)?),
             };
             let mut reader = BcfReader::from(inner);
-            let header = reader.read_header()?;
+            let header = crate::variant_header::read_bcf_header(&mut reader)?.warned(input_path);
             score_records(
                 &header,
                 "BCF",
@@ -1237,7 +1238,16 @@ where
         return Ok(());
     }
 
-    let (mut gt_series, mut ds_series, mut gp_series) = (None, None, None);
+    // GT is read from the sample block's own bytes: noodles decodes only 8-bit
+    // allele codes and panics on the 16- and 32-bit widths BCF also allows.
+    let gt_series = match header.string_maps().strings().get_index_of(key::GENOTYPE) {
+        Some(gt_key) => {
+            use noodles_vcf::variant::record::Samples as _;
+            GenotypeSeries::find(samples.as_ref(), samples.format_count(), samples.len(), gt_key)?
+        }
+        None => None,
+    };
+    let (mut ds_series, mut gp_series) = (None, None);
     for result in samples.series() {
         let series = result?;
         let name = series.name(header)?;
@@ -1245,8 +1255,6 @@ where
             ds_series = Some(series);
         } else if gp_series.is_none() && name == "GP" {
             gp_series = Some(series);
-        } else if gt_series.is_none() && name == key::GENOTYPE {
-            gt_series = Some(series);
         }
     }
     if gt_series.is_none() && ds_series.is_none() && gp_series.is_none() {
@@ -1254,32 +1262,47 @@ where
     }
 
     // Written in this order: GT, then DS, then GP.
-    let fields: Vec<_> = [&gt_series, &ds_series, &gp_series]
-        .into_iter()
-        .flatten()
-        .collect();
-    let gt_index = gt_series.is_some().then_some(0);
-    let ds_index = ds_series
-        .is_some()
-        .then_some(usize::from(gt_series.is_some()));
-    let gp_index = gp_series.is_some().then(|| fields.len() - 1);
-    let last_format_index = fields.len() - 1;
+    let value_series: Vec<_> = [&ds_series, &gp_series].into_iter().flatten().collect();
+    let has_gt = gt_series.is_some();
+    let field_count = usize::from(has_gt) + value_series.len();
+    let gt_index = has_gt.then_some(0);
+    let ds_index = ds_series.is_some().then_some(usize::from(has_gt));
+    let gp_index = gp_series.is_some().then(|| field_count - 1);
+    let last_format_index = field_count - 1;
 
     let mut sample = String::new();
     for (out_idx, &sample_idx) in kept_indices.iter().enumerate() {
         sample.clear();
         let mut in_record = true;
-        for (offset, series) in fields.iter().enumerate() {
-            if offset > 0 {
-                sample.push(':');
-            }
-            match series.get(header, sample_idx) {
-                None => {
-                    in_record = false;
-                    break;
+        if let Some(gt) = &gt_series {
+            match gt.alleles(sample_idx) {
+                None => in_record = false,
+                Some(alleles) => {
+                    for (offset, allele) in alleles.enumerate() {
+                        if offset > 0 {
+                            sample.push('/');
+                        }
+                        match allele? {
+                            Some(position) => write!(sample, "{position}")?,
+                            None => sample.push('.'),
+                        }
+                    }
                 }
-                Some(None) => sample.push('.'),
-                Some(Some(value)) => write_sample_value(value?, &mut sample)?,
+            }
+        }
+        if in_record {
+            for (offset, series) in value_series.iter().enumerate() {
+                if has_gt || offset > 0 {
+                    sample.push(':');
+                }
+                match series.get(header, sample_idx) {
+                    None => {
+                        in_record = false;
+                        break;
+                    }
+                    Some(None) => sample.push('.'),
+                    Some(Some(value)) => write_sample_value(value?, &mut sample)?,
+                }
             }
         }
         let decoded = if in_record {
@@ -1298,9 +1321,7 @@ where
         visit(out_idx, decoded)?;
     }
     Ok(())
-}
-
-/// Writes one BCF FORMAT value as a VCF sample column holds it.
+}/// Writes one BCF FORMAT value as a VCF sample column holds it.
 fn write_sample_value(
     value: SeriesValue<'_>,
     out: &mut String,
@@ -1462,7 +1483,7 @@ fn parse_vcf_dosage_field(
     alt_count: usize,
     ploidy: Option<u8>,
 ) -> Result<Option<DecodedAltDosage>, Box<dyn Error + Send + Sync>> {
-    if field == "." {
+    if field.is_empty() || field == "." {
         return Ok(None);
     }
     if alt_index == 0 || alt_index > alt_count {
@@ -1507,7 +1528,7 @@ fn parse_vcf_gp(
     alt_count: usize,
     ploidy: Option<u8>,
 ) -> Result<Option<DecodedAltDosage>, Box<dyn Error + Send + Sync>> {
-    if field == "." {
+    if field.is_empty() || field == "." {
         return Ok(None);
     }
     if alt_index == 0 || alt_index > alt_count {
