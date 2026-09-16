@@ -341,7 +341,7 @@ struct TrainArgs {
     pc_centers: usize,
 
     /// Maximum number of P-IRLS iterations for the inner loop (per REML step)
-    #[arg(long, default_value = "50")]
+    #[arg(long, default_value = "50", value_parser = parse_positive_usize)]
     max_iterations: usize,
 
     /// Convergence tolerance for the P-IRLS inner loop deviance change
@@ -349,7 +349,7 @@ struct TrainArgs {
     convergence_tolerance: f64,
 
     /// Maximum number of iterations for the outer REML/BFGS optimization loop
-    #[arg(long, default_value = "100")]
+    #[arg(long, default_value = "100", value_parser = parse_positive_usize)]
     reml_max_iterations: usize,
 
     /// Convergence tolerance for the gradient norm in the outer REML/BFGS loop
@@ -523,6 +523,17 @@ enum CalibrateCommands {
 /// On Windows we fall back to `process::exit` because the CUDA crash
 /// hasn't been reported there and Windows uses a different shutdown
 /// path entirely.
+/// An iteration cap of zero is not a cap: the solver would have to stop before
+/// it starts. Refuse it where every other argument is checked, at parse time.
+#[cfg(feature = "calibrate")]
+fn parse_positive_usize(text: &str) -> Result<usize, String> {
+    match text.trim().parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_string()),
+        Ok(value) => Ok(value),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 fn terminate_skipping_atexit(code: i32) -> ! {
     use std::io::Write;
     let _ = std::io::stdout().flush();
