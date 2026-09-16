@@ -72,9 +72,14 @@ const DENSE_REFERENCE_MAX_SAMPLES: usize = 4_096;
 /// Flops per n³ for a symmetric eigendecomposition (tridiagonalization plus the
 /// QR sweep, with eigenvectors). Order-of-magnitude is all this needs to be.
 const DENSE_EIGEN_FLOPS_PER_CUBE: f64 = 10.0;
-/// Genome passes a converged block-Krylov solve typically needs. `min_passes`
-/// is 2 and `max_passes` 32; four is the middle of what actually converges.
-const ESTIMATED_KRYLOV_PASSES: f64 = 4.0;
+/// Genome passes a converged block-Krylov solve typically needs, measured on a
+/// 32,768-variant structured panel at k = 20 (block width 30): 13 passes at
+/// 389 samples, 18 at 600, 23 at 1,000 (#2358). Four, the earlier guess, put
+/// the crossover at 389 samples where the dense route measured 1.4x faster and
+/// stayed faster to 1,000 (3.4 s against 5.1 s); sixteen places it near the
+/// measured one. The count grows with k and with the sample count, so this is
+/// a middle, not a law; the fit diagnostics record the passes each fit took.
+const ESTIMATED_KRYLOV_PASSES: f64 = 16.0;
 pub const DEFAULT_LD_WINDOW: usize = 51;
 const DEFAULT_LD_RIDGE: f64 = 1.0e-3;
 const MIN_LD_WEIGHT: f64 = 1.0e-6;
