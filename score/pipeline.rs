@@ -13,7 +13,6 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, bounded};
 use crossbeam_queue::ArrayQueue;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memmap2::{Mmap, MmapOptions};
-use num_cpus;
 use rayon::prelude::*;
 use std::fs::{self, File};
 use std::io::{BufWriter, IsTerminal, Write};
@@ -501,8 +500,7 @@ fn io_buffer_count(
     let max_ram = memory_budget.max_ram_bytes();
     let io_budget = (max_ram / 8).min(MAX_IO_BUDGET_BYTES).max(row_bytes);
     let by_budget = (io_budget / row_bytes).max(1);
-    let by_parallelism = num_cpus::get()
-        .max(1)
+    let by_parallelism = worker_ceiling()
         .saturating_mul(DENSE_BATCH_SIZE.saturating_add(64))
         .max(1);
     Ok(by_budget.min(by_parallelism).max(1))
@@ -568,7 +566,7 @@ impl PipelineContext {
     pub fn new(prep_result: Arc<PreparationResult>) -> Self {
         Self {
             prep_result,
-            tile_pool: Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 4)),
+            tile_pool: Arc::new(ArrayQueue::new(worker_ceiling() * 4)),
             memory_budget: MemoryBudget::default(),
             genome_build: None,
         }
@@ -581,7 +579,7 @@ impl PipelineContext {
     ) -> Self {
         Self {
             prep_result,
-            tile_pool: Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 4)),
+            tile_pool: Arc::new(ArrayQueue::new(worker_ceiling() * 4)),
             memory_budget,
             genome_build,
         }
@@ -1981,9 +1979,17 @@ fn initialize_final_output(
     Ok((final_scores, final_counts))
 }
 
+/// The widest any worker set may be: the global rayon pool's size, which
+/// follows `RAYON_NUM_THREADS` and otherwise the CPUs this process may run on
+/// (its affinity mask and cgroup quota). The visible CPU count is neither.
+#[inline]
+fn worker_ceiling() -> usize {
+    rayon::current_num_threads().max(1)
+}
+
 #[inline]
 fn choose_consumer_threads(result_size: usize, memory_budget: MemoryBudget) -> usize {
-    let cpu_cap = num_cpus::get().max(1);
+    let cpu_cap = worker_ceiling();
 
     let bytes_per_accumulator = result_bytes(result_size).unwrap_or(usize::MAX);
     if bytes_per_accumulator == 0 {
