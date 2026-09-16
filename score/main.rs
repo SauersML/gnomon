@@ -580,7 +580,7 @@ fn read_label_from_cached_file(path: &Path) -> Result<String, Box<dyn Error + Se
     let reader = BufReader::new(file);
     for line in reader.lines() {
         let line = line?;
-        if line.starts_with('#') {
+        if line.starts_with('#') || line.trim().is_empty() {
             continue;
         }
         let cols: Vec<&str> = line.split('\t').collect();
@@ -601,7 +601,7 @@ fn read_score_names_from_cached_file(
     let reader = BufReader::new(file);
     for line in reader.lines() {
         let line = line?;
-        if line.starts_with('#') {
+        if line.starts_with('#') || line.trim().is_empty() {
             continue;
         }
         let cols: Vec<&str> = line.split('\t').collect();

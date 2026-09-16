@@ -210,7 +210,7 @@ pub fn is_gnomon_native_format(path: &Path) -> io::Result<bool> {
         if reader.read_line(&mut line)? == 0 {
             return Ok(false);
         }
-        if !line.starts_with('#') {
+        if !line.starts_with('#') && !line.trim().is_empty() {
             break;
         }
     }
