@@ -115,7 +115,8 @@ struct ScoreArgs {
 #[cfg(feature = "map")]
 #[derive(Args)]
 struct FitArgs {
-    /// Path to PLINK .bed file or directory containing .bed files
+    /// Path to a PLINK 1 .bed fileset, a PLINK 2 .pgen fileset, a VCF/BCF file, or a
+    /// directory of VCF/BCF parts (.vcf, .vcf.gz, .vcf.bgz, .bcf)
     #[arg(value_name = "GENOTYPE_PATH")]
     genotype_path: PathBuf,
 
@@ -209,7 +210,8 @@ struct FitArgs {
 #[cfg(feature = "map")]
 #[derive(Args)]
 struct ProjectArgs {
-    /// Path to PLINK .bed file or directory containing .bed files
+    /// Path to a PLINK 1 .bed fileset, a PLINK 2 .pgen fileset, a VCF/BCF file, or a
+    /// directory of VCF/BCF parts (.vcf, .vcf.gz, .vcf.bgz, .bcf)
     #[arg(value_name = "GENOTYPE_PATH")]
     genotype_path: PathBuf,
 

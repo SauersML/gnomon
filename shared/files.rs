@@ -1380,7 +1380,8 @@ fn gather_local_variant_files(dir: &Path) -> Result<Vec<PathBuf>, PipelineError>
 
     if files.is_empty() {
         return Err(PipelineError::Io(format!(
-            "No variant files found in directory {}",
+            "No variant files found in directory {}: a directory is read as VCF/BCF parts \
+             (.vcf, .vcf.gz, .vcf.bgz, .bcf); pass a PLINK or PGEN fileset by its file path",
             dir.display()
         )));
     }
