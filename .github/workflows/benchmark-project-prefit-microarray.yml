@@ -59,12 +59,8 @@ jobs:
           # Specific CPU target instead of 'native': keeps SIMD optimization while
           # staying portable across runners (avoids the ring#2527 SIGILL).
           RUSTFLAGS: "-C target-cpu=x86-64-v3"
-        # This benchmark exercises only `map project`. Building the full default
-        # feature set links unrelated calibrate/score/terms products and can exhaust
-        # a hosted runner before the benchmark starts.
-        run: >-
-          cargo +nightly build --release --no-default-features --features map
-          --bin gnomon-map
+        # This benchmark exercises only `map project`.
+        run: cargo +nightly build --release --bin gnomon-map
 
       - name: Upload release binary
         uses: actions/upload-artifact@v4

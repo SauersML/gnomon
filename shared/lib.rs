@@ -4,19 +4,15 @@
 #![deny(unused_imports)]
 #![deny(clippy::no_effect_underscore_binding)]
 
-// The CLI's score orchestrator (`score/main.rs`) refers to this crate by name
-// (`gnomon::score::...`) because it is normally compiled into the binary, where
-// `gnomon` is an external dependency. When the `python` feature pulls that same
-// file into the library (so the in-process bindings can call
-// `run_gnomon_with_args` directly), this self-alias makes those `gnomon::`
-// paths resolve to the current crate.
-#[cfg(feature = "python")]
+// The score orchestrator (`score/main.rs`) refers to this crate by name
+// (`gnomon::score::...`), as the command-line programs do. This self-alias
+// makes those paths resolve to the current crate when the file is compiled
+// here, so one copy serves the binaries and the Python extension alike.
 extern crate self as gnomon;
 
 /// Centralized, idempotent Rayon global thread-pool initialization. Used by
 /// every Rayon-using phase (`score`, `project`, `terms`) so that the
 /// multi-phase `gnomon all` driver cannot abort on a racing `build_global()`.
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod parallel;
 
 pub mod pipeline_error;
@@ -24,70 +20,51 @@ pub mod pipeline_error;
 /// The stderr logger the command-line programs install, so library warnings print.
 pub mod logging;
 
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub(crate) mod genotype_table;
 
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod files;
 pub mod bcf_genotypes;
 pub mod variant_header;
 
 /// Atomic publication of results and caches, so a concurrent
 /// reader never observes a partially written file.
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod output;
 
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod memory;
 
 /// CPUs this process can run on: affinity, cgroup quota and NUMA nodes.
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod cpu;
 
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 mod range_fetch;
 
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub(crate) mod cuda_utils;
 
 pub mod shared {
-    #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
     pub use super::files;
 }
 
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod adapt_plink2;
 
-#[cfg(feature = "score")]
 #[path = "../score/mod.rs"]
 pub mod score;
 
-#[cfg(feature = "terms")]
 #[path = "../terms/mod.rs"]
 pub mod terms;
 
-#[cfg(feature = "score")]
 pub mod batch {
     pub use crate::score::batch::*;
 }
 
-#[cfg(feature = "score")]
 pub use score::{complex, decide, download, io, kernel, pipeline, prepare, reformat, types};
 
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 #[path = "../map/mod.rs"]
 pub mod map;
 
-#[cfg(feature = "calibrate")]
 #[path = "../calibrate/mod.rs"]
 pub mod calibrate;
 
-// Pull the CLI score orchestrator into the library so the in-process Python
-// bindings call the very same `run_gnomon_with_args` the `gnomon score`
-// subcommand dispatches to (instead of shelling out to the binary).
-#[cfg(feature = "python")]
+/// The `gnomon score` orchestrator, compiled here once: the command-line
+/// programs and the in-process Python bindings both call its
+/// `run_gnomon_with_args`.
 #[path = "../score/main.rs"]
 pub mod score_main;
-
-#[cfg(feature = "python")]
-pub mod python_ext;

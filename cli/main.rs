@@ -3,70 +3,40 @@
 #![deny(unused_imports)]
 #![deny(clippy::no_effect_underscore_binding)]
 
-#[cfg(feature = "calibrate")]
 use clap::ValueEnum;
 use clap::{Args, Parser};
-#[cfg(any(feature = "map", feature = "calibrate"))]
 use clap::{CommandFactory, Subcommand};
-#[cfg(feature = "calibrate")]
 use gam::probability::normal_cdf;
-#[cfg(feature = "map")]
 use gnomon::adapt_plink2::GenomeBuild;
-#[cfg(feature = "calibrate")]
 use gnomon::calibrate::data::{load_prediction_data, load_training_data};
-#[cfg(feature = "calibrate")]
 use gnomon::calibrate::estimate::{train_model, train_survival_model};
-#[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::{BasisConfig, SmoothConfig};
-#[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::SurvivalModelConfig;
-#[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::SurvivalPrediction;
-#[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::SurvivalRiskType;
-#[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::SurvivalTimeWiggleConfig;
-#[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::{LinkFunction, ModelConfig, ModelFamily, TrainedModel};
-#[cfg(feature = "calibrate")]
 use gnomon::calibrate::survival_data::{
     SurvivalPredictionData, has_survival_columns, load_survival_prediction_data,
     load_survival_training_data,
 };
-#[cfg(feature = "map")]
 use gnomon::map::LdWindow;
-#[cfg(feature = "map")]
 use gnomon::map::main as map_cli;
-#[cfg(feature = "terms")]
 use gnomon::terms::{infer_sex_to_tsv, infer_sex_to_tsv_at};
-#[cfg(feature = "terms")]
 use infer_sex::GenomeBuild as SexGenomeBuild;
-#[cfg(feature = "calibrate")]
 use ndarray::{Array1, ArrayView1};
-#[cfg(feature = "calibrate")]
 use std::collections::HashSet;
 use std::env;
-#[cfg(feature = "map")]
 use std::num::NonZeroUsize;
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 use std::path::PathBuf;
 #[cfg(not(unix))]
 use std::process;
 
-#[cfg(feature = "score")]
-#[path = "../score/main.rs"]
-mod score_main;
+use gnomon::score_main;
 
-#[cfg(all(
-    feature = "map",
-    feature = "score",
-    feature = "calibrate",
-    feature = "terms"
-))]
 #[path = "all.rs"]
 mod all_cmd;
 
-#[cfg(feature = "score")]
 #[derive(Args)]
 struct ScoreArgs {
     /// Path to a single score file or a directory containing multiple score files.
@@ -112,7 +82,6 @@ struct ScoreArgs {
     emit_components: bool,
 }
 
-#[cfg(feature = "map")]
 #[derive(Args)]
 struct FitArgs {
     /// Path to a PLINK 1 .bed fileset, a PLINK 2 .pgen fileset, a VCF/BCF file, or a
@@ -207,7 +176,6 @@ struct FitArgs {
     bp_window: Option<u64>,
 }
 
-#[cfg(feature = "map")]
 #[derive(Args)]
 struct ProjectArgs {
     /// Path to a PLINK 1 .bed fileset, a PLINK 2 .pgen fileset, a VCF/BCF file, or a
@@ -228,7 +196,6 @@ struct ProjectArgs {
     output_manifest: Option<PathBuf>,
 }
 
-#[cfg(feature = "map")]
 #[derive(Args)]
 struct ModelKeysArgs {
     /// Name of the built-in projection model to introspect (downloads if needed)
@@ -236,7 +203,6 @@ struct ModelKeysArgs {
     model: String,
 }
 
-#[cfg(feature = "map")]
 #[derive(Args)]
 struct CorrectabilityArgs {
     /// JSON design containing cohort size, subgroup size, marker classes, and optional PGS risk inputs
@@ -244,7 +210,6 @@ struct CorrectabilityArgs {
     design: PathBuf,
 }
 
-#[cfg(feature = "terms")]
 #[derive(Args)]
 struct TermsArgs {
     /// Path to genotype dataset (PLINK .bed/.bim/.fam prefix or VCF/BCF file)
@@ -265,12 +230,6 @@ struct TermsArgs {
     out: Option<PathBuf>,
 }
 
-#[cfg(all(
-    feature = "map",
-    feature = "score",
-    feature = "calibrate",
-    feature = "terms"
-))]
 #[derive(Args)]
 struct AllArgs {
     /// Path to a single score file or a directory containing multiple score files.
@@ -314,14 +273,12 @@ struct AllArgs {
     out: Option<PathBuf>,
 }
 
-#[cfg(feature = "calibrate")]
 #[derive(Clone, ValueEnum)]
 enum ModelFamilyCli {
     Gam,
     Survival,
 }
 
-#[cfg(feature = "calibrate")]
 #[derive(Args)]
 struct TrainArgs {
     #[arg(long, value_enum, default_value_t = ModelFamilyCli::Gam)]
@@ -387,7 +344,6 @@ struct TrainArgs {
     survival_time_wiggle_double_penalty: bool,
 }
 
-#[cfg(feature = "calibrate")]
 #[derive(Args)]
 struct InferArgs {
     /// Path to test TSV file with score,PC1,PC2,... columns (no phenotype needed)
@@ -398,12 +354,6 @@ struct InferArgs {
     model: String,
 }
 
-#[cfg(all(
-    feature = "map",
-    feature = "score",
-    feature = "calibrate",
-    feature = "terms"
-))]
 #[derive(Parser)]
 #[command(
     name = "gnomon",
@@ -416,12 +366,6 @@ struct FullCli {
     command: Option<FullCommands>,
 }
 
-#[cfg(all(
-    feature = "map",
-    feature = "score",
-    feature = "calibrate",
-    feature = "terms"
-))]
 #[derive(Subcommand)]
 enum FullCommands {
     /// Calculate raw polygenic scores
@@ -446,7 +390,6 @@ enum FullCommands {
     Version,
 }
 
-#[cfg(feature = "score")]
 #[derive(Parser)]
 #[command(
     name = "gnomon-score",
@@ -457,7 +400,6 @@ struct ScoreCli {
     args: ScoreArgs,
 }
 
-#[cfg(feature = "map")]
 #[derive(Parser)]
 #[command(name = "gnomon-map", about = "Fit or project HWE PCA models")]
 struct MapCli {
@@ -465,7 +407,6 @@ struct MapCli {
     command: Option<MapCommands>,
 }
 
-#[cfg(feature = "map")]
 #[derive(Subcommand)]
 enum MapCommands {
     Fit(FitArgs),
@@ -476,7 +417,6 @@ enum MapCommands {
     Correctability(CorrectabilityArgs),
 }
 
-#[cfg(feature = "terms")]
 #[derive(Parser)]
 #[command(
     name = "gnomon-terms",
@@ -487,7 +427,6 @@ struct TermsCli {
     args: TermsArgs,
 }
 
-#[cfg(feature = "calibrate")]
 #[derive(Parser)]
 #[command(name = "gnomon-calibrate", about = "Train or apply calibration models")]
 struct CalibrateCli {
@@ -495,7 +434,6 @@ struct CalibrateCli {
     command: Option<CalibrateCommands>,
 }
 
-#[cfg(feature = "calibrate")]
 #[derive(Subcommand)]
 enum CalibrateCommands {
     Train(TrainArgs),
@@ -527,7 +465,6 @@ enum CalibrateCommands {
 /// path entirely.
 /// An iteration cap of zero is not a cap: the solver would have to stop before
 /// it starts. Refuse it where every other argument is checked, at parse time.
-#[cfg(feature = "calibrate")]
 fn parse_positive_usize(text: &str) -> Result<usize, String> {
     match text.trim().parse::<usize>() {
         Ok(0) => Err("must be at least 1".to_string()),
@@ -583,23 +520,13 @@ fn dispatch_current_binary() -> Result<(), Box<dyn std::error::Error>> {
 
     let binary_name = binary_name.strip_suffix(".exe").unwrap_or(&binary_name);
     let entrypoint_name = release_entrypoint_name(binary_name)
-        .ok_or_else(|| format!("unsupported binary '{binary_name}' for this feature set"))?;
+        .ok_or_else(|| format!("unsupported binary '{binary_name}' : not a gnomon binary name"))?;
 
     match entrypoint_name {
-        #[cfg(all(
-            feature = "map",
-            feature = "score",
-            feature = "calibrate",
-            feature = "terms"
-        ))]
         "gnomon" => run_full_entrypoint(),
-        #[cfg(feature = "score")]
         "gnomon-score" => run_score_entrypoint(),
-        #[cfg(feature = "map")]
         "gnomon-map" => run_map_entrypoint(),
-        #[cfg(feature = "terms")]
         "gnomon-terms" => run_terms_entrypoint(),
-        #[cfg(feature = "calibrate")]
         "gnomon-calibrate" => run_calibrate_entrypoint(),
         other => Err(format!("unsupported binary '{other}' for this feature set").into()),
     }
@@ -633,12 +560,6 @@ fn release_asset_base_name(binary_name: &str) -> &str {
         .unwrap_or(binary_name)
 }
 
-#[cfg(all(
-    feature = "map",
-    feature = "score",
-    feature = "calibrate",
-    feature = "terms"
-))]
 fn run_full_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
     let cli = FullCli::parse();
     match cli.command {
@@ -663,13 +584,11 @@ fn run_full_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-#[cfg(feature = "score")]
 fn run_score_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
     let cli = ScoreCli::parse();
     run_score(cli.args)
 }
 
-#[cfg(feature = "map")]
 fn run_map_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
     let cli = MapCli::parse();
     match cli.command {
@@ -685,13 +604,11 @@ fn run_map_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-#[cfg(feature = "terms")]
 fn run_terms_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
     let cli = TermsCli::parse();
     run_terms(cli.args)
 }
 
-#[cfg(feature = "calibrate")]
 fn run_calibrate_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
     let cli = CalibrateCli::parse();
     match cli.command {
@@ -705,7 +622,6 @@ fn run_calibrate_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-#[cfg(feature = "score")]
 fn run_score(args: ScoreArgs) -> Result<(), Box<dyn std::error::Error>> {
     score_main::run_gnomon_with_args(
         args.input_path,
@@ -721,7 +637,6 @@ fn run_score(args: ScoreArgs) -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|err| err as Box<dyn std::error::Error>)
 }
 
-#[cfg(feature = "map")]
 fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let genome_build = args.build.as_deref().map(GenomeBuild::parse).transpose()?;
     if let Some(threads) = args.threads {
@@ -832,7 +747,6 @@ fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }
 
-#[cfg(feature = "map")]
 fn run_map_project(args: ProjectArgs) -> Result<(), Box<dyn std::error::Error>> {
     let genome_build = args.build.as_deref().map(GenomeBuild::parse).transpose()?;
     map_cli::run(map_cli::MapCommand::Project {
@@ -844,7 +758,6 @@ fn run_map_project(args: ProjectArgs) -> Result<(), Box<dyn std::error::Error>> 
     .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }
 
-#[cfg(feature = "map")]
 fn run_model_keys(args: ModelKeysArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Emit only the JSON document on stdout (model loading / download chatter
     // goes to stderr inside the loader), so callers can parse stdout directly.
@@ -854,7 +767,6 @@ fn run_model_keys(args: ModelKeysArgs) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-#[cfg(feature = "map")]
 fn run_correctability(args: CorrectabilityArgs) -> Result<(), Box<dyn std::error::Error>> {
     let json = gnomon::map::correctability::calculate_json_file(&args.design)
         .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
@@ -862,7 +774,6 @@ fn run_correctability(args: CorrectabilityArgs) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-#[cfg(feature = "terms")]
 fn run_terms(args: TermsArgs) -> Result<(), Box<dyn std::error::Error>> {
     if !args.sex {
         return Err(Box::new(std::io::Error::new(
@@ -892,12 +803,6 @@ fn run_terms(args: TermsArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(all(
-    feature = "map",
-    feature = "score",
-    feature = "calibrate",
-    feature = "terms"
-))]
 fn run_all(args: AllArgs) -> Result<(), Box<dyn std::error::Error>> {
     all_cmd::run(all_cmd::AllOptions {
         score: args.score,
@@ -912,7 +817,6 @@ fn run_all(args: AllArgs) -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
-#[cfg(feature = "calibrate")]
 fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     match args.model_family {
         ModelFamilyCli::Gam => {
@@ -987,7 +891,6 @@ fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "calibrate")]
 fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Loading survival training data from: {}",
@@ -1054,7 +957,6 @@ fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-#[cfg(feature = "calibrate")]
 fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading model from: {}", args.model);
 
@@ -1111,7 +1013,6 @@ fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "calibrate")]
 fn detect_link_function(phenotype: &Array1<f64>) -> LinkFunction {
     let unique_values: HashSet<_> = phenotype.iter().map(|&value| value as i64).collect();
     if unique_values.len() == 2 {
@@ -1121,7 +1022,6 @@ fn detect_link_function(phenotype: &Array1<f64>) -> LinkFunction {
     }
 }
 
-#[cfg(feature = "calibrate")]
 fn calculate_range(data: ArrayView1<f64>) -> (f64, f64) {
     let min_val = data
         .iter()
@@ -1132,7 +1032,6 @@ fn calculate_range(data: ArrayView1<f64>) -> (f64, f64) {
     (min_val, max_val)
 }
 
-#[cfg(feature = "calibrate")]
 fn write_tsv_row(
     file: &mut std::fs::File,
     base_fields: &[&dyn std::fmt::Display],
@@ -1159,7 +1058,6 @@ fn write_tsv_row(
     Ok(())
 }
 
-#[cfg(feature = "calibrate")]
 fn se_and_ci(
     se_eta_opt: Option<&Array1<f64>>,
     index: usize,
@@ -1202,7 +1100,6 @@ fn se_and_ci(
     }
 }
 
-#[cfg(feature = "calibrate")]
 fn save_predictions_detailed(
     sample_ids: &[String],
     signed_distance: &Array1<f64>,
@@ -1266,7 +1163,6 @@ fn save_predictions_detailed(
     Ok(())
 }
 
-#[cfg(feature = "calibrate")]
 fn save_survival_predictions(
     output_path: &str,
     data: &SurvivalPredictionData,
@@ -1310,12 +1206,6 @@ fn save_survival_predictions(
     Ok(())
 }
 
-#[cfg(all(
-    feature = "map",
-    feature = "score",
-    feature = "calibrate",
-    feature = "terms"
-))]
 fn format_duration_ago(seconds: u64) -> String {
     const UNITS: &[(u64, &str)] = &[
         (365 * 24 * 3600, "years"),
@@ -1334,12 +1224,6 @@ fn format_duration_ago(seconds: u64) -> String {
     format!("{seconds} seconds ago")
 }
 
-#[cfg(all(
-    feature = "map",
-    feature = "score",
-    feature = "calibrate",
-    feature = "terms"
-))]
 fn print_version_info() {
     let version = env!("CARGO_PKG_VERSION");
     let release_tag = option_env!("GNOMON_RELEASE_TAG");

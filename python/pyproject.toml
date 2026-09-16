@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "gnomon-pgs"
-version = "0.1.5"
+version = "0.2.0"
 description = "Python bindings for SauersML/gnomon (high-performance polygenic score engine)."
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -30,7 +30,7 @@ Homepage = "https://github.com/SauersML/gnomon"
 Issues = "https://github.com/SauersML/gnomon/issues"
 
 [tool.maturin]
-# The extension crate depends on the repo-root core with its `python` feature.
+# The extension crate depends on the repo-root core and owns the PyO3 bindings.
 # Keeping the `cdylib` here prevents ordinary CLI builds from linking it too.
 manifest-path = "native/Cargo.toml"
 module-name = "gnomon._gnomon"

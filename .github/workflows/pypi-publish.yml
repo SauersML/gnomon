@@ -4,7 +4,7 @@ name: Publish to PyPI
 # them in one final job with twine. Modeled on SauersML/gam's pypi-wheels.yml.
 #
 # The Python package (`python/pyproject.toml`) uses the maturin build backend
-# with `manifest-path = "native/Cargo.toml"` and the core's `python` feature, so each
+# with `manifest-path = "native/Cargo.toml"`, so each
 # wheel embeds the compiled `gnomon._gnomon` extension and runs the Rust core
 # in-process. abi3-py39 means one wheel per platform covers CPython >= 3.9.
 #

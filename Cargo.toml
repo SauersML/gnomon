@@ -5,7 +5,7 @@ resolver = "3"
 
 [package]
 name = "gnomon-pgs"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2024" # Nightly is required
 description = "A high-performance engine for polygenic scores."
 repository = "https://github.com/SauersML/gnomon/"
@@ -30,7 +30,6 @@ crate-type = ["rlib"]
 [[bin]]
 name = "gnomon"
 path = "cli/main.rs"
-required-features = ["map", "score", "calibrate", "terms"]
 
 [[bin]]
 name = "convert_genome"
@@ -39,37 +38,21 @@ path = "cli/convert_genome.rs"
 [[bin]]
 name = "gnomon-score"
 path = "cli/main.rs"
-required-features = ["score"]
 
 [[bin]]
 name = "gnomon-map"
 path = "cli/main.rs"
-required-features = ["map"]
 
 [[bin]]
 name = "gnomon-terms"
 path = "cli/main.rs"
-required-features = ["terms"]
 
 [[bin]]
 name = "gnomon-calibrate"
 path = "cli/main.rs"
-required-features = ["calibrate"]
-
-[features]
-default = ["map", "score", "calibrate", "terms"]
-map = []
-score = ["terms"]
-terms = []
-calibrate = ["dep:gam", "dep:polars"]
-bench-path = []
-# In-process Python bindings (PyO3). Pulls in the same `score`/`map`/`terms`
-# entry points the CLI uses and exposes them through a `#[pymodule]`. Built by
-# maturin into the `cdylib` to give `import gnomon` a native, in-process core.
-python = ["dep:pyo3", "score", "map", "terms"]
 
 [dependencies]
-gam = { version = "0.2.1", optional = true }
+gam = "0.2.1"
 ahash = "0.8.12"
 clap = { version = "4.5.48", features = ["derive"] }
 memmap2 = "0.9.8"
@@ -91,7 +74,7 @@ ndarray = { version = "0.17.1", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"
 toml = "0.9.7"
-polars = { version = "0.51.0", features = ["csv", "ndarray", "parquet"], optional = true }
+polars = { version = "0.51.0", features = ["csv", "ndarray", "parquet"] }
 wolfe_bfgs = "0.2.2"
 log = "0.4.28"
 faer = "0.23.2"
@@ -126,11 +109,6 @@ infer_sex = "0.1.0"
 convert_genome = { version = "0.3.4", git = "https://github.com/SauersML/convert_genome", rev = "b3c504336cb2377f053f387dcf166d544799def7" }
 
 planus = "=1.1.1" # cf. https://github.com/pola-rs/polars/issues/24208
-
-# PyO3 backs the in-process Python extension module (the `python` feature).
-# `extension-module` keeps the cdylib from linking libpython (manylinux/abi3),
-# and `abi3-py39` builds a single stable-ABI wheel usable on Python >= 3.9.
-pyo3 = { version = "0.26", features = ["extension-module", "abi3-py39"], optional = true }
 
 [profile.release]
 opt-level = 3
@@ -174,17 +152,14 @@ grep = "0.3.2"
 [[bench]]
 name = "path_benchmark"
 harness = false
-required-features = ["bench-path"]
 
 [[test]]
 name = "score"
 path = "score/tests/mod.rs"
-required-features = ["score"]
 
 [[test]]
 name = "all"
 path = "cli/tests/all.rs"
-required-features = ["map", "score", "calibrate", "terms"]
 
 # Run tests at release optimization level for maximum speed
 [profile.test]

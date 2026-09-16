@@ -71,7 +71,7 @@ jobs:
 
       - name: Build gnomon-map on the projection runner
         run: |
-          cargo +nightly build --release --no-default-features --features map --bin gnomon-map
+          cargo +nightly build --release --bin gnomon-map
 
       - name: Project full dataset
         shell: bash
