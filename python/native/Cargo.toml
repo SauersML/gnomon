@@ -11,4 +11,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 gnomon = { package = "gnomon-pgs", path = "../.." }
+infer_sex = "0.1.0"
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py39"] }

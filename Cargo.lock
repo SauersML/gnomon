@@ -3893,6 +3893,7 @@ name = "gnomon-python"
 version = "0.2.0"
 dependencies = [
  "gnomon-pgs",
+ "infer_sex",
  "pyo3",
 ]
 
