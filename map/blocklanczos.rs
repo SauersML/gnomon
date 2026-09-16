@@ -681,6 +681,13 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
             // residual test remains the authority on convergence.
             let exhausted = rank == 0
                 || residual_norm <= f64::EPSILON * 64.0 * (dim as f64).sqrt() * image_norm;
+            // ...and it stays the authority when the space is spent. Exhaustion
+            // is complete only in exact arithmetic; on a rank-deficient operator
+            // (fewer variants than samples) the basis covers the range with
+            // rounding error still in it, and the Ritz pairs it certified were
+            // 1e-8 off in the eigenvalues with a residual of 7e-5. A residual
+            // above tolerance is not converged, exhausted or not.
+            let complete = exhausted && residual_ok;
 
             let current = Stage {
                 values: theta[..output].to_vec(),
@@ -688,16 +695,34 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
                 output,
                 certified,
                 passes,
-                converged: converged || exhausted,
+                converged: converged || complete,
                 max_relative_residual: max_relative,
                 subspace_delta,
                 boundary_gap,
                 splits_cluster,
             };
 
-            if converged || exhausted {
+            if converged || complete {
                 let (outcome, _) = finish(&blocks, images.as_deref(), &current, width, n, restarts);
                 return Ok(outcome);
+            }
+
+            if exhausted {
+                // No further pass can add a direction to this basis, so the
+                // only way forward is a fresh one: restart from the lifted Ritz
+                // block, which starts inside the range and refines the pairs
+                // the way subspace iteration does. The pass ceiling still
+                // bounds the work; at the ceiling the outcome is reported as
+                // it is, unconverged.
+                let (outcome, retained) = finish(&blocks, images.as_deref(), &current, width, n, restarts);
+                if passes >= params.max_passes {
+                    return Ok(outcome);
+                }
+                previous = PreviousTop::Lifted(leading_columns(&retained, current.certified));
+                best = Some(outcome);
+                start = restart_block(&retained, n, width, params.seed, restarts);
+                restarts += 1;
+                continue 'restart;
             }
 
             // A clustered k/k+1 boundary is not fixed by more depth: PC k and
