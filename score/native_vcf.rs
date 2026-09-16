@@ -47,7 +47,7 @@ struct ScoreRule {
 #[derive(Debug, Clone, Copy)]
 struct ScoreApplication {
     score_index: usize,
-    weight: f32,
+    weight: f64,
 }
 
 /// Every native score row with at least one weight, found by position.
@@ -589,7 +589,7 @@ impl PendingPosition {
                     matched.extend(rules_by_key.applications(rule).iter().map(|application| {
                         MatchedRule {
                             score_index: application.score_index,
-                            weight: f64::from(application.weight),
+                            weight: application.weight,
                             effect_is_ref,
                         }
                     }));
@@ -830,7 +830,14 @@ fn load_score_rules(
         .collect();
     let mut rules = ScoreRulesBuilder::default();
     let mut skipped_contigs = SkippedContigs::default();
+    let mut rejected = RejectedRows::default();
 
+    // The rules for a row are the PLINK path's (score/prepare.rs), so one score
+    // file gives one answer whatever the genotype format: a row without three
+    // non-empty key columns is malformed and skipped, an `N` other allele
+    // pairs with no record and is skipped, a blank weight means the score does
+    // not use the row, a weight that is not a finite number fails the run, and
+    // weights are read as f64 so the sums are the sums of the written numbers.
     for header in &headers {
         let path = &header.path;
         let mut reader = open_text_reader(path)?;
@@ -857,33 +864,32 @@ fn load_score_rules(
             }
 
             let mut fields = trimmed.split('\t');
-            let variant_id = fields.next().unwrap_or_default();
+            let (variant_id, effect_allele, other_allele) =
+                match (fields.next(), fields.next(), fields.next()) {
+                    (Some(v), Some(e), Some(o))
+                        if !v.is_empty() && !e.is_empty() && !o.is_empty() =>
+                    {
+                        (v, e, o)
+                    }
+                    _ => {
+                        rejected.malformed(path, line_number);
+                        line.clear();
+                        continue;
+                    }
+                };
             if variant_id == "variant_id" {
                 line.clear();
                 continue;
             }
-            let effect_allele = fields.next().unwrap_or_default();
-            let other_allele = fields.next().unwrap_or_default();
-            if effect_allele.is_empty() || other_allele.is_empty() {
-                return Err(format!(
-                    "Malformed native score row in '{}' at line {}.",
-                    path.display(),
-                    line_number
-                )
-                .into());
-            }
             if other_allele == "N" {
-                return Err(format!(
-                    "Native score row in '{}' at line {} has unknown other_allele 'N'. Scores must provide an explicit allele pair.",
-                    path.display(),
-                    line_number
-                )
-                .into());
+                rejected.unknown_other_allele(path, line_number);
+                line.clear();
+                continue;
             }
 
             let mut key_parts = variant_id.splitn(2, ':');
             let chr = key_parts.next().unwrap_or_default();
-            let pos = key_parts.next().unwrap_or_default();
+            let pos = key_parts.next().unwrap_or_default().trim();
             // Harmonized catalog files carry a handful of alt/random contigs that no
             // primary-assembly VCF can match. Skip those rows with a summary instead of
             // aborting a run over hundreds of otherwise-usable score files.
@@ -896,7 +902,7 @@ fn load_score_rules(
                 chr_index,
                 pos.parse::<u32>().map_err(|err| {
                     format!(
-                        "Invalid position in '{}' at line {}: {}",
+                        "Invalid position '{pos}' in '{}' at line {}: {}",
                         path.display(),
                         line_number,
                         err
@@ -904,38 +910,28 @@ fn load_score_rules(
                 })?,
             );
             let applications_start = rules.applications.len();
-            for (column, score_name) in header.score_names.iter().enumerate() {
-                let weight_text = fields.next().unwrap_or_default();
-                if weight_text.trim().is_empty() {
-                    return Err(format!(
-                        "Missing weight for score '{}' in '{}' at line {}.",
-                        score_name,
-                        path.display(),
-                        line_number
-                    )
-                    .into());
+            for (column, weight_text) in fields.enumerate() {
+                let weight_text = weight_text.trim();
+                if weight_text.is_empty() {
+                    continue;
                 }
-                let score_index = score_indices[column].ok_or_else(|| {
-                    format!(
-                        "Internal error: score '{}' from '{}' was not indexed.",
-                        score_name,
-                        path.display()
-                    )
-                })?;
-                if let Some(region) = column_regions[column]
+                let Some(Some(score_index)) = score_indices.get(column).copied() else {
+                    continue;
+                };
+                let weight = match weight_text.parse::<f64>() {
+                    Ok(weight) if weight.is_finite() => weight,
+                    Ok(_) => {
+                        return Err(unusable_weight(weight_text, line_number, path, "not a finite number"));
+                    }
+                    Err(err) => {
+                        return Err(unusable_weight(weight_text, line_number, path, &err.to_string()));
+                    }
+                };
+                if let Some(Some(region)) = column_regions.get(column)
                     && !region.contains(key)
                 {
                     continue;
                 }
-                let weight = weight_text.parse::<f32>().map_err(|err| {
-                    format!(
-                        "Invalid weight for score '{}' in '{}' at line {}: {}",
-                        score_name,
-                        path.display(),
-                        line_number,
-                        err
-                    )
-                })?;
 
                 rules.push_application(ScoreApplication {
                     score_index,
@@ -951,11 +947,68 @@ fn load_score_rules(
     }
 
     skipped_contigs.report();
+    rejected.report();
 
     Ok((score_names, rules.finish()))
 }
 
-/// Counts native score rows dropped for unsupported contigs, keeping a few examples
+/// The error for a weight field that is not a finite number: the PLINK path's
+/// (`plink2 --score` stops on the same coefficients), so neither route scores
+/// NaN or drops a row silently.
+fn unusable_weight(
+    text: &str,
+    line_number: u64,
+    path: &Path,
+    problem: &str,
+) -> Box<dyn Error + Send + Sync> {
+    format!(
+        "Invalid weight '{text}' on line {line_number} of score file '{}': {problem}. Weights must be finite numbers; leave the field empty for a score that does not use the variant.",
+        path.display()
+    )
+    .into()
+}
+
+/// Native score rows skipped on their own: malformed rows and rows whose other
+/// allele is `N`, counted and reported once, as the PLINK path reports them.
+#[derive(Debug, Default)]
+struct RejectedRows {
+    malformed: u64,
+    unknown_other_allele: u64,
+    examples: Vec<String>,
+}
+
+impl RejectedRows {
+    const MAX_EXAMPLES: usize = 5;
+
+    fn malformed(&mut self, path: &Path, line_number: u64) {
+        self.malformed += 1;
+        self.example(path, line_number, "malformed");
+    }
+
+    fn unknown_other_allele(&mut self, path: &Path, line_number: u64) {
+        self.unknown_other_allele += 1;
+        self.example(path, line_number, "other_allele N");
+    }
+
+    fn example(&mut self, path: &Path, line_number: u64, why: &str) {
+        if self.examples.len() < Self::MAX_EXAMPLES {
+            self.examples
+                .push(format!("{}:{line_number} ({why})", path.display()));
+        }
+    }
+
+    fn report(&self) {
+        if self.malformed == 0 && self.unknown_other_allele == 0 {
+            return;
+        }
+        eprintln!(
+            "> Skipped {} malformed score row(s) and {} row(s) with other_allele 'N' (e.g. {})",
+            self.malformed,
+            self.unknown_other_allele,
+            self.examples.join(", ")
+        );
+    }
+}/// Counts native score rows dropped for unsupported contigs, keeping a few examples
 /// so a pipeline can find the offending rows without re-scanning every score file.
 #[derive(Debug, Default)]
 struct SkippedContigs {
@@ -1081,7 +1134,7 @@ fn match_rules_for_allele(
         for application in rules_by_key.applications(rule) {
             matched.push(MatchedRule {
                 score_index: application.score_index,
-                weight: f64::from(application.weight),
+                weight: application.weight,
                 effect_is_ref,
             });
         }
@@ -1687,26 +1740,37 @@ fn resolve_keep_indices(
         return Ok((0..sample_names.len()).collect());
     };
 
+    // The PLINK path's keep layouts: one IID per line, or plink2's `FID IID`
+    // columns, under an optional `#FID IID` / `#IID` header.
+    let by_name: AHashMap<&str, usize> = sample_names
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| (name.as_str(), idx))
+        .collect();
     let mut requested = AHashSet::new();
+    let mut missing = Vec::new();
     for line in BufReader::new(File::open(path)?).lines() {
-        let id = line?.trim().to_string();
-        if !id.is_empty() {
-            requested.insert(id);
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("#FID") || line.starts_with("#IID") {
+            continue;
+        }
+        let resolved = by_name.get(line).copied().or_else(|| {
+            let mut fields = line.split_whitespace();
+            fields.next()?;
+            by_name.get(fields.next()?).copied()
+        });
+        match resolved {
+            Some(idx) => {
+                requested.insert(idx);
+            }
+            None => missing.push(line.to_string()),
         }
     }
 
-    let mut indices = Vec::with_capacity(requested.len());
-    let mut found = AHashSet::new();
-    for (idx, sample) in sample_names.iter().enumerate() {
-        if requested.contains(sample) {
-            indices.push(idx);
-            found.insert(sample.clone());
-        }
-    }
-
-    if found.len() != requested.len() {
-        let mut missing: Vec<_> = requested.difference(&found).cloned().collect();
+    if !missing.is_empty() {
         missing.sort();
+        missing.dedup();
         return Err(format!(
             "Keep file contains sample IDs not present in VCF: {}",
             missing.join(", ")
@@ -1714,10 +1778,10 @@ fn resolve_keep_indices(
         .into());
     }
 
+    let mut indices: Vec<usize> = requested.into_iter().collect();
+    indices.sort_unstable();
     Ok(indices)
-}
-
-fn open_text_reader(path: &Path) -> Result<Box<dyn BufRead>, Box<dyn Error + Send + Sync>> {
+}fn open_text_reader(path: &Path) -> Result<Box<dyn BufRead>, Box<dyn Error + Send + Sync>> {
     let file = File::open(path)?;
     if path
         .extension()
