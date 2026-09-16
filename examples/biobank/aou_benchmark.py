@@ -349,7 +349,7 @@ def failure_class(log):
     """The exception class a failed worker raised, with the fixed category of
     its message when one applies: a code name, never data."""
     text = Path(log).read_bytes()[-65536:].decode("utf-8", errors="replace")
-    found = re.findall(r"^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\b(.*) , text, re.MULTILINE)
+    found = re.findall(r"^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\b(.*)$", text, re.MULTILINE)
     if not found:
         return "unclassified"
     exception, message = found[-1]
