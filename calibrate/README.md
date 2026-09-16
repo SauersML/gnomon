@@ -282,17 +282,18 @@ any of the schema requirements below are violated.
 - `phenotype` – numeric response (0/1 for probit fits, real-valued for
   Gaussian fits). Missing values are not permitted.
 - `score` – the standardized polygenic score used as the primary smooth.
-- `sex` – binary indicator encoded as 0/1. Other encodings are rejected during
-  type coercion.
+- `sex` – binary indicator encoded as 0/1. Any other value (a 1/2 PLINK
+  coding, or 0 for unknown beside 1/2) is rejected when the table is loaded,
+  for training and for prediction alike.
 - `PC1`, `PC2`, …, `PCk` – one column per requested principal component. The
   number of PCs must match the `num_pcs` configuration supplied to the CLI or
   library entry point. Columns are required even if they are all zeros.
 - `weights` (optional) – positive prior weights. When omitted, the loader
   supplies a length-`n` vector of ones so unweighted fits do not require a
   synthetic column.
-- `sample_id` (optional) – string identifiers passed through to the serialized
-  model for auditing. Absent IDs are replaced with deterministic `1`, `2`, …
-  labels.
+- `sample_id` (optional) – string identifiers. Training ignores the column; the
+  model stores no per-row identifiers. Prediction copies it to the output table,
+  and rows without one are labelled with deterministic `1`, `2`, … labels.
 
 All required columns must be finite, and at least 20 rows are recommended for a
 stable fit. The loader prints the resolved schema so callers can confirm the

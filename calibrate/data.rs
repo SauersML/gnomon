@@ -81,6 +81,11 @@ pub enum DataError {
     InsufficientRows { found: usize, required: usize },
 
     #[error(
+        "The 'sex' column must be coded 0/1; row {row} holds {value}. Recode 1/2 (PLINK) as 0/1, and drop rows of unknown sex."
+    )]
+    InvalidSexCoding { row: usize, value: f64 },
+
+    #[error(
         "Non-finite values (NaN or Infinity) were found in the required column '{0}'. This tool requires all data to be finite."
     )]
     NonFiniteValuesFound(String),
@@ -195,6 +200,18 @@ mod internal {
             .reversed_axes()
     }
 
+    /// The `sex` column is a 0/1 indicator, and only that: it enters every fit as
+    /// a linear covariate, so a 1/2 coding would shift the intercept and an
+    /// unknown-sex code of 0 beside 1/2 would be fitted as a third dose of the
+    /// other two. Any other value is refused here, where the contract is stated.
+    pub(super) fn extract_sex_column(df: &DataFrame) -> Result<Array1<f64>, DataError> {
+        let sex = extract_f64_column(df, "sex")?;
+        if let Some((row, &value)) = sex.iter().enumerate().find(|(_, v)| **v != 0.0 && **v != 1.0) {
+            return Err(DataError::InvalidSexCoding { row: row + 1, value });
+        }
+        Ok(sex)
+    }
+
     /// Validate supplied weights independently of whether the column is optional.
     pub(super) fn extract_weights(df: &DataFrame) -> Result<Array1<f64>, DataError> {
         let has_weights = df.get_column_names().iter().any(|c| c == &"weights");
@@ -266,7 +283,7 @@ mod internal {
         num_pcs: usize,
     ) -> Result<(Array1<f64>, Array1<f64>, Array2<f64>), DataError> {
         let pgs = extract_f64_column(df, "score")?;
-        let sex = extract_f64_column(df, "sex")?;
+        let sex = extract_sex_column(df)?;
         let mut pc_arrays = Vec::with_capacity(num_pcs);
         for i in 1..=num_pcs {
             pc_arrays.push(extract_f64_column(df, &format!("PC{i}"))?);
@@ -382,6 +399,28 @@ mod tests {
         assert_abs_diff_eq!(data.sex[29], (29 % 2) as f64, epsilon = 1e-6);
         assert_abs_diff_eq!(data.pcs[[29, 0]], 1.350, epsilon = 1e-6);
         assert_abs_diff_eq!(data.pcs[[29, 1]], 2.133, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn sex_outside_zero_one_is_rejected_by_row() {
+        let mut rows = vec!["phenotype\tscore\tsex".to_string()];
+        for i in 0..20 {
+            // PLINK's 1/2 coding, with one unknown-sex 0 among them.
+            let sex = if i == 7 { 0 } else { i % 2 + 1 };
+            rows.push(format!("{}\t{:.1}\t{sex}", i % 2, i as f64 / 10.0));
+        }
+        let file = create_test_csv(&rows.join("\n")).unwrap();
+        let err = load_training_data(file.path().to_str().unwrap(), 0).unwrap_err();
+        match err {
+            DataError::InvalidSexCoding { row, value } => {
+                // Row 1 holds a 1, which is a valid code on its own; row 2's 2 is the first refusal.
+                assert_eq!(row, 2);
+                assert_eq!(value, 2.0);
+            }
+            other => panic!("expected InvalidSexCoding, got {other:?}"),
+        }
+        let err = load_prediction_data(file.path().to_str().unwrap(), 0).unwrap_err();
+        assert!(matches!(err, DataError::InvalidSexCoding { .. }));
     }
 
     #[test]
