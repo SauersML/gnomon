@@ -245,7 +245,13 @@ impl<'a> BedRows<'a> {
         {
             #[cfg(unix)]
             let map = self.source.mmap();
-            let batch_rows = mapped_batch_rows(indices.len(), row_len, available_bytes);
+            // A mapped batch is bounded like a read batch. Sizing it by a share of
+            // free memory let one batch span a 40 GB file on a large node, and every
+            // page it touched stayed charged to the process (2.5 GB resident for a
+            // 2.5 GB fileset). Each batch is released once counted, so the working
+            // set is one batch plus the per-sample counters.
+            let batch_rows = mapped_batch_rows(indices.len(), row_len, available_bytes)
+                .min((batch_bytes / row_len).max(1));
             for batch in indices.chunks(batch_rows) {
                 #[cfg(unix)]
                 let span = mapped_span(batch, row_len);
@@ -254,7 +260,7 @@ impl<'a> BedRows<'a> {
                 // from this mapping once it is counted, so the resident set stays
                 // near one batch.
                 #[cfg(unix)]
-                if let (Some(map), true) = (&map, batch.len() < indices.len()) {
+                if let Some(map) = &map {
                     let _ = map.advise_range(Advice::WillNeed, span.start, span.len());
                 }
                 let rows: Vec<&[u8]> = batch
