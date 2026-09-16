@@ -1217,7 +1217,9 @@ fn decode_virtual_block(
     if alt_count != 0 && alt_ord > alt_count {
         return Err(ioerr("ALT ordinal exceeds allele count in .pvar"));
     }
-    if decoder.try_decode_packed_block(in_idx, block) {
+    // The packed fast path has no ALT ordinal: it hands back ALT1's calls for
+    // whichever split row asked, so it can only serve single-ALT records.
+    if alt_count == 1 && decoder.try_decode_packed_block(in_idx, block) {
         return Ok(());
     }
 
@@ -2260,6 +2262,13 @@ impl PgenDecoder {
                 alt_ord_1b,
                 &mut a1dosage,
             )?;
+        } else if alt_count > 1 && alt_ord_1b > 1 {
+            // No patch track means no sample carries any ALT past the first, so
+            // a later ALT's row is zero copies wherever the sample is called and
+            // missing where it is not.
+            for (dosage, &cat) in a1dosage.iter_mut().zip(cats.iter()) {
+                *dosage = if cat == 3 { 255 } else { 0 };
+            }
         } else {
             cats_to_a1dosage(&mut a1dosage, cats);
         }
