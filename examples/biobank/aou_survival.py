@@ -327,7 +327,7 @@ def partition_support(train, test, config):
     errors = fit_support(train, test, config)
     for horizon in config["horizons_years"]:
         try:
-            ipcw_weights(train, test, horizon)
+            ipcw_weights(train, test, horizon, [])
         except ValueError as error:
             errors.append(f"horizon {horizon:g}: {error}")
     return errors
@@ -448,12 +448,38 @@ def censor_km(train):
     return times, np.cumprod(1 - fraction)
 
 
-def ipcw_weights(train, test, horizon):
+def censoring_reference(train, ancestry, horizon, pooled):
+    """The rows whose reverse Kaplan-Meier weights a test stratum.
+
+    The stratum's own training rows, when it has at least 20 of them and its
+    censoring survival at the horizon is estimable. Otherwise, when `pooled`
+    is a list, every training row stands in and the stratum's name is appended
+    to it as the caveat the report carries; when `pooled` is None the shortfall
+    is fatal, as a confirmatory run demands."""
+    reference = train.loc[train.ancestry == ancestry]
+    if len(reference) < 20:
+        problem = "insufficient training support for ancestry-specific censoring"
+    elif censor_km_at(reference, horizon) < 0.05 or not (reference.followup > horizon).any():
+        problem = "evaluation horizon lacks censoring support in an ancestry stratum"
+    else:
+        return reference
+    if pooled is None:
+        raise ValueError(problem)
+    if censor_km_at(train, horizon) < 0.05 or not (train.followup > horizon).any():
+        raise ValueError(f"{problem}, and the pooled training set lacks it too")
+    pooled.append(str(ancestry))
+    return train
+
+
+def censor_km_at(reference, horizon):
+    km_t, km_g = censor_km(reference)
+    return float(np.r_[1.0, km_g][np.searchsorted(km_t, horizon, side="right")])
+
+
+def ipcw_weights(train, test, horizon, pooled=None):
     result = np.zeros(len(test))
     for ancestry in test.ancestry.unique():
-        reference = train.loc[train.ancestry == ancestry]
-        if len(reference) < 20:
-            raise ValueError("insufficient training support for ancestry-specific censoring")
+        reference = censoring_reference(train, ancestry, horizon, pooled)
         km_t, km_g = censor_km(reference)
         def g_at(t, side):
             idx = np.searchsorted(km_t, t, side=side)
@@ -462,8 +488,6 @@ def ipcw_weights(train, test, horizon):
         t = test.followup.to_numpy(float)
         observed = (test.event_code.to_numpy(int) != 0) & (t <= horizon)
         g_horizon = float(g_at(horizon, "right"))
-        if g_horizon < 0.05 or not (reference.followup > horizon).any():
-            raise ValueError("evaluation horizon lacks censoring support in an ancestry stratum")
         g_event = g_at(t[mask & observed], "left")
         if (g_event < 0.05).any():
             raise ValueError("event-time censoring weights are unstable")
@@ -490,12 +514,18 @@ def evaluation_cells(train, test, risk, horizons, min_count):
     """Yield one (horizon index, horizon, label, mask, weights, targets) per reportable
     audit cell, or a status row for cells that cannot be reported."""
     for j, horizon in enumerate(horizons):
+        pooled = []
         try:
-            weights = ipcw_weights(train, test, horizon)
+            weights = ipcw_weights(train, test, horizon, pooled)
         except ValueError as error:
             yield {"group": "overall", "horizon": horizon,
                    "status": "insufficient_support", "reason": str(error)}
             continue
+        if pooled:
+            # The horizon is reported, with the strata whose censoring weights
+            # came from the pooled training set named beside it.
+            yield {"group": "overall", "horizon": horizon, "status": "pooled_censoring",
+                   "strata": sorted(pooled)}
         y = ((test.event_code == 1) & (test.followup <= horizon)).to_numpy(float)
         groups = audit_groups(train, test)
         # Fixed probability intervals, not test-outcome-selected bins.

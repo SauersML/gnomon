@@ -535,6 +535,24 @@ class SurvivalContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             aou.ipcw_weights(train, test, 4)
 
+    def test_pooled_censoring_stands_in_for_a_thin_stratum_and_says_so(self):
+        big = pd.DataFrame({"followup": [1, 1, 2, 3] * 10,
+                            "event_code": [1, 0, 2, 1] * 10, "ancestry": ["A"] * 40})
+        thin = pd.DataFrame({"followup": [1, 3, 3], "event_code": [1, 0, 1], "ancestry": ["B"] * 3})
+        train = pd.concat([big, thin], ignore_index=True)
+        test = pd.DataFrame({"followup": [1, 2.5, 1, 2.5], "event_code": [1, 0, 1, 0],
+                             "ancestry": ["A", "A", "B", "B"]})
+        with self.assertRaises(ValueError):
+            aou.ipcw_weights(train, test, 2)
+        pooled = []
+        weights = aou.ipcw_weights(train, test, 2, pooled)
+        self.assertEqual(pooled, ["B"])
+        # A has its own reference; B takes the pooled one, so its weights are finite.
+        self.assertTrue(np.all(weights > 0))
+        np.testing.assert_allclose(weights[:2], aou.ipcw_weights(big, test.iloc[:2], 2))
+        with self.assertRaises(ValueError):
+            aou.ipcw_weights(train, test, 4, [])
+
     def test_cached_score_uses_identified_column_and_rejects_duplicate_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
