@@ -421,7 +421,7 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
     let indexed = matches!(dataset, GenotypeDataset::Plink(_) | GenotypeDataset::Pgen(_));
     if let Some(budget) = effective_marker_budget(markers, ld.is_some(), indexed, &selection_plan)
     {
-        selection_plan = thin_selection_plan(&dataset, selection_plan, budget)?;
+        selection_plan = thin_selection_plan(&dataset, selection_plan, budget, indexed)?;
         if let Some(keys) = variant_keys.take() {
             // A list-backed selection cached model-oriented keys before
             // thinning. Thin those by the same logical slots instead of
@@ -839,10 +839,22 @@ fn thin_selection_plan(
     dataset: &GenotypeDataset,
     plan: SelectionPlan,
     budget: usize,
+    indexed: bool,
 ) -> Result<SelectionPlan, MapDriverError> {
     if budget == 0 {
         return Err(MapDriverError::InvalidState(
             "--markers must retain at least one variant".into(),
+        ));
+    }
+    // A streamed VCF/BCF has no index to stride over: which variants exist is
+    // only known once the file has been read, which is the very cost the budget
+    // exists to avoid. Refusing is better than silently ignoring the flag, and
+    // the refusal must not depend on whether `--list` was also given.
+    if !indexed {
+        return Err(MapDriverError::InvalidState(
+            "--markers needs an indexed genotype source (PLINK/PGEN); for a streamed \
+             VCF/BCF, thin the variant list passed to --list instead"
+                .into(),
         ));
     }
 
@@ -851,7 +863,7 @@ fn thin_selection_plan(
             let available = dataset.n_variants();
             if available == 0 || available <= budget {
                 println!(
-                    "Marker budget {budget} is at or above the {available} available variants;                      using all of them."
+                    "Marker budget {budget} is at or above the {available} available variants; using all of them."
                 );
                 return Ok(SelectionPlan::All);
             }
@@ -891,18 +903,11 @@ fn thin_selection_plan(
                 match_kinds,
             )))
         }
-        SelectionPlan::ByKeys(filter) => {
-            // A key-matched stream has no index to stride over: which variants
-            // exist is only known once the file has been read, which is the very
-            // cost the budget exists to avoid. Refusing is better than silently
-            // ignoring the flag.
-            let _ = filter;
-            Err(MapDriverError::InvalidState(
-                "--markers needs an indexed genotype source (PLINK/PGEN); for a streamed \
-                 VCF/BCF, thin the variant list passed to --list instead"
-                    .into(),
-            ))
-        }
+        SelectionPlan::ByKeys(_) => Err(MapDriverError::InvalidState(
+            "--markers cannot thin a key-matched selection; thin the variant list passed to \
+             --list instead"
+                .into(),
+        )),
     }
 }
 
