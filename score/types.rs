@@ -26,7 +26,8 @@ impl fmt::Display for GenomicRegion {
         let chr_label = match self.chromosome {
             23 => "X".to_string(),
             24 => "Y".to_string(),
-            25 => "MT".to_string(),
+            25 => "XY".to_string(),
+            26 => "MT".to_string(),
             n => format!("{n}"),
         };
         write!(f, "chr{chr_label}:{}-{}", self.start, self.end)
@@ -49,13 +50,16 @@ pub fn parse_chromosome_label(chr_str: &str) -> Result<u8, String> {
     if trimmed.eq_ignore_ascii_case("Y") {
         return Ok(24);
     }
-    if trimmed.eq_ignore_ascii_case("MT") {
+    if trimmed.eq_ignore_ascii_case("XY") {
         return Ok(25);
+    }
+    if trimmed.eq_ignore_ascii_case("MT") || trimmed.eq_ignore_ascii_case("M") {
+        return Ok(26);
     }
 
     trimmed.parse::<u8>().map_err(|_| {
         format!(
-            "Invalid chromosome format '{}'. Expected a number, 'X', 'Y', 'MT', or 'chr' prefix.",
+            "Invalid chromosome format '{}'. Expected a number, 'X', 'Y', 'XY', 'MT', or a 'chr' prefix.",
             chr_str.trim()
         )
     })
@@ -70,7 +74,9 @@ mod tests {
         assert_eq!(parse_chromosome_label("1").unwrap(), 1);
         assert_eq!(parse_chromosome_label("chr2").unwrap(), 2);
         assert_eq!(parse_chromosome_label("chrX").unwrap(), 23);
-        assert_eq!(parse_chromosome_label("MT").unwrap(), 25);
+        assert_eq!(parse_chromosome_label("XY").unwrap(), 25);
+        assert_eq!(parse_chromosome_label("MT").unwrap(), 26);
+        assert_eq!(parse_chromosome_label("chrM").unwrap(), 26);
     }
 
     #[test]

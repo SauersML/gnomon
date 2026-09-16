@@ -582,7 +582,8 @@ impl JoinOutputs {
             let chr_str = match key.0 {
                 23 => "X".to_string(),
                 24 => "Y".to_string(),
-                25 => "MT".to_string(),
+                25 => "XY".to_string(),
+                26 => "MT".to_string(),
                 n => n.to_string(),
             };
 
@@ -1021,7 +1022,8 @@ impl EffectOnlyMatches {
             let chr = match chr {
                 23 => "X".to_string(),
                 24 => "Y".to_string(),
-                25 => "MT".to_string(),
+                25 => "XY".to_string(),
+                26 => "MT".to_string(),
                 n => n.to_string(),
             };
             let reason = if *decision == OtherAlleleMatch::SeveralRows {
