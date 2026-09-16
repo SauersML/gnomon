@@ -2378,18 +2378,23 @@ fn solve_projection_with_sparse_missing_variants(
     let solve_chunk = projection_solve_sample_chunk(n_samples);
     let solve_chunks = n_samples.div_ceil(solve_chunk);
 
-    // Rebuild this sample's information matrix from the global one by removing
-    // the rank-one contribution of each variant the sample is missing. Shared by
-    // the first attempt and by every rung of the ridge ladder.
-    let fill_sample_info = |dst: &mut [f64], missing: &[u32]| {
+    // `loadings` is column-major over `p` variants, so one variant's `k` loadings
+    // sit a whole column apart. Each is gathered once into `row` and the
+    // rank-one downdate runs over that contiguous copy: read strided `k` times
+    // per missing variant, not `k²/2` times through a bounds-checked index,
+    // which was 92% of a K = 64 projection's time and grew faster than `k²`.
+    // The products and their order are unchanged, so the result is the same.
+    let fill_sample_info = |dst: &mut [f64], row: &mut [f64], missing: &[u32]| {
         let dense = components * components;
         dst[..dense].copy_from_slice(&solve_base.base_info[..dense]);
         for &variant in missing {
             let variant = variant as usize;
-            for row in 0..components {
-                let row_loading = loadings[(variant, row)];
-                for col in row..components {
-                    dst[col * components + row] -= row_loading * loadings[(variant, col)];
+            for (k, slot) in row[..components].iter_mut().enumerate() {
+                *slot = loadings[(variant, k)];
+            }
+            for (r, &row_loading) in row[..components].iter().enumerate() {
+                for c in r..components {
+                    dst[c * components + r] -= row_loading * row[c];
                 }
             }
         }
@@ -2403,6 +2408,7 @@ fn solve_projection_with_sparse_missing_variants(
                 vec![0.0f64; components],
                 vec![0.0f64; components],
                 vec![0.0f64; components],
+                vec![0.0f64; components],
                 vec![0.0f64; SPARSE_MISSING_WOODBURY_MAX * components],
                 vec![0.0f64; SPARSE_MISSING_WOODBURY_MAX],
                 vec![0.0f64; SPARSE_MISSING_WOODBURY_MAX * SPARSE_MISSING_WOODBURY_MAX],
@@ -2410,6 +2416,7 @@ fn solve_projection_with_sparse_missing_variants(
         },
         |(
             info_matrix,
+            row_scratch,
             rhs,
             diag_mass,
             alignment_values,
@@ -2494,7 +2501,7 @@ fn solve_projection_with_sparse_missing_variants(
                     // the previous fallback did not, and solved the explicit
                     // system against that corrupted vector.
                     outputs.read_rhs(sample, components, rhs);
-                    fill_sample_info(&mut info_matrix[..], missing);
+                    fill_sample_info(&mut info_matrix[..], &mut row_scratch[..], missing);
                     conditioning = solve_sample_information_system(
                         info_matrix,
                         &mut rhs[..components],
@@ -2503,7 +2510,7 @@ fn solve_projection_with_sparse_missing_variants(
                         trace,
                         solve_base.policy,
                         want_conditioning,
-                        |restored| fill_sample_info(restored, missing),
+                        |restored| fill_sample_info(restored, &mut row_scratch[..], missing),
                     );
                 }
 
