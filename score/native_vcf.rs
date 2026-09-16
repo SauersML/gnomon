@@ -1,7 +1,6 @@
 use crate::score::prepare::{
     EffectOnlyMatches, OtherAlleleMatch, names_no_single_other_allele, resolve_other_allele,
 };
-use crate::bcf_genotypes::GenotypeSeries;
 use crate::score::types::{GenomicRegion, parse_chromosome_label};
 use crate::shared::files::{VariantCompression, VariantFormat, VariantSource, open_variant_source};
 use ahash::{AHashMap, AHashSet};
@@ -11,8 +10,10 @@ use flate2::read::MultiGzDecoder;
 use libdeflater::Decompressor;
 use memchr::{memchr, memchr_iter, memrchr};
 use noodles_bcf::io::Reader as BcfReader;
+use noodles_vcf::header::record::value::map::format::{Number as FormatNumber, Type as FormatType};
 use noodles_vcf::io::Reader as VcfReader;
 use noodles_vcf::variant::record::AlternateBases as _;
+use noodles_vcf::variant::record::Samples as _;
 use noodles_vcf::variant::record::samples::keys::key;
 use noodles_vcf::variant::record::samples::series::{
     Value as SeriesValue, value::Array as SeriesArray,
@@ -1267,11 +1268,13 @@ where
 }
 
 /// Visits each kept person's dosage for ALT `alt_index` of a BCF `record`, as
-/// `for_each_vcf_dosage_best` does for a VCF record. Each person's GT, DS and GP
-/// values are written out as the VCF text of the same record would hold them and
-/// read by `decode_vcf_sample`, so both formats take the same dosage rules and
-/// raise the same errors. A float is written in the shortest form that parses
-/// back to its exact value.
+/// `for_each_vcf_dosage_best` does for a VCF record. GT, DS and GP are decoded
+/// from the record's typed values under the rules `decode_vcf_sample` applies to
+/// the VCF text of the same record, so both formats give the same dosages and
+/// raise the same errors. A record whose DS or GP is typed as a string is read
+/// through that text instead (`for_each_bcf_dosage_via_text`), and one whose
+/// fields are typed unlike their header definitions, which noodles panics on,
+/// is an error.
 fn for_each_bcf_dosage_best<F>(
     record: &noodles_bcf::Record,
     header: &noodles_vcf::Header,
@@ -1291,16 +1294,456 @@ where
         return Ok(());
     }
 
-    // GT is read from the sample block's own bytes: noodles decodes only 8-bit
-    // allele codes and panics on the 16- and 32-bit widths BCF also allows.
-    let gt_series = match header.string_maps().strings().get_index_of(key::GENOTYPE) {
-        Some(gt_key) => {
-            use noodles_vcf::variant::record::Samples as _;
-            GenotypeSeries::find(samples.as_ref(), samples.format_count(), samples.len(), gt_key)?
+    let sample_count = samples.len();
+    let fields = BcfDosageFields::read(
+        samples.as_ref(),
+        samples.format_count(),
+        sample_count,
+        header,
+    )?;
+    if fields.gt.is_none() && fields.ds.is_none() && fields.gp.is_none() {
+        return Err("BCF record is missing GT, DS, or GP FORMAT fields.".into());
+    }
+    match fields.route(header) {
+        BcfDosageRoute::Typed => {}
+        BcfDosageRoute::Text => {
+            return for_each_bcf_dosage_via_text(
+                record,
+                header,
+                alt_index,
+                alt_count,
+                kept_indices,
+                visit,
+            );
         }
-        None => None,
+        BcfDosageRoute::Invalid => {
+            return Err(
+                "BCF GT, DS or GP FORMAT field is typed unlike its header definition.".into(),
+            );
+        }
+    }
+
+    for (out_idx, &sample_idx) in kept_indices.iter().enumerate() {
+        let decoded = if sample_idx < sample_count {
+            fields.decode_sample(sample_idx, alt_index, alt_count)?
+        } else {
+            None
+        };
+        visit(out_idx, decoded)?;
+    }
+    Ok(())
+}
+
+/// The value type of a BCF typed value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BcfType {
+    Int8,
+    Int16,
+    Int32,
+    Float,
+    Character,
+}
+
+impl BcfType {
+    fn size(self) -> usize {
+        match self {
+            Self::Int8 | Self::Character => 1,
+            Self::Int16 => 2,
+            Self::Int32 | Self::Float => 4,
+        }
+    }
+
+    fn is_integer(self) -> bool {
+        matches!(self, Self::Int8 | Self::Int16 | Self::Int32)
+    }
+}
+
+/// One BCF integer or float, classified as noodles classifies it.
+#[derive(Debug, Clone, Copy)]
+enum BcfValue {
+    Value(f64),
+    Missing,
+    EndOfVector,
+    Reserved,
+}
+
+fn invalid_bcf_samples() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "invalid BCF FORMAT field")
+}
+
+/// Reads a typed-value descriptor: the value type (`None` for the missing type)
+/// and how many values follow.
+fn read_bcf_type(src: &mut &[u8]) -> io::Result<(Option<BcfType>, usize)> {
+    let (&descriptor, rest) = src.split_first().ok_or_else(invalid_bcf_samples)?;
+    *src = rest;
+    let mut len = usize::from(descriptor >> 4);
+    if len == 0x0f {
+        len = usize::try_from(read_bcf_int(src)?).map_err(|_| invalid_bcf_samples())?;
+    }
+    let ty = match descriptor & 0x0f {
+        0 => None,
+        1 => Some(BcfType::Int8),
+        2 => Some(BcfType::Int16),
+        3 => Some(BcfType::Int32),
+        5 => Some(BcfType::Float),
+        7 => Some(BcfType::Character),
+        _ => return Err(invalid_bcf_samples()),
     };
-    let (mut ds_series, mut gp_series) = (None, None);
+    Ok((ty, len))
+}
+
+/// Reads one typed integer, as a string map index or a long vector length is written.
+fn read_bcf_int(src: &mut &[u8]) -> io::Result<i32> {
+    let (Some(ty), 1) = read_bcf_type(src)? else {
+        return Err(invalid_bcf_samples());
+    };
+    if !ty.is_integer() || src.len() < ty.size() {
+        return Err(invalid_bcf_samples());
+    }
+    let (bytes, rest) = src.split_at(ty.size());
+    *src = rest;
+    match bcf_value(ty, bytes) {
+        BcfValue::Value(value) => Ok(value as i32),
+        _ => Err(invalid_bcf_samples()),
+    }
+}
+
+/// The value `bytes` holds, which is at least one value of type `ty` long.
+#[inline]
+fn bcf_value(ty: BcfType, bytes: &[u8]) -> BcfValue {
+    let (value, missing) = match ty {
+        BcfType::Int8 => (i64::from(bytes[0] as i8), i64::from(i8::MIN)),
+        BcfType::Int16 => (
+            i64::from(i16::from_le_bytes([bytes[0], bytes[1]])),
+            i64::from(i16::MIN),
+        ),
+        BcfType::Int32 => (
+            i64::from(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+            i64::from(i32::MIN),
+        ),
+        BcfType::Float => {
+            return match u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) {
+                0x7f80_0001 => BcfValue::Missing,
+                0x7f80_0002 => BcfValue::EndOfVector,
+                0x7f80_0003..=0x7f80_0007 => BcfValue::Reserved,
+                bits => BcfValue::Value(f64::from(f32::from_bits(bits))),
+            };
+        }
+        BcfType::Character => unreachable!("characters are not numbers"),
+    };
+    match value - missing {
+        0 => BcfValue::Missing,
+        1 => BcfValue::EndOfVector,
+        2..=7 => BcfValue::Reserved,
+        _ => BcfValue::Value(value as f64),
+    }
+}
+
+/// One FORMAT field of a BCF record: `width` values of type `ty` per sample.
+#[derive(Debug, Clone, Copy)]
+struct BcfSeries<'r> {
+    ty: BcfType,
+    width: usize,
+    src: &'r [u8],
+    /// Whether the header declares one value per sample, so only the first is read.
+    scalar: bool,
+}
+
+/// What one sample's VCF text would hold for a DS or GP field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BcfFieldText {
+    /// A lone '.'.
+    Missing,
+    /// Nothing, which reads as one missing value.
+    Empty,
+    /// This many comma-separated values.
+    Values(usize),
+}
+
+impl BcfSeries<'_> {
+    /// Value `offset` of sample `sample`'s vector.
+    #[inline]
+    fn value(&self, sample: usize, offset: usize) -> BcfValue {
+        bcf_value(
+            self.ty,
+            &self.src[(sample * self.width + offset) * self.ty.size()..],
+        )
+    }
+
+    /// Sample `sample`'s values as its VCF text would list them: the first value
+    /// alone for a scalar field, or every value but end-of-vector padding.
+    #[inline]
+    fn sample_values(&self, sample: usize) -> impl Iterator<Item = BcfValue> + '_ {
+        let len = if self.scalar { 1 } else { self.width };
+        (0..len)
+            .map(move |offset| self.value(sample, offset))
+            .filter(|value| !matches!(value, BcfValue::EndOfVector))
+    }
+
+    /// What sample `sample`'s VCF text would hold for this DS or GP field. A reserved
+    /// value has no text, so writing it fails, as reading a scalar field's
+    /// end-of-vector value does.
+    #[inline]
+    fn sample_field(&self, sample: usize) -> io::Result<BcfFieldText> {
+        if self.scalar {
+            return match self.value(sample, 0) {
+                BcfValue::Value(_) => Ok(BcfFieldText::Values(1)),
+                BcfValue::Missing => Ok(BcfFieldText::Missing),
+                BcfValue::EndOfVector | BcfValue::Reserved => {
+                    Err(io::Error::from(io::ErrorKind::InvalidData))
+                }
+            };
+        }
+        let mut len = 0;
+        let mut only_missing = true;
+        for value in self.sample_values(sample) {
+            match value {
+                BcfValue::Reserved => return Err(io::Error::from(io::ErrorKind::InvalidData)),
+                BcfValue::Value(_) => only_missing = false,
+                BcfValue::Missing | BcfValue::EndOfVector => {}
+            }
+            len += 1;
+        }
+        Ok(match len {
+            0 => BcfFieldText::Empty,
+            1 if only_missing => BcfFieldText::Missing,
+            len => BcfFieldText::Values(len),
+        })
+    }
+
+    /// Sample `sample`'s GT alleles, as noodles' genotype iterator yields them: every
+    /// value up to the first missing, end-of-vector or reserved one, each as its
+    /// allele position, or `None` for a missing allele.
+    #[inline]
+    fn genotype_alleles(&self, sample: usize) -> impl Iterator<Item = Option<usize>> + '_ {
+        let size = self.ty.size();
+        let src = &self.src[sample * self.width * size..(sample + 1) * self.width * size];
+        let ty = self.ty;
+        src.chunks_exact(size)
+            .take_while(move |bytes| matches!(bcf_value(ty, bytes), BcfValue::Value(_)))
+            .map(move |bytes| {
+                // The unsigned value, as noodles reads an Int8 genotype byte.
+                let value = match ty {
+                    BcfType::Int8 => usize::from(bytes[0]),
+                    BcfType::Int16 => usize::from(u16::from_le_bytes([bytes[0], bytes[1]])),
+                    _ => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize,
+                };
+                (value >> 1).checked_sub(1)
+            })
+    }
+}
+
+/// How `for_each_bcf_dosage_best` reads a record's GT, DS and GP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BcfDosageRoute {
+    Typed,
+    Text,
+    Invalid,
+}
+
+/// The GT, DS and GP FORMAT fields of a BCF record, read from its typed values.
+#[derive(Debug, Default)]
+struct BcfDosageFields<'r> {
+    gt: Option<BcfSeries<'r>>,
+    ds: Option<BcfSeries<'r>>,
+    gp: Option<BcfSeries<'r>>,
+}
+
+impl<'r> BcfDosageFields<'r> {
+    /// Reads the `format_count` FORMAT fields in `src`, the samples section of a
+    /// record holding `sample_count` samples, keeping the first GT, DS and GP.
+    fn read(
+        mut src: &'r [u8],
+        format_count: usize,
+        sample_count: usize,
+        header: &noodles_vcf::Header,
+    ) -> io::Result<Self> {
+        let mut fields = Self::default();
+        for _ in 0..format_count {
+            let id = usize::try_from(read_bcf_int(&mut src)?).map_err(|_| invalid_bcf_samples())?;
+            let (Some(ty), width) = read_bcf_type(&mut src)? else {
+                return Err(invalid_bcf_samples());
+            };
+            let len = ty
+                .size()
+                .checked_mul(width)
+                .and_then(|len| len.checked_mul(sample_count))
+                .filter(|&len| len <= src.len())
+                .ok_or_else(invalid_bcf_samples)?;
+            let (values, rest) = src.split_at(len);
+            src = rest;
+            let name = header
+                .string_maps()
+                .strings()
+                .get_index(id)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid string map ID")
+                })?;
+            let series = Some(BcfSeries {
+                ty,
+                width,
+                src: values,
+                scalar: header
+                    .formats()
+                    .get(name)
+                    .is_some_and(|format| format.number() == FormatNumber::Count(1)),
+            });
+            if fields.ds.is_none() && name == "DS" {
+                fields.ds = series;
+            } else if fields.gp.is_none() && name == "GP" {
+                fields.gp = series;
+            } else if fields.gt.is_none() && name == key::GENOTYPE {
+                fields.gt = series;
+            }
+        }
+        Ok(fields)
+    }
+
+    /// How the fields are read: typed when every field present is numeric, typed
+    /// as its header defines it and, for DS and GP, holds at least one value per
+    /// sample; through text when a DS or GP is a string under a string definition
+    /// and GT (if any) is the Int8 noodles reads. Anything else is invalid.
+    fn route(&self, header: &noodles_vcf::Header) -> BcfDosageRoute {
+        if self.gt.is_some_and(|gt| !gt.ty.is_integer()) {
+            return BcfDosageRoute::Invalid;
+        }
+        let mut route = BcfDosageRoute::Typed;
+        for (series, name) in [(self.ds, "DS"), (self.gp, "GP")] {
+            let Some(series) = series else {
+                continue;
+            };
+            let Some(format) = header.formats().get(name) else {
+                return BcfDosageRoute::Invalid;
+            };
+            if series.width == 0 || format.number() == FormatNumber::Count(0) {
+                return BcfDosageRoute::Invalid;
+            }
+            match (format.ty(), series.ty) {
+                (FormatType::Integer, ty) if ty.is_integer() => {}
+                (FormatType::Float, BcfType::Float) => {}
+                (FormatType::Character | FormatType::String, BcfType::Character) => {
+                    route = BcfDosageRoute::Text;
+                }
+                _ => return BcfDosageRoute::Invalid,
+            }
+        }
+        if route == BcfDosageRoute::Text && self.gt.is_some_and(|gt| gt.ty != BcfType::Int8) {
+            return BcfDosageRoute::Invalid;
+        }
+        route
+    }
+
+    /// Sample `sample`'s dosage for ALT `alt_index`, as `decode_vcf_sample` reads the
+    /// sample column of the same record.
+    #[inline]
+    fn decode_sample(
+        &self,
+        sample: usize,
+        alt_index: usize,
+        alt_count: usize,
+    ) -> Result<Option<DecodedAltDosage>, Box<dyn Error + Send + Sync>> {
+        // The text holds GT, then DS, then GP, and a reserved value fails its
+        // writing before anything is decoded.
+        let ds_text = self.ds.map(|ds| ds.sample_field(sample)).transpose()?;
+        let gp_text = self.gp.map(|gp| gp.sample_field(sample)).transpose()?;
+
+        let ploidy = if ds_text.is_some() || gp_text.is_some() {
+            self.gt.and_then(|gt| {
+                u8::try_from(gt.genotype_alleles(sample).count())
+                    .ok()
+                    .filter(|&ploidy| ploidy > 0)
+            })
+        } else {
+            None
+        };
+        if let (Some(ds), Some(text)) = (self.ds, ds_text) {
+            let parsed = match text {
+                BcfFieldText::Missing => None,
+                BcfFieldText::Empty => {
+                    dosage_from_values(std::iter::once(Ok(None)), alt_index, alt_count, ploidy)?
+                }
+                BcfFieldText::Values(_) => {
+                    let values = ds.sample_values(sample).map(|value| match value {
+                        BcfValue::Value(dosage) if !dosage.is_finite() => {
+                            Err("Dosage must be finite".into())
+                        }
+                        BcfValue::Value(dosage) => Ok(Some(dosage)),
+                        _ => Ok(None),
+                    });
+                    dosage_from_values(values, alt_index, alt_count, ploidy)?
+                }
+            };
+            if parsed.is_some() {
+                return Ok(parsed);
+            }
+        }
+        if let (Some(gp), Some(text)) = (self.gp, gp_text) {
+            let actual_len = match text {
+                BcfFieldText::Missing => None,
+                // An empty field is one value, too few for any GP layout.
+                BcfFieldText::Empty => Some(1),
+                BcfFieldText::Values(len) => Some(len),
+            };
+            if let Some(actual_len) = actual_len {
+                let parts = gp.sample_values(sample).map(|value| match value {
+                    BcfValue::Value(probability) => Ok(Some(probability)),
+                    _ => Ok(None),
+                });
+                let parsed = gp_from_values(actual_len, parts, alt_index, alt_count, ploidy)?;
+                if parsed.is_some() {
+                    return Ok(parsed);
+                }
+            }
+        }
+        let Some(gt) = self.gt else {
+            return Ok(None);
+        };
+        let mut dosage = 0.0f64;
+        let mut ref_dosage = 0.0f64;
+        let mut ploidy = 0u8;
+        for allele in gt.genotype_alleles(sample) {
+            let Some(allele) = allele else {
+                return Ok(None);
+            };
+            if allele == alt_index {
+                dosage += 1.0;
+            }
+            if allele == 0 {
+                ref_dosage += 1.0;
+            }
+            ploidy = ploidy.checked_add(1).ok_or("genotype ploidy overflow")?;
+        }
+        Ok((ploidy > 0).then_some(DecodedAltDosage {
+            alt_dosage: dosage,
+            ref_dosage: Some(ref_dosage),
+        }))
+    }
+}
+
+/// `for_each_bcf_dosage_best` through text: each person's GT, DS and GP values are
+/// written out as the VCF text of the same record would hold them and read by
+/// `decode_vcf_sample`. A float is written in the shortest form that parses back
+/// to its exact value.
+fn for_each_bcf_dosage_via_text<F>(
+    record: &noodles_bcf::Record,
+    header: &noodles_vcf::Header,
+    alt_index: usize,
+    alt_count: usize,
+    kept_indices: &[usize],
+    mut visit: F,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    F: FnMut(usize, Option<DecodedAltDosage>) -> Result<(), Box<dyn Error + Send + Sync>>,
+{
+    let samples = record.samples()?;
+    if samples.format_count() == 0 {
+        for out_idx in 0..kept_indices.len() {
+            visit(out_idx, None)?;
+        }
+        return Ok(());
+    }
+
+    let (mut gt_series, mut ds_series, mut gp_series) = (None, None, None);
     for result in samples.series() {
         let series = result?;
         let name = series.name(header)?;
@@ -1308,6 +1751,8 @@ where
             ds_series = Some(series);
         } else if gp_series.is_none() && name == "GP" {
             gp_series = Some(series);
+        } else if gt_series.is_none() && name == key::GENOTYPE {
+            gt_series = Some(series);
         }
     }
     if gt_series.is_none() && ds_series.is_none() && gp_series.is_none() {
@@ -1315,47 +1760,32 @@ where
     }
 
     // Written in this order: GT, then DS, then GP.
-    let value_series: Vec<_> = [&ds_series, &gp_series].into_iter().flatten().collect();
-    let has_gt = gt_series.is_some();
-    let field_count = usize::from(has_gt) + value_series.len();
-    let gt_index = has_gt.then_some(0);
-    let ds_index = ds_series.is_some().then_some(usize::from(has_gt));
-    let gp_index = gp_series.is_some().then(|| field_count - 1);
-    let last_format_index = field_count - 1;
+    let fields: Vec<_> = [&gt_series, &ds_series, &gp_series]
+        .into_iter()
+        .flatten()
+        .collect();
+    let gt_index = gt_series.is_some().then_some(0);
+    let ds_index = ds_series
+        .is_some()
+        .then_some(usize::from(gt_series.is_some()));
+    let gp_index = gp_series.is_some().then(|| fields.len() - 1);
+    let last_format_index = fields.len() - 1;
 
     let mut sample = String::new();
     for (out_idx, &sample_idx) in kept_indices.iter().enumerate() {
         sample.clear();
         let mut in_record = true;
-        if let Some(gt) = &gt_series {
-            match gt.alleles(sample_idx) {
-                None => in_record = false,
-                Some(alleles) => {
-                    for (offset, allele) in alleles.enumerate() {
-                        if offset > 0 {
-                            sample.push('/');
-                        }
-                        match allele? {
-                            Some(position) => write!(sample, "{position}")?,
-                            None => sample.push('.'),
-                        }
-                    }
-                }
+        for (offset, series) in fields.iter().enumerate() {
+            if offset > 0 {
+                sample.push(':');
             }
-        }
-        if in_record {
-            for (offset, series) in value_series.iter().enumerate() {
-                if has_gt || offset > 0 {
-                    sample.push(':');
+            match series.get(header, sample_idx) {
+                None => {
+                    in_record = false;
+                    break;
                 }
-                match series.get(header, sample_idx) {
-                    None => {
-                        in_record = false;
-                        break;
-                    }
-                    Some(None) => sample.push('.'),
-                    Some(Some(value)) => write_sample_value(value?, &mut sample)?,
-                }
+                Some(None) => sample.push('.'),
+                Some(Some(value)) => write_sample_value(value?, &mut sample)?,
             }
         }
         let decoded = if in_record {
@@ -1374,7 +1804,9 @@ where
         visit(out_idx, decoded)?;
     }
     Ok(())
-}/// Writes one BCF FORMAT value as a VCF sample column holds it.
+}
+
+/// Writes one BCF FORMAT value as a VCF sample column holds it.
 fn write_sample_value(
     value: SeriesValue<'_>,
     out: &mut String,
@@ -1539,14 +1971,33 @@ fn parse_vcf_dosage_field(
     if field.is_empty() || field == "." {
         return Ok(None);
     }
+    dosage_from_values(
+        field.split(',').map(parse_numeric_str),
+        alt_index,
+        alt_count,
+        ploidy,
+    )
+}
+
+/// The DS rules for one sample's values, in field order, each already read as a
+/// finite number or `None` for a missing value.
+fn dosage_from_values<I>(
+    values: I,
+    alt_index: usize,
+    alt_count: usize,
+    ploidy: Option<u8>,
+) -> Result<Option<DecodedAltDosage>, Box<dyn Error + Send + Sync>>
+where
+    I: Iterator<Item = Result<Option<f64>, Box<dyn Error + Send + Sync>>>,
+{
     if alt_index == 0 || alt_index > alt_count {
         return Err("ALT allele index is out of range".into());
     }
     let mut alt_dosage = None;
     let mut total_alt_dosage = Some(0.0);
     let mut count = 0;
-    for (offset, value) in field.split(',').enumerate() {
-        let dosage = parse_numeric_str(value)?;
+    for (offset, value) in values.enumerate() {
+        let dosage = value?;
         if dosage.is_some_and(|dosage| dosage < 0.0) {
             return Err("DS dosage must be nonnegative".into());
         }
@@ -1584,6 +2035,34 @@ fn parse_vcf_gp(
     if field.is_empty() || field == "." {
         return Ok(None);
     }
+    let parts = field.split(',').map(|part| {
+        if part == "." {
+            Ok(None)
+        } else {
+            Ok(Some(part.parse::<f64>()?))
+        }
+    });
+    gp_from_values(
+        field.split(',').count(),
+        parts,
+        alt_index,
+        alt_count,
+        ploidy,
+    )
+}
+
+/// The GP rules for one sample's `actual_len` probabilities, in field order, each
+/// already read as a number or `None` for a missing value.
+fn gp_from_values<I>(
+    actual_len: usize,
+    mut parts: I,
+    alt_index: usize,
+    alt_count: usize,
+    ploidy: Option<u8>,
+) -> Result<Option<DecodedAltDosage>, Box<dyn Error + Send + Sync>>
+where
+    I: Iterator<Item = Result<Option<f64>, Box<dyn Error + Send + Sync>>>,
+{
     if alt_index == 0 || alt_index > alt_count {
         return Err(format!(
             "ALT allele index {alt_index} is out of range for {alt_count} alternate alleles"
@@ -1597,7 +2076,6 @@ fn parse_vcf_gp(
         .and_then(|next| allele_count.checked_mul(next))
         .map(|n| n / 2)
         .ok_or("GP allele count overflow")?;
-    let actual_len = field.split(',').count();
     let ploidy = match ploidy {
         Some(ploidy) => ploidy,
         None if actual_len == allele_count => 1,
@@ -1619,15 +2097,12 @@ fn parse_vcf_gp(
     }
     let mut dosage = 0.0f64;
     let mut ref_dosage = 0.0f64;
-    let mut parts = field.split(',');
     for second in 0..allele_count {
         let first_count = if ploidy == 1 { 1 } else { second + 1 };
         for first in 0..first_count {
-            let part = parts.next().expect("GP cardinality was validated");
-            if part == "." {
+            let Some(probability) = parts.next().expect("GP cardinality was validated")? else {
                 return Ok(None);
-            }
-            let probability = part.parse::<f64>()?;
+            };
             if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
                 return Err("GP probabilities must be finite and between zero and one".into());
             }
@@ -3144,6 +3619,379 @@ mod tests {
                 "{}",
                 path.display()
             );
+        }
+    }
+
+    /// SplitMix64 draws for the typed BCF decoding tests.
+    struct Draws(u64);
+
+    impl Draws {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            ((z ^ (z >> 31)) % n as u64) as usize
+        }
+    }
+
+    /// One value of a BCF FORMAT vector.
+    #[derive(Debug, Clone, Copy)]
+    enum BcfSlot {
+        Value(f64),
+        Missing,
+        EndOfVector,
+        Reserved,
+    }
+
+    /// `slots` as BCF typed values: type code 1, 2 or 3 for integers, 5 for floats.
+    fn bcf_slot_bytes(ty: u8, slots: &[BcfSlot]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &slot in slots {
+            if ty == 5 {
+                let bits = match slot {
+                    BcfSlot::Value(value) => (value as f32).to_bits(),
+                    BcfSlot::Missing => 0x7f80_0001,
+                    BcfSlot::EndOfVector => 0x7f80_0002,
+                    BcfSlot::Reserved => 0x7f80_0005,
+                };
+                out.extend_from_slice(&bits.to_le_bytes());
+            } else {
+                let size = 1usize << (ty - 1);
+                let min = -(1i64 << (8 * size - 1));
+                let value = match slot {
+                    BcfSlot::Value(value) => value as i64,
+                    BcfSlot::Missing => min,
+                    BcfSlot::EndOfVector => min + 1,
+                    BcfSlot::Reserved => min + 4,
+                };
+                out.extend_from_slice(&value.to_le_bytes()[..size]);
+            }
+        }
+        out
+    }
+
+    /// A BCF record at 1:100 with `alt_count` ALT alleles and no INFO. Each FORMAT
+    /// field is (string map index, type code, width, every sample's typed values).
+    fn raw_bcf_record(
+        alt_count: usize,
+        sample_count: usize,
+        fields: &[(u8, u8, usize, Vec<u8>)],
+    ) -> Vec<u8> {
+        let mut site = Vec::new();
+        site.extend_from_slice(&0i32.to_le_bytes());
+        site.extend_from_slice(&99i32.to_le_bytes());
+        site.extend_from_slice(&1i32.to_le_bytes());
+        site.extend_from_slice(&0x7f80_0001u32.to_le_bytes());
+        site.extend_from_slice(&0u16.to_le_bytes());
+        site.extend_from_slice(&u16::try_from(alt_count + 1).unwrap().to_le_bytes());
+        let counts =
+            u32::try_from(sample_count).unwrap() | (u32::try_from(fields.len()).unwrap() << 24);
+        site.extend_from_slice(&counts.to_le_bytes());
+        site.extend_from_slice(&[0x17, b'.']);
+        for allele in &b"ACGT"[..=alt_count] {
+            site.extend_from_slice(&[0x17, *allele]);
+        }
+        site.push(0x00);
+        let mut samples = Vec::new();
+        for (id, ty, width, values) in fields {
+            samples.extend_from_slice(&[0x11, *id, (u8::try_from(*width).unwrap() << 4) | ty]);
+            samples.extend_from_slice(values);
+        }
+        let mut record = Vec::new();
+        record.extend_from_slice(&u32::try_from(site.len()).unwrap().to_le_bytes());
+        record.extend_from_slice(&u32::try_from(samples.len()).unwrap().to_le_bytes());
+        record.extend_from_slice(&site);
+        record.extend_from_slice(&samples);
+        record
+    }
+
+    /// Uncompressed BCF bytes holding `header` and `records`.
+    fn raw_bcf(header: &str, records: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = b"BCF\x02\x02".to_vec();
+        out.extend_from_slice(&u32::try_from(header.len() + 1).unwrap().to_le_bytes());
+        out.extend_from_slice(header.as_bytes());
+        out.push(0);
+        for record in records {
+            out.extend_from_slice(record);
+        }
+        out
+    }
+
+    /// A header whose string map numbers GT 1, DS 2 and GP 3.
+    fn dosage_bcf_header(ds: &str, gp: &str) -> String {
+        format!(
+            "##fileformat=VCFv4.2\n##contig=<ID=1>\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             ##{ds},Description=\"Dosage\">\n\
+             ##FORMAT=<ID=GP,{gp},Description=\"Genotype probabilities\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\ts3\ts4\n"
+        )
+    }
+
+    type Visits = Option<Vec<Option<(u64, Option<u64>)>>>;
+
+    type DosageVisitor<'a> =
+        dyn FnMut(usize, Option<DecodedAltDosage>) -> Result<(), Box<dyn Error + Send + Sync>> + 'a;
+
+    /// Every person a dosage route visits, as bits, or `None` if the route fails.
+    fn bcf_dosage_visits(
+        route: impl FnOnce(&mut DosageVisitor<'_>) -> Result<(), Box<dyn Error + Send + Sync>>,
+    ) -> Visits {
+        let mut visits = Vec::new();
+        let mut visit = |out_idx: usize,
+                         decoded: Option<DecodedAltDosage>|
+         -> Result<(), Box<dyn Error + Send + Sync>> {
+            assert_eq!(out_idx, visits.len());
+            visits.push(decoded.map(|d| (d.alt_dosage.to_bits(), d.ref_dosage.map(f64::to_bits))));
+            Ok(())
+        };
+        let result = route(&mut visit);
+        result.ok().map(|()| visits)
+    }
+
+    /// Reads `records` back under `header`.
+    fn read_raw_bcf(
+        header: &str,
+        records: &[Vec<u8>],
+    ) -> (noodles_vcf::Header, Vec<noodles_bcf::Record>) {
+        let mut reader = BcfReader::from(Cursor::new(raw_bcf(header, records)));
+        let header = reader.read_header().expect("bcf header");
+        let records = records
+            .iter()
+            .map(|_| {
+                let mut record = noodles_bcf::Record::default();
+                assert!(reader.read_record(&mut record).expect("bcf record") > 0);
+                record
+            })
+            .collect();
+        (header, records)
+    }
+
+    /// The typed BCF decoder visits every person as reading the record's VCF text
+    /// does: GT, DS and GP in any order and any integer or float width, missing,
+    /// end-of-vector and reserved values, NaN and infinite dosages, scalar and
+    /// vector definitions, out-of-range ALT indices and people past the record's
+    /// samples. GT wider than Int8, which noodles cannot read, decodes like the same
+    /// alleles in Int8.
+    #[test]
+    fn typed_bcf_dosages_match_the_text_route() {
+        let mut draws = Draws(0x5eed_bcf0);
+        let kept = [0, 1, 3, 5];
+        for (ds, gp) in [
+            ("FORMAT=<ID=DS,Number=A,Type=Float", "Number=G,Type=Float"),
+            ("FORMAT=<ID=DS,Number=1,Type=Float", "Number=3,Type=Float"),
+            ("FORMAT=<ID=DS,Number=A,Type=Integer", "Number=G,Type=Float"),
+            ("FORMAT=<ID=DS,Number=G,Type=Float", "Number=A,Type=Float"),
+        ] {
+            let header = dosage_bcf_header(ds, gp);
+            let ds_scalar = ds.contains("Number=1");
+            let ds_integer = ds.contains("Integer");
+            let mut records = Vec::new();
+            let mut alt = Vec::new();
+            for _ in 0..600 {
+                let alt_count = 1 + draws.below(3);
+                let alt_index = match draws.below(10) {
+                    0 => 0,
+                    1 => alt_count + 1,
+                    _ => 1 + draws.below(alt_count),
+                };
+                let sample_count = [4, 4, 4, 4, 2, 0][draws.below(6)];
+                let slots = |draws: &mut Draws, width: usize, values: &[f64], scalar: bool| {
+                    let mut slots: Vec<BcfSlot> = (0..width * sample_count)
+                        .map(|_| match draws.below(40) {
+                            0 | 1 => BcfSlot::Missing,
+                            2 => BcfSlot::EndOfVector,
+                            3 => BcfSlot::Reserved,
+                            _ => BcfSlot::Value(values[draws.below(values.len())]),
+                        })
+                        .collect();
+                    if scalar {
+                        // noodles panics on a scalar's end-of-vector or reserved value.
+                        for sample in slots.chunks_mut(width) {
+                            if !matches!(sample[0], BcfSlot::Value(_)) {
+                                sample[0] = BcfSlot::Missing;
+                            }
+                        }
+                    }
+                    slots
+                };
+                let gt_width = 1 + draws.below(3);
+                let gt: Vec<BcfSlot> = (0..gt_width * sample_count)
+                    .map(|_| match draws.below(20) {
+                        0 => BcfSlot::Missing,
+                        1 | 2 => BcfSlot::EndOfVector,
+                        3 => BcfSlot::Reserved,
+                        4 | 5 => BcfSlot::Value(draws.below(2) as f64),
+                        _ => BcfSlot::Value(
+                            ((draws.below(alt_count + 2) + 1) * 2 + draws.below(2)) as f64,
+                        ),
+                    })
+                    .collect();
+                // Mostly the widths the definitions expect, so many records decode. A
+                // scalar DS keeps width 1: noodles reads a `Number=1` float through a
+                // fixed 4-byte slice and panics on any other stored width.
+                let ds_width = if ds_scalar {
+                    1
+                } else if draws.below(4) > 0 {
+                    alt_count
+                } else {
+                    1 + draws.below(3)
+                };
+                let ds_values: &[f64] = if ds_integer {
+                    &[0.0, 1.0, 1.0, 0.0, 2.0, 3.0, -1.0]
+                } else {
+                    &[
+                        0.0,
+                        0.25,
+                        0.5,
+                        1.0,
+                        0.75,
+                        2.0,
+                        2.5,
+                        -0.25,
+                        1e-7,
+                        f64::NAN,
+                        f64::INFINITY,
+                    ]
+                };
+                let ds_type = if ds_integer {
+                    1 + draws.below(3) as u8
+                } else {
+                    5
+                };
+                let ds =
+                    bcf_slot_bytes(ds_type, &slots(&mut draws, ds_width, ds_values, ds_scalar));
+                let gp_width = if draws.below(4) > 0 {
+                    (alt_count + 1) * (alt_count + 2) / 2
+                } else {
+                    1 + draws.below(6)
+                };
+                let gp_values: &[f64] = &[0.0, 0.25, 0.5, 1.0, 0.125, 1.25, -0.125, f64::NAN];
+                let gp = bcf_slot_bytes(5, &slots(&mut draws, gp_width, gp_values, false));
+                let mut fields = Vec::new();
+                for field in 0..3 {
+                    if draws.below(4) > 0 {
+                        fields.insert(draws.below(fields.len() + 1), field);
+                    }
+                }
+                if draws.below(8) == 0 {
+                    // A second DS, which neither route reads, and a FORMAT key under
+                    // PASS's string map index, which neither route recognizes.
+                    fields.push(1);
+                    fields.insert(draws.below(fields.len() + 1), 3);
+                }
+                // The same record with GT in Int8 (which the text route reads), Int16 and Int32.
+                for gt_type in [1u8, 2, 3] {
+                    let encoded: Vec<_> = fields
+                        .iter()
+                        .map(|&field| match field {
+                            0 => (1, gt_type, gt_width, bcf_slot_bytes(gt_type, &gt)),
+                            1 => (2, ds_type, ds_width, ds.clone()),
+                            2 => (3, 5, gp_width, gp.clone()),
+                            _ => (0, 1, 1, vec![1; sample_count]),
+                        })
+                        .collect();
+                    records.push(raw_bcf_record(alt_count, sample_count, &encoded));
+                    alt.push((alt_index, alt_count));
+                }
+            }
+            let (header, records) = read_raw_bcf(&header, &records);
+            let (mut with_dosage, mut failed) = (0, 0);
+            for (index, same_record) in records.chunks(3).enumerate() {
+                let (alt_index, alt_count) = alt[3 * index];
+                let text = bcf_dosage_visits(|visit| {
+                    for_each_bcf_dosage_via_text(
+                        &same_record[0],
+                        &header,
+                        alt_index,
+                        alt_count,
+                        &kept,
+                        visit,
+                    )
+                });
+                for (gt_type, record) in same_record.iter().enumerate() {
+                    let typed = bcf_dosage_visits(|visit| {
+                        for_each_bcf_dosage_best(
+                            record, &header, alt_index, alt_count, &kept, visit,
+                        )
+                    });
+                    assert_eq!(
+                        typed,
+                        text,
+                        "{ds} {gp}: record {index}, GT type {}",
+                        gt_type + 1
+                    );
+                }
+                match &text {
+                    None => failed += 1,
+                    Some(visits) if visits.iter().any(Option::is_some) => with_dosage += 1,
+                    Some(_) => {}
+                }
+            }
+            assert!(
+                with_dosage >= 30 && failed >= 30,
+                "{ds} {gp}: {with_dosage} records decode a dosage, {failed} fail"
+            );
+        }
+    }
+
+    /// FORMAT fields typed unlike their header definitions are errors, where noodles
+    /// panics; a string-typed DS is still read through its text.
+    #[test]
+    fn bcf_dosage_fields_typed_unlike_the_header_are_errors() {
+        fn float(values: &[f64]) -> Vec<u8> {
+            let slots: Vec<_> = values.iter().map(|&v| BcfSlot::Value(v)).collect();
+            bcf_slot_bytes(5, &slots)
+        }
+        let gt = bcf_slot_bytes(1, &[BcfSlot::Value(2.0), BcfSlot::Value(4.0)]);
+        let kept = [0];
+        for (ds, fields, expected) in [
+            // DS declared Float, typed Int8.
+            (
+                "FORMAT=<ID=DS,Number=A,Type=Float",
+                vec![(2, 1, 1, vec![1])],
+                None,
+            ),
+            // A scalar DS whose value is end-of-vector.
+            (
+                "FORMAT=<ID=DS,Number=1,Type=Float",
+                vec![(2, 5, 1, bcf_slot_bytes(5, &[BcfSlot::EndOfVector]))],
+                None,
+            ),
+            // DS with no values.
+            (
+                "FORMAT=<ID=DS,Number=A,Type=Float",
+                vec![(2, 5, 0, Vec::new())],
+                None,
+            ),
+            // GT typed as a float.
+            (
+                "FORMAT=<ID=DS,Number=A,Type=Float",
+                vec![(1, 5, 2, float(&[2.0, 4.0]))],
+                None,
+            ),
+            // DS defined only as INFO.
+            (
+                "INFO=<ID=DS,Number=A,Type=Float",
+                vec![(1, 1, 2, gt.clone()), (2, 5, 1, float(&[0.5]))],
+                None,
+            ),
+            // DS as a string, read through its text: 0/1 with DS 0.5.
+            (
+                "FORMAT=<ID=DS,Number=1,Type=String",
+                vec![(1, 1, 2, gt.clone()), (2, 7, 3, b"0.5".to_vec())],
+                Some(vec![Some((0.5f64.to_bits(), Some(1.5f64.to_bits())))]),
+            ),
+        ] {
+            let (header, records) = read_raw_bcf(
+                &dosage_bcf_header(ds, "Number=G,Type=Float"),
+                &[raw_bcf_record(1, 1, &fields)],
+            );
+            let typed = bcf_dosage_visits(|visit| {
+                for_each_bcf_dosage_best(&records[0], &header, 1, 1, &kept, visit)
+            });
+            assert_eq!(typed, expected, "{ds}: {fields:?}");
         }
     }
 
