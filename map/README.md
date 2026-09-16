@@ -133,7 +133,7 @@ finer-grained monitoring is needed.
 2. A dense covariance build is attempted when the implied Gram matrix fits in
    memory; otherwise the partial self-adjoint eigensolver incrementally updates
    covariance from streamed blocks.
-3. `--ld` enables LD weighting with either the default 51-variant window, a
+3. `--ld` enables LD weighting with either the default 500 kbp window, a
    user-provided odd-sized site window, or a base-pair span that adapts to
    variant density. Windows are truncated at dataset and chromosome edges and
    validated against the exact post-filter marker stream before use. The
