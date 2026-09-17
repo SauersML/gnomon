@@ -947,6 +947,130 @@ impl TextSource for StreamingVirtualBim {
     }
 }
 
+/// The rows of the virtual `.bim` that share one chromosome label, with the
+/// label as the `.bim` writes it and each row's position.
+pub(crate) struct PvarRowRun {
+    pub(crate) chrom: String,
+    pub(crate) positions: Vec<u64>,
+}
+
+/// The chromosome and position of every row of the virtual `.bim` over the local
+/// `.pvar` at `pvar_path`, in row order, without rendering the rows.
+///
+/// The file is mapped, its header lines are read in order, and its data lines are
+/// scanned in parallel chunks of about `chunk_bytes`, each extended to the end of
+/// its last line. A line is read as [`StreamingVirtualBim`] reads it. `None` when
+/// the file cannot be mapped, its text is not UTF-8, a `#` line follows the data,
+/// or a line lacks a column the `.bim` needs or an integer position; the caller
+/// then reads the `.bim` rows, which report whatever is wrong.
+pub(crate) fn scan_local_pvar_rows(
+    pvar_path: &Path,
+    chunk_bytes: usize,
+) -> Option<Vec<PvarRowRun>> {
+    use rayon::prelude::*;
+
+    let file = File::open(pvar_path).ok()?;
+    // SAFETY: the map is read-only and dropped before this returns. The file must
+    // not be truncated while it is mapped.
+    let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    let text: &[u8] = &map;
+
+    let mut cols = None;
+    let mut data_start = 0;
+    while data_start < text.len() {
+        let end = memchr::memchr(b'\n', &text[data_start..])
+            .map_or(text.len(), |offset| data_start + offset + 1);
+        let trimmed = str::from_utf8(&text[data_start..end]).ok()?.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            break;
+        }
+        if trimmed.starts_with('#') && !trimmed.starts_with("##") {
+            cols = Some(PvarCols::from_header_line(trimmed).ok()?);
+        }
+        data_start = end;
+    }
+    let data = &text[data_start..];
+    let cols = match cols {
+        Some(cols) => cols,
+        None => {
+            let first_line = data.split(|&byte| byte == b'\n').next()?;
+            PvarCols::from_headerless(str::from_utf8(first_line).ok()?.split_whitespace().count())
+                .ok()?
+        }
+    };
+
+    let chunk_bytes = chunk_bytes.max(1);
+    let mut bounds = vec![0];
+    let mut search_from = chunk_bytes;
+    while search_from < data.len() {
+        let Some(offset) = memchr::memchr(b'\n', &data[search_from..]) else {
+            break;
+        };
+        let end = search_from + offset + 1;
+        bounds.push(end);
+        search_from = end + chunk_bytes;
+    }
+    if bounds.last() != Some(&data.len()) {
+        bounds.push(data.len());
+    }
+    let chunks: Vec<Option<Vec<PvarRowRun>>> = bounds
+        .par_windows(2)
+        .map(|chunk| scan_pvar_chunk(&data[chunk[0]..chunk[1]], cols))
+        .collect();
+    let mut runs: Vec<PvarRowRun> = Vec::new();
+    for chunk in chunks {
+        for run in chunk? {
+            if runs.last().is_some_and(|last| last.chrom == run.chrom) {
+                runs.last_mut()?.positions.extend_from_slice(&run.positions);
+            } else {
+                runs.push(run);
+            }
+        }
+    }
+    Some(runs)
+}
+
+/// The row runs of one chunk of `.pvar` data lines, or `None` where
+/// [`scan_local_pvar_rows`] refuses a line.
+fn scan_pvar_chunk(chunk: &[u8], cols: PvarCols) -> Option<Vec<PvarRowRun>> {
+    let text = str::from_utf8(chunk).ok()?;
+    let mut runs: Vec<PvarRowRun> = Vec::new();
+    let mut chrom = String::new();
+    for line in text.split('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            return None;
+        }
+        let fields = PvarFields::split(trimmed, cols);
+        fields.id?;
+        fields.refa?;
+        normalize_chrom_into(fields.chrom?, &mut chrom);
+        let pos = fields.pos?.parse::<u64>().ok()?;
+        let alts = fields
+            .alt?
+            .split(',')
+            .map(str::trim)
+            .filter(|alt| !alt.is_empty() && *alt != ".")
+            .count();
+        if alts == 0 {
+            continue;
+        }
+        if runs.last().is_none_or(|last| last.chrom != chrom) {
+            runs.push(PvarRowRun {
+                chrom: chrom.clone(),
+                positions: Vec::new(),
+            });
+        }
+        runs.last_mut()?
+            .positions
+            .extend(std::iter::repeat_n(pos, alts));
+    }
+    Some(runs)
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Virtual .fam (TextSource): map .psam to .fam with fixed defaults
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -3524,6 +3648,68 @@ mod tests {
     use super::*;
     use std::convert::TryFrom;
     use std::sync::Arc;
+
+    /// The `.pvar` scan must read the rows the streaming virtual `.bim` renders, on
+    /// any chunking and with or without a header, across multiallelic sites, sites
+    /// without an ALT, labels the `.bim` normalizes, blank lines and line endings.
+    #[test]
+    fn pvar_row_scan_reads_what_the_virtual_bim_renders() {
+        let with_header = concat!(
+            "##fileformat=PVARv1.0\n",
+            "#CHROM\tPOS\tID\tREF\tALT\n",
+            "chr1\t100\trs1\tA\tG\n",
+            "chr1  200 . A C,T\r\n",
+            "\n",
+            "1\t300\trs3\tA\t.\n",
+            "Chr1\t400\trs4\tA\tG,.,T\n",
+            "chrM\t10\trs5\tA\tG\n",
+            "X\t155800000\trs6\tA\tG\n",
+            "PAR2\t155900000\trs7\tC\tA",
+        );
+        let headerless = concat!(
+            "chr1 rs1 0 100 A G\n",
+            "chr1 . 0 200 A C,T\n",
+            "chrX rs3 0 3000000 A G\n",
+            "Y rs4 0 4000000 A .\n",
+            "Y rs5 0 5000000 A T\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text) in [
+            ("header.pvar", with_header),
+            ("headerless.pvar", headerless),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            let mut bim = open_virtual_bim(&path).unwrap();
+            let mut expected: Vec<(String, u64)> = Vec::new();
+            while let Some(line) = bim.next_line().unwrap() {
+                let fields: Vec<&str> = str::from_utf8(line).unwrap().split('\t').collect();
+                expected.push((fields[0].to_string(), fields[3].parse().unwrap()));
+            }
+            assert!(expected.len() >= 5, "{name}: {expected:?}");
+            for chunk_bytes in [1, 7, 64, 1 << 20] {
+                let rows: Vec<(String, u64)> = scan_local_pvar_rows(&path, chunk_bytes)
+                    .unwrap()
+                    .into_iter()
+                    .flat_map(|run| {
+                        run.positions
+                            .into_iter()
+                            .map(move |position| (run.chrom.clone(), position))
+                    })
+                    .collect();
+                assert_eq!(rows, expected, "{name}, {chunk_bytes}-byte chunks");
+            }
+        }
+
+        // A header line after the data is left to the streaming `.bim`.
+        let path = dir.path().join("late_header.pvar");
+        std::fs::write(
+            &path,
+            format!("{headerless}#CHROM\tPOS\tID\tREF\tALT\n1\t10\trs9\tA\tG\n"),
+        )
+        .unwrap();
+        assert!(scan_local_pvar_rows(&path, 1 << 20).is_none());
+    }
 
     #[test]
     fn chromosome_normalization_accepts_utf8_without_slicing_panics() {

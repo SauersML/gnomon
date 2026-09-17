@@ -33,8 +33,8 @@ use crate::shared::files::{BedSource, positional_reads_fit_better};
 const BED_HEADER_LEN: usize = 3;
 
 /// PLINK 1 genotype codes that the counts distinguish.
-const MISSING_CODE: u8 = 0b01;
-const HET_CODE: u8 = 0b10;
+pub(super) const MISSING_CODE: u8 = 0b01;
+pub(super) const HET_CODE: u8 = 0b10;
 
 /// Upper bound on the bytes fetched per batch from a source without a memory map.
 const READ_BATCH_BYTES: usize = 64 << 20;
@@ -58,7 +58,7 @@ pub(super) enum LocusClass {
 }
 
 impl LocusClass {
-    const ALL: [LocusClass; 5] = [
+    pub(super) const ALL: [LocusClass; 5] = [
         LocusClass::Autosome,
         LocusClass::XPar,
         LocusClass::XNonPar,
@@ -374,31 +374,87 @@ fn count_evidence_batched(
             continue;
         }
         let calls = count_calls(rows, &indices, batch_bytes, available_bytes)?;
-        let n_rows = indices.len() as u64;
-        for ((sample, &missing), &het) in evidence.iter_mut().zip(&calls.missing).zip(&calls.het) {
-            let valid = n_rows - missing;
-            match class {
-                LocusClass::Autosome => {
-                    sample.auto_valid = valid;
-                    sample.auto_het = het;
-                }
-                LocusClass::XPar => {
-                    sample.x_par_valid = valid;
-                    sample.x_par_het = het;
-                }
-                LocusClass::XNonPar => {
-                    sample.x_non_par_valid = valid;
-                    sample.x_non_par_het = het;
-                }
-                // The accumulator keeps no heterozygous count on Y.
-                LocusClass::YPar => sample.y_par_valid = valid,
-                LocusClass::YNonPar => sample.y_non_par_valid = valid,
-            }
-        }
+        record_calls(&mut evidence, class, indices.len() as u64, &calls);
         counted += indices.len();
         progress(counted);
     }
     Ok(evidence)
+}
+
+/// Files each sample's call counts over `n_rows` rows of `class` under the
+/// counters the accumulator keeps for that class.
+fn record_calls(
+    evidence: &mut [EvidenceCounts],
+    class: LocusClass,
+    n_rows: u64,
+    calls: &CallCounts,
+) {
+    for ((sample, &missing), &het) in evidence.iter_mut().zip(&calls.missing).zip(&calls.het) {
+        let valid = n_rows - missing;
+        match class {
+            LocusClass::Autosome => {
+                sample.auto_valid = valid;
+                sample.auto_het = het;
+            }
+            LocusClass::XPar => {
+                sample.x_par_valid = valid;
+                sample.x_par_het = het;
+            }
+            LocusClass::XNonPar => {
+                sample.x_non_par_valid = valid;
+                sample.x_non_par_het = het;
+            }
+            // The accumulator keeps no heterozygous count on Y.
+            LocusClass::YPar => sample.y_par_valid = valid,
+            LocusClass::YNonPar => sample.y_non_par_valid = valid,
+        }
+    }
+}
+
+/// Sex evidence for every sample from packed PLINK 1 rows of any class, added in
+/// any order and in any number of batches.
+pub(super) struct EvidenceCounter {
+    n_samples: usize,
+    bytes_per_variant: usize,
+    /// Each class seen so far, with its row count and call counters.
+    classes: Vec<(LocusClass, u64, CallCounter)>,
+}
+
+impl EvidenceCounter {
+    pub(super) fn new(n_samples: usize) -> Self {
+        Self {
+            n_samples,
+            bytes_per_variant: n_samples.div_ceil(4),
+            classes: Vec::new(),
+        }
+    }
+
+    /// Adds rows of `class`, each `ceil(n_samples / 4)` packed bytes.
+    pub(super) fn add_rows(&mut self, class: LocusClass, rows: &[&[u8]]) {
+        if rows.is_empty() {
+            return;
+        }
+        let index = match self.classes.iter().position(|entry| entry.0 == class) {
+            Some(index) => index,
+            None => {
+                let counter = CallCounter::new(self.n_samples, self.bytes_per_variant);
+                self.classes.push((class, 0, counter));
+                self.classes.len() - 1
+            }
+        };
+        let entry = &mut self.classes[index];
+        entry.1 += rows.len() as u64;
+        entry.2.add_rows(rows);
+    }
+
+    pub(super) fn finish(self) -> Vec<EvidenceCounts> {
+        let mut evidence = vec![EvidenceCounts::default(); self.n_samples];
+        for (class, n_rows, counter) in self.classes {
+            let calls = counter.finish(self.n_samples);
+            record_calls(&mut evidence, class, n_rows, &calls);
+        }
+        evidence
+    }
 }
 
 /// Per-sample missing and heterozygous call counts over a set of rows.
@@ -407,36 +463,53 @@ struct CallCounts {
     het: Vec<u64>,
 }
 
+/// Missing and heterozygous call counts over packed rows added a batch at a time.
+struct CallCounter {
+    kernel: Kernel,
+    counters: Vec<RangeCounter>,
+}
+
+impl CallCounter {
+    fn new(n_samples: usize, bytes_per_variant: usize) -> Self {
+        Self {
+            kernel: Kernel::detect(),
+            counters: sample_ranges(n_samples, bytes_per_variant, rayon::current_num_threads())
+                .into_iter()
+                .map(|(bytes, n_samples)| RangeCounter::new(bytes, n_samples))
+                .collect(),
+        }
+    }
+
+    fn add_rows(&mut self, rows: &[&[u8]]) {
+        let kernel = self.kernel;
+        self.counters
+            .par_iter_mut()
+            .for_each(|counter| counter.add_rows(kernel, rows));
+    }
+
+    fn finish(mut self, n_samples: usize) -> CallCounts {
+        self.counters.par_iter_mut().for_each(RangeCounter::fold);
+        let mut missing = Vec::with_capacity(n_samples);
+        let mut het = Vec::with_capacity(n_samples);
+        for counter in self.counters {
+            missing.extend_from_slice(&counter.missing);
+            het.extend_from_slice(&counter.het);
+        }
+        CallCounts { missing, het }
+    }
+}
+
 fn count_calls(
     rows: &BedRows<'_>,
     indices: &[usize],
     batch_bytes: usize,
     available_bytes: u64,
 ) -> Result<CallCounts, PipelineError> {
-    let kernel = Kernel::detect();
-    let mut counters: Vec<RangeCounter> = sample_ranges(
-        rows.n_samples,
-        rows.bytes_per_variant,
-        rayon::current_num_threads(),
-    )
-    .into_iter()
-    .map(|(bytes, n_samples)| RangeCounter::new(bytes, n_samples))
-    .collect();
-
+    let mut counter = CallCounter::new(rows.n_samples, rows.bytes_per_variant);
     rows.for_each_batch(indices, batch_bytes, available_bytes, |batch| {
-        counters
-            .par_iter_mut()
-            .for_each(|counter| counter.add_rows(kernel, batch));
+        counter.add_rows(batch)
     })?;
-    counters.par_iter_mut().for_each(RangeCounter::fold);
-
-    let mut missing = Vec::with_capacity(rows.n_samples);
-    let mut het = Vec::with_capacity(rows.n_samples);
-    for counter in counters {
-        missing.extend_from_slice(&counter.missing);
-        het.extend_from_slice(&counter.het);
-    }
-    Ok(CallCounts { missing, het })
+    Ok(counter.finish(rows.n_samples))
 }
 
 /// Splits a row's packed bytes into contiguous ranges, returning each range with
@@ -833,6 +906,40 @@ mod tests {
                 }
                 assert_eq!(next_byte, row_len);
                 assert_eq!(samples, n_samples);
+            }
+        }
+    }
+
+    /// Rows of every class, added in any order and batching, count like the naive
+    /// decoding.
+    #[test]
+    fn evidence_counter_counts_rows_in_any_order_and_batching() {
+        let mut rng = TestRng(0xbb67_ae85_84ca_a73b);
+        for n_samples in [1usize, 5, 64, 3197] {
+            let row_len = n_samples.div_ceil(4);
+            let n_variants = 700;
+            let payload = random_rows(&mut rng, n_variants * row_len);
+            let loci: Vec<(usize, LocusClass)> = (0..n_variants)
+                .map(|index| (index, LocusClass::ALL[(index * 7 + index / 3) % 5]))
+                .collect();
+            let expected = naive_evidence(&payload, row_len, n_samples, &loci);
+            for batch in [1usize, 3, 256, 700] {
+                let mut counter = EvidenceCounter::new(n_samples);
+                for chunk in loci.chunks(batch) {
+                    for class in LocusClass::ALL {
+                        let rows: Vec<&[u8]> = chunk
+                            .iter()
+                            .filter(|entry| entry.1 == class)
+                            .map(|&(index, _)| &payload[index * row_len..(index + 1) * row_len])
+                            .collect();
+                        counter.add_rows(class, &rows);
+                    }
+                }
+                assert_eq!(
+                    counter.finish(),
+                    expected,
+                    "{n_samples} samples, batch {batch}"
+                );
             }
         }
     }

@@ -2257,6 +2257,10 @@ impl PgenDataset {
         &self.pgen_path
     }
 
+    pub fn pvar_path(&self) -> &Path {
+        &self.pvar_path
+    }
+
     pub fn variant_records(&self) -> Result<PlinkVariantRecordIter, PlinkIoError> {
         let reader = self
             .virtual_plink
@@ -3616,6 +3620,11 @@ impl VcfLikeDataset {
 
     pub fn input_path(&self) -> &Path {
         &self.input_path
+    }
+
+    /// The files the dataset reads, in stream order.
+    pub fn parts(&self) -> &[PathBuf] {
+        &self.parts
     }
 
     pub fn block_source(&self) -> Result<VcfLikeVariantBlockSource, VariantIoError> {
@@ -5910,6 +5919,12 @@ fn create_variant_reader_for_file(
     Ok((reader, compression, format, metrics))
 }
 
+/// The header of one variant file, read as the record reader reads it.
+pub(crate) fn read_variant_part_header(part: &Path) -> Result<vcf::Header, VariantIoError> {
+    let (mut reader, _, _, _) = create_variant_reader_for_file(part)?;
+    reader.read_header(part).map_err(VariantIoError::Io)
+}
+
 fn print_variant_diagnostics(
     path: &Path,
     compression: Option<VariantCompression>,
@@ -6948,7 +6963,7 @@ fn read_fam_records_from_source(
     Ok(records)
 }
 
-struct SortedPositionError {
+pub(crate) struct SortedPositionError {
     chromosome: String,
     previous_position: u64,
     position: u64,
@@ -6956,7 +6971,7 @@ struct SortedPositionError {
 }
 
 #[derive(Default)]
-struct ChromPositionSortState {
+pub(crate) struct ChromPositionSortState {
     current_chromosome_raw: String,
     current_chromosome_key: String,
     current_position: Option<u64>,
@@ -6973,7 +6988,7 @@ impl ChromPositionSortState {
     }
 
     #[inline]
-    fn observe(
+    pub(crate) fn observe(
         &mut self,
         chromosome: &str,
         position: u64,

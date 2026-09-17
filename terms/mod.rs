@@ -2,6 +2,7 @@
 mod cross_format_tests;
 pub mod sex;
 mod sex_counts;
+mod sex_reader;
 
 pub use sex::{
     SexInferenceError, SexInferenceRecord, infer_first_sample_sex, infer_sex_to_tsv,

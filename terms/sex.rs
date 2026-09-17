@@ -12,7 +12,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use thiserror::Error;
 
-use crate::adapt_plink2::GenomeBuild as PgenGenomeBuild;
+use crate::adapt_plink2::{GenomeBuild as PgenGenomeBuild, scan_local_pvar_rows};
 use crate::map::fit::VariantBlockSource;
 use crate::map::io::{
     DatasetBlockSource, GenotypeDataset, GenotypeIoError, PgenDataset, PlinkDataset, PlinkIoError,
@@ -23,6 +23,7 @@ use crate::shared::files::BedSource;
 use crate::terms::sex_counts::{
     BedRows, EvidenceCounts, LocusClass, count_evidence, finish_counts,
 };
+use crate::terms::sex_reader::VariantScan;
 
 #[derive(Debug, Error)]
 pub enum SexInferenceError {
@@ -86,7 +87,7 @@ struct SelectedVariant {
 
 /// How sex inference reads a variant's chromosome label.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LocusChromosome {
+pub(super) enum LocusChromosome {
     Autosome,
     X,
     Y,
@@ -97,9 +98,9 @@ enum LocusChromosome {
 
 /// Chromosome class and position of every variant, in file order.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct VariantLoci {
-    chroms: Vec<Option<LocusChromosome>>,
-    positions: Vec<u64>,
+pub(super) struct VariantLoci {
+    pub(super) chroms: Vec<Option<LocusChromosome>>,
+    pub(super) positions: Vec<u64>,
 }
 
 impl VariantLoci {
@@ -180,6 +181,27 @@ impl VariantLoci {
             let chunk = chunk?;
             loci.chroms.extend_from_slice(&chunk.chroms);
             loci.positions.extend_from_slice(&chunk.positions);
+        }
+        (loci.positions.len() == dataset.n_variants()).then_some(loci)
+    }
+
+    /// The loci of a `.pgen`'s rows, read from its local `.pvar` without building
+    /// a key per row, or `None` where the virtual `.bim` must be read instead. A
+    /// label is classified as its normalized key would be, once per run of rows
+    /// that share it.
+    fn from_pvar(dataset: &PgenDataset) -> Option<Self> {
+        let runs = scan_local_pvar_rows(dataset.pvar_path(), BIM_SCAN_CHUNK_BYTES)?;
+        let mut loci = Self {
+            chroms: Vec::with_capacity(dataset.n_variants()),
+            positions: Vec::with_capacity(dataset.n_variants()),
+        };
+        for run in runs {
+            let class = run.positions.first().and_then(|&position| {
+                classify_chromosome(&VariantKey::new(&run.chrom, position).chromosome)
+            });
+            loci.chroms
+                .extend(std::iter::repeat_n(class, run.positions.len()));
+            loci.positions.extend_from_slice(&run.positions);
         }
         (loci.positions.len() == dataset.n_variants()).then_some(loci)
     }
@@ -485,11 +507,29 @@ fn infer_dataset_records(
     force_build: Option<GenomeBuild>,
     show_progress: bool,
 ) -> Result<(GenomeBuild, Vec<SexInferenceRecord>), SexInferenceError> {
-    let loci = match dataset {
-        GenotypeDataset::Plink(plink) => {
-            VariantLoci::from_bim(plink).map_err(GenotypeIoError::from)?
-        }
-        _ => VariantLoci::from_keys(&dataset.variant_keys_for_plan(&SelectionPlan::All)?),
+    // A local VCF or BCF is read from its own bytes where they allow it, and
+    // through the record reader where they do not.
+    let scan = match dataset {
+        GenotypeDataset::Variants(variants) => VariantScan::read(variants),
+        _ => None,
+    };
+    let (loci, scan) = match (dataset, scan) {
+        (_, Some((loci, scan))) => (loci, Some(scan)),
+        (GenotypeDataset::Plink(plink), None) => (
+            VariantLoci::from_bim(plink).map_err(GenotypeIoError::from)?,
+            None,
+        ),
+        (GenotypeDataset::Pgen(pgen), None) => match VariantLoci::from_pvar(pgen) {
+            Some(loci) => (loci, None),
+            None => (
+                VariantLoci::from_keys(&dataset.variant_keys_for_plan(&SelectionPlan::All)?),
+                None,
+            ),
+        },
+        (_, None) => (
+            VariantLoci::from_keys(&dataset.variant_keys_for_plan(&SelectionPlan::All)?),
+            None,
+        ),
     };
     let build = resolve_build(force_build, &loci)?;
     let selection = SexVariantSelection::from_loci(&loci, build);
@@ -506,7 +546,18 @@ fn infer_dataset_records(
             &selection,
             show_progress,
         )?,
-        GenotypeDataset::Variants(_) => collect_inference(dataset, &selection, show_progress)?,
+        GenotypeDataset::Variants(_) => {
+            let scanned = match &scan {
+                Some(scan) => {
+                    collect_scanned_inference(dataset.samples(), scan, &selection, show_progress)?
+                }
+                None => None,
+            };
+            match scanned {
+                Some(records) => records,
+                None => collect_inference(dataset, &selection, show_progress)?,
+            }
+        }
     };
     Ok((build, records))
 }
@@ -774,24 +825,10 @@ fn collect_packed_inference(
     selection: &SexVariantSelection,
     show_progress: bool,
 ) -> Result<Vec<SexInferenceRecord>, SexInferenceError> {
-    let build = selection.build;
-    let platform = derive_platform_definition(&selection.keys, build);
-    ensure_informative_platform(&platform)?;
-    let config = InferenceConfig {
-        build,
-        platform,
-        thresholds: None,
-    };
-
-    let constants = build.algorithm_constants();
-    let loci: Vec<(usize, LocusClass)> = selection
-        .indices
+    let (config, selected) = counted_selection(selection)?;
+    let loci: Vec<(usize, LocusClass)> = selected
         .iter()
-        .zip(&selection.keys)
-        .filter_map(|(&index, selected)| {
-            LocusClass::of(&constants, selected.chrom, selected.position)
-                .map(|class| (index, class))
-        })
+        .filter_map(|&(index, class)| class.map(|class| (index, class)))
         .collect();
 
     if parts.is_empty() {
@@ -836,14 +873,72 @@ fn collect_packed_inference(
     }
     progress.finish(total_variants);
 
+    records_from_counts(samples, &evidence, &config)
+}
+
+/// [`collect_packed_inference`] for a VCF or BCF that [`VariantScan`] has read:
+/// the selected rows are packed from the files' own bytes. `None` where the
+/// record reader must decode them.
+fn collect_scanned_inference(
+    samples: &[SampleRecord],
+    scan: &VariantScan,
+    selection: &SexVariantSelection,
+    show_progress: bool,
+) -> Result<Option<Vec<SexInferenceRecord>>, SexInferenceError> {
+    let (config, selected) = counted_selection(selection)?;
+    let total_variants = selection.keys.len();
+    let mut progress = TermsProgress::new(total_variants, show_progress);
+    let Some(evidence) = scan.count_evidence(&selected, |counted| {
+        progress.update(counted, total_variants)
+    }) else {
+        return Ok(None);
+    };
+    progress.finish(total_variants);
+    records_from_counts(samples, &evidence, &config).map(Some)
+}
+
+/// The inference configuration of a selection, and every selected row with the
+/// counter it feeds, if any.
+fn counted_selection(
+    selection: &SexVariantSelection,
+) -> Result<(InferenceConfig, Vec<(usize, Option<LocusClass>)>), SexInferenceError> {
+    let build = selection.build;
+    let platform = derive_platform_definition(&selection.keys, build);
+    ensure_informative_platform(&platform)?;
+    let config = InferenceConfig {
+        build,
+        platform,
+        thresholds: None,
+    };
+    let constants = build.algorithm_constants();
+    let selected = selection
+        .indices
+        .iter()
+        .zip(&selection.keys)
+        .map(|(&index, selected)| {
+            (
+                index,
+                LocusClass::of(&constants, selected.chrom, selected.position),
+            )
+        })
+        .collect();
+    Ok((config, selected))
+}
+
+/// Every sample's result from its evidence counts.
+fn records_from_counts(
+    samples: &[SampleRecord],
+    evidence: &[EvidenceCounts],
+    config: &InferenceConfig,
+) -> Result<Vec<SexInferenceRecord>, SexInferenceError> {
     finalize_records(
-        samples.iter().zip(&evidence).map(|(sample, counts)| {
+        samples.iter().zip(evidence).map(|(sample, counts)| {
             Ok(SexInferenceRecord {
                 individual_id: sample.individual_id.clone(),
-                inference: finish_counts(&config, counts)?,
+                inference: finish_counts(config, counts)?,
             })
         }),
-        &platform,
+        &config.platform,
     )
 }
 
@@ -1041,7 +1136,7 @@ fn infer_build(loci: &VariantLoci) -> BuildEvidence {
     }
 }
 
-fn classify_chromosome(label: &str) -> Option<LocusChromosome> {
+pub(super) fn classify_chromosome(label: &str) -> Option<LocusChromosome> {
     let trimmed = label.trim();
     let bytes = trimmed.as_bytes();
     let stripped = if bytes.len() >= 3
@@ -2218,6 +2313,320 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// A VCF whose records cover the shapes the byte-level reader must read as the
+    /// record reader reads them: multiallelic sites and sites without an ALT;
+    /// phased, haploid, partly missing and, with `with_triploids`, triploid calls;
+    /// GT beside DS; X and Y rows outside both PAR intervals, in PAR1 and in the
+    /// non-PAR body; and a contig sex inference ignores. Odd samples look male.
+    /// The positions prove GRCh38.
+    fn messy_vcf(n_samples: usize, with_dosages: bool, with_triploids: bool) -> String {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64 ^ n_samples as u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut text = String::from("##fileformat=VCFv4.3\n");
+        for contig in ["1", "chr2", "22", "X", "Y", "MT"] {
+            text.push_str(&format!("##contig=<ID={contig}>\n"));
+        }
+        text.push_str("##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n");
+        text.push_str("##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Dosage\">\n");
+        text.push_str("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT");
+        for sample in 0..n_samples {
+            text.push_str(&format!("\tS{sample}"));
+        }
+        text.push('\n');
+        let mut rows: Vec<(&str, u64)> = Vec::new();
+        for (contig, count) in [("1", 900u64), ("chr2", 700), ("22", 500)] {
+            rows.extend((0..count).map(|i| (contig, 10_000 + i * 97)));
+        }
+        rows.extend((0..400u64).map(|i| ("X", 5_000 + i * 390_000)));
+        rows.extend((0..120u64).map(|i| ("Y", 5_000 + i * 470_000)));
+        rows.push(("MT", 100));
+        for (index, &(contig, position)) in rows.iter().enumerate() {
+            let (alt, alleles) = match index % 37 {
+                5 => ("C,T", 3u64),
+                11 => (".", 1),
+                _ => ("G", 2),
+            };
+            let with_ds = with_dosages && index % 29 == 3;
+            let format = if with_ds { "GT:DS" } else { "GT" };
+            text.push_str(&format!(
+                "{contig}\t{position}\t.\tA\t{alt}\t.\tPASS\t.\t{format}"
+            ));
+            for sample in 0..n_samples {
+                let roll = next();
+                let male = sample % 2 == 1;
+                let allele = |shift: u32| (roll >> shift) % alleles;
+                let gt = if roll % 50 == 0 {
+                    match (roll >> 8) % 4 {
+                        0 => "./.".to_string(),
+                        1 => ".".to_string(),
+                        2 => format!("./{}", allele(16)),
+                        _ => format!("{}|.", allele(16)),
+                    }
+                } else if (male && (contig == "X" || contig == "Y")) || (roll >> 40) % 23 == 0 {
+                    allele(16).to_string()
+                } else if contig == "Y" {
+                    "./.".to_string()
+                } else if with_triploids && (roll >> 44) % 31 == 0 {
+                    format!("{}/{}/{}", allele(16), allele(24), allele(32))
+                } else {
+                    let separator = if (roll >> 50) % 2 == 0 { '/' } else { '|' };
+                    format!("{}{separator}{}", allele(16), allele(24))
+                };
+                text.push('\t');
+                text.push_str(&gt);
+                if with_ds {
+                    text.push_str(&format!(":{:.2}", (roll >> 56) as f64 / 128.0));
+                }
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    /// `text` as BGZF blocks of at most `block_len` bytes, then the empty EOF block.
+    fn bgzf(text: &[u8], block_len: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in text.chunks(block_len).chain(std::iter::once(&[][..])) {
+            let mut encoder =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(chunk).expect("deflate");
+            let data = encoder.finish().expect("finish deflate");
+            let mut crc = flate2::Crc::new();
+            crc.update(chunk);
+            out.extend_from_slice(&[
+                0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, b'B', b'C',
+                0x02, 0x00,
+            ]);
+            out.extend_from_slice(&u16::try_from(data.len() + 25).expect("BSIZE").to_le_bytes());
+            out.extend_from_slice(&data);
+            out.extend_from_slice(&crc.sum().to_le_bytes());
+            out.extend_from_slice(&u32::try_from(chunk.len()).expect("ISIZE").to_le_bytes());
+        }
+        out
+    }
+
+    /// Writes the BCF noodles writes from the GT-only VCF at `vcf`, with a missing
+    /// call written as the string ".", as bcftools writes one.
+    fn write_bcf(vcf: &Path, bcf: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        use noodles_vcf::variant::RecordBuf;
+        use noodles_vcf::variant::io::Write as _;
+        use noodles_vcf::variant::record_buf::samples::{Keys, Samples, sample::Value};
+
+        let mut reader = noodles_vcf::io::Reader::new(std::io::BufReader::new(File::open(vcf)?));
+        let header = reader.read_header()?;
+        let mut writer = noodles_bcf::io::Writer::new(File::create(bcf)?);
+        writer.write_header(&header)?;
+        let mut record = RecordBuf::default();
+        while reader.read_record_buf(&header, &mut record)? != 0 {
+            let keys: Keys = record.samples().keys().as_ref().iter().cloned().collect();
+            let n_keys = keys.as_ref().len();
+            let values: Vec<Vec<Option<Value>>> = record
+                .samples()
+                .values()
+                .map(|sample| {
+                    let mut values = sample.values().to_vec();
+                    values.resize(n_keys, None);
+                    values
+                        .into_iter()
+                        .map(|value| value.or_else(|| Some(Value::String(".".to_string()))))
+                        .collect()
+                })
+                .collect();
+            *record.samples_mut() = Samples::new(keys, values);
+            writer.write_variant_record(&header, &record)?;
+        }
+        writer.try_finish()?;
+        Ok(())
+    }
+
+    /// The byte-level reader must read the loci the key scan reads, and infer
+    /// exactly what the record reader infers, record for record and down to the
+    /// metric bits, reading a plain file in each window size of `windows`.
+    fn assert_scan_reproduces_the_reader(
+        path: &Path,
+        windows: &[usize],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dataset = GenotypeDataset::open(path, None)?;
+        let GenotypeDataset::Variants(variants) = &dataset else {
+            panic!("{} is a variant file", path.display());
+        };
+        let loci = VariantLoci::from_keys(&dataset.variant_keys_for_plan(&SelectionPlan::All)?);
+        let build = infer_build(&loci)
+            .chosen()
+            .expect("the fixture settles one build");
+        let selection = SexVariantSelection::from_loci(&loci, build);
+        let expected = collect_inference(&dataset, &selection, false)?;
+        for &window in windows {
+            let context = format!("{} in {window}-byte windows", path.display());
+            let (scanned_loci, scan) = VariantScan::read_in_windows(variants, window)
+                .unwrap_or_else(|| panic!("{context}: the first pass reads the file"));
+            assert_eq!(scanned_loci, loci, "{context}");
+            let records = collect_scanned_inference(dataset.samples(), &scan, &selection, false)?
+                .unwrap_or_else(|| panic!("{context}: the second pass decodes the rows"));
+            assert_eq!(records.len(), expected.len(), "{context}");
+            for (record, expected) in records.iter().zip(&expected) {
+                assert_eq!(record.individual_id, expected.individual_id);
+                assert_eq!(record.inference, expected.inference, "{context}");
+                assert_eq!(
+                    metric_bits(&record.inference),
+                    metric_bits(&expected.inference)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scanned_variants_infer_what_the_record_reader_infers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let text = messy_vcf(13, true, true);
+        let plain = dir.path().join("messy.vcf");
+        std::fs::write(&plain, &text)?;
+        assert_scan_reproduces_the_reader(&plain, &[1, 7, 64, 4096, 1 << 20])?;
+        for block_len in [7, 257, 65_536] {
+            let compressed = dir.path().join(format!("messy_{block_len}.vcf.gz"));
+            std::fs::write(&compressed, bgzf(text.as_bytes(), block_len))?;
+            assert_scan_reproduces_the_reader(&compressed, &[1 << 20])?;
+        }
+        let calls = dir.path().join("calls.vcf");
+        // noodles' BCF writer pads a short call after each of its alleles, so a
+        // record that mixes triploid and diploid calls is written corrupt.
+        std::fs::write(&calls, messy_vcf(13, false, false))?;
+        let bcf = dir.path().join("calls.bcf");
+        write_bcf(&calls, &bcf)?;
+        assert_scan_reproduces_the_reader(&bcf, &[1 << 20])?;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/testdata/xy_sex.vcf.gz");
+        assert_scan_reproduces_the_reader(&fixture, &[1 << 20])
+    }
+
+    fn assert_same_records(records: &[SexInferenceRecord], expected: &[SexInferenceRecord]) {
+        assert_eq!(records.len(), expected.len());
+        for (record, expected) in records.iter().zip(expected) {
+            assert_eq!(record.individual_id, expected.individual_id);
+            assert_eq!(record.inference, expected.inference);
+            assert_eq!(
+                metric_bits(&record.inference),
+                metric_bits(&expected.inference)
+            );
+        }
+    }
+
+    /// What the byte-level reader cannot read as the record reader does goes to
+    /// the record reader, which gives the table, or the refusal, it gives anyway.
+    #[test]
+    fn scanned_variants_leave_what_they_cannot_read_to_the_record_reader()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let text = messy_vcf(13, true, true);
+        let plain = dir.path().join("plain.vcf");
+        std::fs::write(&plain, &text)?;
+        let (_, build, expected) = infer_records(&plain, None, false)?;
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let first_record = lines
+            .iter()
+            .position(|line| !line.starts_with('#'))
+            .expect("the fixture has records");
+        let edited = |edit: &dyn Fn(&mut Vec<String>)| {
+            let mut lines = lines.clone();
+            edit(&mut lines);
+            lines.join("\n") + "\n"
+        };
+
+        // A non-ASCII ID: the first pass refuses the file, and the record reader
+        // reads it to the same table.
+        let non_ascii = dir.path().join("non_ascii.vcf");
+        std::fs::write(
+            &non_ascii,
+            edited(&|lines| {
+                lines[first_record] = lines[first_record].replacen("\t.\t", "\trs\u{e9}\t", 1)
+            }),
+        )?;
+        let dataset = GenotypeDataset::open(&non_ascii, None)?;
+        let GenotypeDataset::Variants(variants) = &dataset else {
+            panic!("a variant file");
+        };
+        assert!(VariantScan::read(variants).is_none());
+        let (_, non_ascii_build, records) = infer_records(&non_ascii, None, false)?;
+        assert_eq!(non_ascii_build, build);
+        assert_same_records(&records, &expected);
+
+        // A selected autosome with dosages and no GT: the second pass refuses it,
+        // and the record reader decodes the dosages.
+        let dosages = dir.path().join("dosages.vcf");
+        std::fs::write(
+            &dosages,
+            edited(&|lines| {
+                let fields: Vec<&str> = lines[first_record].split('\t').collect();
+                lines[first_record] = fields[..8].join("\t") + "\tDS" + &"\t0.3".repeat(13);
+            }),
+        )?;
+        let dataset = GenotypeDataset::open(&dosages, None)?;
+        let GenotypeDataset::Variants(variants) = &dataset else {
+            panic!("a variant file");
+        };
+        let (loci, scan) = VariantScan::read(variants).expect("the first pass reads the file");
+        let selection = SexVariantSelection::from_loci(&loci, build);
+        assert_eq!(
+            selection.indices.first(),
+            Some(&0),
+            "the edited row is selected"
+        );
+        assert!(collect_scanned_inference(dataset.samples(), &scan, &selection, false)?.is_none());
+        let expected_dosages = collect_inference(&dataset, &selection, false)?;
+        let (_, _, records) = infer_records(&dosages, Some(build), false)?;
+        assert_same_records(&records, &expected_dosages);
+
+        // A GT the genotype parser refuses: the same refusal.
+        let malformed = dir.path().join("malformed.vcf");
+        std::fs::write(
+            &malformed,
+            edited(&|lines| {
+                let mut fields: Vec<String> = lines[first_record]
+                    .split('\t')
+                    .map(str::to_string)
+                    .collect();
+                fields[9] = "0/x".to_string();
+                lines[first_record] = fields.join("\t");
+            }),
+        )?;
+        assert!(infer_records(&malformed, None, false).is_err());
+
+        // A cut BGZF file: the first pass refuses it, and the record reader
+        // reports the cut.
+        let compressed = bgzf(text.as_bytes(), 4096);
+        let cut = dir.path().join("cut.vcf.gz");
+        std::fs::write(&cut, &compressed[..compressed.len() - 40])?;
+        let dataset = GenotypeDataset::open(&cut, None)?;
+        let GenotypeDataset::Variants(variants) = &dataset else {
+            panic!("a variant file");
+        };
+        assert!(VariantScan::read(variants).is_none());
+        assert!(infer_records(&cut, None, false).is_err());
+
+        // A BCF whose sample blocks hold bytes past their series, as noodles'
+        // writer leaves after a triploid call: the second pass refuses it, and
+        // the record reader reports the bytes it cannot read.
+        let triploid = dir.path().join("triploid.vcf");
+        std::fs::write(&triploid, messy_vcf(13, false, true))?;
+        let overrun = dir.path().join("overrun.bcf");
+        write_bcf(&triploid, &overrun)?;
+        let dataset = GenotypeDataset::open(&overrun, None)?;
+        let GenotypeDataset::Variants(variants) = &dataset else {
+            panic!("a variant file");
+        };
+        let (loci, scan) = VariantScan::read(variants).expect("the site blocks read");
+        let selection = SexVariantSelection::from_loci(&loci, build);
+        assert!(collect_scanned_inference(dataset.samples(), &scan, &selection, false)?.is_none());
+        assert!(infer_records(&overrun, None, false).is_err());
         Ok(())
     }
 }
