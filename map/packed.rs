@@ -20,6 +20,10 @@
 //!   groups. A leaf adds rows and multiplies nothing, three rows where it would
 //!   have added eight.
 //!
+//! [`covariance_product`] takes them in that order, for the sample-side
+//! operator `XXᵀ/(n−1)`; [`gram_product`] takes them the other way round, for
+//! the variant-side operator `XᵀX/(n−1)`, whose block has a row per variant.
+//!
 //! The f64 working sets are a leaf of rows per thread, one tile of variant
 //! images and one chunk of tables, whatever the cohort size.
 //!
@@ -38,7 +42,7 @@ use rayon::prelude::*;
 use std::ops::Range;
 use std::simd::StdFloat;
 use std::simd::prelude::*;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 type Lanes = Simd<f64, 4>;
 
@@ -714,136 +718,143 @@ fn build_group_tables(
         });
 }
 
-/// `out ← out + scale·X·Xᵀ·rhs`, and `factor ← Xᵀ·rhs` when given, for the
-/// standardized genotypes behind `packed`: logical variant `j` takes the value
-/// `code_values[j][c]` wherever its 2-bit code is `c`.
-///
-/// Returns `false` having written nothing when the view cannot serve every row
-/// and variant, or a matrix is not stored contiguously; the caller then takes
-/// the product another way.
-pub(crate) fn covariance_product(
-    packed: &HardCallPacked<'_>,
-    code_values: &[[f64; 4]],
-    scale: f64,
-    rhs: MatRef<'_, f64>,
-    mut out: MatMut<'_, f64>,
-    mut factor: Option<MatMut<'_, f64>>,
-    progress: &dyn Fn(usize),
-) -> bool {
-    let n_samples = rhs.nrows();
-    let width = rhs.ncols();
-    let variants = code_values.len();
-    if out.nrows() != n_samples
-        || out.ncols() != width
-        || factor
-            .as_ref()
-            .is_some_and(|factor| factor.nrows() != variants || factor.ncols() != width)
-    {
-        return false;
-    }
-    let Some(rows) = LeafRows::new(packed, n_samples) else {
-        return false;
-    };
-    let Some(slices) = (0..variants)
-        .map(|variant| packed.slice(variant, 1))
-        .collect::<Option<Vec<&[u8]>>>()
-    else {
-        return false;
-    };
-    if slices.iter().any(|bytes| bytes.len() < rows.bytes_needed()) {
-        return false;
-    }
-    let Some(columns) = (0..width)
-        .map(|column| {
-            rhs.col(column)
-                .try_as_col_major()
-                .map(|column| column.as_slice())
-        })
-        .collect::<Option<Vec<&[f64]>>>()
-    else {
-        return false;
-    };
-    if (0..width).any(|column| out.rb().col(column).try_as_col_major().is_none()) {
-        return false;
-    }
-    if n_samples == 0 || width == 0 || variants == 0 {
-        if let Some(factor) = factor.as_mut() {
-            factor.fill(0.0);
+/// A packed view and a block shape, checked and sized once and shared by both
+/// orders of multiplication.
+struct Product<'a> {
+    rows: LeafRows<'a>,
+    slices: Vec<&'a [u8]>,
+    code_values: &'a [[f64; 4]],
+    n_samples: usize,
+    width: usize,
+    lanes_total: usize,
+    /// `(first lane, lanes)` of every kernel group of the block's columns.
+    groups: Vec<(usize, usize)>,
+    leaves: usize,
+    /// Variants a tile takes, in whole groups.
+    per_tile: usize,
+    /// Groups a chunk of tables takes.
+    chunk_groups: usize,
+    fused: bool,
+    scratch: Vec<Mutex<Scratch>>,
+}
+
+impl<'a> Product<'a> {
+    /// `None` when the view cannot serve `n_samples` rows of every variant.
+    /// Every count here is at least one.
+    fn new(
+        packed: &'a HardCallPacked<'_>,
+        code_values: &'a [[f64; 4]],
+        n_samples: usize,
+        width: usize,
+    ) -> Option<Self> {
+        let rows = LeafRows::new(packed, n_samples)?;
+        let variants = code_values.len();
+        let slices = (0..variants)
+            .map(|variant| packed.slice(variant, 1))
+            .collect::<Option<Vec<&[u8]>>>()?;
+        if slices.iter().any(|bytes| bytes.len() < rows.bytes_needed()) {
+            return None;
         }
-        return true;
+        let lanes_total = width.div_ceil(4);
+        let groups = (0..lanes_total)
+            .step_by(GROUP_LANES)
+            .map(|first_lane| (first_lane, GROUP_LANES.min(lanes_total - first_lane)))
+            .collect();
+        let leaf_height = LEAF_ROWS.min(n_samples);
+        // Whole groups to a tile and to a chunk, so neither boundary splits one.
+        let per_tile = (PARTIAL_BYTES / (LEAF_BATCH * width * std::mem::size_of::<f64>()))
+            .max(1)
+            .next_multiple_of(GROUP_VARIANTS)
+            .min(variants);
+        let group_len = TABLE_KINDS * GROUP_SUBSETS * lanes_total;
+        let chunk_groups = (TABLE_BYTES / (group_len * std::mem::size_of::<Lanes>()))
+            .clamp(1, per_tile.div_ceil(GROUP_VARIANTS));
+        let workers = rayon::current_num_threads().max(1);
+        let scratch = (0..workers)
+            .map(|_| {
+                Mutex::new(Scratch {
+                    lanes: vec![Lanes::splat(0.0); leaf_height * GROUP_LANES],
+                    codes: vec![0u8; leaf_height],
+                    high: vec![0u8; leaf_height * chunk_groups],
+                    low: vec![0u8; leaf_height * chunk_groups],
+                })
+            })
+            .collect();
+        Some(Self {
+            rows,
+            slices,
+            code_values,
+            n_samples,
+            width,
+            lanes_total,
+            groups,
+            leaves: n_samples.div_ceil(LEAF_ROWS),
+            per_tile,
+            chunk_groups,
+            fused: fused_multiply_add(),
+            scratch,
+        })
     }
 
-    let fused = fused_multiply_add();
-    let lanes_total = width.div_ceil(4);
-    let groups: Vec<(usize, usize)> = (0..lanes_total)
-        .step_by(GROUP_LANES)
-        .map(|first_lane| (first_lane, GROUP_LANES.min(lanes_total - first_lane)))
-        .collect();
-    let leaves = n_samples.div_ceil(LEAF_ROWS);
-    let leaf_height = LEAF_ROWS.min(n_samples);
-    // Whole groups to a tile and to a chunk, so neither boundary splits one.
-    let per_tile = (PARTIAL_BYTES / (LEAF_BATCH * width * std::mem::size_of::<f64>()))
-        .max(1)
-        .next_multiple_of(GROUP_VARIANTS)
-        .min(variants);
-    let group_len = TABLE_KINDS * GROUP_SUBSETS * lanes_total;
-    let chunk_groups = (TABLE_BYTES / (group_len * std::mem::size_of::<Lanes>()))
-        .clamp(1, per_tile.div_ceil(GROUP_VARIANTS));
-    let chunk_variants = chunk_groups * GROUP_VARIANTS;
-    let workers = rayon::current_num_threads().max(1);
-    let scratch: Vec<Mutex<Scratch>> = (0..workers)
-        .map(|_| {
-            Mutex::new(Scratch {
-                lanes: vec![Lanes::splat(0.0); leaf_height * GROUP_LANES],
-                codes: vec![0u8; leaf_height],
-                high: vec![0u8; leaf_height * chunk_groups],
-                low: vec![0u8; leaf_height * chunk_groups],
-            })
-        })
-        .collect();
-    let worker_scratch = || {
-        let index = rayon::current_thread_index().unwrap_or(0).min(workers - 1);
-        scratch[index]
+    /// Doubles the partial images of one batch of leaves take.
+    fn partials_len(&self) -> usize {
+        LEAF_BATCH.min(self.leaves) * self.per_tile * self.width
+    }
+
+    /// Lanes one chunk of tables takes.
+    fn tables_len(&self) -> usize {
+        self.chunk_groups * TABLE_KINDS * GROUP_SUBSETS * self.lanes_total
+    }
+
+    fn worker_scratch(&self) -> MutexGuard<'_, Scratch> {
+        let index = rayon::current_thread_index()
+            .unwrap_or(0)
+            .min(self.scratch.len() - 1);
+        self.scratch[index]
             .lock()
             .expect("packed covariance scratch poisoned")
-    };
-    let mut partials = vec![0.0f64; LEAF_BATCH.min(leaves) * per_tile * width];
-    let mut images = vec![0.0f64; per_tile * width];
-    let mut compensations = vec![0.0f64; per_tile * width];
-    let mut tables = vec![Lanes::splat(0.0); chunk_groups * group_len];
+    }
 
-    let mut first = 0usize;
-    while first < variants {
-        let count = per_tile.min(variants - first);
+    /// `images ← Xᵀ·rhs` for the `count` variants from `first`, `width`
+    /// columns a variant, where `columns` are the columns of `rhs`: a batch of
+    /// leaves at a time, each leaf's partial merged into the running image in
+    /// leaf order.
+    fn project(
+        &self,
+        first: usize,
+        count: usize,
+        columns: &[&[f64]],
+        images: &mut [f64],
+        compensations: &mut [f64],
+        partials: &mut [f64],
+    ) {
+        let width = self.width;
         let tile = Tile {
-            slices: &slices[first..first + count],
-            values: &code_values[first..first + count],
+            slices: &self.slices[first..first + count],
+            values: &self.code_values[first..first + count],
         };
         let span = count * width;
         let images = &mut images[..span];
         let compensations = &mut compensations[..span];
         images.fill(0.0);
         compensations.fill(0.0);
-
-        // Xᵀ·rhs: a batch of leaves at a time, each leaf's partial merged into
-        // the running image in leaf order.
-        for batch_first in (0..leaves).step_by(LEAF_BATCH) {
-            let batch = LEAF_BATCH.min(leaves - batch_first);
+        for batch_first in (0..self.leaves).step_by(LEAF_BATCH) {
+            let batch = LEAF_BATCH.min(self.leaves - batch_first);
             partials[..batch * span]
                 .par_chunks_mut(span)
                 .enumerate()
                 .for_each(|(offset, partial)| {
                     let leaf = batch_first + offset;
-                    let count = LEAF_ROWS.min(n_samples - leaf * LEAF_ROWS);
-                    let mut guard = worker_scratch();
-                    for &(first_lane, lanes) in &groups {
+                    let count = LEAF_ROWS.min(self.n_samples - leaf * LEAF_ROWS);
+                    let mut guard = self.worker_scratch();
+                    for &(first_lane, lanes) in &self.groups {
                         let first_column = 4 * first_lane;
                         let end_column = width.min(4 * (first_lane + lanes));
                         by_lanes!(
                             lanes,
                             project_leaf_lanes(
-                                fused,
-                                &rows,
+                                self.fused,
+                                &self.rows,
                                 leaf,
                                 count,
                                 &columns[first_column..end_column],
@@ -881,25 +892,32 @@ pub(crate) fn covariance_product(
         for (image, error) in images.iter_mut().zip(compensations.iter()) {
             *image += *error;
         }
-        if let Some(factor) = factor.as_mut() {
-            for variant in 0..count {
-                for column in 0..width {
-                    factor[(first + variant, column)] = images[variant * width + column];
-                }
-            }
-        }
+    }
 
-        // X·images: a chunk of groups at a time, its tables formed once and
-        // read by every leaf of rows.
-        let images = &*images;
+    /// `out ← out + scale·X·images` for the `count` variants from `first`,
+    /// whose images hold `width` columns a variant: a chunk of groups at a
+    /// time, its tables formed once and read by every leaf of rows.
+    fn scatter(
+        &self,
+        first: usize,
+        count: usize,
+        images: &[f64],
+        scale: f64,
+        mut out: MatMut<'_, f64>,
+        tables: &mut [Lanes],
+    ) {
+        let width = self.width;
+        let lanes_total = self.lanes_total;
+        let group_len = TABLE_KINDS * GROUP_SUBSETS * lanes_total;
+        let chunk_variants = self.chunk_groups * GROUP_VARIANTS;
         for chunk_first in (0..count).step_by(chunk_variants) {
             let chunk_count = chunk_variants.min(count - chunk_first);
-            let chunk_slices = &tile.slices[chunk_first..chunk_first + chunk_count];
+            let chunk_slices = &self.slices[first + chunk_first..first + chunk_first + chunk_count];
             let chunk_groups = chunk_count.div_ceil(GROUP_VARIANTS);
             let tables = &mut tables[..chunk_groups * group_len];
             build_group_tables(
                 &images[chunk_first * width..(chunk_first + chunk_count) * width],
-                &tile.values[chunk_first..chunk_first + chunk_count],
+                &self.code_values[first + chunk_first..first + chunk_first + chunk_count],
                 width,
                 lanes_total,
                 scale,
@@ -911,7 +929,7 @@ pub(crate) fn covariance_product(
                 .enumerate()
                 .for_each(|(leaf, mut chunk)| {
                     let count = chunk.nrows();
-                    let mut guard = worker_scratch();
+                    let mut guard = self.worker_scratch();
                     let Scratch {
                         lanes,
                         codes,
@@ -919,7 +937,7 @@ pub(crate) fn covariance_product(
                         low,
                     } = &mut *guard;
                     for (group, members) in chunk_slices.chunks(GROUP_VARIANTS).enumerate() {
-                        rows.masks(
+                        self.rows.masks(
                             members,
                             leaf,
                             &mut high[group * count..(group + 1) * count],
@@ -927,12 +945,12 @@ pub(crate) fn covariance_product(
                             &mut codes[..count],
                         );
                     }
-                    for &(first_lane, lanes_here) in &groups {
+                    for &(first_lane, lanes_here) in &self.groups {
                         let columns = 4 * first_lane..width.min(4 * (first_lane + lanes_here));
                         by_lanes!(
                             lanes_here,
                             scatter_leaf_lanes(
-                                fused,
+                                self.fused,
                                 chunk.rb_mut(),
                                 columns,
                                 first_lane,
@@ -947,9 +965,201 @@ pub(crate) fn covariance_product(
                     }
                 });
         }
+    }
+}
 
+/// The columns of `matrix` as slices, or `None` when one is not stored
+/// contiguously.
+fn contiguous_columns<'m>(matrix: MatRef<'m, f64>) -> Option<Vec<&'m [f64]>> {
+    (0..matrix.ncols())
+        .map(|column| {
+            matrix
+                .col(column)
+                .try_as_col_major()
+                .map(|column| column.as_slice())
+        })
+        .collect()
+}
+
+/// `out ← out + scale·X·Xᵀ·rhs`, and `factor ← Xᵀ·rhs` when given, for the
+/// standardized genotypes behind `packed`: logical variant `j` takes the value
+/// `code_values[j][c]` wherever its 2-bit code is `c`.
+///
+/// Returns `false` having written nothing when the view cannot serve every row
+/// and variant, or a matrix is not stored contiguously; the caller then takes
+/// the product another way.
+pub(crate) fn covariance_product(
+    packed: &HardCallPacked<'_>,
+    code_values: &[[f64; 4]],
+    scale: f64,
+    rhs: MatRef<'_, f64>,
+    mut out: MatMut<'_, f64>,
+    mut factor: Option<MatMut<'_, f64>>,
+    progress: &dyn Fn(usize),
+) -> bool {
+    let n_samples = rhs.nrows();
+    let width = rhs.ncols();
+    let variants = code_values.len();
+    if out.nrows() != n_samples
+        || out.ncols() != width
+        || factor
+            .as_ref()
+            .is_some_and(|factor| factor.nrows() != variants || factor.ncols() != width)
+    {
+        return false;
+    }
+    let Some(columns) = contiguous_columns(rhs) else {
+        return false;
+    };
+    if contiguous_columns(out.rb()).is_none() {
+        return false;
+    }
+    if n_samples == 0 || width == 0 || variants == 0 {
+        if let Some(factor) = factor.as_mut() {
+            factor.fill(0.0);
+        }
+        return true;
+    }
+    let Some(product) = Product::new(packed, code_values, n_samples, width) else {
+        return false;
+    };
+
+    let mut partials = vec![0.0f64; product.partials_len()];
+    let mut images = vec![0.0f64; product.per_tile * width];
+    let mut compensations = vec![0.0f64; product.per_tile * width];
+    let mut tables = vec![Lanes::splat(0.0); product.tables_len()];
+    let mut first = 0usize;
+    while first < variants {
+        let count = product.per_tile.min(variants - first);
+        product.project(
+            first,
+            count,
+            &columns,
+            &mut images,
+            &mut compensations,
+            &mut partials,
+        );
+        if let Some(factor) = factor.as_mut() {
+            for variant in 0..count {
+                for column in 0..width {
+                    factor[(first + variant, column)] = images[variant * width + column];
+                }
+            }
+        }
+        product.scatter(
+            first,
+            count,
+            &images[..count * width],
+            scale,
+            out.rb_mut(),
+            &mut tables,
+        );
         first += count;
         progress(first);
     }
     true
+}
+
+/// `image ← X·rhs`, and `out ← scale·Xᵀ·image` when given, for the same
+/// genotypes as [`covariance_product`] and a block `rhs` with a row per
+/// variant: the product of the variant-side operator `scale·XᵀX`, and with no
+/// `out`, the lift of variant-side vectors onto the samples.
+///
+/// `image` and `out` are overwritten. Returns `false` having written nothing
+/// on the same terms as [`covariance_product`]. `progress` sees the variants of
+/// both multiplications, half of the count each.
+pub(crate) fn gram_product(
+    packed: &HardCallPacked<'_>,
+    code_values: &[[f64; 4]],
+    scale: f64,
+    rhs: MatRef<'_, f64>,
+    mut image: MatMut<'_, f64>,
+    mut out: Option<MatMut<'_, f64>>,
+    progress: &dyn Fn(usize),
+) -> bool {
+    let n_samples = image.nrows();
+    let width = rhs.ncols();
+    let variants = code_values.len();
+    if rhs.nrows() != variants
+        || image.ncols() != width
+        || out
+            .as_ref()
+            .is_some_and(|out| out.nrows() != variants || out.ncols() != width)
+        || contiguous_columns(image.rb()).is_none()
+    {
+        return false;
+    }
+    if n_samples == 0 || width == 0 || variants == 0 {
+        image.fill(0.0);
+        if let Some(out) = out.as_mut() {
+            out.fill(0.0);
+        }
+        return true;
+    }
+    let Some(product) = Product::new(packed, code_values, n_samples, width) else {
+        return false;
+    };
+
+    let mut images = vec![0.0f64; product.per_tile * width];
+    let mut tables = vec![Lanes::splat(0.0); product.tables_len()];
+    let halves = if out.is_some() { 2 } else { 1 };
+    image.fill(0.0);
+    let mut first = 0usize;
+    while first < variants {
+        let count = product.per_tile.min(variants - first);
+        for variant in 0..count {
+            for column in 0..width {
+                images[variant * width + column] = rhs[(first + variant, column)];
+            }
+        }
+        product.scatter(
+            first,
+            count,
+            &images[..count * width],
+            1.0,
+            image.rb_mut(),
+            &mut tables,
+        );
+        first += count;
+        progress(first / halves);
+    }
+
+    if let Some(out) = out.as_mut() {
+        let columns = contiguous_columns(image.rb()).expect("image columns checked contiguous");
+        let mut partials = vec![0.0f64; product.partials_len()];
+        let mut compensations = vec![0.0f64; product.per_tile * width];
+        let mut first = 0usize;
+        while first < variants {
+            let count = product.per_tile.min(variants - first);
+            product.project(
+                first,
+                count,
+                &columns,
+                &mut images,
+                &mut compensations,
+                &mut partials,
+            );
+            for variant in 0..count {
+                for column in 0..width {
+                    out[(first + variant, column)] = scale * images[variant * width + column];
+                }
+            }
+            first += count;
+            progress((variants + first) / 2);
+        }
+    }
+    true
+}
+
+/// Whether [`gram_product`] can serve `n_samples` rows of `variants` variants
+/// from `packed`.
+pub(crate) fn serves(packed: &HardCallPacked<'_>, n_samples: usize, variants: usize) -> bool {
+    let Some(rows) = LeafRows::new(packed, n_samples) else {
+        return false;
+    };
+    (0..variants).all(|variant| {
+        packed
+            .slice(variant, 1)
+            .is_some_and(|bytes| bytes.len() >= rows.bytes_needed())
+    })
 }

@@ -1,6 +1,9 @@
-use super::blocklanczos::{BlockKrylovError, BlockKrylovParams, BlockOperator, block_krylov_eigen};
+use super::blocklanczos::{
+    BlockKrylovError, BlockKrylovOutcome, BlockKrylovParams, BlockOperator, block_krylov_eigen,
+    orthonormalize,
+};
 use super::io::plink_standardized_code_values;
-use super::packed::covariance_product;
+use super::packed::{covariance_product, gram_product, serves as packed_serves};
 use super::partitioned::{
     add_mul_rows_in_chunks, gram_rows, gram_rows_in_chunks, mul_rows, self_adjoint_eigen_seq,
 };
@@ -18,6 +21,7 @@ use faer::linalg::matmul::matmul;
 use faer::linalg::matmul::triangular as triangular_matmul;
 #[cfg(test)]
 use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
+use faer::linalg::triangular_solve::solve_lower_triangular_in_place;
 use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
 use faer::mat::AsMatMut;
 use faer::matrix_free::LinOp;
@@ -4546,6 +4550,20 @@ where
     // Arnoldi does — spends the expensive resource (a genome traversal) to buy
     // the cheap one (a matrix-vector product). See `super::blocklanczos`.
     let requested = desired.min(upper_target).max(1);
+
+    // More samples than variants: solve on the variant side, whose Krylov basis
+    // is `p × b` a pass where the sample side's is `n × b`. At 500,000 samples
+    // and 10,000 variants that is 23 MiB of basis in place of 1.1 GiB.
+    let variants = operator.observed_variants;
+    if variants < n && operator.packed_gram_available() {
+        return compute_variant_side_eigenpairs(
+            operator,
+            requested.min(variants),
+            desired,
+            max_passes,
+        );
+    }
+
     let mut params = BlockKrylovParams::auto(requested, n, krylov_basis_budget_bytes());
     if let Some(max_passes) = max_passes {
         params.max_passes = max_passes.max(params.min_passes);
@@ -4562,31 +4580,7 @@ where
             BlockKrylovError::Operator(inner) => inner,
             other => HwePcaError::Eigen(other.to_string()),
         })?;
-
-    // The whole termination record, carried out with the eigenpairs so that the
-    // serialized model can answer "did this converge?" long after the warning
-    // below has scrolled off somebody's terminal.
-    let diagnostics = Some(FitDiagnostics {
-        solver: FitSolver::BlockKrylov,
-        converged: outcome.converged,
-        passes: outcome.passes,
-        max_relative_residual: Some(outcome.max_relative_residual),
-        subspace_delta: Some(outcome.subspace_delta),
-        boundary_gap: outcome.boundary_gap,
-        restarts: outcome.restarts,
-    });
-
-    if !outcome.converged {
-        // Said once here where the numbers are, and enforced by
-        // `require_converged` where the fit is assembled: unless the caller
-        // opted in, this subspace does not become a model at all.
-        eprintln!(
-            "warning: PCA eigensolver stopped after {} covariance passes without reaching its \
-             tolerance (worst relative Ritz residual {:.3e}, subspace change {:.3e}); the \
-             reported components are the best available estimate.",
-            outcome.passes, outcome.max_relative_residual, outcome.subspace_delta
-        );
-    }
+    let diagnostics = krylov_diagnostics(&outcome);
 
     // Ritz values arrive in descending order, so the positive prefix is the
     // usable spectrum.
@@ -4621,6 +4615,234 @@ where
         vectors,
         diagnostics,
         factor_products,
+    })
+}
+
+/// `‖values‖₂`, its squares summed in order with each rounding error carried
+/// apart (Neumaier), so the same bits come out at any thread count and
+/// wherever the values are allocated.
+fn compensated_norm(values: &[f64]) -> f64 {
+    let mut sum = 0.0f64;
+    let mut compensation = 0.0f64;
+    for &value in values {
+        let term = value * value;
+        let next = sum + term;
+        compensation += if sum.abs() >= term.abs() {
+            (sum - next) + term
+        } else {
+            (term - next) + sum
+        };
+        sum = next;
+    }
+    (sum + compensation).sqrt()
+}
+
+/// The whole termination record of a block-Krylov solve, carried out with the
+/// eigenpairs so that the serialized model can answer "did this converge?" long
+/// after the warning said here has scrolled off somebody's terminal.
+fn krylov_diagnostics(outcome: &BlockKrylovOutcome) -> Option<FitDiagnostics> {
+    if !outcome.converged {
+        // Said once here where the numbers are, and enforced by
+        // `require_converged` where the fit is assembled: unless the caller
+        // opted in, this subspace does not become a model at all.
+        eprintln!(
+            "warning: PCA eigensolver stopped after {} covariance passes without reaching its \
+             tolerance (worst relative Ritz residual {:.3e}, subspace change {:.3e}); the \
+             reported components are the best available estimate.",
+            outcome.passes, outcome.max_relative_residual, outcome.subspace_delta
+        );
+    }
+    Some(FitDiagnostics {
+        solver: FitSolver::BlockKrylov,
+        converged: outcome.converged,
+        passes: outcome.passes,
+        max_relative_residual: Some(outcome.max_relative_residual),
+        subspace_delta: Some(outcome.subspace_delta),
+        boundary_gap: outcome.boundary_gap,
+        restarts: outcome.restarts,
+    })
+}
+
+/// The block solver's operator on the variant side, `XᵀX/(n−1)`, whose blocks
+/// have a row per observed variant; see [`compute_variant_side_eigenpairs`].
+struct VariantSideBlockOperator<'a, 'b, S, P>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    inner: &'a StandardizedCovarianceOp<'b, S, P>,
+    /// The `n × b` sample image every pass multiplies through, kept from one
+    /// pass to the next.
+    image: Mutex<Mat<f64>>,
+    pass: AtomicUsize,
+    max_passes: usize,
+}
+
+impl<S, P> BlockOperator for VariantSideBlockOperator<'_, '_, S, P>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    type Error = HwePcaError;
+
+    fn dim(&self) -> usize {
+        self.inner.observed_variants
+    }
+
+    /// `factor_rows` is `None`, so the solver never hands this a factor.
+    fn apply_block(
+        &self,
+        out: MatMut<'_, f64>,
+        _factor: Option<MatMut<'_, f64>>,
+        q: MatRef<'_, f64>,
+    ) -> Result<(), Self::Error> {
+        let pass = self.pass.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        if let Some(progress) = self.inner.progress.as_ref() {
+            progress.begin_pass(pass, self.max_passes);
+        }
+        let mut image = self
+            .image
+            .lock()
+            .expect("variant-side image mutex poisoned");
+        if image.nrows() != self.inner.n_samples || image.ncols() != q.ncols() {
+            *image = Mat::zeros(self.inner.n_samples, q.ncols());
+        }
+        if self
+            .inner
+            .try_apply_gram_packed(image.as_mut(), Some(out), q)
+        {
+            Ok(())
+        } else {
+            Err(HwePcaError::Eigen(
+                "the packed genotype view stopped serving the variant-side covariance product"
+                    .into(),
+            ))
+        }
+    }
+}
+
+/// Top eigenpairs of the sample covariance, solved on the variant side.
+///
+/// `XXᵀ` and `XᵀX` share their nonzero eigenvalues, so the solver runs where
+/// the dimension is the variant count and keeps a `p × b` basis where the
+/// sample side keeps `n × b`. Its passes, residuals and stopping rules are the
+/// variant-side operator's; the spectrum is the same.
+///
+/// What it returns are variant-side vectors `v`. As loadings those sit half a
+/// power step behind the sample side's `Xᵀ·u` from as many passes, and `X·v`
+/// half a step ahead of its `u`; on the map edge workloads `v` alone moved
+/// loadings by 1e-5 relative. So two multiplications through the genotypes
+/// carry them one step further before anything is stored: `B₁ = Xᵀ·X·v`, then
+/// `u = X·B₁` orthonormalized, and the cross-products `B = Xᵀ·u` for exactly
+/// that `u`, which the fit's Rayleigh–Ritz rotation then works from as it does
+/// for the sample side.
+fn compute_variant_side_eigenpairs<S, P>(
+    operator: &StandardizedCovarianceOp<'_, S, P>,
+    requested: usize,
+    desired: usize,
+    max_passes: Option<usize>,
+) -> Result<Eigenpairs, HwePcaError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    let n = operator.n_samples();
+    let variants = operator.observed_variants;
+    let mut params = BlockKrylovParams::auto(requested, variants, krylov_basis_budget_bytes());
+    if let Some(max_passes) = max_passes {
+        params.max_passes = max_passes.max(params.min_passes);
+    }
+    // The operator, and the sample image it holds, go before the lift.
+    let outcome = {
+        let block_operator = VariantSideBlockOperator {
+            inner: operator,
+            image: Mutex::new(Mat::new()),
+            pass: AtomicUsize::new(0),
+            max_passes: params.max_passes,
+        };
+        block_krylov_eigen(&block_operator, requested, params).map_err(|err| match err {
+            BlockKrylovError::Operator(inner) => inner,
+            other => HwePcaError::Eigen(other.to_string()),
+        })?
+    };
+    let diagnostics = krylov_diagnostics(&outcome);
+
+    let positive = outcome
+        .values
+        .iter()
+        .take_while(|value| **value > EIGENVALUE_EPSILON)
+        .count();
+    let keep = positive.min(desired);
+    if keep == 0 {
+        return Ok(Eigenpairs {
+            values: Vec::new(),
+            vectors: Mat::zeros(n, 0),
+            diagnostics,
+            factor_products: None,
+        });
+    }
+
+    let values = outcome.values[..keep].to_vec();
+    let mut rhs = outcome.vectors;
+    rhs.truncate(variants, keep);
+    // Each product writes `X·rhs` over `vectors` and `Xᵀ·X·rhs/(n−1)` beside
+    // it, which becomes the next `rhs`: after two, `vectors` holds `X·B₁` and
+    // `rhs` holds `Xᵀ·(X·B₁)/(n−1)`.
+    let mut vectors = Mat::<f64>::zeros(n, keep);
+    let mut images = Mat::<f64>::zeros(variants, keep);
+    for _ in 0..2 {
+        if !operator.try_apply_gram_packed(vectors.as_mut(), Some(images.as_mut()), rhs.as_ref()) {
+            return Err(HwePcaError::Eigen(
+                "the packed genotype view stopped serving the variant-side lift".into(),
+            ));
+        }
+        std::mem::swap(&mut rhs, &mut images);
+    }
+    let mut cross_products = rhs;
+
+    // Unit columns first, so the orthonormalization sees a well-conditioned
+    // block whatever the spread of the eigenvalues; the cross-products follow
+    // every scaling, and so stay `Xᵀ·vectors`.
+    let lifted_scale = (n - 1) as f64;
+    for (mut column, mut cross) in vectors.col_iter_mut().zip(cross_products.col_iter_mut()) {
+        let norm = compensated_norm(
+            column
+                .as_ref()
+                .try_as_col_major()
+                .expect("a freshly allocated column is contiguous")
+                .as_slice(),
+        );
+        let inverse = if norm > 0.0 { norm.recip() } else { 0.0 };
+        zip!(&mut column).for_each(|unzip!(value)| {
+            *value *= inverse;
+        });
+        let factor = lifted_scale * inverse;
+        zip!(&mut cross).for_each(|unzip!(value)| {
+            *value *= factor;
+        });
+    }
+    let mut r = Mat::<f64>::zeros(keep, keep);
+    if orthonormalize(vectors.as_mut(), Some(r.as_mut())) < keep {
+        return Err(HwePcaError::Eigen(
+            "the variant-side lift collapsed a component".into(),
+        ));
+    }
+    // `vectors` was `Q·R` and is now `Q`, so `Xᵀ·Q = (Xᵀ·Q·R)·R⁻¹`: `Rᵀ·Bᵀ` is
+    // the transpose of what the cross-products held.
+    solve_lower_triangular_in_place(
+        r.transpose(),
+        cross_products.as_mut().transpose_mut(),
+        Par::Seq,
+    );
+
+    Ok(Eigenpairs {
+        values,
+        vectors,
+        diagnostics,
+        factor_products: Some(cross_products),
     })
 }
 
@@ -5063,34 +5285,9 @@ where
         let Some(packed) = source.hard_call_packed() else {
             return false;
         };
-
-        let variants = self.observed_variants;
-        let freqs = self.scaler.allele_frequencies();
-        let scales = self.scaler.variant_scales();
-        if packed.n_variants() < variants || freqs.len() < variants || scales.len() < variants {
+        let Some(code_values) = self.packed_code_values(&packed) else {
             return false;
-        }
-        // The scaler was estimated from the logically oriented stream, while
-        // the view holds physical BED codes: a swapped match maps physical
-        // dosage 0 to logical dosage 2, so its code values trade places.
-        let code_values: Vec<[f64; 4]> = (0..variants)
-            .map(|variant| {
-                let denom = scales[variant].max(HWE_SCALE_FLOOR);
-                let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
-                let weight = self
-                    .ld_weights
-                    .as_deref()
-                    .and_then(|weights| weights.get(variant))
-                    .copied()
-                    .unwrap_or(1.0);
-                plink_standardized_code_values(
-                    2.0 * freqs[variant],
-                    inv,
-                    weight,
-                    packed.match_kind(variant) == MatchKind::Swap,
-                )
-            })
-            .collect();
+        };
         let progress = |processed: usize| {
             if let Some(progress) = self.progress.as_ref() {
                 progress.advance(processed);
@@ -5104,6 +5301,99 @@ where
             out,
             factor,
             &progress,
+        )
+    }
+
+    /// `image ← X·rhs`, and `out ← XᵀX·rhs/(n−1)` when given, for a block with
+    /// a row per observed variant, straight from the source's 2-bit codes; see
+    /// [`super::packed::gram_product`]. `false` leaves both untouched, on the
+    /// same terms as [`Self::try_apply_hardcall_packed`].
+    fn try_apply_gram_packed(
+        &self,
+        image: MatMut<'_, f64>,
+        out: Option<MatMut<'_, f64>>,
+        rhs: MatRef<'_, f64>,
+    ) -> bool {
+        let mut guard = self
+            .source
+            .lock()
+            .expect("covariance source mutex poisoned");
+        let source: &mut S = &mut guard;
+        if source.reset().is_err() {
+            return false;
+        }
+        let Some(packed) = source.hard_call_packed() else {
+            return false;
+        };
+        let Some(code_values) = self.packed_code_values(&packed) else {
+            return false;
+        };
+        let progress = |processed: usize| {
+            if let Some(progress) = self.progress.as_ref() {
+                progress.advance(processed);
+            }
+        };
+        gram_product(
+            &packed,
+            &code_values,
+            self.scale,
+            rhs,
+            image,
+            out,
+            &progress,
+        )
+    }
+
+    /// Whether the source hands out a packed view that serves every row and
+    /// observed variant, so that products can multiply in either order.
+    fn packed_gram_available(&self) -> bool {
+        let mut guard = self
+            .source
+            .lock()
+            .expect("covariance source mutex poisoned");
+        let source: &mut S = &mut guard;
+        if source.reset().is_err() {
+            return false;
+        }
+        let Some(packed) = source.hard_call_packed() else {
+            return false;
+        };
+        self.packed_code_values(&packed).is_some()
+            && packed_serves(&packed, self.n_samples, self.observed_variants)
+    }
+
+    /// The standardized value of every observed variant at each of its 2-bit
+    /// codes in `packed`, or `None` when the view or the scaler covers fewer
+    /// variants than were observed.
+    fn packed_code_values(&self, packed: &HardCallPacked<'_>) -> Option<Vec<[f64; 4]>> {
+        let variants = self.observed_variants;
+        let freqs = self.scaler.allele_frequencies();
+        let scales = self.scaler.variant_scales();
+        if packed.n_variants() < variants || freqs.len() < variants || scales.len() < variants {
+            return None;
+        }
+        // The scaler was estimated from the logically oriented stream, while
+        // the view holds physical BED codes: a swapped match maps physical
+        // dosage 0 to logical dosage 2, so its code values trade places.
+        Some(
+            (0..variants)
+                .map(|variant| {
+                    let denom = scales[variant].max(HWE_SCALE_FLOOR);
+                    let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+                    let weight = self
+                        .ld_weights
+                        .as_deref()
+                        .and_then(|weights| weights.get(variant))
+                        .copied()
+                        .unwrap_or(1.0);
+                    plink_standardized_code_values(
+                        2.0 * freqs[variant],
+                        inv,
+                        weight,
+                        packed.match_kind(variant) == MatchKind::Swap,
+                    )
+                })
+                .collect(),
         )
     }
 }
@@ -9652,6 +9942,286 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The variant-side product, `X·q` and then `XᵀX·q/(n−1)` for a block with
+    /// a row per variant, must match the same products of the standardized
+    /// matrix the tile path decodes, across leaves, with and without a sample
+    /// subset, and give the same bits on any number of threads.
+    #[test]
+    fn packed_gram_product_matches_the_decoded_matrix_and_ignores_the_thread_count() {
+        use super::super::packed::LEAF_ROWS;
+        const PHYSICAL_SAMPLES: usize = 2 * LEAF_ROWS + 1_003;
+        const N_VARIANTS: usize = 19;
+
+        let mut physical = synthetic_genotypes(PHYSICAL_SAMPLES, N_VARIANTS);
+        for (index, value) in physical.iter_mut().enumerate() {
+            if index % 29 == 4 {
+                *value = f64::NAN;
+            }
+        }
+        let subset: Vec<usize> = (0..PHYSICAL_SAMPLES)
+            .filter(|sample| sample % 7 != 2)
+            .collect();
+
+        for selection in [None, Some(subset)] {
+            let n_samples = selection.as_ref().map_or(PHYSICAL_SAMPLES, Vec::len);
+            let mut logical = Vec::with_capacity(n_samples * N_VARIANTS);
+            for variant in 0..N_VARIANTS {
+                let column =
+                    &physical[variant * PHYSICAL_SAMPLES..(variant + 1) * PHYSICAL_SAMPLES];
+                match &selection {
+                    Some(rows) => logical.extend(rows.iter().map(|&row| column[row])),
+                    None => logical.extend_from_slice(column),
+                }
+            }
+
+            let mut stats_source =
+                DenseBlockSource::new(&logical, n_samples, N_VARIANTS).expect("stats source");
+            let stats_progress = StageProgressHandle::new(
+                Arc::new(NoopFitProgress),
+                FitProgressStage::AlleleStatistics,
+            );
+            let (scaler, _, observed) = compute_variant_statistics(
+                &mut stats_source,
+                N_VARIANTS,
+                Par::Seq,
+                stats_progress,
+                N_VARIANTS,
+            )
+            .expect("variant statistics");
+
+            // Xᵀ, from the tile path's factor image of the identity.
+            let mut general_source =
+                DenseBlockSource::new(&logical, n_samples, N_VARIANTS).expect("general source");
+            let general =
+                covariance_operator(&mut general_source, N_VARIANTS, observed, scaler.clone());
+            let identity = Mat::<f64>::identity(n_samples, n_samples);
+            let mut discarded = Mat::<f64>::zeros(n_samples, n_samples);
+            let mut transpose = Mat::<f64>::zeros(observed, n_samples);
+            let mut mem = MemBuffer::new(general.apply_scratch(n_samples, Par::Seq));
+            general.apply_with_factor(
+                discarded.as_mut(),
+                Some(transpose.as_mut()),
+                identity.as_ref(),
+                Par::Seq,
+                MemStack::new(&mut mem),
+            );
+            let scale = 1.0 / (n_samples as f64 - 1.0);
+
+            for width in [1usize, 5, 13] {
+                let rhs = Mat::<f64>::from_fn(observed, width, |row, col| {
+                    (((row * 13 + col * 7) % 17) as f64 - 8.0) / 5.0
+                });
+                let mut expected_image = Mat::<f64>::zeros(n_samples, width);
+                mul_rows(
+                    expected_image.as_mut(),
+                    Accum::Replace,
+                    transpose.transpose(),
+                    rhs.as_ref(),
+                    1.0,
+                );
+                let mut expected_out = Mat::<f64>::zeros(observed, width);
+                mul_rows(
+                    expected_out.as_mut(),
+                    Accum::Replace,
+                    transpose.as_ref(),
+                    expected_image.as_ref(),
+                    scale,
+                );
+
+                let mut direct = DirectPackedSource::new(&physical, PHYSICAL_SAMPLES, N_VARIANTS);
+                if let Some(rows) = &selection {
+                    direct = direct.with_sample_selection(rows.clone());
+                }
+                let mut cached = CachedVariantBlockSource::new(&mut direct, true);
+                let packed = covariance_operator(&mut cached, N_VARIANTS, observed, scaler.clone());
+                assert!(
+                    packed.packed_gram_available(),
+                    "the packed view must serve the variant side"
+                );
+                let products = |threads: usize| {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .expect("thread pool")
+                        .install(|| {
+                            let mut image = Mat::<f64>::zeros(n_samples, width);
+                            let mut out = Mat::<f64>::zeros(observed, width);
+                            assert!(
+                                packed.try_apply_gram_packed(
+                                    image.as_mut(),
+                                    Some(out.as_mut()),
+                                    rhs.as_ref()
+                                ),
+                                "packed gram product refused {n_samples} rows"
+                            );
+                            (image, out)
+                        })
+                };
+
+                let (serial_image, serial_out) = products(1);
+                for (name, expected, actual) in [
+                    ("sample image", &expected_image, &serial_image),
+                    ("operator image", &expected_out, &serial_out),
+                ] {
+                    let mut magnitude = 0.0f64;
+                    let mut max_diff = 0.0f64;
+                    for col in 0..width {
+                        for row in 0..expected.nrows() {
+                            magnitude = magnitude.max(expected[(row, col)].abs());
+                            max_diff =
+                                max_diff.max((expected[(row, col)] - actual[(row, col)]).abs());
+                        }
+                    }
+                    assert!(
+                        max_diff <= 1.0e-10 * magnitude.max(1.0),
+                        "{name} over {n_samples} rows at width {width}: packed and decoded products differ by {max_diff} (magnitude {magnitude})"
+                    );
+                }
+                for threads in [3usize, 8] {
+                    let (image, out) = products(threads);
+                    for (name, serial, threaded) in [
+                        ("sample image", &serial_image, &image),
+                        ("operator image", &serial_out, &out),
+                    ] {
+                        for col in 0..width {
+                            for row in 0..serial.nrows() {
+                                assert_eq!(
+                                    serial[(row, col)].to_bits(),
+                                    threaded[(row, col)].to_bits(),
+                                    "{name} entry ({row}, {col}) differs at {threads} threads"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// With more samples than variants a packed source is solved on the variant
+    /// side and lifted. Its eigenvalues, the span of its sample vectors, and its
+    /// cross-products `Xᵀ·u` must match the sample-side solve of the tile path.
+    /// Both Krylov spaces exhaust the rank here, so both answers are exact to
+    /// roundoff.
+    #[test]
+    fn variant_side_eigenpairs_match_the_sample_side_solve() {
+        const N_SAMPLES: usize = 1_537;
+        const N_VARIANTS: usize = 23;
+        const COMPONENTS: usize = 4;
+
+        let mut data = synthetic_genotypes(N_SAMPLES, N_VARIANTS);
+        for (index, value) in data.iter_mut().enumerate() {
+            if index % 31 == 7 {
+                *value = f64::NAN;
+            }
+        }
+        let mut stats_source =
+            DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("stats source");
+        let stats_progress = StageProgressHandle::new(
+            Arc::new(NoopFitProgress),
+            FitProgressStage::AlleleStatistics,
+        );
+        let (scaler, _, observed) = compute_variant_statistics(
+            &mut stats_source,
+            N_VARIANTS,
+            Par::Seq,
+            stats_progress,
+            N_VARIANTS,
+        )
+        .expect("variant statistics");
+
+        let mut general_source =
+            DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("general source");
+        let general =
+            covariance_operator(&mut general_source, N_VARIANTS, observed, scaler.clone());
+        let mut direct = DirectPackedSource::new(&data, N_SAMPLES, N_VARIANTS);
+        let mut cached = CachedVariantBlockSource::new(&mut direct, true);
+        let packed = covariance_operator(&mut cached, N_VARIANTS, observed, scaler);
+        assert!(!general.packed_gram_available());
+        assert!(packed.packed_gram_available());
+
+        let progress: Option<&StageProgressHandle<NoopFitProgress>> = None;
+        let sample_side = compute_covariance_eigenpairs(
+            &general,
+            Par::Seq,
+            CovarianceComputationMode::Partial,
+            COMPONENTS,
+            None,
+            progress,
+        )
+        .expect("sample-side solve");
+        let variant_side = compute_covariance_eigenpairs(
+            &packed,
+            Par::Seq,
+            CovarianceComputationMode::Partial,
+            COMPONENTS,
+            None,
+            progress,
+        )
+        .expect("variant-side solve");
+
+        assert_eq!(sample_side.values.len(), COMPONENTS);
+        assert_eq!(variant_side.values.len(), COMPONENTS);
+        for (component, (&expected, &actual)) in sample_side
+            .values
+            .iter()
+            .zip(&variant_side.values)
+            .enumerate()
+        {
+            assert!(
+                (expected - actual).abs() <= 1.0e-9 * expected.abs(),
+                "eigenvalue {component}: sample side {expected}, variant side {actual}"
+            );
+        }
+
+        let mut overlap = Mat::<f64>::zeros(COMPONENTS, COMPONENTS);
+        gram_rows(
+            overlap.as_mut(),
+            variant_side.vectors.as_ref(),
+            sample_side.vectors.as_ref(),
+        );
+        let mut residual = sample_side.vectors.clone();
+        mul_rows(
+            residual.as_mut(),
+            Accum::Add,
+            variant_side.vectors.as_ref(),
+            overlap.as_ref(),
+            -1.0,
+        );
+        let sine = residual.as_ref().norm_l2();
+        assert!(
+            sine <= 1.0e-8,
+            "the sample and variant sides span different subspaces: residual {sine}"
+        );
+
+        let cross_products = variant_side
+            .factor_products
+            .as_ref()
+            .expect("the variant side lifts its cross-products");
+        let mut discarded = Mat::<f64>::zeros(N_SAMPLES, COMPONENTS);
+        let mut expected = Mat::<f64>::zeros(observed, COMPONENTS);
+        let mut mem = MemBuffer::new(general.apply_scratch(COMPONENTS, Par::Seq));
+        general.apply_with_factor(
+            discarded.as_mut(),
+            Some(expected.as_mut()),
+            variant_side.vectors.as_ref(),
+            Par::Seq,
+            MemStack::new(&mut mem),
+        );
+        let mut magnitude = 0.0f64;
+        let mut max_diff = 0.0f64;
+        for col in 0..COMPONENTS {
+            for row in 0..observed {
+                magnitude = magnitude.max(expected[(row, col)].abs());
+                max_diff = max_diff.max((expected[(row, col)] - cross_products[(row, col)]).abs());
+            }
+        }
+        assert!(
+            max_diff <= 1.0e-9 * magnitude,
+            "cross-products differ from Xᵀ·u by {max_diff} (magnitude {magnitude})"
+        );
     }
 
     #[test]

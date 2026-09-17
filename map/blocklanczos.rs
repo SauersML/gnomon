@@ -1127,7 +1127,7 @@ fn remove_constant_direction(mut block: MatMut<'_, f64>) {
 /// The collapse threshold is relative to the block's own largest column. `Z` is
 /// `C·Q` and carries the operator's units, so a fixed absolute threshold
 /// quietly changes meaning when the covariance is rescaled.
-fn orthonormalize(mut block: MatMut<'_, f64>, mut r: Option<MatMut<'_, f64>>) -> usize {
+pub(crate) fn orthonormalize(mut block: MatMut<'_, f64>, mut r: Option<MatMut<'_, f64>>) -> usize {
     let n = block.nrows();
     let width = block.ncols();
     if let Some(r) = r.as_mut() {
