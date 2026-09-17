@@ -759,9 +759,10 @@ fn open_pgen_as_bed_source(
     let pvar: crate::adapt_plink2::PvarFactory =
         Arc::new(move || open_text_source(&pvar_for_factory));
 
-    let virtual_plink = crate::adapt_plink2::open_virtual_plink19_from_sources(
+    let virtual_plink = crate::adapt_plink2::open_virtual_plink19_with_local_pvar(
         pgen,
         pvar,
+        Some(pvar_path.as_path()),
         &mut *psam,
         genome_build,
     )?;

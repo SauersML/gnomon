@@ -33,7 +33,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
+#[cfg(not(unix))]
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::str;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -151,10 +154,24 @@ pub fn open_virtual_plink19_from_paths(
 ) -> Result<VirtualPlink19, PipelineError> {
     let mut psam_for_plan = open_text_source(psam_path)?;
     let pgen = Arc::new(LocalFileByteRangeSource::open(pgen_path)?);
-    let pvar_path = pvar_path.to_path_buf();
-    let pvar: PvarFactory = Arc::new(move || open_text_source(&pvar_path));
+    let factory_path = pvar_path.to_path_buf();
+    let pvar: PvarFactory = Arc::new(move || open_text_source(&factory_path));
 
-    open_virtual_plink19_from_sources(pgen, pvar, &mut *psam_for_plan, build)
+    open_virtual_plink19_with_local_pvar(pgen, pvar, Some(pvar_path), &mut *psam_for_plan, build)
+}
+
+/// Bytes of `.pvar` data one chunk of the parallel variant-plan scan takes.
+const PLAN_SCAN_CHUNK_BYTES: usize = 4 << 20;
+
+/// The variant plan of the `.pvar` that `pvar` opens: by a parallel scan of the
+/// mapped file when `local_pvar` names it and the scan can read it, and by
+/// streaming the file otherwise, which also makes every refusal the streamed
+/// one.
+fn plan_for(pvar: &PvarFactory, local_pvar: Option<&Path>) -> Result<VariantPlan, PipelineError> {
+    match local_pvar.and_then(|path| VariantPlan::from_local_pvar(path, PLAN_SCAN_CHUNK_BYTES)) {
+        Some(plan) => Ok(plan),
+        None => VariantPlan::from_pvar(&mut *pvar()?),
+    }
 }
 
 /// Open from caller-provided sources. Callers may pass a custom/remote-capable
@@ -170,11 +187,24 @@ pub fn open_virtual_plink19_from_sources(
     pgen: Arc<dyn ByteRangeSource>,
     pvar: PvarFactory,
     psam_for_plan: &mut dyn TextSource,
+    build: GenomeBuild,
+) -> Result<VirtualPlink19, PipelineError> {
+    open_virtual_plink19_with_local_pvar(pgen, pvar, None, psam_for_plan, build)
+}
+
+/// [`open_virtual_plink19_from_sources`], given the local path of the `.pvar`
+/// the factory opens when there is one, so that the variant plan can come from
+/// a parallel scan of the mapped file; see [`plan_for`].
+pub(crate) fn open_virtual_plink19_with_local_pvar(
+    pgen: Arc<dyn ByteRangeSource>,
+    pvar: PvarFactory,
+    local_pvar: Option<&Path>,
+    psam_for_plan: &mut dyn TextSource,
     _build: GenomeBuild,
 ) -> Result<VirtualPlink19, PipelineError> {
     let header = PgenHeader::parse(&*pgen)?;
     let psam_info = PsamInfo::from_psam(psam_for_plan)?;
-    let plan = VariantPlan::from_pvar(&mut *pvar()?)?;
+    let plan = plan_for(&pvar, local_pvar)?;
 
     if header.m_variants != 0 && header.m_variants as usize != plan.in_variants {
         return Err(PipelineError::Io(format!(
@@ -634,6 +664,51 @@ impl VariantPlan {
         })
     }
 
+    /// [`Self::from_pvar`] over a local `.pvar`, its data lines scanned in
+    /// parallel chunks of about `chunk_bytes`.
+    ///
+    /// `None` wherever the scan would need a rule only the streaming reader
+    /// applies, or the file is one it would refuse: see [`LocalPvar::open`] and
+    /// [`scan_plan_chunk`], and positions out of order across chunks. The caller
+    /// then streams the file, which reports whatever is wrong in its own words
+    /// at its own record.
+    fn from_local_pvar(pvar_path: &Path, chunk_bytes: usize) -> Option<Self> {
+        use rayon::prelude::*;
+
+        let local = LocalPvar::open(pvar_path, chunk_bytes)?;
+        let data = local.data();
+        let chunks: Vec<Option<PlanChunk>> = local
+            .bounds
+            .par_windows(2)
+            .map(|chunk| scan_plan_chunk(&data[chunk[0]..chunk[1]], local.cols))
+            .collect();
+        let mut alts_per_in: Vec<u16> = Vec::new();
+        // Positions within a run are sorted already; a run's first position is
+        // what the streaming check compares with earlier records, and its last
+        // is what later records are compared with.
+        let mut sorted_positions = PvarPositionSortState::default();
+        for chunk in chunks {
+            let chunk = chunk?;
+            for (chrom, first, last) in &chunk.runs {
+                sorted_positions.observe(chrom, *first, 0).ok()?;
+                sorted_positions.observe(chrom, *last, 0).ok()?;
+            }
+            alts_per_in.extend_from_slice(&chunk.alts);
+        }
+        let mut out_to_in: Vec<(u32, u16)> =
+            Vec::with_capacity(alts_per_in.iter().map(|&count| usize::from(count)).sum());
+        for (in_idx, &count) in alts_per_in.iter().enumerate() {
+            let in_idx = u32::try_from(in_idx).ok()?;
+            out_to_in.extend((1..=count).map(|alt_ord| (in_idx, alt_ord)));
+        }
+        Some(Self {
+            in_variants: alts_per_in.len(),
+            out_variants: out_to_in.len(),
+            out_to_in,
+            alts_per_in,
+        })
+    }
+
     #[inline]
     fn mapping(&self, out_idx: usize) -> Option<(u32, u16)> {
         self.out_to_in.get(out_idx).copied()
@@ -947,6 +1022,81 @@ impl TextSource for StreamingVirtualBim {
     }
 }
 
+/// A local `.pvar`, mapped for a parallel scan: its column layout, where its data
+/// lines start, and the bounds of data chunks of about a given size, each ending
+/// on a line end.
+struct LocalPvar {
+    map: memmap2::Mmap,
+    cols: PvarCols,
+    data_start: usize,
+    bounds: Vec<usize>,
+}
+
+impl LocalPvar {
+    /// The header lines are read in order, as the streaming readers read them.
+    /// `None` when the file cannot be mapped, a header line is not UTF-8 or not a
+    /// header the readers accept, or no header or first data line sets the
+    /// columns.
+    fn open(pvar_path: &Path, chunk_bytes: usize) -> Option<Self> {
+        let file = File::open(pvar_path).ok()?;
+        // SAFETY: the map is read-only and lives only as long as the scan that
+        // opened it. The file must not be truncated while it is mapped.
+        let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+        let text: &[u8] = &map;
+
+        let mut cols = None;
+        let mut data_start = 0;
+        while data_start < text.len() {
+            let end = memchr::memchr(b'\n', &text[data_start..])
+                .map_or(text.len(), |offset| data_start + offset + 1);
+            let trimmed = str::from_utf8(&text[data_start..end]).ok()?.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                break;
+            }
+            if trimmed.starts_with('#') && !trimmed.starts_with("##") {
+                cols = Some(PvarCols::from_header_line(trimmed).ok()?);
+            }
+            data_start = end;
+        }
+        let data = &text[data_start..];
+        let cols = match cols {
+            Some(cols) => cols,
+            None => {
+                let first_line = data.split(|&byte| byte == b'\n').next()?;
+                PvarCols::from_headerless(
+                    str::from_utf8(first_line).ok()?.split_whitespace().count(),
+                )
+                .ok()?
+            }
+        };
+
+        let chunk_bytes = chunk_bytes.max(1);
+        let mut bounds = vec![0];
+        let mut search_from = chunk_bytes;
+        while search_from < data.len() {
+            let Some(offset) = memchr::memchr(b'\n', &data[search_from..]) else {
+                break;
+            };
+            let end = search_from + offset + 1;
+            bounds.push(end);
+            search_from = end + chunk_bytes;
+        }
+        if bounds.last() != Some(&data.len()) {
+            bounds.push(data.len());
+        }
+        Some(Self {
+            map,
+            cols,
+            data_start,
+            bounds,
+        })
+    }
+
+    fn data(&self) -> &[u8] {
+        &self.map[self.data_start..]
+    }
+}
+
 /// The rows of the virtual `.bim` that share one chromosome label, with the
 /// label as the `.bim` writes it and each row's position.
 pub(crate) struct PvarRowRun {
@@ -969,53 +1119,12 @@ pub(crate) fn scan_local_pvar_rows(
 ) -> Option<Vec<PvarRowRun>> {
     use rayon::prelude::*;
 
-    let file = File::open(pvar_path).ok()?;
-    // SAFETY: the map is read-only and dropped before this returns. The file must
-    // not be truncated while it is mapped.
-    let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
-    let text: &[u8] = &map;
-
-    let mut cols = None;
-    let mut data_start = 0;
-    while data_start < text.len() {
-        let end = memchr::memchr(b'\n', &text[data_start..])
-            .map_or(text.len(), |offset| data_start + offset + 1);
-        let trimmed = str::from_utf8(&text[data_start..end]).ok()?.trim();
-        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-            break;
-        }
-        if trimmed.starts_with('#') && !trimmed.starts_with("##") {
-            cols = Some(PvarCols::from_header_line(trimmed).ok()?);
-        }
-        data_start = end;
-    }
-    let data = &text[data_start..];
-    let cols = match cols {
-        Some(cols) => cols,
-        None => {
-            let first_line = data.split(|&byte| byte == b'\n').next()?;
-            PvarCols::from_headerless(str::from_utf8(first_line).ok()?.split_whitespace().count())
-                .ok()?
-        }
-    };
-
-    let chunk_bytes = chunk_bytes.max(1);
-    let mut bounds = vec![0];
-    let mut search_from = chunk_bytes;
-    while search_from < data.len() {
-        let Some(offset) = memchr::memchr(b'\n', &data[search_from..]) else {
-            break;
-        };
-        let end = search_from + offset + 1;
-        bounds.push(end);
-        search_from = end + chunk_bytes;
-    }
-    if bounds.last() != Some(&data.len()) {
-        bounds.push(data.len());
-    }
-    let chunks: Vec<Option<Vec<PvarRowRun>>> = bounds
+    let local = LocalPvar::open(pvar_path, chunk_bytes)?;
+    let data = local.data();
+    let chunks: Vec<Option<Vec<PvarRowRun>>> = local
+        .bounds
         .par_windows(2)
-        .map(|chunk| scan_pvar_chunk(&data[chunk[0]..chunk[1]], cols))
+        .map(|chunk| scan_pvar_chunk(&data[chunk[0]..chunk[1]], local.cols))
         .collect();
     let mut runs: Vec<PvarRowRun> = Vec::new();
     for chunk in chunks {
@@ -1111,6 +1220,97 @@ fn scan_pvar_chunk(chunk: &[u8], cols: PvarCols) -> Option<Vec<PvarRowRun>> {
     Some(runs)
 }
 
+/// One chunk of `.pvar` data lines for the variant plan: each record's ALT
+/// count, and the chromosome runs it holds with each run's first and last
+/// position.
+struct PlanChunk {
+    alts: Vec<u16>,
+    runs: Vec<(String, u64, u64)>,
+}
+
+/// The plan's view of one chunk, or `None` where [`VariantPlan::from_pvar`]
+/// reads a line by a rule this scan does not apply, or would refuse it: a chunk
+/// that is not ASCII or holds a vertical tab (whitespace to `str::trim` but not
+/// to `trim_ascii`), a `#` line, a missing column, a position that is not a
+/// positive integer, or positions falling within a run.
+fn scan_plan_chunk(chunk: &[u8], cols: PvarCols) -> Option<PlanChunk> {
+    if !chunk.is_ascii() || memchr::memchr(0x0b, chunk).is_some() {
+        return None;
+    }
+    let last = cols
+        .chrom
+        .max(cols.id)
+        .max(cols.pos)
+        .max(cols.refa)
+        .max(cols.alt);
+    let mut plan = PlanChunk {
+        alts: Vec::new(),
+        runs: Vec::new(),
+    };
+    // The last raw label, and the label it normalizes to.
+    let mut label: &[u8] = &[];
+    let mut chrom = String::new();
+    for line in chunk.split(|&byte| byte == b'\n') {
+        let trimmed = line.trim_ascii();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed[0] == b'#' {
+            return None;
+        }
+        let (mut raw_chrom, mut id, mut pos, mut refa, mut alt) = (None, None, None, None, None);
+        for (column, field) in trimmed
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty())
+            .take(last + 1)
+            .enumerate()
+        {
+            if column == cols.chrom {
+                raw_chrom = Some(field);
+            }
+            if column == cols.id {
+                id = Some(field);
+            }
+            if column == cols.pos {
+                pos = Some(field);
+            }
+            if column == cols.refa {
+                refa = Some(field);
+            }
+            if column == cols.alt {
+                alt = Some(field);
+            }
+        }
+        id?;
+        refa?;
+        let raw_chrom = raw_chrom?;
+        if raw_chrom != label {
+            label = raw_chrom;
+            normalize_chrom_into(str::from_utf8(raw_chrom).ok()?, &mut chrom);
+        }
+        let pos = str::from_utf8(pos?).ok()?.parse::<u64>().ok()?;
+        if pos == 0 {
+            return None;
+        }
+        let alts = alt?
+            .split(|&byte| byte == b',')
+            .map(<[u8]>::trim_ascii)
+            .filter(|alt| !alt.is_empty() && *alt != b".")
+            .count();
+        plan.alts.push(u16::try_from(alts).ok()?);
+        match plan.runs.last_mut() {
+            Some((run_chrom, _, run_last)) if *run_chrom == chrom => {
+                if pos < *run_last {
+                    return None;
+                }
+                *run_last = pos;
+            }
+            _ => plan.runs.push((chrom.clone(), pos, pos)),
+        }
+    }
+    Some(plan)
+}
+
 /// [`scan_pvar_chunk`] for a chunk read as text.
 fn scan_pvar_text_chunk(text: &str, cols: PvarCols) -> Option<Vec<PvarRowRun>> {
     let mut runs: Vec<PvarRowRun> = Vec::new();
@@ -1196,7 +1396,7 @@ const BED_MODE_SNP_MAJOR: u8 = 0x01;
 
 #[derive(Clone)]
 struct VirtualBed {
-    inner: Arc<Mutex<PgenDecoder>>, // guarded decoder (seekable + scratch buffers)
+    decoders: Arc<DecoderSlots>,
     plan: VariantPlan,
     n_samples: usize,
     block_bytes: usize, // ceil(n_samples / 4)
@@ -1204,10 +1404,63 @@ struct VirtualBed {
     cache: Arc<Mutex<BlockCache>>,
 }
 
+/// A decoder and the hard-call scratch it decodes into.
+struct Decoding {
+    decoder: PgenDecoder,
+    hard_buf: Vec<u8>,
+}
+
+/// A decoder for each rayon worker and one for every other thread, each used in
+/// place by the thread holding its slot. Reads on different threads never wait
+/// on one another's decodes, a lone reader pays one uncontended lock per read,
+/// and a worker walking its own range of records keeps the LD anchor it decoded
+/// last. A read that finds its slot held (a nested read on the same worker, or
+/// two threads outside the pool reading at once) takes a spare decoder instead,
+/// forked the first time one is needed. Which decoder serves a block decides
+/// nothing about its bytes.
+struct DecoderSlots {
+    template: PgenDecoder,
+    slots: Box<[Mutex<Option<Decoding>>]>,
+    spares: Mutex<Vec<Decoding>>,
+}
+
+impl DecoderSlots {
+    fn new(template: PgenDecoder) -> Self {
+        let workers = rayon::current_num_threads().max(1);
+        Self {
+            template,
+            slots: (0..=workers).map(|_| Mutex::new(None)).collect(),
+            spares: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn fork(&self) -> Decoding {
+        Decoding {
+            decoder: self.template.fork(),
+            hard_buf: Vec::new(),
+        }
+    }
+
+    /// Runs `read` with this thread's decoder, or with a spare while that
+    /// decoder is in use.
+    fn with_decoding<R>(&self, read: impl FnOnce(&mut Decoding) -> R) -> R {
+        let shared = self.slots.len() - 1;
+        let index = rayon::current_thread_index().map_or(shared, |index| index.min(shared));
+        if let Ok(mut slot) = self.slots[index].try_lock() {
+            return read(slot.get_or_insert_with(|| self.fork()));
+        }
+        let spare = self.spares.lock().unwrap().pop();
+        let mut decoding = spare.unwrap_or_else(|| self.fork());
+        let result = read(&mut decoding);
+        self.spares.lock().unwrap().push(decoding);
+        result
+    }
+}
+
 impl VirtualBed {
     fn new(decoder: PgenDecoder, plan: VariantPlan, n_samples: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(decoder)),
+            decoders: Arc::new(DecoderSlots::new(decoder)),
             plan,
             n_samples,
             block_bytes: n_samples.div_ceil(4),
@@ -1269,7 +1522,6 @@ impl ByteRangeSource for VirtualBed {
         }
 
         let mut written = 0usize;
-        let mut hard_buf: Vec<u8> = Vec::new();
 
         // 1) Serve the 3-byte header if requested.
         if offset < 3 {
@@ -1289,81 +1541,86 @@ impl ByteRangeSource for VirtualBed {
         let mut out_idx = (body_off / (self.block_bytes as u64)) as usize;
         let within_block = (body_off % (self.block_bytes as u64)) as usize;
 
-        if within_block > 0 && out_idx < self.plan.out_variants {
-            let to_copy = (self.block_bytes - within_block).min(dst.len() - written);
-            let mut decoder = self.inner.lock().unwrap();
-            copy_virtual_block(
-                self,
-                &mut decoder,
-                out_idx,
-                within_block,
-                &mut dst[written..written + to_copy],
-                &mut hard_buf,
-            )?;
-            written += to_copy;
-            out_idx += 1;
-        }
-
-        // A pass over many whole blocks (a PCA pass reads thousands per call)
-        // decodes them on the rayon pool straight into `dst`, one forked
-        // decoder per worker. Each block is the same bytes the one-at-a-time
-        // path produces, and the first error in block order is the one
-        // returned.
-        let whole_blocks = (dst.len() - written) / self.block_bytes;
-        if whole_blocks >= PARALLEL_DECODE_MIN_BLOCKS {
-            use rayon::prelude::*;
-
-            let template = self.inner.lock().unwrap().fork();
-            let region = &mut dst[written..written + whole_blocks * self.block_bytes];
-            let results: Vec<Result<(), PipelineError>> = region
-                .par_chunks_mut(self.block_bytes)
-                .enumerate()
-                .map_init(
-                    || (template.fork(), Vec::new()),
-                    |(decoder, hard_buf), (block_idx, block)| {
-                        decode_virtual_block(self, decoder, out_idx + block_idx, hard_buf, block)
-                    },
-                )
-                .collect();
-            if let Some(err) = results.into_iter().find_map(Result::err) {
-                return Err(err);
-            }
-            written += whole_blocks * self.block_bytes;
-            out_idx += whole_blocks;
-        }
-
-        let mut decoder = self.inner.lock().unwrap();
-        while written < dst.len() {
-            if out_idx >= self.plan.out_variants {
-                break;
-            }
-            let to_copy = self.block_bytes.min(dst.len() - written);
-            if to_copy == self.block_bytes {
-                // A whole block goes straight into `dst`, as a scoring pass
-                // reads one block per call. Only a partial read, which comes
-                // back for the rest of its block, goes through the cache.
-                decode_virtual_block(
-                    self,
-                    &mut decoder,
-                    out_idx,
-                    &mut hard_buf,
-                    &mut dst[written..written + to_copy],
-                )?;
-            } else {
+        self.decoders.with_decoding(|decoding| {
+            if within_block > 0 && out_idx < self.plan.out_variants {
+                let to_copy = (self.block_bytes - within_block).min(dst.len() - written);
                 copy_virtual_block(
                     self,
-                    &mut decoder,
+                    &mut decoding.decoder,
                     out_idx,
-                    0,
+                    within_block,
                     &mut dst[written..written + to_copy],
-                    &mut hard_buf,
+                    &mut decoding.hard_buf,
                 )?;
+                written += to_copy;
+                out_idx += 1;
             }
-            written += to_copy;
-            out_idx += 1;
-        }
 
-        Ok(())
+            // A pass over many whole blocks (a PCA pass reads thousands per call)
+            // decodes them on the rayon pool straight into `dst`, one forked
+            // decoder per worker. Each block is the same bytes the one-at-a-time
+            // path produces, and the first error in block order is the one
+            // returned.
+            let whole_blocks = (dst.len() - written) / self.block_bytes;
+            if whole_blocks >= PARALLEL_DECODE_MIN_BLOCKS {
+                use rayon::prelude::*;
+
+                let template = &self.decoders.template;
+                let region = &mut dst[written..written + whole_blocks * self.block_bytes];
+                let results: Vec<Result<(), PipelineError>> = region
+                    .par_chunks_mut(self.block_bytes)
+                    .enumerate()
+                    .map_init(
+                        || (template.fork(), Vec::new()),
+                        |(decoder, hard_buf), (block_idx, block)| {
+                            decode_virtual_block(
+                                self,
+                                decoder,
+                                out_idx + block_idx,
+                                hard_buf,
+                                block,
+                            )
+                        },
+                    )
+                    .collect();
+                if let Some(err) = results.into_iter().find_map(Result::err) {
+                    return Err(err);
+                }
+                written += whole_blocks * self.block_bytes;
+                out_idx += whole_blocks;
+            }
+
+            while written < dst.len() {
+                if out_idx >= self.plan.out_variants {
+                    break;
+                }
+                let to_copy = self.block_bytes.min(dst.len() - written);
+                if to_copy == self.block_bytes {
+                    // A whole block goes straight into `dst`, as a scoring pass
+                    // reads one block per call. Only a partial read, which comes
+                    // back for the rest of its block, goes through the cache.
+                    decode_virtual_block(
+                        self,
+                        &mut decoding.decoder,
+                        out_idx,
+                        &mut decoding.hard_buf,
+                        &mut dst[written..written + to_copy],
+                    )?;
+                } else {
+                    copy_virtual_block(
+                        self,
+                        &mut decoding.decoder,
+                        out_idx,
+                        0,
+                        &mut dst[written..written + to_copy],
+                        &mut decoding.hard_buf,
+                    )?;
+                }
+                written += to_copy;
+                out_idx += 1;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1492,7 +1749,12 @@ impl BlockCache {
 // Minimal local ByteRangeSource for `.pgen` (seekable)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/// On unix every read is positional (`pread`), so threads reading different
+/// records never wait on one another for a file cursor.
 struct LocalFileByteRangeSource {
+    #[cfg(unix)]
+    file: File,
+    #[cfg(not(unix))]
     file: Mutex<File>,
     len: u64,
 }
@@ -1506,9 +1768,24 @@ impl LocalFileByteRangeSource {
             .map_err(|e| PipelineError::Io(format!("Metadata {}: {e}", path.display())))?
             .len();
         Ok(Self {
+            #[cfg(unix)]
+            file: f,
+            #[cfg(not(unix))]
             file: Mutex::new(f),
             len,
         })
+    }
+
+    #[cfg(unix)]
+    fn read_exact_positioned(&self, offset: u64, dst: &mut [u8]) -> std::io::Result<()> {
+        self.file.read_exact_at(dst, offset)
+    }
+
+    #[cfg(not(unix))]
+    fn read_exact_positioned(&self, offset: u64, dst: &mut [u8]) -> std::io::Result<()> {
+        let mut f = self.file.lock().unwrap();
+        f.seek(SeekFrom::Start(offset))?;
+        f.read_exact(dst)
     }
 }
 impl ByteRangeSource for LocalFileByteRangeSource {
@@ -1522,10 +1799,7 @@ impl ByteRangeSource for LocalFileByteRangeSource {
         if offset.saturating_add(dst.len() as u64) > self.len {
             return Err(ioerr("Attempted to read past end of local .pgen"));
         }
-        let mut f = self.file.lock().unwrap();
-        f.seek(SeekFrom::Start(offset))
-            .map_err(|e| PipelineError::Io(e.to_string()))?;
-        f.read_exact(dst)
+        self.read_exact_positioned(offset, dst)
             .map_err(|e| PipelineError::Io(e.to_string()))
     }
 }
@@ -3793,6 +4067,115 @@ mod tests {
         assert!(scan_local_pvar_rows(&path, 1 << 20).is_none());
     }
 
+    /// A local `.pvar`'s variant plan from the parallel scan must equal the
+    /// streamed plan on any chunking, with or without a header, across
+    /// multiallelic sites, sites without an ALT, blank lines and line endings.
+    /// Wherever the scan declines a file, the plan must still be the streamed
+    /// plan, or the streamed error word for word.
+    #[test]
+    fn a_local_pvar_plan_is_the_streamed_plan() {
+        type Parts = (usize, usize, Vec<(u32, u16)>, Vec<u16>);
+        fn parts(plan: VariantPlan) -> Parts {
+            (
+                plan.in_variants,
+                plan.out_variants,
+                plan.out_to_in,
+                plan.alts_per_in,
+            )
+        }
+        fn streamed(path: &Path) -> Result<Parts, String> {
+            VariantPlan::from_pvar(&mut *open_text_source(path).unwrap())
+                .map(parts)
+                .map_err(|err| err.to_string())
+        }
+        fn opened(path: &Path) -> Result<Parts, String> {
+            let factory_path = path.to_path_buf();
+            let pvar: PvarFactory = Arc::new(move || open_text_source(&factory_path));
+            plan_for(&pvar, Some(path))
+                .map(parts)
+                .map_err(|err| err.to_string())
+        }
+
+        let scanned = [
+            (
+                "header.pvar",
+                concat!(
+                    "##fileformat=PVARv1.0\n",
+                    "#CHROM\tPOS\tID\tREF\tALT\n",
+                    "chr1\t100\trs1\tA\tG\n",
+                    "chr1  200 . A C,T\r\n",
+                    "\n",
+                    "1\t300\trs3\tA\t.\n",
+                    "Chr1\t400\trs4\tA\tG,.,T\n",
+                    "chrM\t10\trs5\tA\tG\n",
+                    "X\t155800000\trs6\tA\tG\n",
+                    "PAR2\t155900000\trs7\tC\tA",
+                ),
+            ),
+            (
+                "headerless.pvar",
+                concat!(
+                    "chr1 rs1 0 100 A G\n",
+                    "chr1 . 0 200 A C,T\n",
+                    "chrX rs3 0 3000000 A G\n",
+                    "Y rs4 0 4000000 A .\n",
+                    "Y rs5 0 5000000 A T\n",
+                ),
+            ),
+        ];
+        let declined = [
+            (
+                "text.pvar",
+                "#CHROM\tPOS\tID\tREF\tALT\n\u{1f9ec}1\t20\trs8\tA\tG\nchrM\u{0b}30\trs9\tA\t\u{0b}T\n",
+            ),
+            (
+                "late_header.pvar",
+                "#CHROM\tPOS\tID\tREF\tALT\n1\t10\trs1\tA\tG\n#CHROM\tPOS\tID\tREF\tALT\n1\t20\trs2\tA\tG\n",
+            ),
+            (
+                "unsorted.pvar",
+                "#CHROM\tPOS\tID\tREF\tALT\n1\t300\trs1\tA\tG\n1\t200\trs2\tA\tG\n",
+            ),
+            (
+                "reentered.pvar",
+                "#CHROM\tPOS\tID\tREF\tALT\n1\t300\trs1\tA\tG\n2\t10\trs2\tA\tG\n1\t100\trs3\tA\tG\n",
+            ),
+            (
+                "zero_position.pvar",
+                "#CHROM\tPOS\tID\tREF\tALT\n1\t0\trs1\tA\tG\n",
+            ),
+            (
+                "missing_alt.pvar",
+                "#CHROM\tPOS\tID\tREF\tALT\n1\t10\trs1\tA\n",
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text) in scanned {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            let expected = streamed(&path).unwrap();
+            assert!(expected.0 >= 5, "{name}: {expected:?}");
+            for chunk_bytes in [1, 7, 64, 1 << 20] {
+                let plan = VariantPlan::from_local_pvar(&path, chunk_bytes).unwrap_or_else(|| {
+                    panic!("{name}: the scan declined {chunk_bytes}-byte chunks")
+                });
+                assert_eq!(parts(plan), expected, "{name}, {chunk_bytes}-byte chunks");
+            }
+            assert_eq!(opened(&path), Ok(expected), "{name}: opened plan");
+        }
+        for (name, text) in declined {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            for chunk_bytes in [1, 7, 1 << 20] {
+                assert!(
+                    VariantPlan::from_local_pvar(&path, chunk_bytes).is_none(),
+                    "{name}: the scan read what only the streamed plan reads, {chunk_bytes}-byte chunks"
+                );
+            }
+            assert_eq!(opened(&path), streamed(&path), "{name}: opened plan");
+        }
+    }
+
     #[test]
     fn chromosome_normalization_accepts_utf8_without_slicing_panics() {
         assert_eq!(normalize_chrom("🧬1"), "🧬1");
@@ -4560,6 +4943,121 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Reads served by per-thread decoder slots and their spares must give the
+    /// bytes a lone serial reader gets: from rayon workers reading whole
+    /// blocks, partial blocks and runs long enough to decode in parallel (whose
+    /// work stealing can put another read on a worker already holding its
+    /// slot), from threads outside the pool sharing one slot, and from a pool
+    /// wider than the one the slots were sized for.
+    #[test]
+    fn concurrent_reads_through_decoder_slots_match_a_serial_reader() {
+        use rayon::prelude::*;
+
+        const N: usize = 37;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut records: Vec<(u8, Vec<u8>)> = Vec::new();
+        for idx in 0..96usize {
+            if idx % 4 == 0 {
+                let cats: Vec<u8> = (0..N).map(|_| (next() & 3) as u8).collect();
+                records.push((0, pack_twobit_values(&cats)));
+            } else {
+                // An LD record without differences: its anchor, or the anchor inverted.
+                records.push((2 + (idx % 2) as u8, encode_varint(0)));
+            }
+        }
+        let m = records.len();
+        let rec_types: Vec<u8> = records.iter().map(|(ty, _)| *ty).collect();
+        let rec_lens: Vec<u32> = records.iter().map(|(_, rec)| rec.len() as u32).collect();
+        let data: Vec<u8> = records.iter().flat_map(|(_, rec)| rec.clone()).collect();
+        let src: Arc<dyn ByteRangeSource> = Arc::new(VecSource::new(data));
+        let virtual_bed = || {
+            let hdr = PgenHeader {
+                mode: PgenMode::Var,
+                m_variants: m as u32,
+                n_samples: N as u32,
+                fmt_byte: 0,
+                block_offsets: vec![0],
+                rec_types: rec_types.clone(),
+                rec_lens: rec_lens.clone(),
+            };
+            let decoder = PgenDecoder::new(Arc::clone(&src), hdr, N, m, vec![1; m]).unwrap();
+            let plan = VariantPlan {
+                in_variants: m,
+                out_variants: m,
+                out_to_in: (0..m as u32).map(|idx| (idx, 1)).collect(),
+                alts_per_in: vec![1; m],
+            };
+            VirtualBed::new(decoder, plan, N)
+        };
+
+        let block_bytes = N.div_ceil(4);
+        let serial = virtual_bed();
+        let mut expected = vec![0u8; 3 + m * block_bytes];
+        serial.read_at(0, &mut expected[..3]).unwrap();
+        for idx in 0..m {
+            let start = 3 + idx * block_bytes;
+            serial
+                .read_at(start as u64, &mut expected[start..start + block_bytes])
+                .unwrap();
+        }
+        assert_eq!(
+            expected[3 + 2 * block_bytes..3 + 3 * block_bytes],
+            expected[3..3 + block_bytes],
+            "record 2 repeats its anchor, so the fixture decodes through LD anchors"
+        );
+
+        let requests: Vec<(usize, usize)> = (0..400usize)
+            .map(|i| {
+                let start = (i * 7919) % expected.len();
+                let len = match i % 4 {
+                    0 => block_bytes,
+                    1 => i % block_bytes + 1,
+                    2 => (PARALLEL_DECODE_MIN_BLOCKS + i % 5) * block_bytes,
+                    _ => 2 * block_bytes + 3,
+                };
+                (start, len.min(expected.len() - start))
+            })
+            .collect();
+        let check = |bed: &VirtualBed, &(start, len): &(usize, usize)| {
+            let mut got = vec![0u8; len];
+            bed.read_at(start as u64, &mut got).unwrap();
+            assert_eq!(
+                got,
+                expected[start..start + len],
+                "read of {len} bytes at {start}"
+            );
+        };
+
+        let narrow = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let wide = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        for sized_in in [&narrow, &wide] {
+            let bed = sized_in.install(virtual_bed);
+            wide.install(|| requests.par_iter().for_each(|request| check(&bed, request)));
+            let (bed, requests, check) = (&bed, &requests, &check);
+            std::thread::scope(|scope| {
+                for reader in 0..4 {
+                    scope.spawn(move || {
+                        for request in requests.iter().skip(reader).step_by(3) {
+                            check(bed, request);
+                        }
+                    });
+                }
+            });
         }
     }
 
