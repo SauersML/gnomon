@@ -253,6 +253,19 @@ def test_failure_message_keeps_the_typed_failure_and_masks_every_number():
         assert "participant" not in template and set(template) <= set("abcdefghijklmnopqrstuvwxyz_")
 
 
+def test_failure_message_of_a_fit_killed_at_its_bound_is_its_last_solver_status_line():
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp, "fit.log")
+        log.write_text(
+            "gnomon_fit_started\n[0s] bernoulli-marginal-slope: z has skewness=2.475 and excess kurtosis=99.703\n"
+            "[5m 15s] coupled exact-joint inner solve exhausted the joint Newton budget without KKT convergence "
+            "after 8 cycle(s)\n[44m 53s] [BFGS Adaptive] Strong Wolfe failed at iter 16. Falling back to Backtracking.\n")
+        assert bench.failure_message(log) == "bfgs_adaptive_strong_wolfe_failed_at_iter_n_falling_back_to_backtracking"
+        silent = Path(tmp, "silent.log")
+        silent.write_text("gnomon_fit_started\n")
+        assert bench.failure_message(silent) == ""
+
+
 def test_failed_fit_tokens_carry_the_message_in_order_and_the_table_reassembles_it():
     template = "gamfit_exceptions_gamerror_" + "_".join(["no_candidate_seeds_passed"] * 30)
     names = ["digest__type_2_diabetes__pgs000014__development__european.txt",

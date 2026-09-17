@@ -390,12 +390,20 @@ def failure_message(log):
     """The failed worker's last exception, class and whole message, as a template:
     every number masked to `n`, so no participant value, row index or count can
     leave, while the words that name the typed failure (its class, gam's
-    InnerFailure kind, a refusal diagnosis, the carrying block) all stay."""
+    InnerFailure kind, a refusal diagnosis, the carrying block) all stay. A worker
+    that raised nothing, such as a fit killed at its bound, gives its last solver
+    status line instead, without the elapsed-time prefix, so a timeout still says
+    what the solver was doing."""
     text = Path(log).read_bytes()[-65536:].decode("utf-8", errors="replace")
     starts = [m.start() for m in re.finditer(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)\b", text, re.MULTILINE)]
-    if not starts:
-        return ""
-    masked = NUMBER.sub("n", text[starts[-1]:])
+    if starts:
+        tail = text[starts[-1]:]
+    else:
+        status = re.findall(r"^\[[^\]\n]*\] *(\S.*)$", text, re.MULTILINE)
+        if not status:
+            return ""
+        tail = status[-1]
+    masked = NUMBER.sub("n", tail)
     return re.sub(r"[^a-z]+", "_", masked.lower()).strip("_")
 
 
