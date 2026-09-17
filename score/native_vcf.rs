@@ -22,6 +22,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
+mod crc;
 mod stream;
 
 #[derive(Debug)]
@@ -2772,7 +2773,7 @@ fn inflate_bgzf_block(
     if written != block.len() {
         return Err(invalid("BGZF block is shorter than its recorded length"));
     }
-    if libdeflater::crc32(block) != crc32 {
+    if crc::crc32(block) != crc32 {
         return Err(invalid("BGZF block data checksum mismatch"));
     }
     Ok(())
@@ -3430,8 +3431,12 @@ mod tests {
     }
 
     fn bgzf_block(data: &[u8]) -> Vec<u8> {
-        let mut encoder =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        bgzf_block_with(data, flate2::Compression::default())
+    }
+
+    /// A BGZF block of `data` deflated at `compression`.
+    fn bgzf_block_with(data: &[u8], compression: flate2::Compression) -> Vec<u8> {
+        let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), compression);
         encoder.write_all(data).expect("deflate");
         let compressed = encoder.finish().expect("finish deflate");
         let mut crc = Crc::new();
@@ -4190,6 +4195,34 @@ mod tests {
                 score_vcf_streaming(&path, std::slice::from_ref(&score_path), None, None).is_err(),
                 "{label}"
             );
+        }
+    }
+
+    /// A block that inflates to its recorded length but whose data disagree with
+    /// its recorded CRC32 is refused: a byte inside a stored (uncompressed)
+    /// deflate block is changed, which inflation itself cannot notice.
+    #[test]
+    fn blocks_whose_data_disagree_with_their_crc32_are_refused() {
+        let data: Vec<u8> = (0..60_000u64)
+            .map(|index| (index.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as u8)
+            .collect();
+        let block = bgzf_block_with(&data, flate2::Compression::none());
+        let mut decompressor = Decompressor::new();
+        let mut inflated = vec![0u8; data.len()];
+        inflate_bgzf_block(&block, &mut decompressor, &mut inflated)
+            .expect("the block as written inflates");
+        assert_eq!(inflated, data);
+        for start in [1000, 50_000] {
+            let offset = block
+                .windows(64)
+                .position(|window| window == &data[start..start + 64])
+                .expect("a stored block holds the data as written")
+                + 10;
+            let mut corrupt = block.clone();
+            corrupt[offset] ^= 0x20;
+            let err = inflate_bgzf_block(&corrupt, &mut decompressor, &mut inflated)
+                .expect_err("a changed byte fails the CRC32 check");
+            assert!(err.to_string().contains("checksum mismatch"), "{err}");
         }
     }
 
