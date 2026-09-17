@@ -381,6 +381,24 @@ def failure_class(log):
     return label
 
 
+MESSAGE_LIMIT = 3200
+MESSAGE_CHUNK = 160
+NUMBER = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
+
+
+def failure_message(log):
+    """The failed worker's last exception, class and whole message, as a template:
+    every number masked to `n`, so no participant value, row index or count can
+    leave, while the words that name the typed failure (its class, gam's
+    InnerFailure kind, a refusal diagnosis, the carrying block) all stay."""
+    text = Path(log).read_bytes()[-65536:].decode("utf-8", errors="replace")
+    starts = [m.start() for m in re.finditer(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)\b", text, re.MULTILINE)]
+    if not starts:
+        return ""
+    masked = NUMBER.sub("n", text[starts[-1]:])
+    return re.sub(r"[^a-z]+", "_", masked.lower()).strip("_")
+
+
 def failure_stage(log):
     """The last stage marker a worker printed before it stopped: a code name, never data."""
     text = Path(log).read_bytes().decode("utf-8", errors="replace")
@@ -550,6 +568,12 @@ def run(args):
             label = outcome if outcome == "timeout" else "error_" + failure_class(log)
             digest.emit(disease, slug(pgs), "gnomon", "status", label)
             digest.emit(disease, slug(pgs), "gnomon", "failed_stage", failure_stage(log))
+            template = failure_message(log)
+            if len(template) > MESSAGE_LIMIT:
+                digest.emit(disease, slug(pgs), "gnomon", "error_text", "truncated")
+            for index in range(0, min(len(template), MESSAGE_LIMIT), MESSAGE_CHUNK):
+                digest.emit(disease, slug(pgs), "gnomon", "error_text", f"{index // MESSAGE_CHUNK:02d}",
+                            template[index:index + MESSAGE_CHUNK])
         report(digest, disease, pgs, test, predictions, config)
     publish_status(status, "benchmark_completed")
 

@@ -47,8 +47,13 @@ def parse(names):
         facts = scores.setdefault((disease, pgs), {})
         if rest[0] == "development" and len(rest) == 2:
             facts["development"] = rest[1]
-        elif rest[0] == "gnomon" and rest[1] in ("status", "fit_wall") and len(rest) == 3:
+        elif rest[0] == "gnomon" and rest[1] in ("status", "fit_wall", "failed_stage") and len(rest) == 3:
             facts[f"gnomon_{rest[1]}"] = rest[2]
+        elif rest[0] == "gnomon" and rest[1] == "error_text" and len(rest) in (3, 4):
+            if len(rest) == 3:
+                facts["gnomon_error_truncated"] = True
+            else:
+                facts.setdefault("gnomon_error_chunks", {})[int(rest[2])] = rest[3]
         elif rest[0] == "delta" and len(rest) == 7 and rest[2] == "vs":
             _, method, _, reference, group, key, value = rest
             deltas.setdefault((disease, pgs, method, reference, group), {})[key] = number(value)
@@ -111,6 +116,20 @@ def table(scores, cells, deltas, group, minimum=MINIMUM):
     return "\n".join(rows)
 
 
+def failures(scores):
+    """Every failed gnomon fit with its status, stage and message template (numbers masked)."""
+    rows = []
+    for (disease, pgs), facts in sorted(scores.items()):
+        chunks = facts.get("gnomon_error_chunks")
+        if facts.get("gnomon_status", "ok") == "ok" and not chunks:
+            continue
+        text = "".join(chunks[i] for i in sorted(chunks)) if chunks else "no exception text"
+        suffix = " … (truncated)" if facts.get("gnomon_error_truncated") else ""
+        rows.append(f"- {disease.replace('_', ' ')} {pgs.upper()}: {facts.get('gnomon_status', 'n/a')}, "
+                    f"stage {facts.get('gnomon_failed_stage', 'n/a')}\n\n  `{text}{suffix}`")
+    return "\n".join(rows)
+
+
 def render(names, minimum=MINIMUM):
     scores, cells, deltas, support = parse(names)
     sections = []
@@ -120,6 +139,10 @@ def render(names, minimum=MINIMUM):
         for group, title in groups:
             sections.append(f"### Held-out gains in {title} ({kind})\n\n"
                             + table(scores, cells, deltas, group, minimum))
+    failed = failures(scores)
+    if failed:
+        sections.append("### Failed gnomon fits (exception class and message, every number masked to n)\n\n"
+                        + failed)
     return "\n\n".join(sections) + "\n"
 
 

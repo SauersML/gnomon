@@ -231,3 +231,41 @@ def test_every_status_the_benchmark_publishes_is_a_public_label():
     published = set(regex.findall(r'publish_status\(status, "([a-z_]+)"\)', source))
     assert "benchmark_support_completed" in published and "benchmark_completed" in published
     assert published <= aou_status.LABELS
+
+
+def test_failure_message_keeps_the_typed_failure_and_masks_every_number():
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp, "fit.log")
+        log.write_text(
+            "gnomon_fit_started\n[5m 15s] warn: participant 1234567 z=-1.2345 y=1\n"
+            "Traceback (most recent call last):\n  File \"x.py\", line 42\n"
+            "gamfit._exceptions.GamError: gam error: exact two-block spatial optimization failed: "
+            "no candidate seeds passed outer startup validation\n"
+            "  seed 3: BudgetExhausted coupled exact-joint inner solve exhausted the joint Newton budget "
+            "after 8 cycle(s) — cert REFUSED: residual=1.081e3 > tol=5.352e-2; carrying-block: slope_surface "
+            "(idx=1); rigid probit neglog_only: non-finite log Φ at q=0.5, g=2, z=38.36, y=1; row 29779 of 29780\n")
+        template = bench.failure_message(log)
+        assert template.startswith("gamfit_exceptions_gamerror_gam_error_exact_two_block_spatial")
+        for words in ("no_candidate_seeds_passed_outer_startup_validation", "budgetexhausted",
+                      "cert_refused", "carrying_block_slope_surface", "non_finite_log"):
+            assert words in template
+        assert not any(character.isdigit() for character in template)
+        assert "participant" not in template and set(template) <= set("abcdefghijklmnopqrstuvwxyz_")
+
+
+def test_failed_fit_tokens_carry_the_message_in_order_and_the_table_reassembles_it():
+    template = "gamfit_exceptions_gamerror_" + "_".join(["no_candidate_seeds_passed"] * 30)
+    names = ["digest__type_2_diabetes__pgs000014__development__european.txt",
+             "digest__type_2_diabetes__pgs000014__gnomon__status__error_gamerror_startup_seeds.txt",
+             "digest__type_2_diabetes__pgs000014__gnomon__failed_stage__fit.txt"]
+    with tempfile.TemporaryDirectory() as tmp:
+        digest = bench.Digest(tmp)
+        for index in range(0, len(template), bench.MESSAGE_CHUNK):
+            digest.emit("type_2_diabetes", "pgs000014", "gnomon", "error_text", f"{index // bench.MESSAGE_CHUNK:02d}",
+                        template[index:index + bench.MESSAGE_CHUNK])
+        emitted = sorted(p.name for p in Path(tmp).iterdir())
+    assert len(emitted) == -(-len(template) // bench.MESSAGE_CHUNK)
+    assert all(len(name) < 1024 and not any(c.isdigit() for c in name.split("__")[-1]) for name in emitted)
+    text = table.render(names + emitted)
+    failed = text.split("### Failed gnomon fits")[1]
+    assert "PGS000014: error_gamerror_startup_seeds, stage fit" in failed and f"`{template}`" in failed
