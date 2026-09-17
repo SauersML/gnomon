@@ -1056,7 +1056,7 @@ mod tests {
             if draws.below(3) > 0 {
                 text.insert(draws.below(text.len() + 1), '.');
             }
-            if let Some(value) = parse_plain_decimal(&text) {
+            if let Some(value) = plain_decimal(text.as_bytes()) {
                 assert_eq!(
                     Some(value.to_bits()),
                     text.parse::<f64>().ok().map(f64::to_bits),

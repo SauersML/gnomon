@@ -1514,27 +1514,29 @@ fn vcf_gt_ds_dosages(
         if pos >= bytes.len() {
             break;
         }
+        // Two GT slots give ploidy two, and `dosage_from_values` sums the one DS
+        // value from zero, which leaves it unchanged. The DS is found and read in
+        // place, the column this layout holds most.
+        if let Some(&[b'0'..=b'9' | b'.', b'/' | b'|', b'0'..=b'9' | b'.', b':']) =
+            bytes.get(pos..pos + 4)
+        {
+            let ds = &bytes[pos + 4..];
+            let len = ds.iter().position(|&byte| byte == b'\t').unwrap_or(ds.len());
+            if let Some(value) = plain_decimal(&ds[..len]).filter(|&value| 2.0 - value >= -1e-6) {
+                dosages.push([value, (2.0 - value).max(0.0)]);
+                pos = (pos + 5 + len).min(bytes.len());
+                sample_idx += 1;
+                continue;
+            }
+        }
         let end = memchr(b'\t', &bytes[pos..]).map_or(bytes.len(), |offset| pos + offset);
         let column = &columns[pos..end];
         pos = (end + 1).min(bytes.len());
-        // Two GT slots give ploidy two, and `dosage_from_values` sums the one DS
-        // value from zero, which leaves it unchanged.
-        let plain = match column.as_bytes() {
-            [b'0'..=b'9' | b'.', b'/' | b'|', b'0'..=b'9' | b'.', b':', ..] => {
-                parse_plain_decimal(&column[4..]).filter(|&value| 2.0 - value >= -1e-6)
-            }
-            _ => None,
-        };
-        dosages.push(match plain {
-            Some(value) => [value, (2.0 - value).max(0.0)],
-            None => {
-                let column = if column == "." { "" } else { column };
-                dosage_pair(
-                    decode_vcf_sample(column, Some(1), None, Some(0), 1, alt_index, alt_count)?,
-                    ref_effect_error,
-                )?
-            }
-        });
+        let column = if column == "." { "" } else { column };
+        dosages.push(dosage_pair(
+            decode_vcf_sample(column, Some(1), None, Some(0), 1, alt_index, alt_count)?,
+            ref_effect_error,
+        )?);
         sample_idx += 1;
     }
     dosages.resize(kept_indices.len(), [f64::NAN; 2]);
@@ -2649,7 +2651,7 @@ where
 }
 
 fn parse_numeric_str(text: &str) -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
-    if let Some(value) = parse_plain_decimal(text) {
+    if let Some(value) = plain_decimal(text.as_bytes()) {
         return Ok(Some(value));
     }
     let trimmed = text.trim();
@@ -2664,18 +2666,18 @@ fn parse_numeric_str(text: &str) -> Result<Option<f64>, Box<dyn Error + Send + S
     }
 }
 
-/// The value of `text` when it is a plain decimal of at most fifteen digits,
+/// The value of `bytes` when they are a plain decimal of at most fifteen digits,
 /// without sign, exponent or space: its digits as an integer divided by a power
 /// of ten. Both operands are exact and IEEE division rounds correctly, so the
 /// quotient is the correctly rounded value `str::parse` returns.
-fn parse_plain_decimal(text: &str) -> Option<f64> {
+fn plain_decimal(bytes: &[u8]) -> Option<f64> {
     const POWERS_OF_TEN: [f64; 16] = [
         1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
     ];
     let mut mantissa = 0u64;
     let mut digits = 0usize;
     let mut fraction_digits = None;
-    for &byte in text.as_bytes() {
+    for &byte in bytes {
         if byte.is_ascii_digit() {
             digits += 1;
             if digits > 15 {
