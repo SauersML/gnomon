@@ -1,4 +1,6 @@
 use super::blocklanczos::{BlockKrylovError, BlockKrylovParams, BlockOperator, block_krylov_eigen};
+use super::io::plink_standardized_code_values;
+use super::packed::covariance_product;
 use super::partitioned::{
     add_mul_rows_in_chunks, gram_rows, gram_rows_in_chunks, mul_rows, self_adjoint_eigen_seq,
 };
@@ -42,22 +44,6 @@ use std::thread;
 
 pub const HWE_VARIANCE_EPSILON: f64 = 1.0e-12;
 pub const HWE_SCALE_FLOOR: f64 = 1.0e-6;
-/// Right-hand-side columns handled per pass of the packed hard-call kernel.
-///
-/// Not a ceiling on block width: wider right-hand sides are processed in
-/// chunks of this many columns. It bounds the small on-stack projection buffer
-/// and how often the packed bytes are re-walked in the scatter phase.
-///
-/// `PACKED_RHS_MAX_COLS` keeps production below one chunk, so the chunk loop
-/// runs exactly once there. It stays anyway: the kernel is correct at any
-/// width, and `packed_hard_call_kernel_matches_the_general_path` exercises it
-/// across a chunk boundary so the loop cannot rot behind the gate.
-const PACKED_RHS_CHUNK_COLS: usize = 32;
-/// Widest right-hand side that still takes the packed hard-call kernel.
-///
-/// A throughput gate, not a correctness one — see the dispatch in
-/// [`StandardizedCovarianceOp::apply`].
-const PACKED_RHS_MAX_COLS: usize = 8;
 pub const EIGENVALUE_EPSILON: f64 = 1.0e-9;
 /// Largest streamed variant tile. On 250k-sample PLINK microarray data, 512
 /// matched 1,024's throughput while cutting the decode-buffer working set.
@@ -1983,20 +1969,6 @@ fn hard_call_decode_table() -> &'static [[f64; 4]; 256] {
                     3 => 2.0,
                     _ => unreachable!(),
                 };
-            }
-        }
-        table
-    })
-}
-
-fn hard_call_code_table() -> &'static [[u8; 4]; 256] {
-    static TABLE: OnceLock<[[u8; 4]; 256]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut table = [[0u8; 4]; 256];
-        for byte in 0u16..256 {
-            for offset in 0..4 {
-                let code = ((byte >> (offset * 2)) & 0b11) as u8;
-                table[byte as usize][offset] = code;
             }
         }
         table
@@ -4090,30 +4062,15 @@ where
             return;
         }
 
-        // Narrow right-hand sides only — a throughput gate, not a correctness
-        // one. The packed kernel is a serial walk over variants with no rayon
-        // anywhere in it; what it buys is never materializing an f64 tile, and
-        // that only pays while there are a handful of columns to project. The
-        // general path below decodes a tile and hands it to faer's `matmul`
-        // on fixed row leaves, which are parallel across every core.
-        //
-        // Past a few columns the trade reverses decisively: a block solver
-        // asking for ~30 columns would run 30× the per-pass work on one core
-        // while the tile path spreads the same work over all of them. A
-        // measured baseline fit sat at 104% CPU — one core — for exactly this
-        // reason. Enabling the packed kernel for wide blocks is a pessimization.
-        //
-        // The real fix is to parallelize the kernel over disjoint sample ranges
-        // (a reduction to form the projection, then a disjoint scatter), after
-        // which this gate can go. Until then it stays.
-        //
-        // A request for the factor image takes the tile path, whose projection
-        // is that image. The solver's blocks are always wider than the gate, so
-        // this changes no production arithmetic.
-        if factor.is_none()
-            && rhs.ncols() <= PACKED_RHS_MAX_COLS
-            && self.try_apply_hardcall_packed(out.rb_mut(), rhs)
-        {
+        // A source that hands out its 2-bit codes takes the whole product from
+        // them, at any width and with the factor image, on row leaves across
+        // every core; see `super::packed`. Every other source decodes f64
+        // tiles below.
+        if self.try_apply_hardcall_packed(
+            out.rb_mut(),
+            factor.as_mut().map(|factor| factor.rb_mut()),
+            rhs,
+        ) {
             return;
         }
 
@@ -5086,183 +5043,69 @@ where
     S::Error: Error + Send + Sync + 'static,
     P: FitProgressObserver + Send + Sync + 'static,
 {
-    fn try_apply_hardcall_packed(&self, mut out: MatMut<'_, f64>, rhs: MatRef<'_, f64>) -> bool {
+    /// `out ← out + C·rhs`, and `factor ← Xᵀ·rhs` when given, straight from
+    /// the source's 2-bit codes; see [`super::packed`]. `false` leaves both
+    /// untouched, for a source with no packed view or one that cannot serve
+    /// the product.
+    fn try_apply_hardcall_packed(
+        &self,
+        out: MatMut<'_, f64>,
+        factor: Option<MatMut<'_, f64>>,
+        rhs: MatRef<'_, f64>,
+    ) -> bool {
         let mut guard = self
             .source
             .lock()
             .expect("covariance source mutex poisoned");
         let source: &mut S = &mut guard;
-        let _ = source.reset();
-        let packed = match source.hard_call_packed() {
-            Some(packed) => packed,
-            None => return false,
+        if source.reset().is_err() {
+            return false;
+        }
+        let Some(packed) = source.hard_call_packed() else {
+            return false;
         };
 
-        let n_samples = self.n_samples;
-        let ncols = rhs.ncols();
+        let variants = self.observed_variants;
         let freqs = self.scaler.allele_frequencies();
         let scales = self.scaler.variant_scales();
-        let max_variants = self.observed_variants.min(packed.n_variants());
-        let max_variants = max_variants.min(freqs.len()).min(scales.len());
-        let code_table = hard_call_code_table();
-        let sample_selection = packed.sample_selection();
-        let sample_byte_masks = packed.sample_byte_masks();
-        debug_assert!(sample_selection.is_none_or(|selection| selection.len() == n_samples));
-        debug_assert_eq!(sample_selection.is_some(), sample_byte_masks.is_some());
-
-        for variant_idx in 0..max_variants {
-            let mean = 2.0 * freqs[variant_idx];
-            let denom = scales[variant_idx].max(HWE_SCALE_FLOOR);
-            let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
-            if inv == 0.0 {
-                if (variant_idx + 1) % 1_024 == 0 || variant_idx + 1 == max_variants {
-                    if let Some(progress) = self.progress.as_ref() {
-                        progress.advance(variant_idx + 1);
-                    }
-                }
-                continue;
-            }
-
-            let mut z0 = (0.0 - mean) * inv;
-            let z1 = (1.0 - mean) * inv;
-            let mut z2 = (2.0 - mean) * inv;
-            if packed.match_kind(variant_idx) == MatchKind::Swap {
-                // The scaler was estimated from the logically oriented stream,
-                // while this view points at the physical BED codes. A swapped
-                // match maps physical dosage 0 to logical dosage 2 and vice
-                // versa; ignoring that here makes the packed operator disagree
-                // with every decoded fit path.
-                std::mem::swap(&mut z0, &mut z2);
-            }
-
-            let weight_sq = if let Some(weights) = &self.ld_weights {
-                let w = weights.get(variant_idx).copied().unwrap_or(1.0);
-                w * w
-            } else {
-                1.0
-            };
-            let coeff = self.scale * weight_sq;
-
-            let variant_bytes = match packed.slice(variant_idx, 1) {
-                Some(slice) => slice,
-                None => break,
-            };
-
-            // Wide right-hand sides are taken a chunk at a time so the
-            // projection buffer stays on the stack and the scatter phase walks
-            // the variant's bytes once per chunk rather than once per column.
-            let mut chunk_start = 0usize;
-            while chunk_start < ncols {
-                let chunk = (ncols - chunk_start).min(PACKED_RHS_CHUNK_COLS);
-                let mut proj = [0.0f64; PACKED_RHS_CHUNK_COLS];
-
-                for local in 0..chunk {
-                    let col = chunk_start + local;
-                    let mut sum0 = 0.0f64;
-                    let mut sum1 = 0.0f64;
-                    let mut sum2 = 0.0f64;
-
-                    if let Some(masks) = sample_byte_masks {
-                        let valid = for_each_packed_masked_code(
-                            variant_bytes,
-                            masks,
-                            n_samples,
-                            |idx, code| {
-                                let val = rhs[(idx, col)];
-                                match code {
-                                    0 => sum0 += val,
-                                    2 => sum1 += val,
-                                    3 => sum2 += val,
-                                    _ => {}
-                                }
-                            },
-                        );
-                        debug_assert!(valid.is_some());
-                    } else {
-                        let mut sample_idx = 0usize;
-                        for &byte in variant_bytes {
-                            if sample_idx >= n_samples {
-                                break;
-                            }
-                            let codes = &code_table[byte as usize];
-                            for offset in 0..4 {
-                                let idx = sample_idx + offset;
-                                if idx >= n_samples {
-                                    break;
-                                }
-                                let val = rhs[(idx, col)];
-                                match codes[offset] {
-                                    0 => sum0 += val,
-                                    2 => sum1 += val,
-                                    3 => sum2 += val,
-                                    _ => {}
-                                }
-                            }
-                            sample_idx += 4;
-                        }
-                    }
-
-                    proj[local] = (z0 * sum0 + z1 * sum1 + z2 * sum2) * coeff;
-                }
-
-                if let Some(masks) = sample_byte_masks {
-                    let valid = for_each_packed_masked_code(
-                        variant_bytes,
-                        masks,
-                        n_samples,
-                        |idx, code| {
-                            let z = match code {
-                                0 => z0,
-                                2 => z1,
-                                3 => z2,
-                                _ => 0.0,
-                            };
-                            if z != 0.0 {
-                                for local in 0..chunk {
-                                    out[(idx, chunk_start + local)] += z * proj[local];
-                                }
-                            }
-                        },
-                    );
-                    debug_assert!(valid.is_some());
-                } else {
-                    let mut sample_idx = 0usize;
-                    for &byte in variant_bytes {
-                        if sample_idx >= n_samples {
-                            break;
-                        }
-                        let codes = &code_table[byte as usize];
-                        for offset in 0..4 {
-                            let idx = sample_idx + offset;
-                            if idx >= n_samples {
-                                break;
-                            }
-                            let z = match codes[offset] {
-                                0 => z0,
-                                2 => z1,
-                                3 => z2,
-                                _ => 0.0,
-                            };
-                            if z != 0.0 {
-                                for local in 0..chunk {
-                                    out[(idx, chunk_start + local)] += z * proj[local];
-                                }
-                            }
-                        }
-                        sample_idx += 4;
-                    }
-                }
-
-                chunk_start += chunk;
-            }
-            if (variant_idx + 1) % 1_024 == 0 || variant_idx + 1 == max_variants {
-                if let Some(progress) = self.progress.as_ref() {
-                    progress.advance(variant_idx + 1);
-                }
-            }
+        if packed.n_variants() < variants || freqs.len() < variants || scales.len() < variants {
+            return false;
         }
-
-        true
+        // The scaler was estimated from the logically oriented stream, while
+        // the view holds physical BED codes: a swapped match maps physical
+        // dosage 0 to logical dosage 2, so its code values trade places.
+        let code_values: Vec<[f64; 4]> = (0..variants)
+            .map(|variant| {
+                let denom = scales[variant].max(HWE_SCALE_FLOOR);
+                let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+                let weight = self
+                    .ld_weights
+                    .as_deref()
+                    .and_then(|weights| weights.get(variant))
+                    .copied()
+                    .unwrap_or(1.0);
+                plink_standardized_code_values(
+                    2.0 * freqs[variant],
+                    inv,
+                    weight,
+                    packed.match_kind(variant) == MatchKind::Swap,
+                )
+            })
+            .collect();
+        let progress = |processed: usize| {
+            if let Some(progress) = self.progress.as_ref() {
+                progress.advance(processed);
+            }
+        };
+        covariance_product(
+            &packed,
+            &code_values,
+            self.scale,
+            rhs,
+            out,
+            factor,
+            &progress,
+        )
     }
 }
 
@@ -9469,7 +9312,7 @@ mod tests {
         );
 
         let mut actual = Mat::<f64>::zeros(N_SAMPLES, 5);
-        assert!(packed.try_apply_hardcall_packed(actual.as_mut(), rhs.as_ref()));
+        assert!(packed.try_apply_hardcall_packed(actual.as_mut(), None, rhs.as_ref()));
         let mut max_diff = 0.0f64;
         for col in 0..rhs.ncols() {
             for row in 0..N_SAMPLES {
@@ -9538,7 +9381,7 @@ mod tests {
         );
 
         let mut actual = Mat::<f64>::zeros(n_samples, 5);
-        assert!(packed.try_apply_hardcall_packed(actual.as_mut(), rhs.as_ref()));
+        assert!(packed.try_apply_hardcall_packed(actual.as_mut(), None, rhs.as_ref()));
         let mut scale = 0.0f64;
         let mut max_diff = 0.0f64;
         for col in 0..rhs.ncols() {
@@ -9580,16 +9423,12 @@ mod tests {
     /// The packed 2-bit kernel must compute the same operator application as
     /// the general f64 tile path it is an optimization of.
     ///
-    /// The kernel walks its right-hand side in chunks of
-    /// `PACKED_RHS_CHUNK_COLS`, so the widths that matter straddle a chunk
-    /// boundary: 32 fills a chunk exactly, 33 leaves a one-column remainder,
-    /// and 1 is the single-column case the kernel has to keep reproducing.
-    ///
-    /// It is called here directly rather than through `apply`, which gates the
-    /// packed path at `PACKED_RHS_MAX_COLS` for throughput. The gate decides
-    /// *when* the kernel runs; this test decides whether it is right, and the
-    /// two should not be entangled — a chunk-loop off-by-one that only shows up
-    /// at width 33 must not be able to hide behind a gate at 8.
+    /// The kernel carries the right-hand side in lanes of four columns, twelve
+    /// lanes to a group, so the widths that matter straddle those boundaries:
+    /// 1 is the single-column case, 3 and 5 leave a partial lane, 48 fills a
+    /// group exactly, and 49 and 53 spill into a second group. Its scatter
+    /// tables take variants eight at a time, and 23 variants leave a short
+    /// last group.
     #[test]
     fn packed_hard_call_kernel_matches_the_general_path() {
         const N_SAMPLES: usize = 37;
@@ -9646,7 +9485,7 @@ mod tests {
         let packed =
             covariance_operator(&mut packed_cache, BLOCK_CAPACITY, observed_variants, scaler);
 
-        for &ncols in &[1usize, 8, 31, 32, 33, 40] {
+        for &ncols in &[1usize, 3, 4, 5, 8, 31, 32, 33, 40, 48, 49, 53] {
             let rhs = Mat::<f64>::from_fn(N_SAMPLES, ncols, |row, col| {
                 ((row * 7 + col * 13) % 11) as f64 - 5.0
             });
@@ -9662,7 +9501,7 @@ mod tests {
             // accumulates, so the caller owns the zeroing either way.
             let mut packed_out = Mat::<f64>::zeros(N_SAMPLES, ncols);
             assert!(
-                packed.try_apply_hardcall_packed(packed_out.as_mut(), rhs.as_ref()),
+                packed.try_apply_hardcall_packed(packed_out.as_mut(), None, rhs.as_ref()),
                 "packed kernel refused a {ncols}-column right-hand side"
             );
 
@@ -9682,6 +9521,137 @@ mod tests {
                 max_diff <= 1.0e-10 * scale.max(1.0),
                 "width {ncols}: packed and general paths differ by {max_diff} (magnitude {scale})"
             );
+        }
+    }
+
+    /// Across several leaves, with and without a sample subset, the packed
+    /// product must match the tile path's operator and factor images to
+    /// roundoff, and give the same bits on any number of threads: its leaves,
+    /// lane groups and merge order are fixed shapes.
+    #[test]
+    fn packed_covariance_product_spans_leaves_and_ignores_the_thread_count() {
+        use super::super::packed::LEAF_ROWS;
+        const PHYSICAL_SAMPLES: usize = 2 * LEAF_ROWS + 1_003;
+        const N_VARIANTS: usize = 11;
+        const WIDTH: usize = 53;
+
+        let mut physical = synthetic_genotypes(PHYSICAL_SAMPLES, N_VARIANTS);
+        for (index, value) in physical.iter_mut().enumerate() {
+            if index % 23 == 9 {
+                *value = f64::NAN;
+            }
+        }
+        let subset: Vec<usize> = (0..PHYSICAL_SAMPLES)
+            .filter(|sample| sample % 5 != 3)
+            .collect();
+
+        for selection in [None, Some(subset)] {
+            let n_samples = selection.as_ref().map_or(PHYSICAL_SAMPLES, Vec::len);
+            let mut logical = Vec::with_capacity(n_samples * N_VARIANTS);
+            for variant in 0..N_VARIANTS {
+                let column =
+                    &physical[variant * PHYSICAL_SAMPLES..(variant + 1) * PHYSICAL_SAMPLES];
+                match &selection {
+                    Some(rows) => logical.extend(rows.iter().map(|&row| column[row])),
+                    None => logical.extend_from_slice(column),
+                }
+            }
+
+            let mut stats_source =
+                DenseBlockSource::new(&logical, n_samples, N_VARIANTS).expect("stats source");
+            let stats_progress = StageProgressHandle::new(
+                Arc::new(NoopFitProgress),
+                FitProgressStage::AlleleStatistics,
+            );
+            let (scaler, _, observed) = compute_variant_statistics(
+                &mut stats_source,
+                N_VARIANTS,
+                Par::Seq,
+                stats_progress,
+                N_VARIANTS,
+            )
+            .expect("variant statistics");
+
+            let rhs = Mat::<f64>::from_fn(n_samples, WIDTH, |row, col| {
+                (((row * 31 + col * 17) % 29) as f64 - 14.0) / 7.0
+            });
+
+            let mut general_source =
+                DenseBlockSource::new(&logical, n_samples, N_VARIANTS).expect("general source");
+            let general =
+                covariance_operator(&mut general_source, N_VARIANTS, observed, scaler.clone());
+            let mut expected_out = Mat::<f64>::zeros(n_samples, WIDTH);
+            let mut expected_factor = Mat::<f64>::zeros(observed, WIDTH);
+            let mut mem = MemBuffer::new(general.apply_scratch(WIDTH, Par::Seq));
+            general.apply_with_factor(
+                expected_out.as_mut(),
+                Some(expected_factor.as_mut()),
+                rhs.as_ref(),
+                Par::Seq,
+                MemStack::new(&mut mem),
+            );
+
+            let mut direct = DirectPackedSource::new(&physical, PHYSICAL_SAMPLES, N_VARIANTS);
+            if let Some(rows) = &selection {
+                direct = direct.with_sample_selection(rows.clone());
+            }
+            let mut cached = CachedVariantBlockSource::new(&mut direct, true);
+            let packed = covariance_operator(&mut cached, N_VARIANTS, observed, scaler);
+            let packed_products = |threads: usize| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("thread pool")
+                    .install(|| {
+                        let mut out = Mat::<f64>::zeros(n_samples, WIDTH);
+                        let mut factor = Mat::<f64>::zeros(observed, WIDTH);
+                        assert!(
+                            packed.try_apply_hardcall_packed(
+                                out.as_mut(),
+                                Some(factor.as_mut()),
+                                rhs.as_ref()
+                            ),
+                            "packed product refused {n_samples} rows"
+                        );
+                        (out, factor)
+                    })
+            };
+
+            let (serial_out, serial_factor) = packed_products(1);
+            for (name, expected, actual) in [
+                ("operator image", &expected_out, &serial_out),
+                ("factor image", &expected_factor, &serial_factor),
+            ] {
+                let mut magnitude = 0.0f64;
+                let mut max_diff = 0.0f64;
+                for col in 0..WIDTH {
+                    for row in 0..expected.nrows() {
+                        magnitude = magnitude.max(expected[(row, col)].abs());
+                        max_diff = max_diff.max((expected[(row, col)] - actual[(row, col)]).abs());
+                    }
+                }
+                assert!(
+                    max_diff <= 1.0e-10 * magnitude.max(1.0),
+                    "{name} over {n_samples} rows: packed and tile paths differ by {max_diff} (magnitude {magnitude})"
+                );
+            }
+            for threads in [3usize, 8] {
+                let (out, factor) = packed_products(threads);
+                for (name, serial, threaded) in [
+                    ("operator image", &serial_out, &out),
+                    ("factor image", &serial_factor, &factor),
+                ] {
+                    for col in 0..WIDTH {
+                        for row in 0..serial.nrows() {
+                            assert_eq!(
+                                serial[(row, col)].to_bits(),
+                                threaded[(row, col)].to_bits(),
+                                "{name} entry ({row}, {col}) differs at {threads} threads"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

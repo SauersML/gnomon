@@ -3,6 +3,7 @@ pub mod correctability;
 pub mod fit;
 pub mod io;
 pub mod main;
+pub mod packed;
 pub mod partitioned;
 pub mod prefit;
 pub mod progress;

@@ -6681,7 +6681,7 @@ fn decode_plink_variant_rows(
 }
 
 #[inline(always)]
-fn plink_standardized_code_values(mean: f64, inv: f64, weight: f64, swap: bool) -> [f64; 4] {
+pub(crate) fn plink_standardized_code_values(mean: f64, inv: f64, weight: f64, swap: bool) -> [f64; 4] {
     let transform = |raw: f64| {
         let value = (raw - mean) * inv;
         if (weight - 1.0).abs() < f64::EPSILON {
