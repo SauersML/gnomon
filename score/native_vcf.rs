@@ -2,14 +2,11 @@ use crate::score::prepare::{
     EffectOnlyMatches, OtherAlleleMatch, names_no_single_other_allele, resolve_other_allele,
 };
 use crate::score::types::{GenomicRegion, parse_chromosome_label};
-use crate::shared::files::{VariantCompression, VariantFormat, VariantSource, open_variant_source};
+use crate::shared::files::open_variant_source;
 use ahash::{AHashMap, AHashSet};
-use crossbeam_channel::{Receiver, Sender};
-use flate2::Crc;
 use flate2::read::MultiGzDecoder;
 use libdeflater::Decompressor;
-use memchr::{memchr, memchr_iter, memrchr};
-use noodles_bcf::io::Reader as BcfReader;
+use memchr::memchr;
 use noodles_vcf::header::record::value::map::format::{Number as FormatNumber, Type as FormatType};
 use noodles_vcf::io::Reader as VcfReader;
 use noodles_vcf::variant::record::AlternateBases as _;
@@ -22,10 +19,10 @@ use rayon::prelude::*;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Cursor, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+
+mod stream;
 
 #[derive(Debug)]
 pub struct NativeVcfScoreResult {
@@ -164,208 +161,108 @@ pub fn score_vcf_streaming(
     score_regions: Option<&std::collections::HashMap<String, GenomicRegion>>,
 ) -> Result<NativeVcfScoreResult, Box<dyn Error + Send + Sync>> {
     let (score_names, rules_by_key) = load_score_rules(native_score_files, score_regions)?;
-    let rules_by_key = Arc::new(rules_by_key);
-
     let source = open_variant_source(input_path)?;
-    match source.format() {
-        VariantFormat::Vcf => {
-            let mut reader = match source.compression() {
-                VariantCompression::Plain => {
-                    let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(source));
-                    VcfReader::new(reader)
-                }
-                VariantCompression::Bgzf => {
-                    let reader: Box<dyn BufRead + Send> = Box::new(PrefilteredBgzfReader::spawn(
-                        source,
-                        Some(Arc::clone(&rules_by_key)),
-                    )?);
-                    VcfReader::new(reader)
-                }
-            };
-            let header = crate::variant_header::read_vcf_header(&mut reader)?.warned(input_path);
-            score_records(
-                &header,
-                "VCF",
-                input_path,
-                keep,
-                score_names,
-                &rules_by_key,
-                |record: &mut noodles_vcf::Record| reader.read_record(record),
-                |record, kept_indices, score_names, decoded| {
-                    decode_scored_record(record, &rules_by_key, kept_indices, score_names, decoded)
-                },
-                |record| record.reference_sequence_name().to_string(),
-            )
+    stream::score_source(source, input_path, keep, score_names, &rules_by_key)
+}
+
+/// What decoding a record needs besides the record.
+struct DecodeContext<'a> {
+    rules_by_key: &'a ScoreRules,
+    kept_indices: &'a [usize],
+    score_names: &'a [String],
+}
+
+/// Accumulates decoded records taken in input order.
+///
+/// The records at a position holding a rule that names no single other allele
+/// are accumulated together, when the next scored position or the end of input
+/// shows every one of them has been read.
+struct RecordAccumulator<'a> {
+    rules_by_key: &'a ScoreRules,
+    score_names: &'a [String],
+    totals: ScoreTotals,
+    pending: PendingPosition,
+    effect_only_matches: EffectOnlyMatches,
+}
+
+impl<'a> RecordAccumulator<'a> {
+    fn new(rules_by_key: &'a ScoreRules, score_names: &'a [String], num_people: usize) -> Self {
+        Self {
+            rules_by_key,
+            score_names,
+            totals: ScoreTotals::new(num_people, score_names.len()),
+            pending: PendingPosition::default(),
+            effect_only_matches: EffectOnlyMatches::default(),
         }
-        VariantFormat::Bcf => {
-            let inner: Box<dyn Read + Send> = match source.compression() {
-                VariantCompression::Plain => Box::new(BufReader::new(source)),
-                // BCF records are binary, so no line can be dropped before
-                // noodles parses them; the blocks are still inflated in parallel.
-                VariantCompression::Bgzf => Box::new(PrefilteredBgzfReader::spawn(source, None)?),
-            };
-            let mut reader = BcfReader::from(inner);
-            let header = crate::variant_header::read_bcf_header(&mut reader)?.warned(input_path);
-            score_records(
-                &header,
-                "BCF",
-                input_path,
-                keep,
-                score_names,
-                &rules_by_key,
-                |record: &mut noodles_bcf::Record| reader.read_record(record),
-                |record, kept_indices, score_names, decoded| {
-                    decode_scored_bcf_record(
-                        record,
-                        &header,
-                        &rules_by_key,
-                        kept_indices,
-                        score_names,
-                        decoded,
+    }
+
+    /// Takes the next record in input order, returning the error scoring it raises.
+    fn take(&mut self, decoded: &mut DecodedRecord) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if let Some(err) = decoded.error.take() {
+            return Err(err);
+        }
+        let rules_by_key = self.rules_by_key;
+        let score_names = self.score_names;
+        if let Some(key) = decoded.key {
+            if self.pending.key.is_some_and(|open| open != key) {
+                self.pending.resolve(
+                    rules_by_key,
+                    score_names,
+                    &mut self.effect_only_matches,
+                    &mut self.totals,
+                )?;
+            }
+            if decoded.effect_only {
+                if self.pending.key.is_none() {
+                    self.pending
+                        .open(key, decoded.chromosome.clone(), rules_by_key)?;
+                }
+                self.pending.push(decoded);
+                return Ok(());
+            }
+        }
+        for allele in &mut decoded.alleles[..decoded.allele_count] {
+            self.totals.add_allele(
+                std::mem::take(&mut allele.matched_rules),
+                std::mem::take(&mut allele.column),
+                |score_index| {
+                    ref_effect_error(
+                        &score_names[score_index],
+                        &decoded.chromosome,
+                        decoded.position,
                     )
                 },
-                |record| {
-                    record
-                        .reference_sequence_name(header.string_maps())
-                        .map_or_else(|_| String::from("?"), str::to_string)
-                },
-            )
+            )?;
         }
+        Ok(())
+    }
+
+    /// Adds the terms of every allele taken so far to the sums.
+    fn apply(&mut self) {
+        self.totals.apply();
+    }
+
+    /// Accumulates the records at the last open position and returns the totals.
+    fn finish(mut self) -> Result<ScoreTotals, Box<dyn Error + Send + Sync>> {
+        self.pending.resolve(
+            self.rules_by_key,
+            self.score_names,
+            &mut self.effect_only_matches,
+            &mut self.totals,
+        )?;
+        self.totals.apply();
+        self.effect_only_matches.report();
+        Ok(self.totals)
     }
 }
 
-/// Scores the records `read_record` yields for the kept samples of `header`.
-///
-/// Records are read in order, decoded on the rayon pool, and accumulated in
-/// order again, so every sum takes the same operands in the same sequence as a
-/// one-record-at-a-time scan, and the first error is the one it raises. The
-/// records at a position holding a rule that names no single other allele are
-/// accumulated together, when the next scored position or the end of input shows
-/// every one of them has been read.
-#[allow(clippy::too_many_arguments)]
-fn score_records<R, ReadRecord, Decode, Chromosome>(
-    header: &noodles_vcf::Header,
-    format_name: &str,
-    input_path: &Path,
-    keep: Option<&Path>,
+/// The scores `totals` holds, or the error for a run that matched no variant.
+fn native_result(
+    totals: ScoreTotals,
+    person_iids: Vec<String>,
     score_names: Vec<String>,
-    rules_by_key: &ScoreRules,
-    mut read_record: ReadRecord,
-    decode: Decode,
-    chromosome: Chromosome,
-) -> Result<NativeVcfScoreResult, Box<dyn Error + Send + Sync>>
-where
-    R: Default + Sync,
-    ReadRecord: FnMut(&mut R) -> io::Result<usize>,
-    Decode: Fn(&R, &[usize], &[String], &mut DecodedRecord) -> Result<(), Box<dyn Error + Send + Sync>>
-        + Sync,
-    Chromosome: Fn(&R) -> String,
-{
-    let all_samples: Vec<String> = header.sample_names().iter().cloned().collect();
-    if all_samples.is_empty() {
-        return Err(format!("{format_name} contains no samples.").into());
-    }
-
-    let kept_indices = resolve_keep_indices(keep, &all_samples)?;
-    let person_iids: Vec<String> = kept_indices
-        .iter()
-        .map(|&idx| all_samples[idx].clone())
-        .collect();
-
-    let num_people = person_iids.len();
-    let num_scores = score_names.len();
-    let mut totals = ScoreTotals {
-        num_scores,
-        sum_scores: vec![0.0f64; num_people * num_scores],
-        missing_counts: vec![0u32; num_people * num_scores],
-        score_variant_counts: vec![0u32; num_scores],
-    };
-    let mut pending = PendingPosition::default();
-    let mut effect_only_matches = EffectOnlyMatches::default();
-
-    let threads = rayon::current_num_threads().max(1);
-    let batch_len =
-        (DECODE_BATCH_DOSAGES / all_samples.len()).clamp(threads, threads * RECORDS_PER_WORKER);
-    let mut records: Vec<R> = Vec::new();
-    let mut decoded_records: Vec<DecodedRecord> = Vec::new();
-    loop {
-        let mut filled = 0usize;
-        let mut read_error = None;
-        let mut at_eof = false;
-        while filled < batch_len {
-            if records.len() == filled {
-                records.push(R::default());
-                decoded_records.push(DecodedRecord::default());
-            }
-            match read_record(&mut records[filled]) {
-                Ok(0) => {
-                    at_eof = true;
-                    break;
-                }
-                Ok(_) => filled += 1,
-                Err(err) => {
-                    read_error = Some(err);
-                    break;
-                }
-            }
-        }
-
-        records[..filled]
-            .par_iter()
-            .zip(decoded_records[..filled].par_iter_mut())
-            .for_each(|(record, decoded)| {
-                decoded.allele_count = 0;
-                decoded.key = None;
-                decoded.effect_only = false;
-                decoded.error = decode(record, &kept_indices, &score_names, decoded).err();
-            });
-
-        for (record, decoded) in records[..filled].iter().zip(&mut decoded_records[..filled]) {
-            if let Some(err) = decoded.error.take() {
-                return Err(err);
-            }
-            if let Some(key) = decoded.key {
-                if pending.key.is_some_and(|open| open != key) {
-                    pending.resolve(
-                        rules_by_key,
-                        &score_names,
-                        &mut effect_only_matches,
-                        &mut totals,
-                    )?;
-                }
-                if decoded.effect_only {
-                    if pending.key.is_none() {
-                        pending.open(key, chromosome(record), rules_by_key)?;
-                    }
-                    pending.push(decoded);
-                    continue;
-                }
-            }
-            for allele in &decoded.alleles[..decoded.allele_count] {
-                totals.add_allele(&allele.matched_rules, &allele.dosages, |score_index| {
-                    ref_effect_error(
-                        &score_names[score_index],
-                        &chromosome(record),
-                        decoded.position,
-                    )
-                })?;
-            }
-        }
-
-        if let Some(err) = read_error {
-            return Err(err.into());
-        }
-        if at_eof {
-            pending.resolve(
-                rules_by_key,
-                &score_names,
-                &mut effect_only_matches,
-                &mut totals,
-            )?;
-            break;
-        }
-    }
-    effect_only_matches.report();
+    input_path: &Path,
+) -> Result<NativeVcfScoreResult, Box<dyn Error + Send + Sync>> {
     let ScoreTotals {
         sum_scores,
         missing_counts,
@@ -398,17 +295,19 @@ where
     })
 }
 
-/// Records decoded per rayon worker before the ordered accumulation pass.
-const RECORDS_PER_WORKER: usize = 64;
-/// Dosages one decode batch may hold, so cohorts with many samples take smaller batches.
-const DECODE_BATCH_DOSAGES: usize = 1 << 22;
+/// The fewest people in one range when the sums are split across the rayon pool.
+const MIN_PEOPLE_PER_RANGE: usize = 256;
+/// Ranges of people per rayon worker when the sums are split across the pool.
+const RANGES_PER_WORKER: usize = 4;
 
-/// What scoring one VCF record needs, decoded away from the accumulating thread.
+/// What scoring one VCF or BCF record needs, decoded away from the accumulating thread.
 #[derive(Default)]
 struct DecodedRecord {
     position: u32,
     /// The record's position, when score rules sit there.
     key: Option<VariantKey>,
+    /// The record's chromosome as written, for messages about a scored record.
+    chromosome: String,
     /// Whether a rule at the position names no single other allele. Which
     /// alleles such a rule scores is decided by `PendingPosition`, so this
     /// record's alleles carry no matched rules yet.
@@ -423,13 +322,80 @@ struct DecodedRecord {
     error: Option<Box<dyn Error + Send + Sync>>,
 }
 
+impl DecodedRecord {
+    /// The next allele slot, for ALT ordinal `alt_offset`.
+    fn next_allele(&mut self, alt_offset: usize) -> &mut DecodedAllele {
+        if self.alleles.len() == self.allele_count {
+            self.alleles.push(DecodedAllele::default());
+        }
+        let allele = &mut self.alleles[self.allele_count];
+        allele.alt_offset = alt_offset;
+        allele
+    }
+}
+
 #[derive(Default)]
 struct DecodedAllele {
     /// The allele's ALT ordinal, from 0.
     alt_offset: usize,
     matched_rules: Vec<MatchedRule>,
-    /// One entry per kept person, in output order.
-    dosages: Vec<Option<DecodedAltDosage>>,
+    /// One dosage per kept person, in output order.
+    column: DosageColumn,
+}
+
+/// The code of a person without a hard call in `DosageColumn::Calls`. No real
+/// code reaches it: a code holds at most fourteen copies of each allele.
+const MISSING_CALL: u8 = 0xff;
+
+/// Every kept person's dosage of one ALT allele, in output order.
+enum DosageColumn {
+    /// Hard calls, each `alt | ref << 4` allele copies, or `MISSING_CALL`.
+    Calls(Vec<u8>),
+    /// `[alt, ref]` dosages. A NaN ALT dosage is a missing dosage, and a NaN
+    /// REF dosage one that genotype ploidy and every ALT dosage could not complete.
+    Dosages(Vec<[f64; 2]>),
+}
+
+impl Default for DosageColumn {
+    fn default() -> Self {
+        Self::Calls(Vec::new())
+    }
+}
+
+impl DosageColumn {
+    /// The column, emptied, as hard calls.
+    fn calls(&mut self) -> &mut Vec<u8> {
+        if let Self::Dosages(_) = self {
+            *self = Self::Calls(Vec::new());
+        }
+        let Self::Calls(codes) = self else {
+            unreachable!("the column holds hard calls");
+        };
+        codes.clear();
+        codes
+    }
+
+    /// The column, emptied, as dosages.
+    fn dosages(&mut self) -> &mut Vec<[f64; 2]> {
+        if let Self::Calls(_) = self {
+            *self = Self::Dosages(Vec::new());
+        }
+        let Self::Dosages(dosages) = self else {
+            unreachable!("the column holds dosages");
+        };
+        dosages.clear();
+        dosages
+    }
+
+    /// Whether some person has a dosage without a REF dosage.
+    fn has_incomplete_ref(&self) -> bool {
+        match self {
+            Self::Calls(_) => false,
+            Self::Dosages(dosages) => dosages
+                .iter()
+                .any(|&[alt, reference]| !alt.is_nan() && reference.is_nan()),
+        }
+    }
 }
 
 /// Per-person score sums and missing counts, and each score's matched variants.
@@ -438,55 +404,171 @@ struct ScoreTotals {
     sum_scores: Vec<f64>,
     missing_counts: Vec<u32>,
     score_variant_counts: Vec<u32>,
+    /// Alleles counted in `score_variant_counts` whose terms are not yet in the
+    /// sums, in input order.
+    unapplied: Vec<ScoredAllele>,
+}
+
+/// One scored allele's merged rules and every kept person's dosage of it.
+struct ScoredAllele {
+    matched_rules: Vec<MatchedRule>,
+    /// The distinct scores of `matched_rules`, each counted once for a missing dosage.
+    missing_scores: Vec<usize>,
+    /// For hard calls, each rule's weight times 0 through 14 copies, and a zero
+    /// at index 15, which is where a missing call's nibble points.
+    call_terms: Vec<[f64; 16]>,
+    column: DosageColumn,
 }
 
 impl ScoreTotals {
-    /// Adds each rule's weight times every kept person's dosage of its effect
-    /// allele, and counts the allele once in each score it scores.
+    fn new(num_people: usize, num_scores: usize) -> Self {
+        Self {
+            num_scores,
+            sum_scores: vec![0.0f64; num_people * num_scores],
+            missing_counts: vec![0u32; num_people * num_scores],
+            score_variant_counts: vec![0u32; num_scores],
+            unapplied: Vec::new(),
+        }
+    }
+
+    /// Counts the allele once in each score it scores, and queues each rule's
+    /// weight times every kept person's dosage of its effect allele for
+    /// [`ScoreTotals::apply`]. A REF-effect rule fails when some person's dosage
+    /// has no REF dosage.
     fn add_allele(
         &mut self,
-        matched_rules: &[MatchedRule],
-        dosages: &[Option<DecodedAltDosage>],
+        matched_rules: Vec<MatchedRule>,
+        column: DosageColumn,
         ref_effect_error: impl Fn(usize) -> String,
     ) -> Result<(), String> {
-        let num_scores = self.num_scores;
-        for (out_person_idx, dosage) in dosages.iter().enumerate() {
-            match dosage {
-                Some(decoded_dosage) => {
-                    for rule in matched_rules {
-                        let cell = out_person_idx * num_scores + rule.score_index;
-                        let effect_dosage = if rule.effect_is_ref {
-                            decoded_dosage
-                                .ref_dosage
-                                .ok_or_else(|| ref_effect_error(rule.score_index))?
-                        } else {
-                            decoded_dosage.alt_dosage
-                        };
-                        self.sum_scores[cell] += rule.weight * effect_dosage;
-                    }
-                }
-                None => {
-                    let mut previous_score = None;
-                    for rule in matched_rules {
-                        if previous_score == Some(rule.score_index) {
-                            continue;
-                        }
-                        let cell = out_person_idx * num_scores + rule.score_index;
-                        self.missing_counts[cell] += 1;
-                        previous_score = Some(rule.score_index);
-                    }
-                }
-            }
+        if let Some(rule) = matched_rules.iter().find(|rule| rule.effect_is_ref)
+            && column.has_incomplete_ref()
+        {
+            return Err(ref_effect_error(rule.score_index));
         }
-
-        let mut previous_score = None;
-        for rule in matched_rules {
-            if previous_score != Some(rule.score_index) {
+        let mut missing_scores = Vec::new();
+        for rule in &matched_rules {
+            if missing_scores.last() != Some(&rule.score_index) {
+                missing_scores.push(rule.score_index);
                 self.score_variant_counts[rule.score_index] += 1;
-                previous_score = Some(rule.score_index);
             }
         }
+        if matched_rules.is_empty() {
+            return Ok(());
+        }
+        let call_terms = match column {
+            DosageColumn::Calls(_) => matched_rules
+                .iter()
+                .map(|rule| {
+                    let mut terms = [0.0f64; 16];
+                    for (copies, term) in (0u8..15).zip(&mut terms) {
+                        *term = rule.weight * f64::from(copies);
+                    }
+                    terms
+                })
+                .collect(),
+            DosageColumn::Dosages(_) => Vec::new(),
+        };
+        self.unapplied.push(ScoredAllele {
+            matched_rules,
+            missing_scores,
+            call_terms,
+            column,
+        });
         Ok(())
+    }
+
+    /// Adds the terms of every queued allele to the sums, over ranges of people
+    /// on the rayon pool. Each cell takes its terms in input order, so the sums
+    /// do not depend on how the people are split.
+    fn apply(&mut self) {
+        if self.unapplied.is_empty() {
+            return;
+        }
+        let num_scores = self.num_scores;
+        let num_people = self.sum_scores.len() / num_scores;
+        let range_people = num_people
+            .div_ceil(rayon::current_num_threads().max(1) * RANGES_PER_WORKER)
+            .max(MIN_PEOPLE_PER_RANGE);
+        let range_cells = range_people * num_scores;
+        let alleles = &self.unapplied;
+        self.sum_scores
+            .par_chunks_mut(range_cells)
+            .zip(self.missing_counts.par_chunks_mut(range_cells))
+            .enumerate()
+            .for_each(|(range, (sums, missing))| {
+                for allele in alleles {
+                    allele.apply(range * range_people, num_scores, sums, missing);
+                }
+            });
+        self.unapplied.clear();
+    }
+}
+
+impl ScoredAllele {
+    /// Adds this allele's terms for the people from `first_person` on, whose
+    /// cells `sums` and `missing` hold.
+    fn apply(&self, first_person: usize, num_scores: usize, sums: &mut [f64], missing: &mut [u32]) {
+        let people = first_person..first_person + sums.len() / num_scores;
+        match (&self.column, &self.matched_rules[..]) {
+            (DosageColumn::Calls(codes), [rule]) if num_scores == 1 => {
+                // A missing call's nibble selects the zero term, and it counts once.
+                let terms = &self.call_terms[0];
+                let shift = if rule.effect_is_ref { 4 } else { 0 };
+                for ((&code, sum), count) in codes[people].iter().zip(sums).zip(missing) {
+                    *sum += terms[usize::from((code >> shift) & 0x0f)];
+                    *count += u32::from(code == MISSING_CALL);
+                }
+            }
+            (DosageColumn::Calls(codes), rules) => {
+                let cells = sums
+                    .chunks_exact_mut(num_scores)
+                    .zip(missing.chunks_exact_mut(num_scores));
+                for (&code, (sums, missing)) in codes[people].iter().zip(cells) {
+                    if code == MISSING_CALL {
+                        for &score_index in &self.missing_scores {
+                            missing[score_index] += 1;
+                        }
+                        continue;
+                    }
+                    for (rule, terms) in rules.iter().zip(&self.call_terms) {
+                        let copies = if rule.effect_is_ref {
+                            code >> 4
+                        } else {
+                            code & 0x0f
+                        };
+                        sums[rule.score_index] += terms[usize::from(copies)];
+                    }
+                }
+            }
+            (DosageColumn::Dosages(dosages), [rule]) if num_scores == 1 => {
+                let side = usize::from(rule.effect_is_ref);
+                for ((dosage, sum), count) in dosages[people].iter().zip(sums).zip(missing) {
+                    if dosage[0].is_nan() {
+                        *count += 1;
+                    } else {
+                        *sum += rule.weight * dosage[side];
+                    }
+                }
+            }
+            (DosageColumn::Dosages(dosages), _) => {
+                let cells = sums
+                    .chunks_exact_mut(num_scores)
+                    .zip(missing.chunks_exact_mut(num_scores));
+                for (dosage, (sums, missing)) in dosages[people].iter().zip(cells) {
+                    if dosage[0].is_nan() {
+                        for &score_index in &self.missing_scores {
+                            missing[score_index] += 1;
+                        }
+                        continue;
+                    }
+                    for rule in &self.matched_rules {
+                        sums[rule.score_index] +=
+                            rule.weight * dosage[usize::from(rule.effect_is_ref)];
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -569,7 +651,7 @@ impl PendingPosition {
             })
             .collect();
 
-        for (row, allele) in &self.alleles {
+        for (row, allele) in &mut self.alleles {
             let (ref_allele, alt_allele) = &self.rows[*row];
             let mut matched = Vec::new();
             for (rule, decision) in rules.iter().zip(&decisions) {
@@ -597,8 +679,8 @@ impl PendingPosition {
                 }
             }
             totals.add_allele(
-                &merge_matched_rules(matched),
-                &allele.dosages,
+                merge_matched_rules(matched),
+                std::mem::take(&mut allele.column),
                 |score_index| ref_effect_error(&score_names[score_index], &self.chromosome, key.1),
             )?;
         }
@@ -608,71 +690,153 @@ impl PendingPosition {
     }
 }
 
-/// Decodes the dosages `record` contributes to its matched rules into
-/// `decoded`, stopping at the first error a sequential scan raises for this
-/// record: a malformed position or ALT, a missing dosage FORMAT field, an
-/// undecodable sample, or a REF-effect rule without a complete REF dosage.
-fn decode_scored_record(
-    record: &noodles_vcf::Record,
-    rules_by_key: &ScoreRules,
-    kept_indices: &[usize],
-    score_names: &[String],
+/// The fields of a VCF record that scoring reads, as noodles' `Record` returns them.
+struct VcfFields<'r> {
+    chromosome: &'r str,
+    variant_start: Option<io::Result<usize>>,
+    reference_bases: &'r str,
+    /// The ALT alleles, empty for a missing ALT.
+    alternate_bases: &'r str,
+    /// FORMAT and the sample columns, empty when FORMAT is missing.
+    samples: &'r str,
+}
+
+/// Decodes one VCF record line, with its newline when it has one, into
+/// `decoded`. A line `split_vcf_line` cannot split is read by noodles, so a
+/// line noodles cannot read fails as noodles fails.
+fn decode_vcf_line(
+    line: &[u8],
+    context: &DecodeContext<'_>,
     decoded: &mut DecodedRecord,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let Ok(chr) = parse_chromosome_label(record.reference_sequence_name()) else {
+    if let Some(fields) = split_vcf_line(line.strip_suffix(b"\n").unwrap_or(line)) {
+        return decode_scored_fields(fields, context, decoded);
+    }
+    let mut record = noodles_vcf::Record::default();
+    VcfReader::new(line).read_record(&mut record)?;
+    decode_scored_record(&record, context, decoded)
+}
+
+/// A record line's fields as noodles reads them, for a line whose bytes cannot
+/// make noodles read them any differently from a split on tabs: valid UTF-8, no
+/// carriage return but a last byte (which noodles drops), seven tab-terminated
+/// fields, and a position that is `0` or a number above zero. Any other line
+/// gives `None`.
+fn split_vcf_line(line: &[u8]) -> Option<VcfFields<'_>> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if memchr(b'\r', line).is_some() {
+        return None;
+    }
+    let mut rest = std::str::from_utf8(line).ok()?;
+    let mut fields = [""; 7];
+    for field in &mut fields {
+        (*field, rest) = rest.split_once('\t')?;
+    }
+    // INFO ends at the next tab, and FORMAT and the samples fill the rest of the line.
+    let samples = rest.split_once('\t').map_or("", |(_, samples)| samples);
+    let variant_start = match fields[1] {
+        "0" => None,
+        position => Some(Ok(position
+            .parse::<usize>()
+            .ok()
+            .filter(|&start| start > 0)?)),
+    };
+    Some(VcfFields {
+        chromosome: fields[0],
+        variant_start,
+        reference_bases: fields[3],
+        alternate_bases: if fields[4] == "." { "" } else { fields[4] },
+        samples: if samples.split('\t').next() == Some(".") {
+            ""
+        } else {
+            samples
+        },
+    })
+}
+
+/// Decodes the dosages a noodles `record` contributes to its matched rules into
+/// `decoded`, as [`decode_scored_fields`] decodes them.
+fn decode_scored_record(
+    record: &noodles_vcf::Record,
+    context: &DecodeContext<'_>,
+    decoded: &mut DecodedRecord,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let alternate_bases = record.alternate_bases();
+    let samples = record.samples();
+    let fields = VcfFields {
+        chromosome: record.reference_sequence_name(),
+        variant_start: record
+            .variant_start()
+            .map(|start| start.map(|position| position.get())),
+        reference_bases: record.reference_bases(),
+        alternate_bases: alternate_bases.as_ref(),
+        samples: samples.as_ref(),
+    };
+    decode_scored_fields(fields, context, decoded)
+}
+
+/// Decodes the dosages a VCF record contributes to its matched rules into
+/// `decoded`, stopping at the first error a sequential scan raises for this
+/// record: a malformed position, a missing dosage FORMAT field, an undecodable
+/// sample, or a REF-effect rule without a complete REF dosage.
+fn decode_scored_fields(
+    fields: VcfFields<'_>,
+    context: &DecodeContext<'_>,
+    decoded: &mut DecodedRecord,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let rules_by_key = context.rules_by_key;
+    let Ok(chr) = parse_chromosome_label(fields.chromosome) else {
         return Ok(());
     };
-    let Some(start) = record.variant_start() else {
+    let Some(start) = fields.variant_start else {
         return Ok(());
     };
-    let pos = start?.get() as u32;
+    let pos = start? as u32;
     let Some(score_rules) = rules_by_key.get(&(chr, pos)) else {
         return Ok(());
     };
     decoded.position = pos;
     decoded.key = Some((chr, pos));
+    decoded.chromosome.clear();
+    decoded.chromosome.push_str(fields.chromosome);
 
-    let ref_allele = record.reference_bases();
-    let alternate_bases = record.alternate_bases();
-    let alt_alleles = alternate_bases.iter().collect::<Result<Vec<_>, _>>()?;
-    decode_rows(rules_by_key, score_rules, ref_allele, &alt_alleles, decoded);
+    let alt_alleles: Vec<&str> = if fields.alternate_bases.is_empty() {
+        Vec::new()
+    } else {
+        fields.alternate_bases.split(',').collect()
+    };
+    decode_rows(
+        rules_by_key,
+        score_rules,
+        fields.reference_bases,
+        &alt_alleles,
+        decoded,
+    );
     for (alt_offset, alt_allele) in alt_alleles.iter().enumerate() {
-        let alt_index = alt_offset + 1;
         let Some(matched_rules) = rules_for_allele(
             rules_by_key,
             score_rules,
             decoded.effect_only,
-            ref_allele,
+            fields.reference_bases,
             alt_allele,
         ) else {
             continue;
         };
-        if decoded.alleles.len() == decoded.allele_count {
-            decoded.alleles.push(DecodedAllele::default());
-        }
-        let allele = &mut decoded.alleles[decoded.allele_count];
-        allele.alt_offset = alt_offset;
-        allele.dosages.clear();
-        let ref_effect_rule = matched_rules.iter().find(|rule| rule.effect_is_ref);
-        for_each_vcf_dosage_best(
-            record,
-            alt_index,
+        let ref_effect_rule = matched_rules
+            .iter()
+            .find(|rule| rule.effect_is_ref)
+            .map(|rule| rule.score_index);
+        let allele = decoded.next_allele(alt_offset);
+        decode_vcf_column(
+            fields.samples,
+            alt_offset + 1,
             alt_alleles.len(),
-            kept_indices,
-            |_, dosage| {
-                if let Some(decoded_dosage) = dosage
-                    && decoded_dosage.ref_dosage.is_none()
-                    && let Some(rule) = ref_effect_rule
-                {
-                    return Err(ref_effect_error(
-                        &score_names[rule.score_index],
-                        record.reference_sequence_name(),
-                        pos,
-                    )
-                    .into());
-                }
-                allele.dosages.push(dosage);
-                Ok(())
+            context.kept_indices,
+            &mut allele.column,
+            || {
+                ref_effect_rule.map(|score_index| {
+                    ref_effect_error(&context.score_names[score_index], fields.chromosome, pos)
+                })
             },
         )?;
         allele.matched_rules = matched_rules;
@@ -736,15 +900,14 @@ fn rules_for_allele(
 }
 
 /// Decodes the dosages a BCF `record` contributes to its matched rules into
-/// `decoded`, as `decode_scored_record` does for a VCF record.
+/// `decoded`, as [`decode_scored_fields`] does for a VCF record.
 fn decode_scored_bcf_record(
     record: &noodles_bcf::Record,
     header: &noodles_vcf::Header,
-    rules_by_key: &ScoreRules,
-    kept_indices: &[usize],
-    score_names: &[String],
+    context: &DecodeContext<'_>,
     decoded: &mut DecodedRecord,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let rules_by_key = context.rules_by_key;
     let chromosome = record.reference_sequence_name(header.string_maps())?;
     let Ok(chr) = parse_chromosome_label(chromosome) else {
         return Ok(());
@@ -758,6 +921,8 @@ fn decode_scored_bcf_record(
     };
     decoded.position = pos;
     decoded.key = Some((chr, pos));
+    decoded.chromosome.clear();
+    decoded.chromosome.push_str(chromosome);
 
     let reference_bases = record.reference_bases();
     let ref_allele = std::str::from_utf8(reference_bases.as_ref())?;
@@ -765,7 +930,6 @@ fn decode_scored_bcf_record(
     let alt_alleles = alternate_bases.iter().collect::<Result<Vec<_>, _>>()?;
     decode_rows(rules_by_key, score_rules, ref_allele, &alt_alleles, decoded);
     for (alt_offset, alt_allele) in alt_alleles.iter().enumerate() {
-        let alt_index = alt_offset + 1;
         let Some(matched_rules) = rules_for_allele(
             rules_by_key,
             score_rules,
@@ -775,30 +939,22 @@ fn decode_scored_bcf_record(
         ) else {
             continue;
         };
-        if decoded.alleles.len() == decoded.allele_count {
-            decoded.alleles.push(DecodedAllele::default());
-        }
-        let allele = &mut decoded.alleles[decoded.allele_count];
-        allele.alt_offset = alt_offset;
-        allele.dosages.clear();
-        let ref_effect_rule = matched_rules.iter().find(|rule| rule.effect_is_ref);
-        for_each_bcf_dosage_best(
+        let ref_effect_rule = matched_rules
+            .iter()
+            .find(|rule| rule.effect_is_ref)
+            .map(|rule| rule.score_index);
+        let allele = decoded.next_allele(alt_offset);
+        decode_bcf_column(
             record,
             header,
-            alt_index,
+            alt_offset + 1,
             alt_alleles.len(),
-            kept_indices,
-            |_, dosage| {
-                if let Some(decoded_dosage) = dosage
-                    && decoded_dosage.ref_dosage.is_none()
-                    && let Some(rule) = ref_effect_rule
-                {
-                    return Err(
-                        ref_effect_error(&score_names[rule.score_index], chromosome, pos).into(),
-                    );
-                }
-                allele.dosages.push(dosage);
-                Ok(())
+            context.kept_indices,
+            &mut allele.column,
+            || {
+                ref_effect_rule.map(|score_index| {
+                    ref_effect_error(&context.score_names[score_index], chromosome, pos)
+                })
             },
         )?;
         allele.matched_rules = matched_rules;
@@ -1187,8 +1343,11 @@ struct DecodedAltDosage {
     ref_dosage: Option<f64>,
 }
 
+/// Visits each kept person's dosage for ALT `alt_index` in a record's samples
+/// field (FORMAT, then the sample columns, as noodles' `Record::samples`
+/// returns them).
 fn for_each_vcf_dosage_best<F>(
-    record: &noodles_vcf::Record,
+    samples: &str,
     alt_index: usize,
     alt_count: usize,
     kept_indices: &[usize],
@@ -1197,7 +1356,6 @@ fn for_each_vcf_dosage_best<F>(
 where
     F: FnMut(usize, Option<DecodedAltDosage>) -> Result<(), Box<dyn Error + Send + Sync>>,
 {
-    let samples = record.samples();
     if samples.is_empty() {
         for out_idx in 0..kept_indices.len() {
             visit(out_idx, None)?;
@@ -1208,7 +1366,7 @@ where
     let mut ds_index = None;
     let mut gp_index = None;
     let mut gt_index = None;
-    for (idx, sample_key) in samples.keys().iter().enumerate() {
+    for (idx, sample_key) in vcf_format_keys(samples).enumerate() {
         if ds_index.is_none() && sample_key == "DS" {
             ds_index = Some(idx);
         }
@@ -1235,7 +1393,7 @@ where
     // the header's samples, fewer (the rest are missing) or more (the extra
     // columns are never decoded).
     let mut kept_cursor = 0usize;
-    for (sample_idx, sample) in vcf_sample_columns(samples.as_ref()).enumerate() {
+    for (sample_idx, sample) in vcf_sample_columns(samples).enumerate() {
         while kept_cursor < kept_indices.len() && kept_indices[kept_cursor] < sample_idx {
             kept_cursor += 1;
         }
@@ -1265,6 +1423,289 @@ where
     }
 
     Ok(())
+}
+
+/// The FORMAT keys of a record's samples field, split as noodles'
+/// `Samples::keys` splits them: the text before the first tab (nothing without
+/// a tab), on colons, with nothing after a trailing colon.
+fn vcf_format_keys(samples: &str) -> impl Iterator<Item = &str> {
+    let mut rest = samples.split_once('\t').map_or("", |(keys, _)| keys);
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let (name, tail) = rest.split_once(':').unwrap_or((rest, ""));
+        rest = tail;
+        Some(name)
+    })
+}
+
+/// Decodes every kept person's dosage of ALT `alt_index` from a record's samples
+/// field into `column`, as [`for_each_vcf_dosage_best`] visits them. For a
+/// person whose dosage has no REF dosage, `ref_effect_error` gives the error of
+/// the REF-effect rule that needs one, if a rule does.
+fn decode_vcf_column(
+    samples: &str,
+    alt_index: usize,
+    alt_count: usize,
+    kept_indices: &[usize],
+    column: &mut DosageColumn,
+    ref_effect_error: impl Fn() -> Option<String>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if vcf_gt_calls(samples, alt_index, alt_count, kept_indices, column.calls())? {
+        return Ok(());
+    }
+    if vcf_gt_ds_dosages(
+        samples,
+        alt_index,
+        alt_count,
+        kept_indices,
+        &ref_effect_error,
+        column.dosages(),
+    )? {
+        return Ok(());
+    }
+    let dosages = column.dosages();
+    dosages.reserve(kept_indices.len());
+    for_each_vcf_dosage_best(samples, alt_index, alt_count, kept_indices, |_, dosage| {
+        dosages.push(dosage_pair(dosage, &ref_effect_error)?);
+        Ok(())
+    })
+}
+
+/// Decodes the dosages of a record whose FORMAT is exactly GT:DS over one ALT
+/// allele into `dosages`, one per kept person, as [`for_each_vcf_dosage_best`]
+/// decodes them. A column holding a two-slot call and a plain decimal DS of at
+/// most two copies gives that DS and two copies less it; any other column is
+/// read by `decode_vcf_sample`. Gives `Ok(false)` for any other layout.
+fn vcf_gt_ds_dosages(
+    samples: &str,
+    alt_index: usize,
+    alt_count: usize,
+    kept_indices: &[usize],
+    ref_effect_error: &impl Fn() -> Option<String>,
+    dosages: &mut Vec<[f64; 2]>,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let Some((key::GENOTYPE, "DS")) = samples
+        .split_once('\t')
+        .and_then(|(names, _)| names.split_once(':'))
+    else {
+        return Ok(false);
+    };
+    if alt_count != 1 {
+        return Ok(false);
+    }
+    dosages.reserve(kept_indices.len());
+    let columns = samples.split_once('\t').map_or("", |(_, columns)| columns);
+    let bytes = columns.as_bytes();
+    let mut pos = 0usize;
+    let mut sample_idx = 0usize;
+    for &kept_idx in kept_indices {
+        while sample_idx < kept_idx && pos < bytes.len() {
+            pos = memchr(b'\t', &bytes[pos..]).map_or(bytes.len(), |offset| pos + offset + 1);
+            sample_idx += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+        let end = memchr(b'\t', &bytes[pos..]).map_or(bytes.len(), |offset| pos + offset);
+        let column = &columns[pos..end];
+        pos = (end + 1).min(bytes.len());
+        // Two GT slots give ploidy two, and `dosage_from_values` sums the one DS
+        // value from zero, which leaves it unchanged.
+        let plain = match column.as_bytes() {
+            [b'0'..=b'9' | b'.', b'/' | b'|', b'0'..=b'9' | b'.', b':', ..] => {
+                parse_plain_decimal(&column[4..]).filter(|&value| 2.0 - value >= -1e-6)
+            }
+            _ => None,
+        };
+        dosages.push(match plain {
+            Some(value) => [value, (2.0 - value).max(0.0)],
+            None => {
+                let column = if column == "." { "" } else { column };
+                dosage_pair(
+                    decode_vcf_sample(column, Some(1), None, Some(0), 1, alt_index, alt_count)?,
+                    ref_effect_error,
+                )?
+            }
+        });
+        sample_idx += 1;
+    }
+    dosages.resize(kept_indices.len(), [f64::NAN; 2]);
+    Ok(true)
+}
+
+/// A visited dosage as `[alt, ref]`, or the REF-effect error for a dosage
+/// without a REF dosage when a rule needs one.
+fn dosage_pair(
+    dosage: Option<DecodedAltDosage>,
+    ref_effect_error: &impl Fn() -> Option<String>,
+) -> Result<[f64; 2], Box<dyn Error + Send + Sync>> {
+    match dosage {
+        None => Ok([f64::NAN; 2]),
+        Some(DecodedAltDosage {
+            alt_dosage,
+            ref_dosage: Some(ref_dosage),
+        }) => Ok([alt_dosage, ref_dosage]),
+        Some(DecodedAltDosage {
+            alt_dosage,
+            ref_dosage: None,
+        }) => match ref_effect_error() {
+            Some(message) => Err(message.into()),
+            None => Ok([alt_dosage, f64::NAN]),
+        },
+    }
+}
+
+/// Decodes the hard calls of a record whose only dosage FORMAT field is a
+/// leading GT into `codes`, one per kept person, as
+/// [`for_each_vcf_dosage_best`] decodes them. Gives `Ok(false)` for any other
+/// layout, or for a call holding more copies of an allele than a code holds.
+fn vcf_gt_calls(
+    samples: &str,
+    alt_index: usize,
+    alt_count: usize,
+    kept_indices: &[usize],
+    codes: &mut Vec<u8>,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    if !samples.is_empty() {
+        let mut names = vcf_format_keys(samples);
+        if names.next() != Some(key::GENOTYPE) || names.any(|name| name == "DS" || name == "GP") {
+            return Ok(false);
+        }
+    }
+    codes.reserve(kept_indices.len());
+    let columns = samples.split_once('\t').map_or("", |(_, columns)| columns);
+    let bytes = columns.as_bytes();
+    // The offset of the next column, which exists while it is inside `bytes`.
+    let mut pos = 0usize;
+    let mut sample_idx = 0usize;
+    for &kept_idx in kept_indices {
+        while sample_idx < kept_idx && pos < bytes.len() {
+            pos = memchr(b'\t', &bytes[pos..]).map_or(bytes.len(), |offset| pos + offset + 1);
+            sample_idx += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+        let code = if let Some(&[first @ b'0'..=b'9', b'/' | b'|', second @ b'0'..=b'9', b'\t']) =
+            bytes.get(pos..pos + 4)
+        {
+            // A diploid call of single-digit alleles: the column `parse_vcf_genotype` reads most.
+            pos += 4;
+            let (first, second) = (usize::from(first - b'0'), usize::from(second - b'0'));
+            let alt = u8::from(first == alt_index) + u8::from(second == alt_index);
+            let reference = u8::from(first == 0) + u8::from(second == 0);
+            alt | reference << 4
+        } else {
+            let end = memchr(b'\t', &bytes[pos..]).map_or(bytes.len(), |offset| pos + offset);
+            let column = &columns[pos..end];
+            pos = (end + 1).min(bytes.len());
+            let column = if column == "." { "" } else { column };
+            match decode_vcf_sample(column, None, None, Some(0), 0, alt_index, alt_count)? {
+                None => MISSING_CALL,
+                Some(DecodedAltDosage {
+                    alt_dosage,
+                    ref_dosage: Some(ref_dosage),
+                }) if alt_dosage <= 14.0 && ref_dosage <= 14.0 => {
+                    alt_dosage as u8 | (ref_dosage as u8) << 4
+                }
+                Some(_) => return Ok(false),
+            }
+        };
+        codes.push(code);
+        sample_idx += 1;
+    }
+    codes.resize(kept_indices.len(), MISSING_CALL);
+    Ok(true)
+}
+
+/// Decodes every kept person's dosage of ALT `alt_index` from a BCF `record` into
+/// `column`, as [`for_each_bcf_dosage_best`] visits them, with `ref_effect_error`
+/// as in [`decode_vcf_column`].
+fn decode_bcf_column(
+    record: &noodles_bcf::Record,
+    header: &noodles_vcf::Header,
+    alt_index: usize,
+    alt_count: usize,
+    kept_indices: &[usize],
+    column: &mut DosageColumn,
+    ref_effect_error: impl Fn() -> Option<String>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if bcf_gt_calls(record, header, alt_index, kept_indices, column.calls())? {
+        return Ok(());
+    }
+    let dosages = column.dosages();
+    dosages.reserve(kept_indices.len());
+    for_each_bcf_dosage_best(
+        record,
+        header,
+        alt_index,
+        alt_count,
+        kept_indices,
+        |_, dosage| {
+            dosages.push(dosage_pair(dosage, &ref_effect_error)?);
+            Ok(())
+        },
+    )
+}
+
+/// Decodes the hard calls of a BCF record whose only dosage FORMAT field is an
+/// Int8 GT of at most fourteen values into `codes`, one per kept person, as
+/// [`for_each_bcf_dosage_best`] decodes them. Gives `Ok(false)` for any other record.
+fn bcf_gt_calls(
+    record: &noodles_bcf::Record,
+    header: &noodles_vcf::Header,
+    alt_index: usize,
+    kept_indices: &[usize],
+    codes: &mut Vec<u8>,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let samples = record.samples()?;
+    if samples.format_count() == 0 {
+        codes.resize(kept_indices.len(), MISSING_CALL);
+        return Ok(true);
+    }
+    let sample_count = samples.len();
+    let fields = BcfDosageFields::read(
+        samples.as_ref(),
+        samples.format_count(),
+        sample_count,
+        header,
+    )?;
+    let (Some(gt), None, None) = (fields.gt, fields.ds, fields.gp) else {
+        return Ok(false);
+    };
+    if gt.ty != BcfType::Int8 || gt.width > 14 {
+        return Ok(false);
+    }
+    codes.reserve(kept_indices.len());
+    for &sample_idx in kept_indices {
+        if sample_idx >= sample_count {
+            codes.push(MISSING_CALL);
+            continue;
+        }
+        let (mut alt, mut reference, mut ploidy, mut missing) = (0u8, 0u8, 0u8, false);
+        for &byte in &gt.src[sample_idx * gt.width..(sample_idx + 1) * gt.width] {
+            // A missing, end-of-vector or reserved value ends the genotype, as it
+            // ends `BcfSeries::genotype_alleles`.
+            if byte as i8 <= i8::MIN + 7 {
+                break;
+            }
+            let Some(allele) = usize::from(byte >> 1).checked_sub(1) else {
+                missing = true;
+                break;
+            };
+            alt += u8::from(allele == alt_index);
+            reference += u8::from(allele == 0);
+            ploidy += 1;
+        }
+        codes.push(if missing || ploidy == 0 {
+            MISSING_CALL
+        } else {
+            alt | reference << 4
+        });
+    }
+    Ok(true)
 }
 
 /// Visits each kept person's dosage for ALT `alt_index` of a BCF `record`, as
@@ -2120,6 +2561,9 @@ where
 }
 
 fn parse_numeric_str(text: &str) -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
+    if let Some(value) = parse_plain_decimal(text) {
+        return Ok(Some(value));
+    }
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed == "." {
         Ok(None)
@@ -2130,6 +2574,36 @@ fn parse_numeric_str(text: &str) -> Result<Option<f64>, Box<dyn Error + Send + S
         }
         Ok(Some(value))
     }
+}
+
+/// The value of `text` when it is a plain decimal of at most fifteen digits,
+/// without sign, exponent or space: its digits as an integer divided by a power
+/// of ten. Both operands are exact and IEEE division rounds correctly, so the
+/// quotient is the correctly rounded value `str::parse` returns.
+fn parse_plain_decimal(text: &str) -> Option<f64> {
+    const POWERS_OF_TEN: [f64; 16] = [
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
+    ];
+    let mut mantissa = 0u64;
+    let mut digits = 0usize;
+    let mut fraction_digits = None;
+    for &byte in text.as_bytes() {
+        if byte.is_ascii_digit() {
+            digits += 1;
+            if digits > 15 {
+                return None;
+            }
+            mantissa = mantissa * 10 + u64::from(byte - b'0');
+            if let Some(count) = &mut fraction_digits {
+                *count += 1;
+            }
+        } else if byte == b'.' && fraction_digits.is_none() {
+            fraction_digits = Some(0usize);
+        } else {
+            return None;
+        }
+    }
+    (digits > 0).then(|| mantissa as f64 / POWERS_OF_TEN[fraction_digits.unwrap_or(0)])
 }
 
 fn parse_vcf_genotype(
@@ -2274,429 +2748,6 @@ const BGZF_HEADER_LEN: usize = 18;
 const BGZF_TRAILER_LEN: usize = 8;
 /// Largest uncompressed payload a BGZF block may carry.
 const BGZF_MAX_DATA_LEN: usize = 1 << 16;
-/// Blocks inflated per rayon worker before the ordered results are stitched.
-const BGZF_FRAMES_PER_WORKER: usize = 64;
-/// Filtered chunks buffered between the inflating thread and the scorer.
-const PREFILTER_CHANNEL_DEPTH: usize = 4;
-/// Blocks inflated per rayon worker when every block is forwarded. A batch is
-/// held inflated until it is sent, so this is smaller than
-/// [`BGZF_FRAMES_PER_WORKER`], whose blocks shrink to their kept lines.
-const BGZF_PASSTHROUGH_FRAMES_PER_WORKER: usize = 16;
-/// Inflated bytes gathered before an unfiltered chunk is sent.
-const PASSTHROUGH_CHUNK_LEN: usize = 4 << 20;
-
-/// A BGZF VCF stream reduced to the lines the native scorer can act on.
-///
-/// Inflating a WGS VCF dominates native scoring, and nearly every record in it
-/// sits at a position no score file mentions. This reader inflates BGZF blocks
-/// on the rayon pool and drops, inside the workers, each record line that
-/// `score_vcf_streaming` would parse without error and then skip. Everything
-/// else (the header, the first record after it, any line the scorer could
-/// reject, and every record at a scored position) reaches noodles byte for byte
-/// and in file order, so scores and errors are those of a sequential read.
-///
-/// Bytes that do not form a well-formed BGZF block (plain gzip members,
-/// truncated or corrupt blocks, trailing garbage) hand the rest of the stream,
-/// unfiltered, to `MultiGzDecoder`, which is how the whole stream used to be read.
-///
-/// Without score rules the reader only inflates: every block's bytes pass
-/// unchanged and in order, which gives a BGZF BCF the same parallel
-/// inflation without the line filter that its binary records cannot take.
-struct PrefilteredBgzfReader {
-    rx: Option<Receiver<io::Result<Vec<u8>>>>,
-    buf: Vec<u8>,
-    pos: usize,
-    finished: bool,
-    producer: Option<JoinHandle<()>>,
-}
-
-impl PrefilteredBgzfReader {
-    fn spawn(source: VariantSource, rules_by_key: Option<Arc<ScoreRules>>) -> io::Result<Self> {
-        let (tx, rx) = crossbeam_channel::bounded(PREFILTER_CHANNEL_DEPTH);
-        let producer = thread::Builder::new()
-            .name("vcf-bgzf-prefilter".to_string())
-            .spawn(move || {
-                let error_tx = tx.clone();
-                if let Err(err) = BgzfLineFilter::new(source, rules_by_key, tx).run() {
-                    // Fails only when the scorer already stopped reading.
-                    let _ = error_tx.send(Err(err));
-                }
-            })?;
-        Ok(Self {
-            rx: Some(rx),
-            buf: Vec::new(),
-            pos: 0,
-            finished: false,
-            producer: Some(producer),
-        })
-    }
-}
-
-impl Read for PrefilteredBgzfReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let available = self.fill_buf()?;
-        let amt = available.len().min(buf.len());
-        buf[..amt].copy_from_slice(&available[..amt]);
-        self.consume(amt);
-        Ok(amt)
-    }
-}
-
-impl BufRead for PrefilteredBgzfReader {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        while self.pos == self.buf.len() && !self.finished {
-            let rx = self
-                .rx
-                .as_ref()
-                .expect("the receiver is only taken when the reader is dropped");
-            match rx.recv() {
-                // An empty chunk marks the end of the stream.
-                Ok(Ok(chunk)) if chunk.is_empty() => self.finished = true,
-                Ok(Ok(chunk)) => {
-                    self.buf = chunk;
-                    self.pos = 0;
-                }
-                Ok(Err(err)) => return Err(err),
-                Err(_) => {
-                    return Err(io::Error::other(
-                        "BGZF reader thread stopped before the end of the stream",
-                    ));
-                }
-            }
-        }
-        Ok(&self.buf[self.pos..])
-    }
-
-    fn consume(&mut self, amt: usize) {
-        self.pos = (self.pos + amt).min(self.buf.len());
-    }
-}
-
-impl Drop for PrefilteredBgzfReader {
-    fn drop(&mut self) {
-        // Closing the channel first unblocks a producer waiting to send.
-        drop(self.rx.take());
-        if let Some(producer) = self.producer.take() {
-            let _ = producer.join();
-        }
-    }
-}
-
-/// The producing half of [`PrefilteredBgzfReader`].
-struct BgzfLineFilter {
-    source: VariantSource,
-    /// `None` passes every inflated block through unfiltered.
-    rules_by_key: Option<Arc<ScoreRules>>,
-    tx: Sender<io::Result<Vec<u8>>>,
-    /// Raw frames of the batch being read, reused across batches.
-    frames: Vec<Vec<u8>>,
-    /// A line not yet terminated by the blocks read so far.
-    carry: Vec<u8>,
-    /// Kept bytes awaiting the next send.
-    out: Vec<u8>,
-}
-
-enum FrameRead {
-    Block,
-    Eof,
-    /// The bytes read are not a canonical BGZF block; they are left in the
-    /// frame buffer for `MultiGzDecoder`.
-    Irregular,
-}
-
-/// One inflated block whose complete lines have already been filtered.
-struct BlockLines {
-    /// The bytes up to and including the block's first newline, then every
-    /// kept complete line, then the bytes after the block's last newline.
-    bytes: Vec<u8>,
-    /// Length of the leading partial line (the whole block without a newline).
-    head_len: usize,
-    /// Offset in `bytes` of the trailing partial line.
-    tail_start: usize,
-    has_newline: bool,
-}
-
-impl BgzfLineFilter {
-    fn new(
-        source: VariantSource,
-        rules_by_key: Option<Arc<ScoreRules>>,
-        tx: Sender<io::Result<Vec<u8>>>,
-    ) -> Self {
-        Self {
-            source,
-            rules_by_key,
-            tx,
-            frames: Vec::new(),
-            carry: Vec::new(),
-            out: Vec::new(),
-        }
-    }
-
-    fn run(self) -> io::Result<()> {
-        match self.rules_by_key.clone() {
-            Some(rules_by_key) => self.run_filtered(&rules_by_key),
-            None => self.run_passthrough(),
-        }
-    }
-
-    /// Reads up to `batch_len` canonical blocks into `frames`, returning how
-    /// many were read and what stopped the batch short.
-    fn read_batch(&mut self, batch_len: usize) -> io::Result<(usize, Option<FrameRead>)> {
-        let mut count = 0usize;
-        while count < batch_len {
-            if self.frames.len() == count {
-                self.frames.push(Vec::new());
-            }
-            match read_bgzf_frame(&mut self.source, &mut self.frames[count])? {
-                FrameRead::Block => count += 1,
-                other => return Ok((count, Some(other))),
-            }
-        }
-        Ok((count, None))
-    }
-
-    /// Hands the frames from `index` on, plus any irregular bytes that ended
-    /// the batch, to the gzip fallback.
-    fn fall_back_from(
-        mut self,
-        index: usize,
-        count: usize,
-        end: &Option<FrameRead>,
-    ) -> io::Result<()> {
-        let mut consumed = Vec::new();
-        for frame in &self.frames[index..count] {
-            consumed.extend_from_slice(frame);
-        }
-        if matches!(end, Some(FrameRead::Irregular)) {
-            consumed.extend_from_slice(&self.frames[count]);
-        }
-        self.fall_back(consumed)
-    }
-
-    /// Finishes a batch that read every frame it could.
-    fn end_batch(mut self, count: usize, end: Option<FrameRead>) -> io::Result<Option<Self>> {
-        match end {
-            None => {
-                self.flush()?;
-                Ok(Some(self))
-            }
-            Some(FrameRead::Block) => unreachable!("a full frame never ends a batch early"),
-            Some(FrameRead::Eof) => self.finish().map(|()| None),
-            Some(FrameRead::Irregular) => {
-                let consumed = std::mem::take(&mut self.frames[count]);
-                self.fall_back(consumed).map(|()| None)
-            }
-        }
-    }
-
-    /// Inflates the blocks in parallel and forwards their bytes unchanged.
-    fn run_passthrough(mut self) -> io::Result<()> {
-        let batch_len = rayon::current_num_threads().max(1) * BGZF_PASSTHROUGH_FRAMES_PER_WORKER;
-        loop {
-            let (count, end) = self.read_batch(batch_len)?;
-            let blocks: Vec<io::Result<Vec<u8>>> = self.frames[..count]
-                .par_iter()
-                .map_init(Decompressor::new, |decompressor, frame| {
-                    let mut block = Vec::with_capacity(BGZF_MAX_DATA_LEN);
-                    inflate_bgzf_block(frame, decompressor, &mut block)?;
-                    Ok(block)
-                })
-                .collect();
-
-            for (index, result) in blocks.into_iter().enumerate() {
-                match result {
-                    Ok(block) => {
-                        if self.out.capacity() == 0 {
-                            self.out
-                                .reserve(PASSTHROUGH_CHUNK_LEN + BGZF_MAX_DATA_LEN);
-                        }
-                        self.out.extend_from_slice(&block);
-                        if self.out.len() >= PASSTHROUGH_CHUNK_LEN {
-                            self.flush()?;
-                        }
-                    }
-                    Err(_) => return self.fall_back_from(index, count, &end),
-                }
-            }
-
-            match self.end_batch(count, end)? {
-                Some(next) => self = next,
-                None => return Ok(()),
-            }
-        }
-    }
-
-    fn run_filtered(mut self, rules_by_key: &ScoreRules) -> io::Result<()> {
-        // The header ends at the first line that does not start with '#'.
-        // Header lines and that first record always pass, so dropping records
-        // can never pull a later '#' line into the header.
-        let mut decompressor = Decompressor::new();
-        let mut block = Vec::with_capacity(BGZF_MAX_DATA_LEN);
-        let mut frame = Vec::new();
-        let mut scanned = 0usize;
-        'header: loop {
-            match read_bgzf_frame(&mut self.source, &mut frame)? {
-                FrameRead::Block => {}
-                FrameRead::Eof => return self.finish(),
-                FrameRead::Irregular => return self.fall_back(frame),
-            }
-            if inflate_bgzf_block(&frame, &mut decompressor, &mut block).is_err() {
-                return self.fall_back(frame);
-            }
-            self.carry.extend_from_slice(&block);
-            while let Some(offset) = memchr(b'\n', &self.carry[scanned..]) {
-                let line_start = scanned;
-                scanned += offset + 1;
-                if self.carry[line_start] != b'#' {
-                    self.out.extend_from_slice(&self.carry[..scanned]);
-                    self.carry.drain(..scanned);
-                    self.filter_carried_lines(rules_by_key);
-                    break 'header;
-                }
-            }
-        }
-
-        let batch_len = rayon::current_num_threads().max(1) * BGZF_FRAMES_PER_WORKER;
-        loop {
-            let (count, end) = self.read_batch(batch_len)?;
-            let blocks: Vec<io::Result<BlockLines>> = self.frames[..count]
-                .par_iter()
-                .map_init(
-                    || (Decompressor::new(), Vec::with_capacity(BGZF_MAX_DATA_LEN)),
-                    |(decompressor, block), frame| {
-                        inflate_bgzf_block(frame, decompressor, block)?;
-                        Ok(split_block_lines(block, rules_by_key))
-                    },
-                )
-                .collect();
-
-            for (index, result) in blocks.into_iter().enumerate() {
-                match result {
-                    Ok(lines) => self.stitch(lines, rules_by_key),
-                    Err(_) => return self.fall_back_from(index, count, &end),
-                }
-            }
-
-            match self.end_batch(count, end)? {
-                Some(next) => self = next,
-                None => return Ok(()),
-            }
-        }
-    }
-
-    /// Filters every complete line in `carry`, leaving only the trailing partial line.
-    fn filter_carried_lines(&mut self, rules_by_key: &ScoreRules) {
-        let mut line_start = 0usize;
-        while let Some(offset) = memchr(b'\n', &self.carry[line_start..]) {
-            let line_end = line_start + offset;
-            if !is_skippable_record(&self.carry[line_start..line_end], rules_by_key) {
-                self.out
-                    .extend_from_slice(&self.carry[line_start..=line_end]);
-            }
-            line_start = line_end + 1;
-        }
-        self.carry.drain(..line_start);
-    }
-
-    fn stitch(&mut self, lines: BlockLines, rules_by_key: &ScoreRules) {
-        if !lines.has_newline {
-            self.carry.extend_from_slice(&lines.bytes);
-            return;
-        }
-        self.carry.extend_from_slice(&lines.bytes[..lines.head_len]);
-        let line_len = self.carry.len() - 1;
-        if !is_skippable_record(&self.carry[..line_len], rules_by_key) {
-            self.out.extend_from_slice(&self.carry);
-        }
-        self.carry.clear();
-        self.out
-            .extend_from_slice(&lines.bytes[lines.head_len..lines.tail_start]);
-        self.carry
-            .extend_from_slice(&lines.bytes[lines.tail_start..]);
-    }
-
-    fn send(&self, chunk: Vec<u8>) -> io::Result<()> {
-        self.tx.send(Ok(chunk)).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "native VCF scorer stopped reading",
-            )
-        })
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if self.out.is_empty() {
-            return Ok(());
-        }
-        let chunk = std::mem::take(&mut self.out);
-        self.send(chunk)
-    }
-
-    fn finish(mut self) -> io::Result<()> {
-        // A final line without a newline always passes.
-        let carry = std::mem::take(&mut self.carry);
-        self.out.extend_from_slice(&carry);
-        self.flush()?;
-        self.send(Vec::new())
-    }
-
-    fn fall_back(mut self, consumed: Vec<u8>) -> io::Result<()> {
-        let carry = std::mem::take(&mut self.carry);
-        self.out.extend_from_slice(&carry);
-        self.flush()?;
-        let mut decoder = MultiGzDecoder::new(Cursor::new(consumed).chain(self.source));
-        loop {
-            let mut chunk = vec![0u8; BGZF_MAX_DATA_LEN];
-            let len = match decoder.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(len) => len,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) => return Err(err),
-            };
-            chunk.truncate(len);
-            self.tx.send(Ok(chunk)).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "native VCF scorer stopped reading",
-                )
-            })?;
-        }
-        self.tx.send(Ok(Vec::new())).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "native VCF scorer stopped reading",
-            )
-        })
-    }
-}
-
-/// Reads one BGZF block into `frame`.
-fn read_bgzf_frame<R: Read>(reader: &mut R, frame: &mut Vec<u8>) -> io::Result<FrameRead> {
-    frame.clear();
-    let header_len = read_up_to(reader, frame, BGZF_HEADER_LEN)?;
-    if header_len == 0 {
-        return Ok(FrameRead::Eof);
-    }
-    if header_len < BGZF_HEADER_LEN || !is_bgzf_header(frame) {
-        return Ok(FrameRead::Irregular);
-    }
-    let block_len = usize::from(u16::from_le_bytes([frame[16], frame[17]])) + 1;
-    if block_len < BGZF_HEADER_LEN + BGZF_TRAILER_LEN {
-        return Ok(FrameRead::Irregular);
-    }
-    let body_len = block_len - BGZF_HEADER_LEN;
-    if read_up_to(reader, frame, body_len)? < body_len {
-        return Ok(FrameRead::Irregular);
-    }
-    Ok(FrameRead::Block)
-}
-
-/// Appends up to `len` bytes from `reader` to `dst`, stopping short only at end of input.
-fn read_up_to<R: Read>(reader: &mut R, dst: &mut Vec<u8>, len: usize) -> io::Result<usize> {
-    let start = dst.len();
-    reader.take(len as u64).read_to_end(dst)?;
-    Ok(dst.len() - start)
-}
 
 fn is_bgzf_header(header: &[u8]) -> bool {
     header[..4] == [0x1f, 0x8b, 0x08, 0x04]
@@ -2705,86 +2756,55 @@ fn is_bgzf_header(header: &[u8]) -> bool {
         && header[14..16] == [0x02, 0x00]
 }
 
-/// Inflates one canonical BGZF block into `block`, checking its length and CRC32.
+/// Inflates one canonical BGZF block into `block`, which is as long as the
+/// block's recorded length, checking that length and the CRC32.
 fn inflate_bgzf_block(
     frame: &[u8],
     decompressor: &mut Decompressor,
-    block: &mut Vec<u8>,
+    block: &mut [u8],
 ) -> io::Result<()> {
     let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message.to_string());
     let (header_and_data, trailer) = frame.split_at(frame.len() - BGZF_TRAILER_LEN);
     let crc32 = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-    let data_len = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]) as usize;
-    if data_len > BGZF_MAX_DATA_LEN {
-        return Err(invalid("BGZF block is larger than 65536 bytes"));
-    }
-    block.resize(data_len, 0);
     let written = decompressor
         .deflate_decompress(&header_and_data[BGZF_HEADER_LEN..], block)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    if written != data_len {
+    if written != block.len() {
         return Err(invalid("BGZF block is shorter than its recorded length"));
     }
-    let mut crc = Crc::new();
-    crc.update(block);
-    if crc.sum() != crc32 {
+    if libdeflater::crc32(block) != crc32 {
         return Err(invalid("BGZF block data checksum mismatch"));
     }
     Ok(())
 }
 
-/// Splits an inflated block into its partial first line, the complete lines
-/// that survive [`is_skippable_record`], and its partial last line.
-fn split_block_lines(block: &[u8], rules_by_key: &ScoreRules) -> BlockLines {
-    let Some(first_newline) = memchr(b'\n', block) else {
-        return BlockLines {
-            bytes: block.to_vec(),
-            head_len: block.len(),
-            tail_start: block.len(),
-            has_newline: false,
-        };
-    };
-    let last_newline = memrchr(b'\n', block).expect("a block with a first newline has a last one");
-    let mut bytes = Vec::with_capacity(first_newline + block.len() - last_newline);
-    bytes.extend_from_slice(&block[..=first_newline]);
-    let body = &block[first_newline + 1..=last_newline];
-    let mut line_start = 0usize;
-    for line_end in memchr_iter(b'\n', body) {
-        if !is_skippable_record(&body[line_start..line_end], rules_by_key) {
-            bytes.extend_from_slice(&body[line_start..=line_end]);
-        }
-        line_start = line_end + 1;
-    }
-    let tail_start = bytes.len();
-    bytes.extend_from_slice(&block[last_newline + 1..]);
-    BlockLines {
-        bytes,
-        head_len: first_newline + 1,
-        tail_start,
-        has_newline: true,
-    }
-}
-
 /// Whether `score_vcf_streaming` would read this record line without error and
 /// then skip it, so dropping it unread cannot change a score or an error.
+/// `ascii` says the line is already known to hold only ASCII bytes.
 ///
 /// `line` excludes its newline. The checks mirror noodles' `read_record` (valid
 /// UTF-8, seven tab-terminated fields) and the scorer's own tests before a key
 /// lookup: an unsupported contig, a telomeric position `0`, or a position no
 /// score mentions. Anything less certain, including a carriage return in the
 /// first two fields, which noodles may strip, is kept.
-fn is_skippable_record(line: &[u8], rules_by_key: &ScoreRules) -> bool {
-    let Ok(line) = std::str::from_utf8(line) else {
+fn is_skippable_record(line: &[u8], ascii: bool, rules_by_key: &ScoreRules) -> bool {
+    if !ascii && std::str::from_utf8(line).is_err() {
         return false;
-    };
-    let mut fields = line.splitn(8, '\t');
+    }
+    let mut fields = line.splitn(8, |&byte| byte == b'\t');
     let (Some(chromosome), Some(position), Some(_)) = (fields.next(), fields.next(), fields.nth(5))
     else {
         return false;
     };
-    if chromosome.contains('\r') || position.contains('\r') {
+    if chromosome.contains(&b'\r') || position.contains(&b'\r') {
         return false;
     }
+    // Fields split at tabs from valid UTF-8 are valid UTF-8.
+    let (Ok(chromosome), Ok(position)) =
+        (std::str::from_utf8(chromosome), std::str::from_utf8(position))
+    else {
+        return false;
+    };
     let Ok(chr) = parse_chromosome_label(chromosome) else {
         return true;
     };
@@ -2800,8 +2820,10 @@ fn is_skippable_record(line: &[u8], rules_by_key: &ScoreRules) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::Crc;
+    use noodles_bcf::io::Reader as BcfReader;
     use std::collections::HashMap;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
 
     #[test]
     fn multiallelic_ref_dosage_excludes_every_alternate_allele() {
@@ -2994,9 +3016,9 @@ mod tests {
     #[test]
     fn effect_only_positions_straddling_decode_batches_score_like_pairs() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // Each position has a split pair of records after one unscored record, so a
-        // batch of an even number of records ends between the two records of a position.
-        let positions = 4 * RECORDS_PER_WORKER * rayon::current_num_threads().max(1) + 3;
+        // Each position has a split pair of records after one unscored record, so parts
+        // cut at line boundaries end between the two records of many positions.
+        let positions = 256 * rayon::current_num_threads().max(1) + 3;
         let mut vcf = String::from(
             "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\n\
              1\t50\t.\tC\tT\t.\tPASS\t.\tGT\t0/1\t0/1\n",
@@ -4200,7 +4222,7 @@ mod tests {
         for (line, expected) in cases {
             let context = String::from_utf8_lossy(line).into_owned();
             assert_eq!(
-                is_skippable_record(line, &rules_by_key),
+                is_skippable_record(line, false, &rules_by_key),
                 expected,
                 "{context:?}"
             );
