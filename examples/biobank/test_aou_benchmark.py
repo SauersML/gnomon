@@ -222,3 +222,12 @@ def test_support_counts_every_eligible_participant_before_the_cap_and_suppresses
     text = table.render(names)
     assert text.startswith("### Eligible support before the per-ancestry cap")
     assert "| hypertension | AFR | 3,000 |" in text and "| MID |" not in text
+
+
+def test_every_status_the_benchmark_publishes_is_a_public_label():
+    import re as regex
+    import aou_status
+    source = Path(bench.__file__).read_text()
+    published = set(regex.findall(r'publish_status\(status, "([a-z_]+)"\)', source))
+    assert "benchmark_support_completed" in published and "benchmark_completed" in published
+    assert published <= aou_status.LABELS
