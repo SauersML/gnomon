@@ -2,12 +2,14 @@
 
 Each disease is a case-control outcome: a participant is a case with any
 recorded descendant of the disease concept, and a control otherwise, among
-participants with at least a year of EHR history before consent. Every score
-already cached in the workspace feeds the same training and held-out
-participants into five methods, from covariates alone to gnomon's
-ancestry-aware marginal-slope model. Held-out metrics leave the workspace only
-as aggregate tokens over at least the reporting minimum of participants,
-cases and controls.
+participants with at least a year of EHR history before consent. The sample is
+outcome-blind and capped per ancestry, so African and admixed American ancestry
+keep the support their held-out gains need. Every score already cached in the
+workspace feeds the same training and held-out participants into five methods,
+from covariates alone to gnomon's ancestry-aware marginal-slope model; each
+disease leads with multi-ancestry scores and keeps European-trained ones as
+comparators. Held-out metrics leave the workspace only as aggregate tokens over
+at least the reporting minimum of participants, cases and controls.
 """
 from __future__ import annotations
 
@@ -28,13 +30,16 @@ import pandas as pd
 
 METHODS = ("covariates", "standard", "ancestry_z", "pc_adjusted", "gnomon")
 REFERENCES = ("covariates", "standard")
+# A score's development ancestry: discovery GWAS or tuning drawn from several
+# ancestries, or from European ancestry alone (kept as comparators).
+DEVELOPMENT = ("multi_ancestry", "european")
 # E[log chi-square(1)]: the bias of a log squared residual as a log variance.
 LOG_CHI2_1_MEAN = -1.2703628454614782
 
 
 def validate_config(c):
     expected = {"google_project", "workspace_cdr", "seed", "num_pcs", "max_rows_per_disease",
-                "test_fraction", "min_report_count", "maximum_bytes_billed",
+                "max_rows_per_ancestry", "test_fraction", "min_report_count", "maximum_bytes_billed",
                 "query_timeout_seconds", "lookback_days", "gnomon_timeout_seconds",
                 "gnomon_centers", "diseases"}
     if set(c) != expected:
@@ -45,6 +50,8 @@ def validate_config(c):
         raise ValueError("aggregate cells need at least 20 participants, cases and controls")
     if not 1000 <= c["max_rows_per_disease"] <= 250000:
         raise ValueError("participants per disease must be between 1,000 and 250,000")
+    if not 1000 <= c["max_rows_per_ancestry"] <= c["max_rows_per_disease"]:
+        raise ValueError("participants per ancestry must be between 1,000 and the per-disease bound")
     if not 60 <= c["gnomon_timeout_seconds"] <= 3600 or c["gnomon_centers"] <= c["num_pcs"] + 1:
         raise ValueError("gnomon fit bound or Duchon basis size is invalid")
     diseases = c["diseases"]
@@ -56,8 +63,12 @@ def validate_config(c):
         if not re.fullmatch(r"[0-9]{6,18}", disease["snomed_code"]):
             raise ValueError("SNOMED codes are numeric concept codes")
         scores = disease["scores"]
-        if not 1 <= len(scores) <= 3 or not all(re.fullmatch(r"PGS[0-9]{6}", s) for s in scores):
+        if (not isinstance(scores, dict) or not 1 <= len(scores) <= 3
+                or not all(re.fullmatch(r"PGS[0-9]{6}", s) for s in scores)):
             raise ValueError("each disease benchmarks one to three PGS Catalog scores")
+        if not set(scores.values()) <= set(DEVELOPMENT) or "multi_ancestry" not in scores.values():
+            raise ValueError("each score names its development ancestry, and each disease leads "
+                             "with at least one multi-ancestry score")
 
 
 def stable_hash(seed, purpose, identifier):
@@ -122,7 +133,11 @@ def disease_cohort(base, case_ids, scores, config):
         df = df.merge(frame, on="person_id", validate="one_to_one")
     df = df.assign(y=df.person_id.isin(case_ids).astype(float))
     order = df.person_id.map(lambda x: stable_hash(config["seed"], "benchmark-sample", x))
-    df = df.assign(_order=order).sort_values("_order").head(config["max_rows_per_disease"])
+    # Outcome-blind within each ancestry: a common ancestry is capped so the rarer
+    # ones, where a European-trained score gains least, keep their support.
+    df = df.assign(_order=order).sort_values("_order")
+    df = df.groupby("ancestry", sort=False).head(config["max_rows_per_ancestry"])
+    df = df.head(config["max_rows_per_disease"])
     df["is_test"] = df.person_id.map(
         lambda x: int(stable_hash(config["seed"], "benchmark-split", x)[:16], 16) / 2**64 < config["test_fraction"])
     return df.drop(columns="_order").reset_index(drop=True)
@@ -470,7 +485,8 @@ def run(args):
             continue
         digest.emit(disease, "cohort", "n", token(n))
         digest.emit(disease, "cohort", "cases", token(n_cases))
-        for pgs in spec["scores"]:
+        for pgs, development in spec["scores"].items():
+            digest.emit(disease, slug(pgs), "development", development)
             predictions, odds_ratios, z_pc = logistic_predictions(cohort, pgs, config)
             for method, value in odds_ratios.items():
                 digest.emit(disease, slug(pgs), method, "odds_ratio_per_sd", token(value))

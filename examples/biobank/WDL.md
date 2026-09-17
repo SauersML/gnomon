@@ -199,6 +199,18 @@ The pilot's other runs are submitted with `submit_runs.py`: `score-training`,
 `results-digest URI`. Deployment state for them (the portable scorer, analysis
 configurations, the current checkpoint URI) stays in `.aou-workflow/`.
 
+The benchmark's panel is tracked in `aou_benchmark.json`. Each disease leads with
+multi-ancestry scores (discovery GWAS or tuning drawn from several ancestries,
+none with All of Us participants in development) and keeps a European-trained
+score as the comparator; the outcome-blind sample is capped per ancestry so
+African and admixed American ancestry keep the held-out support their gains
+need. Tabulate a finished run from a listing of its token objects, headline
+ancestries first:
+
+```bash
+python examples/biobank/aou_benchmark_table.py tokens.txt
+```
+
 Every launcher stages files with one Cloud Storage media upload per file and
 compares the stored MD5 and size with the local bytes; `wb gsutil cp` has stalled
 indefinitely on a 12 MB archive that a single upload finished in 18 seconds.

@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 import aou_benchmark as bench
+import aou_benchmark_table as table
 
 
 def test_auc_counts_ties_as_half_and_matches_pairwise_definition():
@@ -82,17 +83,45 @@ def test_small_cells_are_suppressed_and_tokens_never_carry_small_counts():
 
 
 def test_config_rejects_disease_spam_and_small_reporting_minimum():
+    scores = {"PGS004236": "multi_ancestry", "PGS004525": "european"}
     config = {"google_project": "p", "workspace_cdr": "p.d", "seed": 1, "num_pcs": 6,
-              "max_rows_per_disease": 40000, "test_fraction": 0.25, "min_report_count": 20,
-              "maximum_bytes_billed": 10**10, "query_timeout_seconds": 300, "lookback_days": 365,
-              "gnomon_timeout_seconds": 600, "gnomon_centers": 8,
-              "diseases": {"hypertension": {"snomed_code": "38341003", "scores": ["PGS004525"]}}}
+              "max_rows_per_disease": 40000, "max_rows_per_ancestry": 20000, "test_fraction": 0.25,
+              "min_report_count": 20, "maximum_bytes_billed": 10**10, "query_timeout_seconds": 300,
+              "lookback_days": 365, "gnomon_timeout_seconds": 600, "gnomon_centers": 8,
+              "diseases": {"hypertension": {"snomed_code": "38341003", "scores": scores}}}
     bench.validate_config(config)
     with pytest.raises(ValueError):
         bench.validate_config(dict(config, min_report_count=5))
     with pytest.raises(ValueError):
-        bench.validate_config(dict(config, diseases={f"d{i}x": {"snomed_code": "38341003", "scores": ["PGS004525"]}
+        bench.validate_config(dict(config, diseases={f"d{i}x": {"snomed_code": "38341003", "scores": scores}
                                                      for i in range(6)}))
+    with pytest.raises(ValueError):
+        bench.validate_config(dict(config, max_rows_per_ancestry=50000))
+
+
+def test_config_requires_development_ancestry_and_a_multi_ancestry_lead():
+    config = {"google_project": "p", "workspace_cdr": "p.d", "seed": 1, "num_pcs": 6,
+              "max_rows_per_disease": 40000, "max_rows_per_ancestry": 20000, "test_fraction": 0.25,
+              "min_report_count": 20, "maximum_bytes_billed": 10**10, "query_timeout_seconds": 300,
+              "lookback_days": 365, "gnomon_timeout_seconds": 600, "gnomon_centers": 8}
+    for scores in (["PGS004236", "PGS004525"], {"PGS004525": "european"}, {"PGS004236": "trans_ethnic"}):
+        with pytest.raises(ValueError):
+            bench.validate_config(dict(config, diseases={"hypertension": {"snomed_code": "38341003",
+                                                                          "scores": scores}}))
+
+
+def test_sample_caps_each_ancestry_without_looking_at_outcomes():
+    rng = np.random.default_rng(7)
+    n = 5000
+    ancestry = np.where(np.arange(n) < 4000, "eur", "afr")
+    base = pd.DataFrame({"person_id": [str(i) for i in range(n)], "ancestry": ancestry})
+    scores = {"PGS000001": pd.DataFrame({"person_id": base.person_id, "PGS000001": rng.normal(size=n)})}
+    config = {"seed": 3, "max_rows_per_disease": 2500, "max_rows_per_ancestry": 1500, "test_fraction": 0.25}
+    first = bench.disease_cohort(base, set(base.person_id[:100]), scores, config)
+    second = bench.disease_cohort(base, set(base.person_id[-2000:]), scores, config)
+    assert first.ancestry.value_counts().to_dict() == {"eur": 1500, "afr": 1000}
+    assert list(first.person_id) == list(second.person_id)
+    assert list(first.is_test) == list(second.is_test)
 
 
 def test_failure_class_reports_only_the_exception_class_name():
@@ -113,3 +142,43 @@ def test_failure_class_names_the_fixed_category_of_a_solver_message():
         assert bench.failure_class(log) == "gamerror_resource_policy"
         log.write_text("Traceback...\ngamfit._exceptions.GamError: something new entirely\n")
         assert bench.failure_class(log) == "gamerror"
+
+
+def test_table_leads_with_african_and_admixed_american_gains_and_never_prints_small_cells():
+    rng = np.random.default_rng(8)
+    ancestry = ["afr"] * 300 + ["amr"] * 300 + ["eur"] * 300 + ["eas"] * 15
+    n = len(ancestry)
+    test = pd.DataFrame({"y": (rng.random(n) < 0.3).astype(float), "sex": rng.integers(0, 2, n),
+                         "age0": rng.uniform(20, 80, n), "ancestry": ancestry})
+    with tempfile.TemporaryDirectory() as tmp:
+        digest = bench.Digest(tmp)
+        for pgs, development in (("PGS000002", "european"), ("PGS000001", "multi_ancestry")):
+            predictions = {m: rng.uniform(0.1, 0.5, n) for m in ("covariates", "standard", "gnomon")}
+            digest.emit("type_2_diabetes", bench.slug(pgs), "development", development)
+            digest.emit("type_2_diabetes", bench.slug(pgs), "gnomon", "status", "ok")
+            bench.report(digest, "type_2_diabetes", pgs, test, predictions, {"min_report_count": 20})
+        names = [f"gs://bucket/run/call-bench/digest/{p.name}" for p in Path(tmp).iterdir()]
+    text = table.render(names)
+    sections = text.split("### ")
+    assert sections[1].startswith("Held-out gains in African ancestry (headline)")
+    assert sections[2].startswith("Held-out gains in admixed American ancestry (headline)")
+    assert sections[3].startswith("Held-out gains in European ancestry (comparator)")
+    rows = [line for line in sections[1].splitlines() if line.startswith("| type 2 diabetes")]
+    assert [row.split(" | ")[1:3] for row in rows] == [["PGS000001", "multi-ancestry"], ["PGS000002", "european"]]
+    assert rows[0].split(" | ")[3] == "300"
+    assert " ± " in rows[0].split(" | ")[7]
+    assert len(sections) == 5 and "ancestry_eas" not in text
+    counts = [int(cell.replace(",", "")) for row in text.splitlines() if row.startswith("| type")
+              for cell in row.split(" | ")[3:5] if cell.replace(",", "").isdigit()]
+    assert min(counts) >= 20
+
+
+def test_table_suppresses_a_cell_below_the_minimum_even_if_a_token_carries_it():
+    names = ["digest__hypertension__pgs000001__development__multi_ancestry.txt",
+             "digest__hypertension__pgs000001__standard__ancestry_afr__n__400.txt",
+             "digest__hypertension__pgs000001__standard__ancestry_afr__cases__12.txt",
+             "digest__hypertension__pgs000001__delta__standard__vs__covariates__ancestry_afr__auc_difference__m1.5em05.txt",
+             "digest__hypertension__pgs000001__delta__standard__vs__covariates__ancestry_afr__auc_difference_se__0.004.txt"]
+    assert table.number("m1.5em05") == -1.5e-05
+    row = next(line for line in table.render(names).split("### ")[1].splitlines() if line.startswith("| hyper"))
+    assert "insufficient support" in row and "12" not in row

@@ -1,0 +1,27 @@
+{
+  "seed": 20260914,
+  "num_pcs": 6,
+  "max_rows_per_disease": 100000,
+  "max_rows_per_ancestry": 25000,
+  "test_fraction": 0.25,
+  "min_report_count": 20,
+  "maximum_bytes_billed": 60000000000,
+  "query_timeout_seconds": 300,
+  "lookback_days": 365,
+  "gnomon_timeout_seconds": 1200,
+  "gnomon_centers": 8,
+  "diseases": {
+    "hypertension": {
+      "snomed_code": "38341003",
+      "scores": {"PGS004236": "multi_ancestry", "PGS004234": "multi_ancestry", "PGS004525": "european"}
+    },
+    "type_2_diabetes": {
+      "snomed_code": "44054006",
+      "scores": {"PGS004859": "multi_ancestry", "PGS002308": "multi_ancestry", "PGS000014": "european"}
+    },
+    "atrial_fibrillation": {
+      "snomed_code": "49436004",
+      "scores": {"PGS005168": "multi_ancestry", "PGS004878": "multi_ancestry", "PGS000331": "european"}
+    }
+  }
+}

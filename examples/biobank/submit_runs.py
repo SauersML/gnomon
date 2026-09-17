@@ -11,6 +11,7 @@ submission holding its inputs, workflow record and receipt.
                            (AOU_ANALYSIS_CONFIG selects the analysis, AOU_FULL_ANALYSIS=1
                            the confirmatory analysis)
   benchmark                score-method benchmark from the workspace sscore cache
+                           (aou_benchmark.json; AOU_BENCHMARK_CONFIG selects another)
   scoring-diagnostic       scoring resource counters of the current checkpoint
   fit-diagnostic           survival fit progress of the current checkpoint
   stderr-diagnostic URI    one failed task's stderr, scanned with its checkpoint
@@ -113,7 +114,7 @@ def newest_cached_scores(objects, prefix, pgs_ids):
 
 def benchmark(wb, args):
     name, folder, uri = new_submission(wb, "aou-benchmark")
-    config = json.loads((STAGING / "benchmark-config.json").read_text())
+    config = json.loads(Path(os.environ.get("AOU_BENCHMARK_CONFIG") or HERE / "aou_benchmark.json").read_text())
     config.update(google_project=wb.project, workspace_cdr=required_env("WORKSPACE_CDR"))
     (folder / "config.json").write_text(json.dumps(config, indent=2))
     sources = folder / "benchmark-sources.tar"
