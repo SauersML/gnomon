@@ -24,8 +24,7 @@ use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
 
-use flate2::Crc;
-use libdeflater::Decompressor;
+use libdeflater::{Crc, Decompressor};
 use memchr::{memchr, memchr_iter};
 use memmap2::Mmap;
 use noodles_vcf as vcf;
@@ -687,37 +686,127 @@ fn pack_bcf_calls(
     }
     series_are_readable(samples, sample_count, header)?;
     let series = GenotypeSeries::find(samples, format_count, sample_count, gt_key?).ok()??;
+    pack_series_calls(&series, alts, n_samples, packed)
+}
+
+/// The calls of the GT series `series` for the first `n_samples` samples, packed
+/// into one row per ALT of `alts`. Four samples whose eight 8-bit codes all name
+/// alleles are coded together by [`int8_group_byte`], any other sample by
+/// [`pack_series_sample`]. `None` where the per-sample path refuses a sample.
+fn pack_series_calls(
+    series: &GenotypeSeries<'_>,
+    alts: &[(usize, Option<LocusClass>)],
+    n_samples: usize,
+    packed: &mut [u8],
+) -> Option<()> {
+    let row_len = n_samples.div_ceil(4);
     let mut carried = vec![0usize; alts.len()];
-    for sample in 0..n_samples {
-        carried.fill(0);
-        let mut alleles = 0usize;
-        let mut missing = false;
-        for allele in series.alleles(sample)? {
-            match allele.ok()? {
-                Some(index) => {
-                    alleles += 1;
-                    for (count, &(alt, _)) in carried.iter_mut().zip(alts) {
-                        *count += usize::from(index == alt);
-                    }
+    let mut next_sample = 0;
+    // A record with fewer samples than the dataset is refused sample by sample.
+    if let Some(codes) = series.diploid_int8_codes()
+        && series.sample_count() >= n_samples
+    {
+        let (groups, _) = codes.get(..n_samples / 4 * 8)?.as_chunks::<8>();
+        for (group, bytes) in groups.iter().enumerate() {
+            let word = u64::from_le_bytes(*bytes);
+            if names_alleles(word) {
+                for (row, &(alt, _)) in packed.chunks_exact_mut(row_len).zip(alts) {
+                    row[group] |= int8_group_byte(word, alt);
                 }
-                None => {
-                    missing = true;
-                    break;
+            } else {
+                for sample in 4 * group..4 * group + 4 {
+                    pack_series_sample(series, sample, alts, row_len, &mut carried, packed)?;
                 }
             }
         }
-        for (row, &count) in packed.chunks_exact_mut(row_len).zip(&carried) {
-            let code = if missing || alleles == 0 {
-                MISSING_CODE
-            } else if alleles > 1 && count == 1 {
-                HET_CODE
-            } else {
-                HOM_CODE
-            };
-            set_code(row, sample, code);
-        }
+        next_sample = groups.len() * 4;
+    }
+    for sample in next_sample..n_samples {
+        pack_series_sample(series, sample, alts, row_len, &mut carried, packed)?;
     }
     Some(())
+}
+
+/// Packs sample `sample`'s call into every row of `packed`, as `decode_bcf_record`
+/// reads it: missing where an allele is missing or the sample has none,
+/// heterozygous where a call of two or more alleles carries the row's ALT once,
+/// homozygous otherwise. `None` where a code names no allele, or past the
+/// record's samples.
+fn pack_series_sample(
+    series: &GenotypeSeries<'_>,
+    sample: usize,
+    alts: &[(usize, Option<LocusClass>)],
+    row_len: usize,
+    carried: &mut [usize],
+    packed: &mut [u8],
+) -> Option<()> {
+    carried.fill(0);
+    let mut alleles = 0usize;
+    let mut missing = false;
+    for allele in series.alleles(sample)? {
+        match allele.ok()? {
+            Some(index) => {
+                alleles += 1;
+                for (count, &(alt, _)) in carried.iter_mut().zip(alts) {
+                    *count += usize::from(index == alt);
+                }
+            }
+            None => {
+                missing = true;
+                break;
+            }
+        }
+    }
+    for (row, &count) in packed.chunks_exact_mut(row_len).zip(carried.iter()) {
+        let code = if missing || alleles == 0 {
+            MISSING_CODE
+        } else if alleles > 1 && count == 1 {
+            HET_CODE
+        } else {
+            HOM_CODE
+        };
+        set_code(row, sample, code);
+    }
+    Some(())
+}
+
+const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+const LOW_SEVEN_BITS: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+
+/// Whether each of the eight 8-bit GT codes in `word` names an allele: a code of
+/// 2 to 127, which [`GenotypeSeries::alleles`] reads as allele `(code >> 1) - 1`.
+/// Missing codes (0, 1 and -128), the end-of-vector code (-127) and other
+/// negative codes do not.
+fn names_alleles(word: u64) -> bool {
+    // With the sign bits clear, a code below 2 has none of the bits 0x7e.
+    let upper = word & 0x7e7e_7e7e_7e7e_7e7e;
+    // Adding 0x7f to a byte of at most 0x7e carries into its top bit exactly when
+    // the byte is not zero, and never into the next byte.
+    word & HIGH_BITS == 0 && ((upper + LOW_SEVEN_BITS) | upper) & HIGH_BITS == HIGH_BITS
+}
+
+/// The packed byte of ALT `alt`'s row for four samples of two 8-bit codes each,
+/// all of which name alleles ([`names_alleles`]): heterozygous where exactly one
+/// of a sample's two alleles is `alt`, homozygous otherwise.
+fn int8_group_byte(word: u64, alt: usize) -> u8 {
+    const HOM_BYTE: u8 = HOM_CODE * 0b0101_0101;
+    // An 8-bit code names at most allele 62, so no allele is a higher ALT.
+    if alt > 62 {
+        return HOM_BYTE;
+    }
+    let target = ((alt as u64 + 1) << 1) * 0x0101_0101_0101_0101;
+    // Zero bytes where a code, phase bit dropped, names `alt`. Both sides are at
+    // most 0x7e, so the zero test below is exact per byte.
+    let differ = (word & 0xfefe_fefe_fefe_fefe) ^ target;
+    let equal = !((differ + LOW_SEVEN_BITS) | differ) & HIGH_BITS;
+    // A sample's first code is an even byte and its second the odd byte above.
+    let het = (equal ^ (equal >> 8)) & 0x0080_0080_0080_0080;
+    let het_samples = ((het >> 7) & 1)
+        | ((het >> 21) & 0b100)
+        | ((het >> 35) & 0b1_0000)
+        | ((het >> 49) & 0b100_0000);
+    // A heterozygous sample's code differs from the homozygous code in its low bit.
+    HOM_BYTE ^ (het_samples as u8 * (HOM_CODE ^ HET_CODE))
 }
 
 /// Walks the FORMAT series of a BCF sample block as the record reader does, to
@@ -1522,6 +1611,100 @@ mod tests {
             assert!(
                 pack_vcf_calls(refused.as_bytes(), &alts, n_samples, &mut Vec::new()).is_none()
             );
+        }
+    }
+
+    /// Four samples of 8-bit codes are packed together only where every code names
+    /// an allele, and must give the rows the per-sample path gives: for every code
+    /// at every position of a group, for missing, end-of-vector and invalid codes
+    /// planted anywhere, and for random series, at every sample count.
+    #[test]
+    fn int8_groups_pack_what_the_per_sample_path_packs() {
+        const GT_KEY: u8 = 5;
+        for at in 0..8 {
+            for code in 0..=255u8 {
+                let mut bytes = [4u8; 8];
+                bytes[at] = code;
+                assert_eq!(
+                    names_alleles(u64::from_le_bytes(bytes)),
+                    (2..=127).contains(&code),
+                    "{code:#x} at {at}"
+                );
+            }
+        }
+        let wide_alts = [
+            (0, None),
+            (1, None),
+            (2, None),
+            (30, None),
+            (61, None),
+            (62, None),
+            (63, None),
+            (200, None),
+        ];
+        let alts = [(1, None), (2, None), (62, None), (63, None)];
+        let mut cases: Vec<(Vec<u8>, &[(usize, Option<LocusClass>)])> = Vec::new();
+        for at in 0..8 {
+            for code in 2..=127u8 {
+                let mut codes = vec![2u8, 4, 6, 8, 3, 5, 0x7e, 0x7f];
+                codes[at] = code;
+                cases.push((codes, &wide_alts));
+            }
+        }
+        // Alleles 0, 1, 2 and 62, unphased and phased; missing (0, 1 and -128); the
+        // end of a vector (-127); and two negative codes that name nothing.
+        let pool = [
+            2u8, 3, 4, 5, 6, 7, 0x7e, 0x7f, 0x00, 0x01, 0x80, 0x81, 0xfe, 0x90,
+        ];
+        let calls = [2u8, 4, 4, 2, 3, 5, 2, 2, 4, 6, 5, 3, 7, 4, 0x7e, 4];
+        for at in 0..calls.len() {
+            for &code in &pool {
+                let mut codes = calls.to_vec();
+                codes[at] = code;
+                cases.push((codes, &alts));
+            }
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..500 {
+            let n = 1 + (next() % 23) as usize;
+            // Mostly allele codes, as a cohort holds them.
+            let codes = (0..2 * n)
+                .map(|_| {
+                    let draw = next();
+                    let kinds = if draw % 16 == 0 { pool.len() } else { 8 };
+                    pool[(draw >> 8) as usize % kinds]
+                })
+                .collect();
+            cases.push((codes, &alts));
+        }
+        for (codes, alts) in &cases {
+            let sample_count = codes.len() / 2;
+            // One series: its key as an int8, then an int8 vector of two per sample.
+            let mut block = vec![0x11, GT_KEY, 0x21];
+            block.extend_from_slice(codes);
+            let series = GenotypeSeries::find(&block, 1, sample_count, usize::from(GT_KEY))
+                .unwrap()
+                .unwrap();
+            for n_samples in 1..=sample_count + 1 {
+                let row_len = n_samples.div_ceil(4);
+                let mut expected = vec![0u8; alts.len() * row_len];
+                let mut carried = vec![0; alts.len()];
+                let per_sample = (0..n_samples).try_for_each(|sample| {
+                    pack_series_sample(&series, sample, alts, row_len, &mut carried, &mut expected)
+                });
+                let mut packed = vec![0u8; alts.len() * row_len];
+                let grouped = pack_series_calls(&series, alts, n_samples, &mut packed);
+                assert_eq!(grouped, per_sample, "{codes:x?} over {n_samples} samples");
+                if per_sample.is_some() {
+                    assert_eq!(packed, expected, "{codes:x?} over {n_samples} samples");
+                }
+            }
         }
     }
 }

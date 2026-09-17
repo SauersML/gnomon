@@ -156,6 +156,12 @@ impl<'a> GenotypeSeries<'a> {
         self.sample_count
     }
 
+    /// The codes of an 8-bit series of two codes per sample, the sample's two
+    /// codes one after the other, or `None` for any other width or length.
+    pub fn diploid_int8_codes(&self) -> Option<&'a [u8]> {
+        (self.width == Width::Int8 && self.len == 2).then_some(self.values)
+    }
+
     /// The alleles of sample `i`, in order, ending at the sample's own ploidy.
     ///
     /// Returns `None` when `i` is past the record's samples. A negative code
