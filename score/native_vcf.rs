@@ -21,6 +21,8 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::simd::cmp::{SimdPartialEq, SimdPartialOrd};
+use std::simd::{Select, simd_swizzle, u8x16, u8x32, u8x64};
 
 mod crc;
 mod stream;
@@ -513,12 +515,15 @@ impl ScoredAllele {
         let people = first_person..first_person + sums.len() / num_scores;
         match (&self.column, &self.matched_rules[..]) {
             (DosageColumn::Calls(codes), [rule]) if num_scores == 1 => {
-                // A missing call's nibble selects the zero term, and it counts once.
-                let terms = &self.call_terms[0];
+                // Each term is the product `call_terms` holds for the call's copies, formed
+                // here so the loop vectorizes. A missing call adds zero, which leaves a sum
+                // that starts at +0.0 unchanged, and counts once.
                 let shift = if rule.effect_is_ref { 4 } else { 0 };
                 for ((&code, sum), count) in codes[people].iter().zip(sums).zip(missing) {
-                    *sum += terms[usize::from((code >> shift) & 0x0f)];
-                    *count += u32::from(code == MISSING_CALL);
+                    let absent = code == MISSING_CALL;
+                    let copies = f64::from((code >> shift) & 0x0f);
+                    *sum += if absent { 0.0 } else { rule.weight * copies };
+                    *count += u32::from(absent);
                 }
             }
             (DosageColumn::Calls(codes), rules) => {
@@ -543,13 +548,13 @@ impl ScoredAllele {
                 }
             }
             (DosageColumn::Dosages(dosages), [rule]) if num_scores == 1 => {
+                // A missing dosage adds zero, which leaves a sum that starts at +0.0
+                // unchanged, so the loop needs no branch.
                 let side = usize::from(rule.effect_is_ref);
                 for ((dosage, sum), count) in dosages[people].iter().zip(sums).zip(missing) {
-                    if dosage[0].is_nan() {
-                        *count += 1;
-                    } else {
-                        *sum += rule.weight * dosage[side];
-                    }
+                    let absent = dosage[0].is_nan();
+                    *sum += if absent { 0.0 } else { rule.weight * dosage[side] };
+                    *count += u32::from(absent);
                 }
             }
             (DosageColumn::Dosages(dosages), _) => {
@@ -1581,13 +1586,26 @@ fn vcf_gt_calls(
     // The offset of the next column, which exists while it is inside `bytes`.
     let mut pos = 0usize;
     let mut sample_idx = 0usize;
-    for &kept_idx in kept_indices {
+    let mut kept = 0usize;
+    while let Some(&kept_idx) = kept_indices.get(kept) {
         while sample_idx < kept_idx && pos < bytes.len() {
             pos = memchr(b'\t', &bytes[pos..]).map_or(bytes.len(), |offset| pos + offset + 1);
             sample_idx += 1;
         }
         if pos >= bytes.len() {
             break;
+        }
+        // Sixteen kept people in adjacent columns decode as one block when every
+        // column holds a diploid call of single-digit alleles.
+        if kept_indices.get(kept + 15) == Some(&(sample_idx + 15))
+            && let Some(block) = bytes.get(pos..pos + 64)
+            && let Some(block_codes) = diploid_call_codes(block, alt_index)
+        {
+            codes.extend_from_slice(&block_codes);
+            pos += 64;
+            sample_idx += 16;
+            kept += 16;
+            continue;
         }
         let code = if let Some(&[first @ b'0'..=b'9', b'/' | b'|', second @ b'0'..=b'9', b'\t']) =
             bytes.get(pos..pos + 4)
@@ -1616,9 +1634,40 @@ fn vcf_gt_calls(
         };
         codes.push(code);
         sample_idx += 1;
+        kept += 1;
     }
     codes.resize(kept_indices.len(), MISSING_CALL);
     Ok(true)
+}
+
+/// The codes of sixteen adjacent columns that each hold a diploid call of
+/// single-digit alleles and end with a tab, as [`vcf_gt_calls`] codes such a
+/// column, or `None` when any column holds something else.
+fn diploid_call_codes(block: &[u8], alt_index: usize) -> Option<[u8; 16]> {
+    const FIRST: [usize; 16] = [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60];
+    const SEPARATOR: [usize; 16] = [1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61];
+    const SECOND: [usize; 16] = [2, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62];
+    const TAB: [usize; 16] = [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63];
+    let columns = u8x64::from_array(block.try_into().ok()?);
+    let first = simd_swizzle!(columns, FIRST) - u8x16::splat(b'0');
+    let separator = simd_swizzle!(columns, SEPARATOR);
+    let second = simd_swizzle!(columns, SECOND) - u8x16::splat(b'0');
+    let tab = simd_swizzle!(columns, TAB);
+    let regular = first.simd_lt(u8x16::splat(10))
+        & second.simd_lt(u8x16::splat(10))
+        & (separator.simd_eq(u8x16::splat(b'/')) | separator.simd_eq(u8x16::splat(b'|')))
+        & tab.simd_eq(u8x16::splat(b'\t'));
+    if !regular.all() {
+        return None;
+    }
+    let copies = |allele: u8| {
+        let allele = u8x16::splat(allele);
+        let (one, zero) = (u8x16::splat(1), u8x16::splat(0));
+        first.simd_eq(allele).select(one, zero) + second.simd_eq(allele).select(one, zero)
+    };
+    // An ALT index above 9 is no single digit, so it matches no allele here.
+    let alt = copies(u8::try_from(alt_index).unwrap_or(u8::MAX));
+    Some((alt | copies(0) << u8x16::splat(4)).to_array())
 }
 
 /// Decodes every kept person's dosage of ALT `alt_index` from a BCF `record` into
@@ -1680,7 +1729,21 @@ fn bcf_gt_calls(
         return Ok(false);
     }
     codes.reserve(kept_indices.len());
-    for &sample_idx in kept_indices {
+    let mut kept = 0usize;
+    while let Some(&sample_idx) = kept_indices.get(kept) {
+        // Sixteen kept people in adjacent samples decode as one block when each
+        // genotype holds two present alleles.
+        if gt.width == 2
+            && sample_idx + 16 <= sample_count
+            && kept_indices.get(kept + 15) == Some(&(sample_idx + 15))
+            && let Some(block_codes) =
+                diploid_bcf_call_codes(&gt.src[2 * sample_idx..2 * (sample_idx + 16)], alt_index)
+        {
+            codes.extend_from_slice(&block_codes);
+            kept += 16;
+            continue;
+        }
+        kept += 1;
         if sample_idx >= sample_count {
             codes.push(MISSING_CALL);
             continue;
@@ -1707,6 +1770,30 @@ fn bcf_gt_calls(
         });
     }
     Ok(true)
+}
+
+/// The codes of sixteen adjacent samples whose Int8 genotypes each hold two
+/// present alleles, as [`bcf_gt_calls`] codes such a genotype, or `None` when any
+/// value is a missing allele, missing, end-of-vector or reserved, or above 127.
+fn diploid_bcf_call_codes(values: &[u8], alt_index: usize) -> Option<[u8; 16]> {
+    const FIRST: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30];
+    const SECOND: [usize; 16] = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31];
+    let values = u8x32::from_array(values.try_into().ok()?);
+    // A present allele is stored as its position plus one, shifted left over the
+    // phasing bit, so 2 through 127.
+    if !(values.simd_ge(u8x32::splat(2)) & values.simd_le(u8x32::splat(0x7f))).all() {
+        return None;
+    }
+    let first = simd_swizzle!(values, FIRST) >> u8x16::splat(1);
+    let second = simd_swizzle!(values, SECOND) >> u8x16::splat(1);
+    let copies = |stored: u8| {
+        let stored = u8x16::splat(stored);
+        let (one, zero) = (u8x16::splat(1), u8x16::splat(0));
+        first.simd_eq(stored).select(one, zero) + second.simd_eq(stored).select(one, zero)
+    };
+    // An ALT position that no stored value in 2 through 127 reaches matches no allele.
+    let alt = copies(u8::try_from(alt_index + 1).unwrap_or(u8::MAX));
+    Some((alt | copies(1) << u8x16::splat(4)).to_array())
 }
 
 /// Visits each kept person's dosage for ALT `alt_index` of a BCF `record`, as
@@ -3960,6 +4047,65 @@ mod tests {
                 with_dosage >= 30 && failed >= 30,
                 "{ds} {gp}: {with_dosage} records decode a dosage, {failed} fail"
             );
+        }
+    }
+
+    /// Wide BCF records of Int8 diploid genotypes decode to the hard calls the typed
+    /// dosage route visits: mostly two present alleles, some records with missing
+    /// alleles, missing, end-of-vector, reserved and out-of-range values scattered
+    /// among them, under keep subsets that hold runs of sixteen adjacent samples,
+    /// and people past the record's samples.
+    #[test]
+    fn wide_bcf_hard_calls_decode_as_the_typed_route_visits() {
+        let mut draws = Draws(0x0bcf_1616);
+        let samples = 60usize;
+        let names: String = (0..samples).map(|index| format!("\ts{index}")).collect();
+        let header = dosage_bcf_header("FORMAT=<ID=DS,Number=A,Type=Float", "Number=G,Type=Float")
+            .replace("\ts1\ts2\ts3\ts4\n", &format!("{names}\n"));
+        let all: Vec<usize> = (0..samples + 3).collect();
+        let gapped: Vec<usize> = (0..samples).filter(|index| index % 19 != 4).collect();
+        let kept_sets: [&[usize]; 2] = [&all, &gapped];
+        let mut records = Vec::new();
+        let mut alts = Vec::new();
+        for _ in 0..400 {
+            let alt_count = 1 + draws.below(3);
+            let irregular_one_in = [0, 30, 6][draws.below(3)];
+            let gt: Vec<u8> = (0..2 * samples)
+                .map(|_| {
+                    if irregular_one_in > 0 && draws.below(irregular_one_in) == 0 {
+                        [0x00, 0x01, 0x80, 0x81, 0x83][draws.below(5)]
+                    } else {
+                        let allele = draws.below(alt_count + 2);
+                        u8::try_from((allele + 1) * 2 + draws.below(2)).expect("a stored allele")
+                    }
+                })
+                .collect();
+            records.push(raw_bcf_record(alt_count, samples, &[(1, 1, 2, gt)]));
+            alts.push((1 + draws.below(alt_count), alt_count));
+        }
+        let (header, records) = read_raw_bcf(&header, &records);
+        for (index, (record, &(alt_index, alt_count))) in records.iter().zip(&alts).enumerate() {
+            let kept = kept_sets[draws.below(kept_sets.len())];
+            let mut codes = Vec::new();
+            let fast = bcf_gt_calls(record, &header, alt_index, kept, &mut codes)
+                .unwrap_or_else(|err| panic!("record {index}: {err}"));
+            assert!(fast, "record {index} decodes as hard calls");
+            let visits = bcf_dosage_visits(|visit| {
+                for_each_bcf_dosage_best(record, &header, alt_index, alt_count, kept, visit)
+            })
+            .unwrap_or_else(|| panic!("record {index}: the typed route fails"));
+            let decoded: Vec<Option<(u64, Option<u64>)>> = codes
+                .iter()
+                .map(|&code| {
+                    (code != MISSING_CALL).then(|| {
+                        (
+                            f64::from(code & 0x0f).to_bits(),
+                            Some(f64::from(code >> 4).to_bits()),
+                        )
+                    })
+                })
+                .collect();
+            assert_eq!(decoded, visits, "record {index}, kept {kept:?}, ALT {alt_index}");
         }
     }
 

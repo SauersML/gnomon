@@ -784,6 +784,57 @@ mod tests {
         );
     }
 
+    /// Wide rows of hard calls decode as the dosage route visits them: rows of
+    /// seventy columns, mostly diploid calls of single-digit alleles, some with
+    /// other shapes scattered among them and some cut short, under keep subsets
+    /// that hold runs of sixteen adjacent people and subsets that skip some.
+    #[test]
+    fn wide_rows_of_hard_calls_decode_as_the_dosage_route_visits() {
+        let mut draws = Draws(0x16c0);
+        let people = 70usize;
+        let all: Vec<usize> = (0..people).collect();
+        let gapped: Vec<usize> = (0..people).filter(|index| index % 23 != 7).collect();
+        let later: Vec<usize> = (40..people).collect();
+        let kept_sets: [&[usize]; 3] = [&all, &gapped, &later];
+        for _ in 0..3000 {
+            let mut samples = String::from("GT");
+            let irregular_one_in = [0, 40, 8][draws.below(3)];
+            for _ in 0..people - draws.below(3) {
+                samples.push('\t');
+                samples.push_str(if irregular_one_in > 0 && draws.below(irregular_one_in) == 0 {
+                    draws.pick(&["./.", "1", "0/1/1", "10/2", ".", "", "1|.", ".|."])
+                } else {
+                    draws.pick(&["0|0", "0|1", "1|0", "1|1", "0/2", "2/1", "3|0", "2|2"])
+                });
+            }
+            let kept = kept_sets[draws.below(kept_sets.len())];
+            let alt_index = 1 + draws.below(3);
+
+            let mut codes = Vec::new();
+            let fast = vcf_gt_calls(&samples, alt_index, 3, kept, &mut codes)
+                .unwrap_or_else(|err| panic!("{samples:?}: {err}"));
+            assert!(fast, "{samples:?} decodes as hard calls");
+            let mut visits: Visits = Vec::new();
+            for_each_vcf_dosage_best(&samples, alt_index, 3, kept, |_, dosage| {
+                visits.push(dosage.map(|d| (d.alt_dosage.to_bits(), d.ref_dosage.map(f64::to_bits))));
+                Ok(())
+            })
+            .unwrap_or_else(|err| panic!("{samples:?}: {err}"));
+            let decoded: Visits = codes
+                .iter()
+                .map(|&code| {
+                    (code != MISSING_CALL).then(|| {
+                        (
+                            f64::from(code & 0x0f).to_bits(),
+                            Some(f64::from(code >> 4).to_bits()),
+                        )
+                    })
+                })
+                .collect();
+            assert_eq!(decoded, visits, "{samples:?} kept {kept:?} ALT {alt_index}");
+        }
+    }
+
     /// The GT:DS decoder visits every kept person as the dosage route does, or fails
     /// with its error: phased, unphased, haploid and missing calls, plain, exponent,
     /// negative, missing and too-large dosages, extra FORMAT values, empty and '.'
