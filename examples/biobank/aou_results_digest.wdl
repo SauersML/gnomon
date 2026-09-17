@@ -55,6 +55,15 @@ task digest {
     def metric_rows(rows, stage):
         for row in rows:
             base = [stage, slug(row["group"]), "h" + token(float(row["horizon"]))]
+            if row.get("status") == "pooled_censoring":
+                # A caveat beside the horizon's cells, not a cell: stratum labels,
+                # reasons, and a mean weight the runner withholds under the minimum.
+                for stratum in row.get("strata") or []:
+                    pooled = [stage, "censoring_pooled", base[2], slug(stratum["ancestry"]), slug(stratum["reason"])]
+                    emit(pooled)
+                    if stratum.get("ipcw_weight_mass") is not None:
+                        emit(pooled + ["ipcw_weight_mass", token(float(stratum["ipcw_weight_mass"]))])
+                continue
             if row.get("status") != "ok" or int(row.get("n", 0)) < MINIMUM_COUNT:
                 emit(base + ["insufficient_support"])
                 continue

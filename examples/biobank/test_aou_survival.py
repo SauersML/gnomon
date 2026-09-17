@@ -157,16 +157,25 @@ class SurvivalContractTests(unittest.TestCase):
 
     def test_sparse_censoring_support_is_not_reported_as_valid_accuracy(self):
         train = pd.DataFrame({"event_code": [1, 2] * 30, "followup": [2.] * 60,
-                              "ancestry": ["major"] * 59 + ["rare"]})
+                              "ancestry": ["major"] * 59 + ["rare"], "sex": [0, 1] * 30,
+                              "age0": [50.] * 60, "PC1": np.arange(60.)})
         test = pd.DataFrame({"event_code": [1, 0] * 10, "followup": [2.] * 20,
-                             "ancestry": ["rare"] * 20})
+                             "ancestry": ["rare"] * 20, "sex": [0, 1] * 10,
+                             "age0": [50.] * 20, "PC1": np.arange(20.)})
         config = {"min_train_events_per_cause": 30, "min_report_count": 20,
                   "horizons_years": [1.]}
         self.assertEqual(aou.fit_support(train, test, config), [])
-        self.assertTrue(aou.partition_support(train, test, config))
+        # One training row cannot carry the rare stratum's reverse KM; the pooled
+        # training set can, so the horizon is supported with the caveat named.
+        self.assertEqual(aou.partition_support(train, test, config), [])
         metrics = aou.evaluate(train, test, np.full((20, 1), .1), [1.], 20)
-        self.assertEqual(metrics[0]["status"], "insufficient_support")
-        self.assertNotIn("brier", metrics[0])
+        self.assertEqual(metrics[0], {"group": "overall", "horizon": 1., "status": "pooled_censoring",
+                                      "strata": [{"ancestry": "rare", "reason": "training_rows",
+                                                  "ipcw_weight_mass": 1.0}]})
+        self.assertEqual(metrics[1]["status"], "insufficient_support")
+        self.assertNotIn("brier", metrics[1])
+        # Nobody is followed past two years, so nothing can stand in there.
+        self.assertTrue(aou.partition_support(train, test, dict(config, horizons_years=[2.])))
         self.assertTrue(aou.fit_support(train.iloc[:20], test, config))
 
     def test_failed_worker_retains_private_log_without_completion_receipt(self):
@@ -544,14 +553,49 @@ class SurvivalContractTests(unittest.TestCase):
                              "ancestry": ["A", "A", "B", "B"]})
         with self.assertRaises(ValueError):
             aou.ipcw_weights(train, test, 2)
-        pooled = []
+        pooled = {}
         weights = aou.ipcw_weights(train, test, 2, pooled)
-        self.assertEqual(pooled, ["B"])
+        self.assertEqual(pooled, {"B": "training_rows"})
         # A has its own reference; B takes the pooled one, so its weights are finite.
         self.assertTrue(np.all(weights > 0))
         np.testing.assert_allclose(weights[:2], aou.ipcw_weights(big, test.iloc[:2], 2))
         with self.assertRaises(ValueError):
-            aou.ipcw_weights(train, test, 4, [])
+            aou.ipcw_weights(train, test, 4, {})
+        # Enough rows, but nobody in C is followed past the horizon.
+        late = pd.DataFrame({"followup": [1.5] * 20, "event_code": [0] * 20, "ancestry": ["C"] * 20})
+        pooled = {}
+        weights = aou.ipcw_weights(pd.concat([big, late], ignore_index=True),
+                                   test.assign(ancestry=["A", "A", "C", "C"]), 2, pooled)
+        self.assertEqual(pooled, {"C": "horizon_support"})
+        np.testing.assert_allclose(weights[2:], [1, 2.5])
+
+    def test_digest_names_pooled_censoring_strata_instead_of_an_unsupported_cell(self):
+        wdl = Path(__file__).with_name("aou_results_digest.wdl").read_text()
+        code = textwrap.dedent(wdl.split("<<'PY'\n", 1)[1].split("    PY\n", 1)[0])
+        metrics = {"hypertension": {"status": "completed", "models": {"pc_varying_ctn": {"metrics": [
+            {"group": "overall", "horizon": 5., "status": "pooled_censoring",
+             "strata": [{"ancestry": "MID", "reason": "training_rows", "ipcw_weight_mass": None},
+                        {"ancestry": "SAS", "reason": "horizon_support", "ipcw_weight_mass": .412}]},
+            {"group": "overall", "horizon": 5., "status": "ok", "n": 4000, "brier": .1}]}}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "metrics.json").write_text(json.dumps(metrics))
+            previous = Path.cwd()
+            try:
+                os.chdir(directory)
+                with patch.object(sys, "argv", ["digest", str(directory / "metrics.json")]), \
+                     patch.dict(sys.modules, {"aou_identity": SimpleNamespace(task_account=lambda: None)}):
+                    exec(compile(code, "aou_results_digest.wdl", "exec"), {})
+            finally:
+                os.chdir(previous)
+            names = {path.name for path in directory.glob("digest__*.txt")}
+        stage = "digest__hypertension__final__pc_varying_ctn__"
+        self.assertEqual(names, {stage + "censoring_pooled__h5__mid__training_rows.txt",
+                                 stage + "censoring_pooled__h5__sas__horizon_support.txt",
+                                 stage + "censoring_pooled__h5__sas__horizon_support__ipcw_weight_mass__0.412.txt",
+                                 stage + "overall__h5__n__4000.txt",
+                                 stage + "overall__h5__brier__0.1.txt",
+                                 "digest__hypertension__status__completed.txt"})
 
     def test_cached_score_uses_identified_column_and_rejects_duplicate_sources(self):
         with tempfile.TemporaryDirectory() as tmp:

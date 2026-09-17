@@ -327,7 +327,7 @@ def partition_support(train, test, config):
     errors = fit_support(train, test, config)
     for horizon in config["horizons_years"]:
         try:
-            ipcw_weights(train, test, horizon, [])
+            ipcw_weights(train, test, horizon, {})
         except ValueError as error:
             errors.append(f"horizon {horizon:g}: {error}")
     return errors
@@ -453,21 +453,25 @@ def censoring_reference(train, ancestry, horizon, pooled):
 
     The stratum's own training rows, when it has at least 20 of them and its
     censoring survival at the horizon is estimable. Otherwise, when `pooled`
-    is a list, every training row stands in and the stratum's name is appended
-    to it as the caveat the report carries; when `pooled` is None the shortfall
-    is fatal, as a confirmatory run demands."""
+    is a dict, every training row stands in and the stratum's name is recorded
+    in it against the reason (`training_rows` or `horizon_support`), the caveat
+    the report carries; when `pooled` is None the shortfall is fatal.
+
+    Pooling assumes the stratum is censored like the pooled training set. Where
+    it is censored more heavily its survivors are under-weighted and its IPCW
+    observed risk and Brier score are biased low."""
     reference = train.loc[train.ancestry == ancestry]
     if len(reference) < 20:
-        problem = "insufficient training support for ancestry-specific censoring"
+        problem, reason = "insufficient training support for ancestry-specific censoring", "training_rows"
     elif censor_km_at(reference, horizon) < 0.05 or not (reference.followup > horizon).any():
-        problem = "evaluation horizon lacks censoring support in an ancestry stratum"
+        problem, reason = "evaluation horizon lacks censoring support in an ancestry stratum", "horizon_support"
     else:
         return reference
     if pooled is None:
         raise ValueError(problem)
     if censor_km_at(train, horizon) < 0.05 or not (train.followup > horizon).any():
         raise ValueError(f"{problem}, and the pooled training set lacks it too")
-    pooled.append(str(ancestry))
+    pooled[str(ancestry)] = reason
     return train
 
 
@@ -514,7 +518,7 @@ def evaluation_cells(train, test, risk, horizons, min_count):
     """Yield one (horizon index, horizon, label, mask, weights, targets) per reportable
     audit cell, or a status row for cells that cannot be reported."""
     for j, horizon in enumerate(horizons):
-        pooled = []
+        pooled = {}
         try:
             weights = ipcw_weights(train, test, horizon, pooled)
         except ValueError as error:
@@ -523,9 +527,18 @@ def evaluation_cells(train, test, risk, horizons, min_count):
             continue
         if pooled:
             # The horizon is reported, with the strata whose censoring weights
-            # came from the pooled training set named beside it.
+            # came from the pooled training set named beside it. Under the right
+            # censoring model a stratum's mean IPCW weight is one in expectation;
+            # well below one, the stratum is censored more heavily than the pooled
+            # set and its cells are biased low. Withheld under the reporting minimum.
+            strata = []
+            for ancestry, reason in sorted(pooled.items()):
+                mask = test.ancestry.astype(str).eq(ancestry).to_numpy()
+                strata.append({"ancestry": ancestry, "reason": reason,
+                               "ipcw_weight_mass": float(weights[mask].mean())
+                               if mask.sum() >= min_count else None})
             yield {"group": "overall", "horizon": horizon, "status": "pooled_censoring",
-                   "strata": sorted(pooled)}
+                   "strata": strata}
         y = ((test.event_code == 1) & (test.followup <= horizon)).to_numpy(float)
         groups = audit_groups(train, test)
         # Fixed probability intervals, not test-outcome-selected bins.
@@ -1075,7 +1088,10 @@ def run(args):
         "reference_ctn_sha256": [digest(path) for path in args.reference_ctn],
         "orthogonality_claim": False,
         "uncertainty": "group-robust Brier intervals conditional on fitted models and training censoring estimates",
-        "censoring_model": "training-only reverse Kaplan-Meier stratified by reported genetic ancestry",
+        "censoring_model": "training-only reverse Kaplan-Meier stratified by reported genetic ancestry; "
+                           "a stratum with fewer than 20 training rows or without censoring support at a "
+                           "horizon takes the pooled training reverse Kaplan-Meier there, named with its "
+                           "reason and mean IPCW weight in that horizon's pooled_censoring row",
     })
     checkpoint.publish()
     if not args.prepare_only and not args.smoke_only:

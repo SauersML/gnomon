@@ -104,7 +104,20 @@ sex, age bands and training-defined PC neighborhoods, including points outside
 their support. Sparse cells are suppressed, not certified as calibrated.
 Loss uncertainty is conditional on fitted models and censoring estimates.
 
-Censoring uses training-only ancestry-stratified reverse Kaplan–Meier. This
+Censoring uses training-only ancestry-stratified reverse Kaplan–Meier. A
+stratum with fewer than 20 training rows, or whose own censoring survival at a
+horizon is below 0.05 or has nobody followed past it, takes the pooled training
+reverse Kaplan–Meier at that horizon. The metrics carry a `pooled_censoring`
+row per horizon naming each such stratum, its reason (`training_rows`,
+`horizon_support`) and its mean IPCW weight (withheld under the reporting
+minimum); the digest emits them as `…__censoring_pooled__h<h>__<stratum>__<reason>`.
+A horizon the pooled set cannot support is still refused. Pooling assumes the
+stratum is censored like the pooled set. Where it is censored more heavily (in
+the limit, nobody in it followed past the horizon) its survivors are
+under-weighted, so its IPCW observed risk and Brier score are biased low and the
+bias leaks into every cell containing it, `overall` included. The mean IPCW
+weight is one in expectation under the right censoring model; well below one
+it shows the stratum is censored more heavily. The stratified model
 assumes sufficient independence within those strata and does not account for
 all site, calendar-period or clinical dependence. No result from this pilot
 establishes optimal deployment accuracy. The marginal identity is a model
@@ -267,7 +280,7 @@ process group. Insufficient training events fail before fitting. The primary-sco
 smoke run records unsupported censoring-adjusted evaluation separately and emits
 no accuracy estimate for those horizons; finite predictions do not establish
 calibration. Final evaluation still requires censoring
-support before fitting. Increase the sample budget only after inspecting that
+support, pooled where a stratum lacks its own, before fitting. Increase the sample budget only after inspecting that
 signal. Failed-worker logs and partial models are checkpointed privately without
 a completion receipt. Population event frequencies
 are never replaced with a balanced case/control sample.
