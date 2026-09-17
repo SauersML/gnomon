@@ -266,8 +266,23 @@ Use a Linux Python 3.12 runtime image that supplies the system libraries those
 wheels require. The runtime image digest, installed versions, gamfit build
 information, source/input hashes, and query IDs are recorded in provenance.
 
-The default run contains one selected disease, at most 20,000
+The default run contains one selected disease, at most `max_rows_per_disease`
 outcome-blind sampled rows each, four CPUs, 16 GiB RAM, and 50 GiB disk.
+The cap must fit the measured fit budget. `fit_budget` records one measured
+stage (gamfit version, solver threads, training rows, the slowest concurrent
+fit's wall seconds, and where it was measured), a cost exponent and the stage
+budget, at most `fit_timeout_seconds`. Validation refuses a cap whose final
+stage (`train_fraction` of the cap) would need more than `budget_seconds` at
+`wall_seconds × (rows / training_rows) ** exponent`, and the runner refuses a
+task whose solver thread count differs from the measurement or whose
+`gamfit._rust` binary does not have the measured `engine_sha256`: a version
+names source, not a build, and a dev-profile wheel fits many times slower than
+a release one (`null` records a measurement no engine matches). An exponent of 1
+is the linear lower bound and over-states the cap when the cost is
+superlinear; measure it at two sizes before raising the cap far past the
+measurement. Provenance records the largest allowed cap as `fit_budget_rows`.
+The budget is a compute bound and stays out of the checkpoint identity; the
+cap itself does not.
 One reference CTN is trained externally per endpoint. Development and final
 evaluation require four cause-specific fits per endpoint and no AoU CTN fits.
 The external trainer uses an explicit two-interior-knot CTN response basis.

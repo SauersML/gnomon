@@ -17,12 +17,22 @@
     5.0
   ],
   "grid_intervals": 200,
-  "fit_timeout_seconds": 180,
+  "fit_timeout_seconds": 4500,
   "query_timeout_seconds": 120,
   "maximum_bytes_billed": 100000000000,
   "min_train_events_per_cause": 30,
   "min_report_count": 20,
   "landmark_days": 180,
   "fit_no_score_comparator": true,
-  "survival_time_anchor": 0.0
+  "survival_time_anchor": 0.0,
+  "fit_budget": {
+    "gamfit_version": "0.1.268",
+    "engine_sha256": null,
+    "solver_threads": 64,
+    "training_rows": 12000,
+    "wall_seconds": 2400,
+    "exponent": 1,
+    "budget_seconds": 4500,
+    "source": "AoU run 7a96b3b7 (2026-09-12), development stage without preemption: slowest of two concurrent fits (death, 48 of 64 threads) 40 min, from a gamfit 0.1.268 wheel built in Cargo's dev profile whose engine digest was not recorded, so no runtime engine matches it; exponent 1 is the linear lower bound, not a measurement"
+  }
 }

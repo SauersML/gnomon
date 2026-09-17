@@ -56,7 +56,7 @@ def validate_config(c):
         "grid_intervals", "fit_timeout_seconds", "query_timeout_seconds",
         "maximum_bytes_billed", "min_train_events_per_cause", "min_report_count",
         "lookback_days", "projection_model_sha256", "landmark_days", "fit_no_score_comparator",
-        "survival_time_anchor",
+        "survival_time_anchor", "fit_budget",
     }
     if set(c) != expected:
         raise ValueError("analysis configuration has missing or unknown keys")
@@ -66,7 +66,7 @@ def validate_config(c):
         raise ValueError("google_project must be a concrete billing project")
     positive = expected - {"google_project", "workspace_cdr", "gamfit_version",
                            "train_fraction", "seed", "horizons_years", "projection_model_sha256",
-                           "landmark_days", "fit_no_score_comparator", "survival_time_anchor"}
+                           "landmark_days", "fit_no_score_comparator", "survival_time_anchor", "fit_budget"}
     anchor = c["survival_time_anchor"]
     if anchor is not None and (type(anchor) not in (int, float) or not 0 <= anchor <= 10):
         raise ValueError("survival_time_anchor must be null or a follow-up time in years within a decade")
@@ -78,6 +78,25 @@ def validate_config(c):
         raise ValueError("resource and sample budgets must be positive integers")
     if not 1 <= c["num_pcs"] <= 16 or not 0.5 <= c["train_fraction"] <= 0.9:
         raise ValueError("unsupported PC count or training fraction")
+    budget = c["fit_budget"]
+    if not isinstance(budget, dict) or set(budget) != {
+            "gamfit_version", "engine_sha256", "solver_threads", "training_rows", "wall_seconds",
+            "exponent", "budget_seconds", "source"}:
+        raise ValueError("fit_budget has missing or unknown keys")
+    engine = budget["engine_sha256"]
+    if (any(type(budget[k]) is not int or budget[k] <= 0 for k in ("solver_threads", "training_rows", "budget_seconds"))
+            or type(budget["wall_seconds"]) not in (int, float) or not budget["wall_seconds"] > 0
+            or type(budget["exponent"]) not in (int, float) or not 1 <= budget["exponent"] <= 3
+            or not (engine is None or (isinstance(engine, str) and re.fullmatch(r"[0-9a-f]{64}", engine)))
+            or not isinstance(budget["source"], str) or not budget["source"].strip()):
+        raise ValueError("fit_budget needs a positive measured cost, an exponent in [1, 3], "
+                         "the measured engine's SHA-256 or null, and its source")
+    if budget["gamfit_version"] != c["gamfit_version"]:
+        raise ValueError("fit_budget was measured with a different gamfit version")
+    if budget["budget_seconds"] > c["fit_timeout_seconds"]:
+        raise ValueError("fit_budget cannot allow more than the per-stage fit timeout")
+    if c["max_rows_per_disease"] > fit_budget_rows(c):
+        raise ValueError("max_rows_per_disease exceeds what the measured fit budget can finish")
     if min(c["baseline_centers"], c["slope_centers"]) <= c["num_pcs"] + 1:
         raise ValueError("Duchon basis sizes must exceed the PC count plus one")
     if c["time_num_internal_knots"] < 2:
@@ -91,6 +110,15 @@ def validate_config(c):
     h = np.asarray(c["horizons_years"], dtype=float)
     if h.ndim != 1 or h.size == 0 or not np.isfinite(h).all() or h[0] <= 0 or (np.diff(h) <= 0).any():
         raise ValueError("horizons must be finite, positive, and strictly increasing")
+
+
+def fit_budget_rows(c):
+    """The largest cohort whose final-stage fits finish within the budget, by the
+    measured stage wall scaled as training rows ** exponent. The final stage trains
+    on `train_fraction` of the cohort; development trains on less."""
+    budget = c["fit_budget"]
+    rows = budget["training_rows"] * (budget["budget_seconds"] / budget["wall_seconds"]) ** (1 / budget["exponent"])
+    return int(rows / c["train_fraction"])
 
 
 class BoundedClient:
@@ -927,12 +955,19 @@ def run(args):
     from disease_selection import select_runtime_diseases
     config = json.loads(args.config.read_text())
     validate_config(config)
+    if solver_threads() != config["fit_budget"]["solver_threads"]:
+        raise ValueError("the fit budget was measured at a different solver thread count")
     endpoint = json.loads(args.endpoint_config.read_text())
     panel = load_score_panel(args.score_panel, exploratory=args.smoke_only or args.prepare_only,
                              endpoints=[endpoint] if endpoint else None)
     import gamfit
     if gamfit.__version__ != config["gamfit_version"]:
         raise ValueError("gamfit version does not match the analysis configuration")
+    engine_hash = digest(importlib.util.find_spec("gamfit._rust").origin)
+    if config["fit_budget"]["engine_sha256"] != engine_hash:
+        # A version names source, not a build: a dev-profile wheel of the same
+        # version fits many times slower, so only the measured binary counts.
+        raise ValueError("the fit budget was not measured with this gamfit engine build")
     if not args.prepare_only:
         # Validate all requested external models before accessing cohort data.
         requested = [panel["endpoints"][endpoint]] if endpoint else panel["endpoints"].values()
@@ -954,7 +989,7 @@ def run(args):
                  "reference_ctn": [digest(path) for path in args.reference_ctn]}
     checkpoint = StudyCheckpoint(args.output, args.checkpoint_uri, config["google_project"],
                                  execution_account, signature, args.resume,
-                                 engine_hash=digest(importlib.util.find_spec("gamfit._rust").origin),
+                                 engine_hash=engine_hash,
                                  resume_latest=args.resume_latest)
     prepared_path = args.output / "prepared.json"
     client = BoundedClient(config, execution_account)
@@ -1064,7 +1099,8 @@ def run(args):
                          "development": development_reports, **report}
     write_json(args.output / "metrics.json", results)
     write_json(args.output / "provenance.json", {
-        "config": config, "runtime_image": image, "gamfit_build": gamfit.build_info(),
+        "config": config, "fit_budget_rows": fit_budget_rows(config),
+        "runtime_image": image, "gamfit_build": gamfit.build_info(),
         "requested_endpoint": endpoint,
         "execution_account": execution_account,
         "packages": {d.metadata["Name"]: d.version for d in importlib.metadata.distributions()},

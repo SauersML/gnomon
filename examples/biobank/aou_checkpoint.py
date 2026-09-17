@@ -11,7 +11,7 @@ from urllib.parse import quote, urlsplit
 # Settings that bound cost, not results. Tuning a wall, query or byte budget
 # must never discard checkpointed scoring or partially fitted models.
 COMPUTE_BOUNDS = frozenset({"fit_timeout_seconds", "query_timeout_seconds",
-                            "maximum_bytes_billed", "timeout_seconds"})
+                            "maximum_bytes_billed", "timeout_seconds", "fit_budget"})
 
 
 def result_identity(settings):

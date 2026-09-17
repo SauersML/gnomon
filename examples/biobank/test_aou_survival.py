@@ -148,9 +148,10 @@ class SurvivalContractTests(unittest.TestCase):
     def test_compute_bounds_never_change_the_checkpoint_identity(self):
         from aou_checkpoint import result_identity
         settings = {"num_pcs": 6, "fit_timeout_seconds": 600, "query_timeout_seconds": 120,
-                    "maximum_bytes_billed": 10**11, "timeout_seconds": 600, "seed": 7}
+                    "maximum_bytes_billed": 10**11, "timeout_seconds": 600, "seed": 7,
+                    "fit_budget": {"wall_seconds": 2400}}
         retuned = dict(settings, fit_timeout_seconds=4500, query_timeout_seconds=300,
-                       maximum_bytes_billed=10**12, timeout_seconds=900)
+                       maximum_bytes_billed=10**12, timeout_seconds=900, fit_budget={"wall_seconds": 900})
         self.assertEqual(result_identity(settings), {"num_pcs": 6, "seed": 7})
         self.assertEqual(result_identity(settings), result_identity(retuned))
         self.assertNotEqual(result_identity(settings), result_identity(dict(settings, num_pcs=8)))
@@ -655,6 +656,28 @@ class SurvivalContractTests(unittest.TestCase):
         config["horizons_years"] = [1, float("nan")]
         with self.assertRaises(ValueError):
             aou.validate_config(config)
+
+    def test_cohort_cap_must_fit_the_measured_fit_budget(self):
+        config = json.loads(Path(__file__).with_name("aou_analysis.json").read_text())
+        config.update(google_project="wb-project", workspace_cdr="cdr-project.release",
+                      fit_timeout_seconds=4000, max_rows_per_disease=40000, train_fraction=.8)
+        config["fit_budget"] = dict(config["fit_budget"], solver_threads=64, training_rows=16000,
+                                    wall_seconds=2000, exponent=1, budget_seconds=4000,
+                                    engine_sha256="ab" * 32)
+        # Twice the measured wall at linear cost trains twice the rows: 32,000 of a 40,000 cohort.
+        self.assertEqual(aou.fit_budget_rows(config), 40000)
+        aou.validate_config(config)
+        budget = config["fit_budget"]
+        for refused in (dict(config, max_rows_per_disease=40001),
+                        dict(config, fit_budget=dict(budget, exponent=2)),
+                        dict(config, fit_budget=dict(budget, exponent=.5)),
+                        dict(config, fit_budget=dict(budget, gamfit_version="0.0.1")),
+                        dict(config, fit_budget=dict(budget, engine_sha256="AB" * 32)),
+                        dict(config, fit_budget={k: v for k, v in budget.items() if k != "engine_sha256"}),
+                        dict(config, fit_budget=dict(budget, source=" ")),
+                        dict(config, fit_timeout_seconds=3999)):
+            with self.assertRaises(ValueError):
+                aou.validate_config(refused)
 
 
 if __name__ == "__main__":
