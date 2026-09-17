@@ -91,9 +91,28 @@ def test_reused_object_with_the_same_md5_is_not_uploaded_again(tmp_path):
     meta = {"name": "artifacts/scorer.tar.gz", "md5Hash": md5(b"scorer"), "size": "6"}
     with patch.object(Workbench, "assert_identity"), \
          patch.object(Workbench, "command", return_value="token"), \
-         patch("submit_aou.urllib.request.urlopen", return_value=response(meta)) as urlopen:
+         patch("submit_aou.urllib.request.urlopen", return_value=response({"items": [meta]})) as urlopen:
         workbench().stage_as(archive, "gs://bucket/artifacts/scorer.tar.gz", reuse=True)
-    assert [call.args[0].method for call in urlopen.call_args_list] == ["GET"]
+    requests = [call.args[0] for call in urlopen.call_args_list]
+    assert [request.method for request in requests] == ["GET"]
+    # A listing, not a metadata GET of the object, which the workspace perimeter refuses with HTTP 403.
+    assert requests[0].full_url.startswith("https://storage.googleapis.com/storage/v1/b/bucket/o?")
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(requests[0].full_url).query)
+    assert query == {"prefix": ["artifacts/scorer.tar.gz"], "fields": ["items(name,md5Hash,size)"],
+                     "userProject": ["project"]}
+
+
+def test_reuse_needs_the_exact_name_not_a_listed_prefix_sibling(tmp_path):
+    archive = tmp_path / "scorer.tar.gz"
+    archive.write_bytes(b"scorer")
+    sibling = {"name": "artifacts/scorer.tar.gz.partial", "md5Hash": md5(b"scorer"), "size": "6"}
+    replies = [response({"items": [sibling]}),
+               response({"name": "artifacts/scorer.tar.gz", "md5Hash": md5(b"scorer"), "size": "6"})]
+    with patch.object(Workbench, "assert_identity"), \
+         patch.object(Workbench, "command", return_value="token"), \
+         patch("submit_aou.urllib.request.urlopen", side_effect=replies) as urlopen:
+        workbench().stage_as(archive, "gs://bucket/artifacts/scorer.tar.gz", reuse=True)
+    assert [call.args[0].method for call in urlopen.call_args_list] == ["GET", "POST"]
 
 
 def test_storage_retries_server_errors_but_not_policy_denials():

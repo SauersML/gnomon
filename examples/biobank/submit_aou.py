@@ -128,7 +128,9 @@ class Workbench:
 
         `wb gsutil cp` stalled indefinitely on a 12 MB archive that one POST
         uploaded in 18 s. With `reuse`, an object whose MD5 already matches is
-        left in place."""
+        left in place. It is found by listing: from outside the workspace
+        perimeter a metadata GET of the object is refused with HTTP 403, and a
+        listing is not."""
         bucket, name = split_uri(uri)
         if not uri.startswith(self.bucket + "/"):
             raise ValueError("objects are staged only in the workspace bucket")
@@ -136,11 +138,13 @@ class Workbench:
             self.assert_identity()
             token = self.access_token()
         body = Path(path).read_bytes()
-        quoted = f"{STORAGE}/storage/v1/b/{bucket}/o/{urllib.parse.quote(name, safe='')}"
         project = urllib.parse.quote(self.project, safe="")
         if reuse:
-            meta = self.storage("GET", f"{quoted}?userProject={project}", token)
-            if meta and meta.get("md5Hash") == md5_base64(body):
+            query = urllib.parse.urlencode({"prefix": name, "fields": "items(name,md5Hash,size)",
+                                            "userProject": self.project})
+            listing = self.storage("GET", f"{STORAGE}/storage/v1/b/{bucket}/o?{query}", token) or {}
+            if any(item.get("name") == name and item.get("md5Hash") == md5_base64(body)
+                   for item in listing.get("items", [])):
                 return uri
         meta = self.storage("POST", f"{STORAGE}/upload/storage/v1/b/{bucket}/o?uploadType=media"
                             f"&name={urllib.parse.quote(name, safe='')}&userProject={project}",
