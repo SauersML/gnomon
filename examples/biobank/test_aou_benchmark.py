@@ -176,8 +176,11 @@ def test_table_leads_with_african_and_admixed_american_gains_and_never_prints_sm
     assert sections[3].startswith("Held-out gains in European ancestry (comparator)")
     rows = [line for line in sections[1].splitlines() if line.startswith("| type 2 diabetes")]
     assert [row.split(" | ")[1:3] for row in rows] == [["PGS000001", "multi-ancestry"], ["PGS000002", "european"]]
-    assert rows[0].split(" | ")[3] == "300"
-    assert " ± " in rows[0].split(" | ")[7]
+    cells = rows[0].split(" | ")
+    assert cells[3] == "300"
+    for delta, detectable in ((cells[6], cells[7]), (cells[8], cells[9])):
+        se = float(delta.split(" ± ")[1])
+        assert float(detectable) == pytest.approx(2.8016 * se, abs=3e-4)
     assert len(sections) == 5 and "ancestry_eas" not in text
     counts = [int(cell.replace(",", "")) for row in text.splitlines() if row.startswith("| type")
               for cell in row.split(" | ")[3:5] if cell.replace(",", "").isdigit()]

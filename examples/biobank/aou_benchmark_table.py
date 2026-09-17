@@ -19,6 +19,9 @@ HEADLINE = (("ancestry_afr", "African ancestry"), ("ancestry_amr", "admixed Amer
 COMPARATORS = (("ancestry_eur", "European ancestry"), ("overall", "all held-out participants"))
 DEVELOPMENT_ORDER = ("multi_ancestry", "european")
 MINIMUM = 20
+# The smallest true AUC difference a two-sided 5 % DeLong test detects with
+# 80 % power at a cell's own support: (z_0.975 + z_0.80) standard errors.
+DETECTABLE_SE_MULTIPLE = 1.959963984540054 + 0.8416212335729143
 
 
 def number(text):
@@ -54,8 +57,9 @@ def parse(names):
 def difference(deltas, key):
     found = deltas.get(key, {})
     if "auc_difference" not in found or "auc_difference_se" not in found:
-        return "n/a"
-    return f"{found['auc_difference']:+.4f} ± {found['auc_difference_se']:.4f}"
+        return "n/a", "n/a"
+    se = found["auc_difference_se"]
+    return f"{found['auc_difference']:+.4f} ± {se:.4f}", f"{DETECTABLE_SE_MULTIPLE * se:.4f}"
 
 
 def slope(cells, key):
@@ -65,8 +69,9 @@ def slope(cells, key):
 
 def table(scores, cells, deltas, group, minimum=MINIMUM):
     rows = ["| disease | score | development | n | cases | AUC covariates | ΔAUC standard − covariates "
-            "| ΔAUC gnomon − standard | calibration slope standard | calibration slope gnomon | gnomon fit |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+            "| detectable | ΔAUC gnomon − standard | detectable | calibration slope standard "
+            "| calibration slope gnomon | gnomon fit |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     def order(item):
         (disease, pgs), facts = item
         development = facts.get("development")
@@ -77,15 +82,17 @@ def table(scores, cells, deltas, group, minimum=MINIMUM):
         n, cases = support.get("n"), support.get("cases")
         label = [disease.replace("_", " "), pgs.upper(), facts.get("development", "not recorded").replace("_", "-")]
         if n is None or cases is None or min(cases, n - cases) < minimum:
-            rows.append("| " + " | ".join(label + ["insufficient support"] + ["n/a"] * 7) + " |")
+            rows.append("| " + " | ".join(label + ["insufficient support"] + ["n/a"] * 9) + " |")
             continue
         covariates = cells.get((disease, pgs, "covariates", group), {}).get("auc")
         rows.append("| " + " | ".join(label + [
             f"{int(n):,}", f"{int(cases):,}", "n/a" if covariates is None else f"{covariates:.4f}",
-            difference(deltas, (disease, pgs, "standard", "covariates", group)),
-            difference(deltas, (disease, pgs, "gnomon", "standard", group)),
+            *difference(deltas, (disease, pgs, "standard", "covariates", group)),
+            *difference(deltas, (disease, pgs, "gnomon", "standard", group)),
             slope(cells, (disease, pgs, "standard", group)), slope(cells, (disease, pgs, "gnomon", group)),
             facts.get("gnomon_status", "n/a").replace("_", " ")]) + " |")
+    rows.append("\n'detectable' is the smallest true AUC difference a two-sided 5 % DeLong test detects "
+                f"with 80 % power at that cell's support ({DETECTABLE_SE_MULTIPLE:.4f} standard errors).")
     return "\n".join(rows)
 
 
