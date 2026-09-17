@@ -1,0 +1,76 @@
+{
+ "existence_uniqueness": {
+  "logit": {
+   "cases": 2000,
+   "max_abs_residual": 7.632783294297951e-16,
+   "max_abs_gap_vs_bisection": 9.325873406851315e-14,
+   "strict_monotone_violations": 0.0
+  },
+  "probit": {
+   "cases": 2000,
+   "max_abs_residual": 3.497202527569243e-15,
+   "max_abs_gap_vs_bisection": 1.7053025658242404e-13,
+   "strict_monotone_violations": 0.0
+  },
+  "wall_seconds": 8.859683260903694
+ },
+ "anchor_deriv_vs_fd": {
+  "logit": {
+   "cases": 300,
+   "fd_step": 0.0001,
+   "max_rel_err": 2.2088611715785474e-09
+  },
+  "probit": {
+   "cases": 300,
+   "fd_step": 0.0001,
+   "max_rel_err": 9.217126464297678e-10
+  },
+  "wall_seconds": 0.35464759508613497
+ },
+ "gaussian_closed_form_vs_gauss_hermite": {
+  "16": {
+   "max_abs_err": 0.10173193751957577,
+   "median_abs_err": 1.165455488782996e-07,
+   "max_abs_err_drive_sd_0_1": 7.002937785216545e-09,
+   "max_abs_err_drive_sd_1_2": 0.0009623707070920418,
+   "max_abs_err_drive_sd_2_4": 0.10173193751957577
+  },
+  "32": {
+   "max_abs_err": 0.00871403712111718,
+   "median_abs_err": 2.0095036745715333e-14,
+   "max_abs_err_drive_sd_0_1": 4.884981308350689e-15,
+   "max_abs_err_drive_sd_1_2": 9.60284427087288e-07,
+   "max_abs_err_drive_sd_2_4": 0.00871403712111718
+  },
+  "64": {
+   "max_abs_err": 0.00014693868926940468,
+   "median_abs_err": 4.440892098500626e-16,
+   "max_abs_err_drive_sd_0_1": 4.884981308350689e-15,
+   "max_abs_err_drive_sd_1_2": 1.2638778912332782e-12,
+   "max_abs_err_drive_sd_2_4": 0.00014693868926940468
+  },
+  "128": {
+   "max_abs_err": 3.891221567187131e-08,
+   "median_abs_err": 6.661338147750939e-16,
+   "max_abs_err_drive_sd_0_1": 1.2878587085651816e-14,
+   "max_abs_err_drive_sd_1_2": 2.7533531010703882e-14,
+   "max_abs_err_drive_sd_2_4": 3.891221567187131e-08
+  },
+  "wall_seconds": 1.9288226179778576
+ },
+ "cross_information": {
+  "logit": {
+   "cases": 300,
+   "max_abs_link_weighted_cross_information": 7.355227538141662e-16,
+   "max_abs_link_weighted_cross_information_fd_deriv": 6.943419977867293e-09,
+   "max_rel_bernoulli_fisher_cross_information": 5.755348917182921e-15
+  },
+  "probit": {
+   "cases": 300,
+   "max_abs_link_weighted_cross_information": 4.579669976578771e-16,
+   "max_abs_link_weighted_cross_information_fd_deriv": 3.989377252155979e-09,
+   "max_rel_bernoulli_fisher_cross_information": 0.2050636652151449
+  },
+  "wall_seconds": 0.2858758040238172
+ }
+}
