@@ -52,7 +52,7 @@ name = "gnomon-calibrate"
 path = "cli/main.rs"
 
 [dependencies]
-gam = "0.2.1"
+gam = { version = "0.3.157", git = "https://github.com/SauersML/gam", rev = "d2f73efe1725c4466784b586a7a9d394098f1520" }
 ahash = "0.8.12"
 clap = { version = "4.5.48", features = ["derive"] }
 memmap2 = "0.9.8"

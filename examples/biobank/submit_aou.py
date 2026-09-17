@@ -264,7 +264,8 @@ def prepare_inputs():
         "relatedness_prune": "AOU_RELATEDNESS_PRUNE_URI",
     }
     inputs = {f"aou_survival.{key}": required_env(env) for key, env in fields.items()}
-    inputs["aou_survival.reference_ctn"] = required_env("AOU_REFERENCE_CTN_URIS").split()
+    # Reference CTN archives exist only for an analysis that declares a reference CTN score.
+    inputs["aou_survival.reference_ctn"] = os.environ.get("AOU_REFERENCE_CTN_URIS", "").split()
     image = inputs["aou_survival.runtime_image"]
     if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image):
         raise ValueError("AOU_RUNTIME_IMAGE must be pinned by digest")

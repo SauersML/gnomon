@@ -27,7 +27,7 @@ import zipfile
 import numpy as np
 import pandas as pd
 
-from aou_score_transform import (baseline_columns,
+from aou_score_transform import (baseline_columns, declared_law_diagnostics,
                                  score_diagnostics, transformed_score)
 from reference_ctn import load_reference
 from aou_checkpoint import StudyCheckpoint, result_identity
@@ -56,17 +56,20 @@ def validate_config(c):
         "grid_intervals", "fit_timeout_seconds", "query_timeout_seconds",
         "maximum_bytes_billed", "min_train_events_per_cause", "min_report_count",
         "lookback_days", "projection_model_sha256", "landmark_days", "fit_no_score_comparator",
-        "survival_time_anchor", "fit_budget",
+        "survival_time_anchor", "fit_budget", "score_law",
     }
     if set(c) != expected:
         raise ValueError("analysis configuration has missing or unknown keys")
+    if c["score_law"] not in {"declared_empirical", "reference_ctn_gaussian"}:
+        raise ValueError("score_law must be declared_empirical or reference_ctn_gaussian")
     if not re.fullmatch(r"[a-z][a-z0-9-]+\.[A-Za-z0-9_]+", c["workspace_cdr"]):
         raise ValueError("workspace_cdr must be a concrete project.dataset")
     if not re.fullmatch(r"[a-z][a-z0-9-]+", c["google_project"]):
         raise ValueError("google_project must be a concrete billing project")
     positive = expected - {"google_project", "workspace_cdr", "gamfit_version",
                            "train_fraction", "seed", "horizons_years", "projection_model_sha256",
-                           "landmark_days", "fit_no_score_comparator", "survival_time_anchor", "fit_budget"}
+                           "landmark_days", "fit_no_score_comparator", "survival_time_anchor", "fit_budget",
+                           "score_law"}
     anchor = c["survival_time_anchor"]
     if anchor is not None and (type(anchor) not in (int, float) or not 0 <= anchor <= 10):
         raise ValueError("survival_time_anchor must be null or a follow-up time in years within a decade")
@@ -810,7 +813,7 @@ def predict_bundle(directory, baseline_data, times):
     return np.asarray(model.predict(data).cumulative_hazard_at(times))
 
 
-def fit_worker(frame_path, config_path, cause, output, transform_path, variant="pc_varying_ctn"):
+def fit_worker(frame_path, config_path, cause, output, transform_path=None, variant="pc_varying"):
     import gamfit
     config = json.loads(Path(config_path).read_text())
     df = pd.read_parquet(frame_path)
@@ -855,6 +858,19 @@ def fit_worker(frame_path, config_path, cause, output, transform_path, variant="
                 knots -= 2
         model.save(output / "model.gamfit")
         print("worker_fit_saved", flush=True)
+    elif config["score_law"] == "declared_empirical":
+        # The score enters as given, and the index is anchored on the weighted
+        # empirical law of these training rows' scores: the same rows and
+        # eligibility the outcome model sees. No transform is fitted.
+        model = gamfit.fit(train, f"Surv(entry, followup, event) ~ {baseline}",
+                           survival_likelihood="marginal-slope",
+                           z_column="PGS",
+                           slope_formula=slope,
+                           config={"time_num_internal_knots": config["time_num_internal_knots"],
+                                   "latent_measure": "global-empirical"},
+                           persistent_warm_start_root=output / "warm", **anchor)
+        model.save(output / "model.gamfit")
+        print("worker_fit_saved", flush=True)
     else:
         transformer = gamfit.load(transform_path)
         model = gamfit.fit(train, f"Surv(entry, followup, event) ~ {baseline}",
@@ -888,13 +904,21 @@ def fit_worker(frame_path, config_path, cause, output, transform_path, variant="
     if variant != "no_score" and (payload["latent_z_rank_int_calibration"] is not None
                                   or payload["latent_z_conditional_calibration"] is not None):
         raise ValueError("outcome fit changed the frozen latent score")
+    declared = variant != "no_score" and config["score_law"] == "declared_empirical"
+    if declared and (payload.get("latent_measure") or {}).get("kind") != "global-empirical":
+        raise ValueError("outcome fit did not anchor on the declared latent law")
+    if variant == "no_score":
+        score_spec = {"slope": None, "kind": "no_score", "normalizer": None, "score_path": "no score term"}
+    elif declared:
+        score_spec = {"slope": slope, "kind": "pc_varying", "score_law": "declared_empirical", "normalizer": None,
+                      "score_path": "raw score as given; anchored on the weighted empirical law of the training rows"}
+    else:
+        score_spec = {"slope": slope, "kind": "pc_varying", "score_law": "reference_ctn_gaussian",
+                      "normalizer": "ctn",
+                      "score_path": "external reference CTN declared standard normal; frozen deployment transform"}
     write_json(output / "spec.json", {"baseline": baseline, "cause": cause, "num_pcs": config["num_pcs"],
                                       "time_num_internal_knots": knots,
-                                      "orthogonality_claim": False, **(
-        {"slope": None, "kind": "no_score", "normalizer": None, "score_path": "no score term"}
-        if variant == "no_score" else
-        {"slope": slope, "kind": "pc_varying", "normalizer": "ctn",
-         "score_path": "external reference CTN; frozen deployment transform"})})
+                                      "orthogonality_claim": False, **score_spec})
     replayed = predict_bundle(output, df.loc[~df.is_train], grid)
     if h.shape != (len(test), len(grid)) or not np.allclose(h, replayed, rtol=1e-7, atol=1e-9):
         raise ValueError("combined transform/outcome save/load predictions disagree")
@@ -1043,18 +1067,27 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, pgs):
     if errors:
         raise ValueError("; ".join(errors))
     groups = audit_groups(train, test)
-    model, transform_path, manifest = load_reference(
-        args.reference_ctn, disease_dir / "reference_ctn",
-        pgs, config["num_pcs"], config["projection_model_sha256"])
-    publish_status(args.checkpoint_uri, "applying_reference_ctn")
-    df["Z_ctn"] = transformed_score(model, "ctn", df, config["num_pcs"])
-    publish_status(args.checkpoint_uri, "score_transform_ready")
-    diagnostics = {"ctn": score_diagnostics(
-        df.loc[~df.is_train, "Z_ctn"].to_numpy(), groups, config["min_report_count"]),
-        "reference": manifest}
+    transform_args = []
+    if config["score_law"] == "declared_empirical":
+        # The law is declared from the training rows the outcome model fits;
+        # its adequacy within each held-out stratum is reported, not assumed.
+        diagnostics = {"declared_law": declared_law_diagnostics(
+            train.PGS.to_numpy(), test.PGS.to_numpy(), groups, config["min_report_count"])}
+        publish_status(args.checkpoint_uri, "score_law_declared")
+    else:
+        model, transform_path, manifest = load_reference(
+            args.reference_ctn, disease_dir / "reference_ctn",
+            pgs, config["num_pcs"], config["projection_model_sha256"])
+        publish_status(args.checkpoint_uri, "applying_reference_ctn")
+        df["Z_ctn"] = transformed_score(model, "ctn", df, config["num_pcs"])
+        publish_status(args.checkpoint_uri, "score_transform_ready")
+        diagnostics = {"ctn": score_diagnostics(
+            df.loc[~df.is_train, "Z_ctn"].to_numpy(), groups, config["min_report_count"]),
+            "reference": manifest}
+        transform_args = ["--transform-model", str(transform_path)]
     frame = disease_dir / "transformed.parquet"
     df.to_parquet(frame, index=False)
-    variants = ["pc_varying_ctn"] + (["no_score"] if config["fit_no_score_comparator"] else [])
+    variants = ["pc_varying"] + (["no_score"] if config["fit_no_score_comparator"] else [])
     pending = []
     for variant in variants:
         for cause in (1, 2):
@@ -1063,7 +1096,7 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, pgs):
             command = [sys.executable, str(Path(__file__).resolve()), "fit",
                        "--frame", str(frame), "--config", str(args.config.resolve()),
                        "--cause", str(cause), "--output", str(fit_dir),
-                       "--transform-model", str(transform_path), "--variant", variant]
+                       *transform_args, "--variant", variant]
             if not checkpoint.step_is_complete(fit_dir, model=True):
                 pending.append((variant, cause, fit_dir, command))
     if pending:
@@ -1073,7 +1106,7 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, pgs):
         # solver threads and the disease fits the rest.
         for variant, cause, _, _ in pending:
             print(f"Fitting {slug}: {variant} cause {cause}", flush=True)
-            if variant == "pc_varying_ctn":
+            if variant == "pc_varying":
                 publish_status(args.checkpoint_uri, "fitting_disease" if cause == 1 else "fitting_death")
         total = solver_threads()
         deaths = sum(1 for _, cause, _, _ in pending if cause == 2)
@@ -1108,7 +1141,7 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, pgs):
                                                config["min_report_count"])}
     report = {"models": models, "score_diagnostics": diagnostics}
     if "no_score" in risks:
-        report["incremental"] = incremental_value(train, test, risks["pc_varying_ctn"], risks["no_score"],
+        report["incremental"] = incremental_value(train, test, risks["pc_varying"], risks["no_score"],
                                                   config["horizons_years"], config["min_report_count"])
     return report
 
@@ -1142,7 +1175,10 @@ def run(args):
         # A version names source, not a build: a dev-profile wheel of the same
         # version fits many times slower, so only the measured binary counts.
         raise ValueError("the fit budget was not measured with this gamfit engine build")
-    if not args.prepare_only:
+    declared = config["score_law"] == "declared_empirical"
+    if declared == bool(args.reference_ctn):
+        raise ValueError("stage reference CTN archives exactly when the analysis declares a reference CTN score")
+    if not args.prepare_only and not declared:
         # Validate all requested external models before accessing cohort data.
         requested = [panel["endpoints"][endpoint]] if endpoint else panel["endpoints"].values()
         for disease in requested:
@@ -1294,7 +1330,10 @@ def run(args):
                        if config["fit_no_score_comparator"] else "none"),
         "validation": "group holdout after published relatedness prune; 75/25 development split for the one prespecified model; outer test remains locked during development",
         "score_panel": panel,
-        "score_transform": "externally fitted PC-conditional CTN; frozen latent scores",
+        "score_law": config["score_law"],
+        "score_transform": ("none; the raw score is anchored on the weighted empirical law of the training rows"
+                            if config["score_law"] == "declared_empirical" else
+                            "externally fitted PC-conditional CTN declared standard normal; frozen latent scores"),
         "reference_ctn_sha256": [digest(path) for path in args.reference_ctn],
         "orthogonality_claim": False,
         "uncertainty": "group-robust test-sampling standard errors conditional on fitted models, and the "
@@ -1328,14 +1367,14 @@ def main():
     fit_parser = sub.add_parser("fit")
     for name in ["frame", "config", "output"]:
         fit_parser.add_argument(f"--{name}", type=Path, required=True)
-    fit_parser.add_argument("--transform-model", type=Path, required=True)
+    fit_parser.add_argument("--transform-model", type=Path)
     fit_parser.add_argument("--cause", type=int, choices=[1, 2], required=True)
-    fit_parser.add_argument("--variant", choices=["pc_varying_ctn", "no_score"], default="pc_varying_ctn")
+    fit_parser.add_argument("--variant", choices=["pc_varying", "no_score"], default="pc_varying")
     args = parser.parse_args()
     if args.command == "run":
         reference_paths = json.loads(args.reference_ctn_list.read_text())
-        if not isinstance(reference_paths, list) or not reference_paths or not all(isinstance(p, str) for p in reference_paths):
-            parser.error("reference CTN list must contain staged model archive paths")
+        if not isinstance(reference_paths, list) or not all(isinstance(p, str) for p in reference_paths):
+            parser.error("reference CTN list must be a list of staged model archive paths")
         args.reference_ctn = [Path(path) for path in reference_paths]
         try:
             run(args)

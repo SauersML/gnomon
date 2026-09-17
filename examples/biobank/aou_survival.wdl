@@ -10,7 +10,8 @@ workflow aou_survival {
     File status_code
     File score_transform
     File reference_code
-    Array[File] reference_ctn
+    # Staged only when the analysis declares a reference CTN's standard-normal score.
+    Array[File] reference_ctn = []
     File checkpoint_code
     File evaluation_code
     File score_panel

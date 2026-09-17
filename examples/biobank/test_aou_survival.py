@@ -523,6 +523,29 @@ class SurvivalContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "frozen external CTN"):
             transforms.transformed_score(model, "location_scale", data, 1)
 
+    def test_declared_law_diagnostics_measure_departure_from_the_pooled_training_law(self):
+        rng = np.random.default_rng(2370)
+        train = rng.standard_normal(4000) * 2.0 + 5.0
+        same = rng.standard_normal(400) * 2.0 + 5.0
+        shifted = rng.standard_normal(400) * 2.0 + 7.0
+        skewed = np.exp(rng.standard_normal(400)) * 2.0 + 3.0
+        test = np.concatenate([same, shifted, skewed, same[:10]])
+        index = np.arange(len(test))
+        groups = [("same", index < 400), ("shifted", (index >= 400) & (index < 800)),
+                  ("skewed", (index >= 800) & (index < 1200)), ("tiny", index >= 1200)]
+        report = transforms.declared_law_diagnostics(train, test, groups, 20)
+        pooled = report["pooled_training_law"]
+        self.assertAlmostEqual(pooled["mean"], 0.0, places=12)
+        self.assertAlmostEqual(pooled["sd"], 1.0, places=12)
+        same_row, shifted_row, skewed_row, tiny_row = report["strata"]
+        # One SD of shift puts the population KS distance at 2Φ(0.5)-1 ≈ 0.38; a held-out
+        # sample of the training law itself sits near its 1/sqrt(n) sampling band.
+        self.assertLess(same_row["ks_distance_to_pooled_training_law"], 0.12)
+        self.assertGreater(shifted_row["ks_distance_to_pooled_training_law"], 0.25)
+        self.assertAlmostEqual(shifted_row["mean"], 1.0, delta=0.25)
+        self.assertGreater(skewed_row["skew"], 1.0)
+        self.assertEqual(tiny_row, {"group": "tiny", "status": "insufficient_support"})
+
     def test_enrollment_lookback_is_required_without_future_survival_requirement(self):
         count = 20
         base = pd.DataFrame({"person_id": [str(i) for i in range(count)],
@@ -780,6 +803,14 @@ class SurvivalContractTests(unittest.TestCase):
                         dict(config, fit_timeout_seconds=3999)):
             with self.assertRaises(ValueError):
                 aou.validate_config(refused)
+
+    def test_score_law_is_one_of_the_two_declarations(self):
+        config = json.loads(Path(__file__).with_name("aou_analysis.json").read_text())
+        config.update(google_project="wb-project", workspace_cdr="cdr-project.release")
+        self.assertEqual(config["score_law"], "declared_empirical")
+        aou.validate_config(dict(config, score_law="reference_ctn_gaussian"))
+        with self.assertRaisesRegex(ValueError, "score_law"):
+            aou.validate_config(dict(config, score_law="ctn"))
 
 
 if __name__ == "__main__":

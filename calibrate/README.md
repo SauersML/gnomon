@@ -5,113 +5,111 @@ survival workflows. It owns schema/data policy, PGS/PC/sex feature semantics,
 artifact mapping, and stable `gnomon::calibrate::*` entrypoints.
 
 Training writes `model.json`, an atomic, versioned bundle containing the model
-configuration, fitted predictor, feature schema and ranges, and the fitted CTN
-score transformation when needed. Prediction reuses that transformation for
-new samples; phenotype and sample weights are never prediction features.
-Bundles with missing feature or transformation metadata require refitting.
+configuration and gam's saved model: the fitted predictor, the feature schema
+and ranges, and, for a marginal-slope model, the latent law the fit anchored
+on. Phenotype and sample weights are never prediction features. Bundles written
+by earlier versions require refitting.
 
-Core numerical engine modules (basis construction, PIRLS/REML, HMC, ALO,
-reparameterization, diagnostics, and shared math types) live in the separate
-solver engine repository and are imported by this crate.
+Core numerical engine modules (basis construction, PIRLS/REML, the
+marginal-slope kernels, persistence, prediction, and shared math types) live in
+the separate solver engine repository and are imported by this crate. The
+marginal-slope models train through gam's formula route (`fit_formula_to_payload`),
+the path gam's CLI and gamfit use, so the saved model is the one those tools save
+for the same fit. The Gaussian location-scale model is requested directly,
+because the formula route refuses a link wiggle on a non-binomial family; its
+saved model is gam's own location-scale assembly
+(`assemble_location_scale_payload`).
 
 ## Statistical model
 
-The crate dispatches three model families from `estimate.rs`, all sharing the
-same marginal term-collection skeleton:
+The crate dispatches three model families from `estimate.rs`. They share one
+context skeleton over sex and the principal components:
 
 ```
-a(x) = β₀ + f_pgs(PGS) + γ_sex·sex + Σ_j f_j(PC_j)
+c(x) = β₀ + γ_sex·sex + Σ_j f_j(PC_j)
 ```
 
-Each `f_*` is a 1-D **Duchon RBF smooth** (farthest-point centers, linear
-nullspace, length scale 1.0, power 1) and `γ_sex` is a doubly-penalized
-unconstrained linear term. Tensor PGS×PC interactions and a sex×PGS varying
-coefficient are intentionally **not** built in v1 — the marginal-slope warps
-described below absorb PGS-by-covariate departures from linearity. This is
-encoded in [`construction.rs`](construction.rs).
+Each `f_j` is a 1-D Duchon smooth
+(`s(PC_j, type=duchon, centers=k, power=1, length_scale=1)`: the hybrid
+Duchon-Matérn kernel at a fixed unit length scale) and `γ_sex` is a penalized
+linear term. Tensor PC interactions are intentionally not built. The formula
+text, and the equivalent term specifications of the Gaussian model, are
+assembled in [`construction.rs`](construction.rs).
 
-`SmoothConfig.num_centers` (CLI `--pgs-centers` / `--pc-centers`) controls
-farthest-point center counts, with at least four centers. These radial smooths
-use their fixed Duchon kernel and operator penalties; polynomial spline degree
-and difference-penalty knobs apply only to the separate survival time splines.
-
-### Likelihoods
-
-- **Probit (binary)** for `phenotype ∈ {0,1}`. Even if `LinkFunction::Logit` is
-  configured, the base link used inside the family is hard-coded to probit
-  ([`estimate.rs`](estimate.rs)).
-- **Identity (Gaussian)** for continuous `phenotype`.
+`SmoothConfig.num_centers` (CLI `--pgs-centers` / `--pc-centers`) sets the
+center counts, with at least four centers. `--pgs-centers` sizes the score
+smooth of the Gaussian model; the marginal-slope models do not smooth the score
+as a covariate, because the score is their latent coordinate.
 
 ### Binary path — Bernoulli marginal-slope
 
-A two-step fit that produces a calibrated probit index whose location and
-slope are both covariate-dependent, plus two cubic warps:
+For `phenotype ∈ {0,1}`. Even if `LinkFunction::Logit` is detected, the base
+link is probit. With `z` the score, the model is
 
-1. **CTN prefit.** The PGS column is treated as a continuous response and fit
-   with a `TransformationNormal` (GAMLSS-style: smooth `T` and smooth
-   `log σ`, both conditional on `sex` linear + each `PC_j` Duchon smooth) so
-   that the fitted conditional distribution supplies a PIT-based latent normal
-   score `z` per row. The same persisted CTN predictor computes training and
-   inference scores. This replaces the discrete phenotype in the score-warp step (the CTN
-   warp itself needs a continuous response).
-2. **De-nested cubic transport kernel** (`gam/src/families/cubic_cell_kernel.rs`):
-   ```
-   η(z, x) = a(x) + b(x)·z + b(x)·δ_h(z) + δ_w(a(x) + b(x)·z)
-   P(Y=1 | x) = Φ( η(z, x) )                 (· / √(1+σ²) if Gaussian-shift frailty)
-   ```
-   where
-   - `a(x)` is the marginal location above,
-   - `log b(x) = f_logslope(PGS)` (an 8-center Duchon smooth on PGS only, from
-     [`build_logslope_termspec`](construction.rs)),
-   - `δ_h(z)` is the **score-warp** cubic spline deviation block in `z`
-     (`DeviationBlockConfig::triple_penalty_default`),
-   - `δ_w(·)` is the **link-wiggle** cubic spline deviation block applied to
-     the affine core `a + b·z` (same triple-penalty default).
+```
+P(Y=1 | x, z) = Φ(η(x, z)),   η(x, z) = α(x) + b(x)·z + b(x)·δ_h(z) + δ_w(α(x) + b(x)·z)
+```
 
-   The "de-nested" name is literal: the kernel is the additive correction
-   `b·δ_h(z) + δ_w(a+b·z)` around the affine core, not the nested composition
-   `L(a + b·H(z))`.
+where `q(x)` is the marginal index over the context formula, `b(x)` the slope
+over `1 + Σ_j f_j(PC_j)`, `δ_h` the score-warp and `δ_w` the link-deviation
+cubic blocks (`linkwiggle()` on the slope and marginal formulas), and `α(x)` is
+defined by the anchoring equation on the declared law `{(u_k, w_k)}` of the
+score:
+
+```
+Σ_k w_k Φ(η(x, u_k)) = Φ(q(x))
+```
+
+The score enters as given; no transform of it is fitted. `ModelConfig::latent_law`
+(CLI `--latent-law`) declares its law:
+
+- `empirical` (the default): the weighted empirical law of the training rows'
+  scores, the same rows, weights and eligibility the outcome model is fitted
+  on. gam compresses it to at most 65 equal-mass nodes and standardizes it to
+  mean 0 and sd 1. It is pooled over the context; whether it is adequate within
+  a context stratum is a diagnostic, not an assumption.
+- `standard-normal`: an explicit declaration that the score is already standard
+  normal given the context, the case in which the anchor has the closed form
+  `α = q·√(1 + b²)`. It is a declared special case, never the target of a
+  transform.
+
+The saved model persists the declared law and prediction replays it.
 
 ### Identity path — Gaussian location-scale (GAMLSS)
 
-A `GaussianLocationScaleFitRequest` from `gam::families::gamlss`: a
-distributional regression in which **both** the conditional mean and the
-conditional log scale are smoothed jointly. The fitted model is
+For a continuous `phenotype`, a distributional regression in which the
+conditional mean and the conditional log scale are smoothed jointly:
 
 ```
 y | x  ~  N( μ(x), σ(x)² )
-μ(x)      = β₀^μ + f_pgs^μ(PGS) + γ_sex^μ·sex + Σ_j f_j^μ(PC_j)
-log σ(x)  = β₀^σ + f_pgs^σ(PGS) + γ_sex^σ·sex + Σ_j f_j^σ(PC_j)
+μ(x)      = f_score^μ(score) + c^μ(x)
+log σ(x)  = f_score^σ(score) + c^σ(x)
 ```
 
-Each `f_*` is again a Duchon RBF smooth (same `build_marginal_termspec`
-machinery as the binary path) and each `γ_sex^*` is a doubly-penalized
-linear term. The two channels are fit jointly under their own GAMLSS
-likelihood — there is no CTN prefit (a continuous response can drive the
-scale channel directly) and no marginal-slope transport kernel.
-
-A cubic triple-penalty **link wiggle** (`WigglePenaltyConfig::cubic_triple_operator_default`)
-is enabled by default and seeded from a no-wiggle pilot fit; its knots,
-degree, and coefficients are persisted so prediction reproduces the warp.
-PIRLS handles the inner Newton step; outer BFGS on `log λ` maximizes REML
-across the joint `(μ, log σ, wiggle)` parameter blocks.
+`f_score` is a Duchon smooth of the score and `c` the context skeleton above;
+both channels share the same terms, and gam's cubic triple-penalty link wiggle
+lets the mean flex away from a strict additive form. gam's formula route
+refuses `linkwiggle()` for a non-binomial family, so the fit is a direct
+`GaussianLocationScaleFitRequest` over the term specifications from
+`construction.rs`. gam standardizes the response for the fit; the saved model
+records that scale and the link wiggle, so prediction reproduces both.
 
 ### Survival path — Survival marginal-slope
 
-Same marginal + log-slope + score-warp + link-wiggle as the binary path, plus
-a `time_block` (`build_time_block_input` in [`survival.rs`](survival.rs)),
-optional `timewiggle_block`, and a derivative guard. Outcome is the
-`(age_entry, age_exit, event_target)` triple; base link is probit; PGS warp is
-again seeded from a CTN prefit on PGS conditional on sex + PCs.
+The outcome is `Surv(age_entry, age_exit, event_target) ~ sex + Σ_j f_j(PC_j)`,
+the slope formula is `1 + Σ_j f_j(PC_j)`, and the score is the latent coordinate,
+declared exactly as on the binary path. The base link is probit.
 
-`SurvivalModelConfig.baseline_basis` controls the I-spline degree and internal
-knots. Its fitted anchor, knots, and baseline offsets are persisted. Optional
-`time_wiggle` settings control a spline transformation of the baseline time
-coordinate, including its degree, knot count, penalty order, and nullspace
-penalty. The CLI exposes these through `--survival-baseline-*` and
-`--survival-time-wiggle*`. These settings describe a baseline transformation;
-the adapter has no PGS-by-age tensor interaction. Survival uses the engine's
-fixed derivative guard and structural spline monotonicity.
+`SurvivalModelConfig.baseline_basis` (CLI `--survival-baseline-knots` /
+`--survival-baseline-degree`) controls the I-spline time basis. The baseline
+starts from unit-shape Weibull offsets at the mean exit age. gam chooses the time
+anchor: marginal-slope centres the time basis at the median exit age, because an
+earliest-entry anchor on delayed-entry ages inflates the unpenalized time column
+until every smoothing seed is refused (gam #751). gam persists the anchor, knots and
+offsets. Under the empirical law gam anchors the index on a rigid baseline:
+there are no score-warp or link-deviation blocks, and a baseline time wiggle is
+refused before fitting. `--survival-time-wiggle*` therefore requires
+`--latent-law standard-normal`.
 
 Survival calibration accepts score, sex, and the configured PCs. Extra static
 covariates are rejected because the prediction API has no corresponding inputs.
@@ -119,25 +117,24 @@ Competing events are censoring events for this net, cause-specific model.
 
 ## Penalties and smoothing selection
 
-Each Duchon smooth carries a default operator penalty (`DuchonOperatorPenaltySpec::default()`)
-respecting the linear nullspace, so intercepts and linear-in-PGS / linear-in-PC
-components remain unpenalized by construction. The sex linear term is fitted
-with `double_penalty = true`. The score-warp and link-wiggle blocks each use
-`WigglePenaltyConfig::cubic_triple_operator_default` — a triple-penalty cubic
-spline (multiple operator orders, double-penalty on, monotonicity epsilon).
+Each Duchon smooth carries gam's default operator penalty, respecting its
+linear nullspace, so intercepts and linear components remain unpenalized by
+construction. The score-warp and link-deviation blocks use gam's cubic
+triple-operator default (multiple operator orders, double penalty, monotonicity
+epsilon).
 
 Smoothing parameters (`λ`) are learned rather than fixed. The solver engine
 implements a nested optimization à la Wood (2011): inner PIRLS for fixed `λ`,
-outer BFGS on marginal likelihood — **REML** for Gaussian fits, **LAML** for
-non-Gaussian (binary, survival). Both objectives include stabilization priors
-and null-space accounting. This is **empirical Bayes**: hyperparameters are
-estimated from the data via marginal likelihood, then coefficients are
-inferred conditional on those point estimates.
-
-At biobank scale the binary/survival families optionally use a stratified
-Horvitz–Thompson subsample of outer rows for the first phase of BFGS
-iterations (`auto_outer_subsample`), reverting to full data for the polish
-phase so `outer_tol` is reached on exact gradients.
+outer optimization on marginal likelihood — **REML** for Gaussian fits, **LAML**
+for non-Gaussian (binary, survival). Both objectives include stabilization
+priors and null-space accounting. This is **empirical Bayes**: hyperparameters
+are estimated from the data via marginal likelihood, then coefficients are
+inferred conditional on those point estimates. gnomon passes no outer bounds of
+its own: the outer loop runs under gam's defaults (80 iterations at relative
+tolerance 1e-4 for the spatial length-scale search, 60 at 1e-5 for the Gaussian
+location-scale fit, 200 on the marginal-slope formula route), and the inner solver
+runs to gam's own certificates. `--reml-max-iterations` and
+`--reml-convergence-tolerance` are optional overrides of those outer defaults.
 
 ## Optimization strategy
 
@@ -190,24 +187,20 @@ background on confidence intervals for penalized splines.
 Adapter/domain files in `gnomon/calibrate`:
 - [`data.rs`](data.rs) and [`survival_data.rs`](survival_data.rs): file/schema
   policy, ingestion, domain validation, and training bundles.
-- [`construction.rs`](construction.rs): `TermCollectionSpec` builders for the
-  marginal collection (`build_marginal_termspec`) and the PGS log-slope
-  channel (`build_logslope_termspec`), plus the `duchon_smooth` helper.
-- [`estimate.rs`](estimate.rs): `train_model` / `train_survival_model` thin
-  adapters over `gam::fit_model`. Picks the family (Standard / Bernoulli
-  marginal-slope / Survival marginal-slope), runs the CTN prefit when a
-  latent `z` is needed, and wraps the result in a `FittedModelPayload`.
-- [`survival.rs`](survival.rs): time-block and time-wiggle-block builders for
-  the survival family.
-- [`model.rs`](model.rs): `ModelConfig`, `TrainedModel`, and serde composition
-  for gnomon artifacts.
+- [`construction.rs`](construction.rs): column names and the formula text for
+  the context and slope formulas.
+- [`estimate.rs`](estimate.rs): `train_model` / `train_survival_model`. Builds
+  the named training table and gam's `FitConfig`, picks the family (Gaussian
+  location-scale / Bernoulli marginal-slope / survival marginal-slope) and the
+  declared latent law, fits through `fit_formula_to_payload`, and records the
+  predictor-only schema.
+- [`survival.rs`](survival.rs): survival data types and input validation.
+- [`model.rs`](model.rs): `ModelConfig`, `LatentLaw`, `TrainedModel`, prediction,
+  and serde composition for gnomon artifacts.
 
-Engine-owned modules in the separate `gam` crate:
-- `families/bernoulli_marginal_slope.rs`, `families/survival_marginal_slope.rs`,
-  `families/transformation_normal.rs`, `families/cubic_cell_kernel.rs`,
-  `families/marginal_slope_shared.rs`, `families/row_kernel.rs`.
-- `smooth/*` (Duchon basis, term-collection design freeze, anisotropic length-scale opt),
-  `pirls`, `estimate::reml::unified`, `custom_family`, `probability`.
+Engine-owned modules live in the separate `gam` workspace (`gam-models`:
+`bms`, `survival::marginal_slope`, `gamlss`, `fit_orchestration`, `inference`;
+`gam-terms`: Duchon bases and formula parsing; `gam-predict`: predictors).
 
 ## Training flow at a glance
 
@@ -215,40 +208,33 @@ Engine-owned modules in the separate `gam` crate:
    Polars, verifies column types (including the binary `sex` column), enforces
    the minimum-row requirement, and returns `TrainingData` (phenotype, score,
    sex, PCs, weights — defaulting to ones if the column is absent).
-2. **Build the column matrix and term specs** – `estimate.rs::build_training_matrix`
-   lays out predictor columns as `score | sex | PC1..PCk`; outcomes and weights
-   are separate fit arguments. Then
-   `construction::build_marginal_termspec` assembles the marginal Duchon-smooth
-   collection and, for the binary/survival families,
-   `construction::build_logslope_termspec` adds the PGS log-slope smooth.
-3. **CTN prefit (binary and survival only)** – `ctn_prefit_latent_z` fits a
-   `TransformationNormal` of PGS conditional on sex + PC smooths and returns
-   the per-row latent normal score `z` used as the calibrated input to the
-   marginal-slope kernel.
-4. **Fit the family** – `gam::fit_model` is called with one of
-   `FitRequest::GaussianLocationScale` (Identity link),
-   `FitRequest::BernoulliMarginalSlope` (Probit/Logit), or
-   `FitRequest::SurvivalMarginalSlope` (survival). The engine alternates PIRLS
-   (inner) and BFGS over `log λ` (outer), maximizing REML (Gaussian) or LAML
-   (binary/survival). Score-warp, link-wiggle, and link-wiggle deviation
-   blocks are seeded from a no-wiggle pilot fit before the joint refit.
-5. **Freeze and persist** – `freeze_term_collection_from_design` snapshots the
-   resolved term-spec + design (knots, transforms, lambdas) into a
-   `FittedModelPayload`; this is wrapped in `TrainedModel` along with the
-   `ModelConfig` so prediction can reconstruct the exact bases.
+2. **Build the table and formulas** – `estimate.rs` lays out the predictor
+   columns as `score | sex | PC1..PCk`, followed by the outcome, time and weight
+   columns the formulas name, and `construction.rs` writes the context and
+   slope formulas.
+3. **Fit** – `fit_formula_to_payload` resolves the formula and `FitConfig`
+   (family, slope formula, `z_column = score`, the declared `latent_measure`,
+   the outer-loop bounds) and fits the family. The engine alternates PIRLS
+   (inner) and optimization over `log λ` (outer), maximizing REML (Gaussian) or
+   LAML (binary/survival).
+4. **Persist** – gam assembles the `FittedModelPayload` (frozen bases, lambdas,
+   coefficients, declared latent law, survival time metadata); gnomon records
+   the predictor-only schema and wraps it in `TrainedModel` with the
+   `ModelConfig`.
 
 ## Prediction path
 
-Prediction reconstructs the resolved term-collection bases from the stored
-knot vectors and transformation matrices, then:
+Prediction builds the predictor matrix in the saved header order and asks gam's
+predictor for the saved model:
 
 - **Identity** — evaluates `μ(x)` and `log σ(x)` from the mean and noise
-  term collections (the engine's `GaussianLocationScalePredictor`), applies
-  the stored cubic link wiggle, and reports a Gaussian density.
-- **Binary/Survival** — evaluates `a(x)` and `b(x)`, applies the cubic
-  transport kernel `η = a + b·z + b·δ_h(z) + δ_w(a+b·z)` using the stored
-  `DeviationRuntime` blocks, and maps to probabilities via `Φ(·)` (with the
-  `1/√(1+σ²)` rescale if Gaussian-shift frailty was fitted).
+  term collections, applies the stored link wiggle, and reports the mean.
+- **Binary** — evaluates `q(x)` and `b(x)`, solves the anchor on the saved
+  latent law, applies the stored deviation blocks, and maps to probabilities
+  via `Φ(·)`.
+- **Survival** — evaluates the plug-in cumulative hazard at each row's entry
+  and exit ages on one coefficient vector, and reports the conditional risk
+  `1 − exp(−(H(exit) − H(entry)))`.
 
 ### Posterior-predictive uncertainty (sketch)
 
@@ -281,7 +267,8 @@ any of the schema requirements below are violated.
 
 - `phenotype` – numeric response (0/1 for probit fits, real-valued for
   Gaussian fits). Missing values are not permitted.
-- `score` – the standardized polygenic score used as the primary smooth.
+- `score` – the polygenic score: the latent coordinate of a marginal-slope fit
+  and a smooth covariate of a Gaussian fit.
 - `sex` – binary indicator encoded as 0/1. Any other value (a 1/2 PLINK
   coding, or 0 for unknown beside 1/2) is rejected when the table is loaded,
   for training and for prediction alike.
@@ -319,7 +306,8 @@ Path ownership is intentionally split:
 - Math/solver engine: separate solver repository
 
 Contract summary:
-- `gnomon/calibrate` performs domain layout assembly and passes full-size `P x P`
-  penalties and numeric arrays into the solver engine.
-- The solver engine performs PIRLS/REML/HMC/ALO and returns fit outputs.
+- `gnomon/calibrate` names the columns, writes the formulas and declares the
+  latent law; it passes a named table and a `FitConfig` to the solver engine.
+- The solver engine performs basis construction, PIRLS/REML and persistence,
+  and returns the saved model.
 - Public call flow remains adapter-stable via `gnomon::calibrate::*` entrypoints.

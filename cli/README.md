@@ -52,9 +52,25 @@ Required arguments:
 Optional arguments:
 - `--pgs-centers`: farthest-point centers for the PGS Duchon smooth (at least 4).
 - `--pc-centers`: farthest-point centers for each PC Duchon smooth (at least 4).
-- `--max-iterations` / `--convergence-tolerance`: control the inner P-IRLS loop.
-- `--reml-max-iterations` / `--reml-convergence-tolerance`: control the outer REML
-  optimization loop.
+- `--latent-law empirical|standard-normal`: the law of the score that a
+  marginal-slope model anchors on. `empirical` (the default) declares the
+  weighted empirical law of the training scores; `standard-normal` declares a
+  score that is already standard normal given the context. The score is never
+  transformed to reach either law.
+- `--survival-time-wiggle*` requires `--latent-law standard-normal`: gam anchors a
+  declared empirical law only on a rigid time baseline, so the combination is
+  refused before fitting.
+
+Removed: `--max-iterations` and `--convergence-tolerance`. Training now leaves
+the inner solver to gam, which stops on its own convergence certificates;
+passing either flag is an error that names
+`--reml-max-iterations` / `--reml-convergence-tolerance` as the outer-loop bounds.
+- `--reml-max-iterations` / `--reml-convergence-tolerance`: optional overrides of the
+  outer smoothing-parameter and length-scale search. Absent, gnomon passes nothing and
+  gam's own defaults apply: 80 iterations at relative tolerance 1e-4 for the spatial
+  length-scale search, 60 at 1e-5 for the Gaussian location-scale fit, and 200 on the
+  marginal-slope formula route. An override can only loosen or tighten what gam
+  certifies; the defaults are the accurate choice.
 
 ### `infer`
 Apply a previously trained calibration model to new samples and saves predictions

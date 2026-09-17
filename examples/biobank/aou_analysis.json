@@ -34,5 +34,6 @@
     "exponent": 1,
     "budget_seconds": 4500,
     "source": "AoU run 7a96b3b7 (2026-09-12), development stage without preemption: slowest of two concurrent fits (death, 48 of 64 threads) 40 min, from a gamfit 0.1.268 wheel built in Cargo's dev profile whose engine digest was not recorded, so no runtime engine matches it; exponent 1 is the linear lower bound, not a measurement"
-  }
+  },
+  "score_law": "declared_empirical"
 }

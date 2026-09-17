@@ -14,7 +14,8 @@ workflow aou_score_training {
     File ancestry_predictions
     File relatedness_prune
     File phenotype_library_archive
-    Array[File] reference_ctn
+    # Staged only when the analysis declares a reference CTN's standard-normal score.
+    Array[File] reference_ctn = []
     File wheelhouse_archive
     String runtime_image
     String checkpoint_uri

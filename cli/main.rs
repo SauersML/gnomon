@@ -15,7 +15,7 @@ use gnomon::calibrate::model::SurvivalModelConfig;
 use gnomon::calibrate::model::SurvivalPrediction;
 use gnomon::calibrate::model::SurvivalRiskType;
 use gnomon::calibrate::model::SurvivalTimeWiggleConfig;
-use gnomon::calibrate::model::{LinkFunction, ModelConfig, ModelFamily, TrainedModel};
+use gnomon::calibrate::model::{LatentLaw, LinkFunction, ModelConfig, ModelFamily, TrainedModel};
 use gnomon::calibrate::survival_data::{
     SurvivalPredictionData, has_survival_columns, load_survival_prediction_data,
     load_survival_training_data,
@@ -290,6 +290,29 @@ enum ModelFamilyCli {
     Survival,
 }
 
+#[derive(Clone, ValueEnum)]
+enum LatentLawCli {
+    Empirical,
+    StandardNormal,
+}
+
+impl From<LatentLawCli> for LatentLaw {
+    fn from(law: LatentLawCli) -> Self {
+        match law {
+            LatentLawCli::Empirical => LatentLaw::Empirical,
+            LatentLawCli::StandardNormal => LatentLaw::StandardNormal,
+        }
+    }
+}
+
+/// A removed inner-solver flag refuses any value instead of being ignored.
+fn removed_inner_solver_flag(_value: &str) -> Result<String, String> {
+    Err("this flag was removed: calibration now leaves the inner solver to gam, which runs to \
+         its own convergence certificates; bound the outer REML loop with \
+         --reml-max-iterations and --reml-convergence-tolerance"
+        .to_string())
+}
+
 #[derive(Args)]
 struct TrainArgs {
     #[arg(long, value_enum, default_value_t = ModelFamilyCli::Gam)]
@@ -310,21 +333,27 @@ struct TrainArgs {
     #[arg(long, default_value = "5")]
     pc_centers: usize,
 
-    /// Maximum number of P-IRLS iterations for the inner loop (per REML step)
-    #[arg(long, default_value = "50", value_parser = parse_positive_usize)]
-    max_iterations: usize,
+    /// Law of the score the marginal-slope index is anchored on: the empirical
+    /// law of the training scores, or a declaration that the score is already
+    /// standard normal given the context
+    #[arg(long, value_enum, default_value_t = LatentLawCli::Empirical)]
+    latent_law: LatentLawCli,
 
-    /// Convergence tolerance for the P-IRLS inner loop deviance change
-    #[arg(long, default_value = "1e-7")]
-    convergence_tolerance: f64,
+    /// Removed; any value is refused with the flags that replace it
+    #[arg(long, hide = true, value_parser = removed_inner_solver_flag)]
+    max_iterations: Option<String>,
 
-    /// Maximum number of iterations for the outer REML/BFGS optimization loop
-    #[arg(long, default_value = "100", value_parser = parse_positive_usize)]
-    reml_max_iterations: usize,
+    /// Removed; any value is refused with the flags that replace it
+    #[arg(long, hide = true, value_parser = removed_inner_solver_flag)]
+    convergence_tolerance: Option<String>,
 
-    /// Convergence tolerance for the gradient norm in the outer REML/BFGS loop
-    #[arg(long, default_value = "1e-3")]
-    reml_convergence_tolerance: f64,
+    /// Override gam's outer iteration cap for the smoothing and length-scale search (absent: gam's own)
+    #[arg(long, value_parser = parse_positive_usize)]
+    reml_max_iterations: Option<usize>,
+
+    /// Override gam's outer convergence tolerance for the smoothing and length-scale search (absent: gam's own)
+    #[arg(long)]
+    reml_convergence_tolerance: Option<f64>,
 
     /// Number of internal knots for the survival baseline spline
     #[arg(long, default_value = "6")]
@@ -881,10 +910,9 @@ fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             println!("Training model with REML estimation of smoothing parameters");
             let config = ModelConfig {
                 model_family: ModelFamily::Gam(link_function),
-                convergence_tolerance: args.convergence_tolerance,
-                max_iterations: args.max_iterations,
                 reml_convergence_tolerance: args.reml_convergence_tolerance,
                 reml_max_iterations: args.reml_max_iterations,
+                latent_law: args.latent_law.clone().into(),
                 pgs_basis_config,
                 pc_configs,
                 pgs_range,
@@ -956,10 +984,9 @@ fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::
                 range: calculate_range(bundle.data.pcs.column(index)),
             }
         }).collect(),
-        convergence_tolerance: args.convergence_tolerance,
-        max_iterations: args.max_iterations,
         reml_convergence_tolerance: args.reml_convergence_tolerance,
         reml_max_iterations: args.reml_max_iterations,
+        latent_law: args.latent_law.clone().into(),
         survival: Some(survival_config),
     };
 

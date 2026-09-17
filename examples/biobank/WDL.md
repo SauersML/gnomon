@@ -31,9 +31,10 @@ The resolved CDR release is recorded; horizons must be supported by that
 release's actual follow-up.
 
 PCs come from pgsEngine's `projection_pcs.parquet`, using the pinned external
-`hwe_1kg_hgdp_gsa_v3` projection. The CTN reference must use that same model
-(uncompressed model SHA-256 is recorded in `aou_analysis.json`). AoU's published
-PC coordinates are a separate coordinate system and are not substituted.
+`hwe_1kg_hgdp_gsa_v3` projection. A reference CTN, when one is declared (below),
+must use that same model (uncompressed model SHA-256 is recorded in
+`aou_analysis.json`). AoU's published PC coordinates are a separate coordinate
+system and are not substituted.
 Ancestry labels still use `research_id` and `ancestry_pred` from the release's
 ancestry file. The published relatedness-prune file's `sample_id` column is
 matched to ancestry `research_id` and applied before sampling
@@ -67,14 +68,54 @@ The score surface has 16 centers and a time-constant signed slope. No frailty,
 ensemble, manifold or post-hoc calibration stack is enabled. The baseline and
 score-effect surfaces are separately penalized and jointly fitted.
 
-CTN is fitted once per PGS on an external genetic reference panel, conditional
-on PCs only. It is never fitted or updated on AoU rows. There are no internal
-AoU CTN folds. CTN uses `transformation_score`, never its conditional-mean
-`predict` operation. The model and manifest are required staged WDL inputs;
-missing, duplicate, mismatched or corrupt reference transforms stop the run.
-GAM's native model embeds the saved CTN and replays it at prediction, with
-save/load and batch-invariance checks. No second
-normalization or influence absorber is fitted.
+## Score law
+
+The score enters the outcome model as given. Each marginal-slope fit declares
+the law of the score its marginal index is anchored on, and the saved native
+model records that law and replays it at prediction. The anchoring equation
+`Σ_k w_k Φ(α(a) + b(a)·u_k) = Φ(q(a))` has one solution on any finite declared
+law, and the Gaussian closed form is its standard-normal instance, so the
+marginal identity is a property of the law the model consumed. Nothing about
+it requires the score to be normal.
+
+With `score_law: declared_empirical` (the default in `aou_analysis.json`) the
+declared law is the weighted empirical law of the training rows the outcome
+model sees: the same development-training or outer-training span, the same
+eligibility and landmark, the same rows. The two cause-specific fits pass the
+raw `PGS` column as `z_column` with `latent_measure: global-empirical`; gamfit
+compresses the law to at most 65 equal-mass nodes and standardizes it. No
+transform of the score is fitted, on AoU rows or anywhere else, and the worker
+refuses a saved model that did not anchor on that law or that fitted a latent
+score transform. The `latent_measure` key needs a gamfit engine built from gam
+at or after d2f73efe17 (gam#2923): gamfit 0.1.268 as released from gam v0.3.157
+has no such key, so `fit_budget.engine_sha256` must name a build measured on
+this declared fit. The anchored survival kernel is rigid: a baseline time wiggle,
+a score-warp or link-deviation block, a follow-up-varying slope or several
+scores have only the closed form, so gam refuses them together with a declared
+law before fitting. The pilot's outcome model uses none of them, and gnomon's
+calibrate refuses `--survival-time-wiggle` with the empirical law up front.
+
+The declared law is pooled over the context (age, sex and PCs). Its adequacy
+within a context stratum is measured rather than assumed: the report's
+`score_diagnostics.declared_law` gives, for the pooled training law and for
+each held-out audit group, the standardized score's mean, SD, skewness, excess
+kurtosis, central-95 fraction and KS distance to the pooled training law. The
+per-group `mean_risk_discrepancy` in the evaluation is the held-out
+`E[p̂ | a]` check the design uses for acceptance. Per-context laws follow when
+gamfit anchors on local empirical laws.
+
+The reference-panel CTN remains only as an explicit Gaussian declaration,
+`score_law: reference_ctn_gaussian`. It is fitted once per PGS on an external
+genetic reference panel, conditional on PCs only, and never on AoU rows. There
+are no internal AoU CTN folds. CTN uses `transformation_score`, never its
+conditional-mean `predict` operation, and its output is declared standard
+normal. GAM's native model embeds the saved CTN and replays it at prediction,
+with save/load and batch-invariance checks; no second normalization or
+influence absorber is fitted. That declaration estimates the reference-panel
+score distribution; it does not establish normality in AoU conditional on age,
+sex or baseline eligibility, so the same diagnostics assess it. Reference
+archives are staged exactly when this declaration is selected; missing,
+duplicate, mismatched or corrupt reference transforms stop the run.
 
 `reference_ctn.py` trains and packages the external model from a real reference
 table containing `sample_id`, the matching `PGSnnnnnn_AVG`, and projected PCs.
@@ -84,11 +125,8 @@ is staged into the workspace. The reference panel's PGS calculation must use
 the same allele, weight and score-scaling conventions as the target cache.
 Variant coverage and projection-marker overlap require a transport audit.
 
-This estimates the reference-panel score distribution. It does not establish
-normality in AoU conditional on age, sex or baseline eligibility. Consequently,
-the exact conditional-normal marginal identity is an assumption to assess, not
-a target-population calibration guarantee. Keep age, sex and PCs in the outcome
-model and evaluate held-out score-distribution and risk diagnostics.
+Keep age, sex and PCs in the outcome model under either declaration and
+evaluate the held-out score-distribution and risk diagnostics.
 
 ## Evaluation, persistence and limits
 
@@ -185,8 +223,10 @@ property, not observed-outcome calibration.
 The first run should use `--prepare-only`: it checks real score availability,
 cohort fields, event counts and horizon support without fitting models.
 After that and native acceptance pass, `--smoke-only` fits the first
-prespecified score using only the development split: frozen external CTN and two
-cause-specific outcome models. Only that primary score must be cached for the
+prespecified score using only the development split: two cause-specific outcome
+models anchored on the declared law of the development-training scores (or on
+a frozen external CTN under the Gaussian declaration), with the declared law's
+per-stratum diagnostics. Only that primary score must be cached for the
 smoke run and final analysis.
 It performs the same persistence, batching,
 monotonicity and CIF checks as the full analysis. It neither selects a score
@@ -207,9 +247,10 @@ remain separate checks; see [VALIDATION.md](VALIDATION.md) for observed results.
 
 ## Environment and submission
 
-`submit_aou.py` reads these required environment variables. They must describe
+`submit_aou.py` reads these environment variables. They must describe
 real resources accessible to the selected workspace; no placeholder JSON is
-used:
+used. All are required except `AOU_REFERENCE_CTN_URIS`, which is set only under
+the Gaussian declaration:
 
 | Variable | Value supplied by the workspace/operator |
 | --- | --- |
@@ -224,7 +265,7 @@ used:
 | `WORKBENCH_CONTEXT_PARENT_DIR` | Local isolated Workbench context directory |
 | `AOU_RUNTIME_IMAGE` | Accessible Linux Python 3.12 image pinned with `@sha256:` |
 | `AOU_WHEELHOUSE_URI` | Staged tar of Linux CPython 3.12 dependency wheels |
-| `AOU_REFERENCE_CTN_URIS` | Space-separated staged external CTN archives, one per requested PGS |
+| `AOU_REFERENCE_CTN_URIS` | Space-separated staged external CTN archives, one per requested PGS; only with `score_law: reference_ctn_gaussian` |
 | `AOU_PHENOTYPE_LIBRARY_URI` | Staged OHDSI PhenotypeLibrary ZIP snapshot |
 | `AOU_SHARED_FEATURES_URI` | Existing pgsEngine `shared_features.tar.gz` |
 | `AOU_ANCESTRY_URI` | Published ancestry-predictions TSV for this CDR |
@@ -319,7 +360,10 @@ support, missing scores and completion without exposing exception text.
 ## Runtime and iteration budget
 
 Stage wheels satisfying `aou_requirements.txt` once, including the pinned
-gamfit wheel and all its transitive dependencies. The task installs only
+gamfit wheel and all its transitive dependencies. The declared-law anchor needs
+a gamfit release that carries the declared-law survival anchor
+(SauersML/gam#2923); `gamfit_version` in the analysis configuration must match
+the pinned wheel. The task installs only
 binary wheels with `--no-index`; it never compiles or downloads dependencies.
 Use a Linux Python 3.12 runtime image that supplies the system libraries those
 wheels require. The runtime image digest, installed versions, gamfit build
@@ -342,9 +386,10 @@ superlinear; measure it at two sizes before raising the cap far past the
 measurement. Provenance records the largest allowed cap as `fit_budget_rows`.
 The budget is a compute bound and stays out of the checkpoint identity; the
 cap itself does not.
-One reference CTN is trained externally per endpoint. Development and final
-evaluation require four cause-specific fits per endpoint and no AoU CTN fits.
-The external trainer uses an explicit two-interior-knot CTN response basis.
+Development and final evaluation require four cause-specific fits per endpoint
+and no AoU CTN fits. Under the Gaussian declaration one reference CTN is
+trained externally per endpoint with an explicit two-interior-knot CTN
+response basis.
 The outcome fits use the configured time basis and run
 sequentially with a checkpoint after each completed unit. Each fit has a
 180-second wall cap, each query a 120-second cap and a billed-byte ceiling;
@@ -379,9 +424,11 @@ for wdl in *.wdl; do miniwdl check "$wdl"; done
 The suite takes under a minute (93 tests on MSI acl42). GitHub Actions runs the
 same commands on every push that touches `examples/biobank`.
 
-The native acceptance check applies the saved external CTN to real public
-reference predictors and fits synthetic survival outcomes. It checks a
-PC-varying fit, held-out cumulative hazards, save/load and batch equivalence:
+The native acceptance check fits synthetic survival outcomes on real public
+reference predictors twice: anchored on the declared law of the training
+scores, and under the frozen reference-CTN Gaussian declaration. Each arm
+checks a PC-varying fit, held-out cumulative hazards, save/load and batch
+equivalence:
 
 ```bash
 python examples/biobank/test_aou_runtime.py \

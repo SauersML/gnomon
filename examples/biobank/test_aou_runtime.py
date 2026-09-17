@@ -1,4 +1,5 @@
-"""MSI acceptance: frozen public-reference CTN and synthetic survival outcomes."""
+"""MSI acceptance: synthetic survival outcomes on public reference predictors, anchored on
+the declared training-score law and under the frozen reference-CTN Gaussian declaration."""
 import argparse
 import json
 from pathlib import Path
@@ -46,19 +47,23 @@ def main():
     frame_path = args.output / "synthetic.parquet"
     frame.to_parquet(frame_path, index=False)
     config = {"num_pcs": len(pcs), "baseline_centers": len(pcs) + 2, "slope_centers": len(pcs) + 2,
-              "time_num_internal_knots": 2,
+              "time_num_internal_knots": 2, "survival_time_anchor": None,
               "horizons_years": [1., 2.], "grid_intervals": 20}
-    config_path = args.output / "config.json"
-    config_path.write_text(json.dumps(config))
-    bounded_fit([sys.executable, str(Path(__file__).with_name("aou_survival.py")), "fit",
-                 "--frame", str(frame_path), "--config", str(config_path),
-                 "--transform-model", str(transform_path),
-                 "--cause", "1", "--output", str(args.output)],
-                90, args.output / "fit.log")
-    with np.load(args.output / "hazards.npz") as artifact:
-        cif = cif_from_hazards(artifact["hazards"][None, :, :])
-    assert np.isfinite(cif).all() and (np.diff(cif, axis=2) >= -1e-10).all()
-    print("Frozen external CTN, synthetic survival, save/load and batch invariance passed.")
+    for score_law, transform_args in [("declared_empirical", []),
+                                      ("reference_ctn_gaussian", ["--transform-model", str(transform_path)])]:
+        output = args.output / score_law
+        output.mkdir(exist_ok=True)
+        config_path = output / "config.json"
+        config_path.write_text(json.dumps(dict(config, score_law=score_law)))
+        bounded_fit([sys.executable, str(Path(__file__).with_name("aou_survival.py")), "fit",
+                     "--frame", str(frame_path), "--config", str(config_path), *transform_args,
+                     "--cause", "1", "--output", str(output)],
+                    90, output / "fit.log")
+        with np.load(output / "hazards.npz") as artifact:
+            cif = cif_from_hazards(artifact["hazards"][None, :, :])
+        assert np.isfinite(cif).all() and (np.diff(cif, axis=2) >= -1e-10).all()
+    print("Declared training-law anchor and frozen external CTN: synthetic survival, "
+          "save/load and batch invariance passed.")
 
 
 if __name__ == "__main__":

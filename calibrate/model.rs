@@ -1,4 +1,12 @@
 pub use gam::types::LinkFunction;
+use gam::families::survival::{
+    SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
+    predict_survival,
+};
+use gam::inference::model::{FittedModel, FittedModelPayload};
+use gam::predict::FittedModelPredictExt;
+
+use crate::calibrate::runtime::on_gam_pool;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -51,6 +59,32 @@ pub enum ModelFamily {
     Survival,
 }
 
+/// The law of the score that a marginal-slope fit anchors its marginal index
+/// on. The score is never transformed to reach either law.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LatentLaw {
+    /// The weighted empirical law of the training rows' scores: the same rows,
+    /// weights and eligibility the outcome model is fitted on. It is pooled
+    /// over the context; its adequacy within a context stratum is a
+    /// diagnostic, not an assumption.
+    #[default]
+    Empirical,
+    /// An explicit declaration that the score is standard normal given the
+    /// context, for a score already on that scale (for example a reference
+    /// transform's output).
+    StandardNormal,
+}
+
+impl LatentLaw {
+    /// gam's `latent_measure` name for this law.
+    pub fn latent_measure(self) -> &'static str {
+        match self {
+            Self::Empirical => "global-empirical",
+            Self::StandardNormal => "standard-normal",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
@@ -58,10 +92,11 @@ pub struct ModelConfig {
     pub pgs_basis_config: SmoothConfig,
     pub pc_configs: Vec<PrincipalComponentConfig>,
     pub pgs_range: (f64, f64),
-    pub max_iterations: usize,
-    pub convergence_tolerance: f64,
-    pub reml_max_iterations: usize,
-    pub reml_convergence_tolerance: f64,
+    /// Overrides gam's outer iteration cap; `None` keeps gam's own.
+    pub reml_max_iterations: Option<usize>,
+    /// Overrides gam's outer convergence tolerance; `None` keeps gam's own.
+    pub reml_convergence_tolerance: Option<f64>,
+    pub latent_law: LatentLaw,
     #[serde(default)]
     pub survival: Option<SurvivalModelConfig>,
 }
@@ -73,10 +108,9 @@ impl Default for ModelConfig {
             pgs_basis_config: SmoothConfig { num_centers: 8 },
             pc_configs: Vec::new(),
             pgs_range: (0.0, 0.0),
-            max_iterations: 200,
-            convergence_tolerance: 1e-7,
-            reml_max_iterations: 50,
-            reml_convergence_tolerance: 1e-3,
+            reml_max_iterations: None,
+            reml_convergence_tolerance: None,
+            latent_law: LatentLaw::default(),
             survival: None,
         }
     }
@@ -88,12 +122,10 @@ impl Default for ModelConfig {
 pub struct TrainedModel {
     pub(super) format_version: u32,
     pub config: ModelConfig,
-    pub saved: gam::inference::model::FittedModelPayload,
-    pub latent_score_model: Option<gam::inference::model::FittedModelPayload>,
+    pub saved: FittedModelPayload,
 }
 
-pub(super) const MODEL_BUNDLE_VERSION: u32 = 1;
-pub(super) const LATENT_SCORE_HEADER: &str = "latent_score";
+pub(super) const MODEL_BUNDLE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PredictDetailed {
@@ -168,7 +200,7 @@ pub(super) fn predictor_headers(num_pcs: usize) -> Vec<String> {
 // pulling from `p`, `sex`, and `pcs` based on header name. Columns the model
 // references but we do not own (none in v1) would error out.
 fn build_predict_data(
-    saved: &gam::inference::model::FittedModelPayload,
+    saved: &FittedModelPayload,
     p: ArrayView1<f64>,
     sex: ArrayView1<f64>,
     pcs: ArrayView2<f64>,
@@ -230,26 +262,24 @@ fn build_predict_data(
     Ok((data, col_map))
 }
 
-pub(super) fn predict_eta_mean(
-    payload: &gam::inference::model::FittedModelPayload,
-    p: ArrayView1<f64>,
-    sex: ArrayView1<f64>,
-    pcs: ArrayView2<f64>,
-) -> Result<gam::predict::PredictResult, ModelError> {
-    let (data, col_map) = build_predict_data(payload, p, sex, pcs)?;
-    predict_from_data(payload, &data, &col_map)
-}
-
 fn predict_from_data(
-    payload: &gam::inference::model::FittedModelPayload,
+    payload: &FittedModelPayload,
     data: &Array2<f64>,
     col_map: &HashMap<String, usize>,
 ) -> Result<gam::predict::PredictResult, ModelError> {
-    let model = gam::inference::model::FittedModel::from_payload(payload.clone());
+    on_gam_pool(|| predict_from_data_on_pool(payload, data, col_map)).map_err(ModelError::Predict)?
+}
+
+fn predict_from_data_on_pool(
+    payload: &FittedModelPayload,
+    data: &Array2<f64>,
+    col_map: &HashMap<String, usize>,
+) -> Result<gam::predict::PredictResult, ModelError> {
+    let model = FittedModel::from_payload(payload.clone());
     let n = data.nrows();
     let offset = Array1::<f64>::zeros(n);
     let offset_noise = Array1::<f64>::zeros(n);
-    let pred_input = gam::inference::predict_input::build_predict_input_for_model(
+    let pred_input = gam::families::inference::predict_input::build_predict_input_for_model(
         &model,
         data.view(),
         col_map,
@@ -275,48 +305,14 @@ impl TrainedModel {
                 self.format_version
             )));
         }
-        let saved = gam::inference::model::FittedModel::from_payload(self.saved.clone());
+        let saved = FittedModel::from_payload(self.saved.clone());
         saved
             .validate_for_persistence()
-            .map_err(ModelError::Serde)?;
+            .map_err(|error| ModelError::Serde(error.to_string()))?;
         saved
             .validate_numeric_finiteness()
-            .map_err(ModelError::Serde)?;
-        match (&self.saved.z_column, &self.latent_score_model) {
-            (None, None) => {}
-            (Some(name), Some(latent)) if name == LATENT_SCORE_HEADER => {
-                let latent = gam::inference::model::FittedModel::from_payload(latent.clone());
-                latent
-                    .validate_for_persistence()
-                    .map_err(ModelError::Serde)?;
-                latent
-                    .validate_numeric_finiteness()
-                    .map_err(ModelError::Serde)?;
-            }
-            _ => {
-                return Err(ModelError::Serde(
-                    "calibration model has inconsistent latent-score metadata".into(),
-                ));
-            }
-        }
+            .map_err(|error| ModelError::Serde(error.to_string()))?;
         Ok(())
-    }
-
-    fn prediction_data(
-        &self,
-        p: ArrayView1<f64>,
-        sex: ArrayView1<f64>,
-        pcs: ArrayView2<f64>,
-    ) -> Result<(Array2<f64>, HashMap<String, usize>), ModelError> {
-        let (mut data, mut col_map) = build_predict_data(&self.saved, p, sex, pcs)?;
-        if let Some(latent) = &self.latent_score_model {
-            let z = predict_eta_mean(latent, p, sex, pcs)?.eta;
-            let index = data.ncols();
-            data.push_column(z.view())
-                .map_err(|error| ModelError::Predict(error.to_string()))?;
-            col_map.insert(LATENT_SCORE_HEADER.to_string(), index);
-        }
-        Ok((data, col_map))
     }
 
     fn predict_result(
@@ -325,7 +321,7 @@ impl TrainedModel {
         sex: ArrayView1<f64>,
         pcs: ArrayView2<f64>,
     ) -> Result<gam::predict::PredictResult, ModelError> {
-        let (data, col_map) = self.prediction_data(p, sex, pcs)?;
+        let (data, col_map) = build_predict_data(&self.saved, p, sex, pcs)?;
         predict_from_data(&self.saved, &data, &col_map)
     }
 
@@ -435,7 +431,7 @@ impl TrainedModel {
         // Build a (covariate) data matrix in training-header order, then
         // append entry/exit time columns under whatever names the SavedModel
         // recorded as `survival_entry` / `survival_exit`.
-        let (cov_data, mut col_map) = self.prediction_data(p_new, sex_new, pcs_new)?;
+        let (cov_data, mut col_map) = build_predict_data(&self.saved, p_new, sex_new, pcs_new)?;
         let entry_name = self.saved.survival_entry.clone().ok_or_else(|| {
             ModelError::Predict("survival model is missing entry column metadata".into())
         })?;
@@ -466,12 +462,14 @@ impl TrainedModel {
             ));
         }
 
-        let model = gam::inference::model::FittedModel::from_payload(self.saved.clone());
+        let model = FittedModel::from_payload(self.saved.clone());
         let primary_offset = Array1::<f64>::zeros(n);
         let noise_offset = Array1::<f64>::zeros(n);
 
-        // Per-row exit cumulative hazard (one column at age_exit).
-        let exit_req = gam::families::survival_predict::SurvivalPredictRequest {
+        // Per-row exit cumulative hazard (one column at age_exit). The plug-in
+        // estimand keeps entry and exit hazards on one coefficient vector, so
+        // their difference is a conditional risk.
+        let exit_req = SurvivalPredictRequest {
             model: &model,
             data: data.view(),
             col_map: &col_map,
@@ -479,9 +477,13 @@ impl TrainedModel {
             primary_offset: &primary_offset,
             noise_offset: &noise_offset,
             time_grid: None,
+            with_uncertainty: false,
+            estimand: SurvivalPredictEstimand::Plugin,
         };
-        let exit_result = gam::families::survival_predict::predict_survival(exit_req)
-            .map_err(ModelError::Predict)?;
+        let exit_result =
+            on_gam_pool(|| predict_survival(exit_req, SurvivalPredictionCovarianceMode::Conditional))
+                .map_err(ModelError::Predict)?
+                .map_err(|error| ModelError::Predict(error.to_string()))?;
         let cumulative_hazard_exit = exit_result.cumulative_hazard.column(0).to_owned();
 
         // Per-row entry cumulative hazard. gam's predict_survival evaluates
@@ -494,7 +496,7 @@ impl TrainedModel {
         for i in 0..n {
             entry_data[[i, n_cov + 1]] = age_entry[i];
         }
-        let entry_req = gam::families::survival_predict::SurvivalPredictRequest {
+        let entry_req = SurvivalPredictRequest {
             model: &model,
             data: entry_data.view(),
             col_map: &col_map,
@@ -502,9 +504,13 @@ impl TrainedModel {
             primary_offset: &primary_offset,
             noise_offset: &noise_offset,
             time_grid: None,
+            with_uncertainty: false,
+            estimand: SurvivalPredictEstimand::Plugin,
         };
-        let entry_result = gam::families::survival_predict::predict_survival(entry_req)
-            .map_err(ModelError::Predict)?;
+        let entry_result =
+            on_gam_pool(|| predict_survival(entry_req, SurvivalPredictionCovarianceMode::Conditional))
+                .map_err(ModelError::Predict)?
+                .map_err(|error| ModelError::Predict(error.to_string()))?;
         let cumulative_hazard_entry = entry_result.cumulative_hazard.column(0).to_owned();
 
         survival_risks_from_hazards(cumulative_hazard_entry, cumulative_hazard_exit)

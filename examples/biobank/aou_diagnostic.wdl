@@ -123,7 +123,8 @@ task diagnose {
                     Path(f"diagnostic__{label}.txt").write_text(label + "\n")
                 parent = Path(member.name).parent
                 stage = "final" if "final" in parent.parts else "development" if "development" in parent.parts else "other"
-                if parent.name in ("pc_varying_ctn_1", "pc_varying_ctn_2", "no_score_1", "no_score_2"):
+                if parent.name in ("pc_varying_1", "pc_varying_2", "pc_varying_ctn_1", "pc_varying_ctn_2",
+                                   "no_score_1", "no_score_2"):
                     wall = metrics.get("wall_seconds")
                     if isinstance(wall, (int, float)) and wall >= 0:
                         bucket = "under_2min" if wall < 120 else "under_10min" if wall < 600 else "under_30min" if wall < 1800 else "over_30min"

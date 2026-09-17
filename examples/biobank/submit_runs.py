@@ -88,7 +88,7 @@ def score_training(wb, args):
                   ancestry_predictions=required_env("AOU_ANCESTRY_URI"),
                   relatedness_prune=required_env("AOU_RELATEDNESS_PRUNE_URI"),
                   phenotype_library_archive=required_env("AOU_PHENOTYPE_LIBRARY_URI"),
-                  reference_ctn=required_env("AOU_REFERENCE_CTN_URIS").split(),
+                  reference_ctn=os.environ.get("AOU_REFERENCE_CTN_URIS", "").split(),
                   wheelhouse_archive=required_env("AOU_WHEELHOUSE_URI"),
                   runtime_image=required_env("AOU_RUNTIME_IMAGE"),
                   checkpoint_uri=f"{wb.bucket}/workflow-checkpoints/hypertension-{checkpoint_key}.tar.gz")
