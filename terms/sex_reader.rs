@@ -6,8 +6,8 @@
 //! and ALT strings, then streams the selected rows through 64-bit dosage blocks.
 //! These two passes read the bytes as the files hold them:
 //!
-//! 1. The blocks of each file (its BGZF blocks, or windows of a plain file's map)
-//!    are inflated in parallel batches, and the records are walked in order for
+//! 1. The blocks of each file (its BGZF blocks, or windows of a plain file) are
+//!    inflated or read in parallel batches, and the records are walked in order for
 //!    their chromosome, position and ALT count. Each block keeps how many records
 //!    start ahead of it and where its own first record starts.
 //! 2. Only the blocks holding selected records are read again. The GT calls of
@@ -311,7 +311,7 @@ impl<'a> TaskReader<'a> {
     }
 }
 
-/// The last block a task inflated.
+/// The last block a task inflated, or read from a plain file.
 struct BlockCache {
     inflater: Decompressor,
     /// The file and block `block` holds.
@@ -328,16 +328,19 @@ impl BlockCache {
         index: usize,
     ) -> Option<&'s [u8]> {
         let blocks = &scan.parts[part].blocks;
-        let Some(frames) = &blocks.frames else {
-            return (index < blocks.len()).then(|| blocks.plain_block(index));
-        };
+        if index >= blocks.len() {
+            return None;
+        }
         if self.cached != Some((part, index)) {
             self.cached = None;
-            inflate(
-                &blocks.map[frames.get(index)?.clone()],
-                &mut self.inflater,
-                &mut self.block,
-            )?;
+            match &blocks.frames {
+                Some(frames) => inflate(
+                    &blocks.map[frames[index].clone()],
+                    &mut self.inflater,
+                    &mut self.block,
+                )?,
+                None => blocks.read_plain(index, &mut self.block)?,
+            }
             self.cached = Some((part, index));
         }
         Some(&self.block)
@@ -518,16 +521,31 @@ fn pack_vcf_calls(
 }
 
 /// The calls of the sample columns `rest`, whose FORMAT leads with GT, packed
-/// into one row per ALT of `alts`. A column is read up to the end of its GT, and
-/// a call of one digit, or of two one-digit alleles and a separator, is coded
-/// without [`call_code`], as it codes one. Returns the number of samples read.
+/// into one row per ALT of `alts`, one walk over the columns per ALT. Returns the
+/// number of samples read.
 fn pack_leading_gt(
-    mut rest: &[u8],
+    rest: &[u8],
     alts: &[(usize, Option<LocusClass>)],
     n_samples: usize,
     packed: &mut [u8],
 ) -> Option<usize> {
     let row_len = n_samples.div_ceil(4);
+    let mut sample = 0;
+    for (row, &(alt, _)) in packed.chunks_exact_mut(row_len).zip(alts) {
+        sample = pack_leading_gt_row(rest, alt, n_samples, row)?;
+    }
+    Some(sample)
+}
+
+/// [`pack_leading_gt`] for ALT `alt` into its packed `row`. A column is read up to
+/// the end of its GT, and a call of one digit, or of two one-digit alleles and a
+/// separator, is coded without [`call_code`], as it codes one.
+fn pack_leading_gt_row(
+    mut rest: &[u8],
+    alt: usize,
+    n_samples: usize,
+    row: &mut [u8],
+) -> Option<usize> {
     // Whether a GT of `len` bytes ends the field there.
     let ends_at = |rest: &[u8], len: usize| {
         rest.get(len)
@@ -535,35 +553,27 @@ fn pack_leading_gt(
     };
     let mut sample = 0;
     while !rest.is_empty() && sample < n_samples {
-        let gt_len = if rest.len() >= 3
+        let (code, gt_len) = if rest.len() >= 3
             && rest[0].is_ascii_digit()
             && matches!(rest[1], b'/' | b'|')
             && rest[2].is_ascii_digit()
             && ends_at(rest, 3)
         {
             let (first, second) = (usize::from(rest[0] - b'0'), usize::from(rest[2] - b'0'));
-            for (row, &(alt, _)) in packed.chunks_exact_mut(row_len).zip(alts) {
-                let code = if (first == alt) != (second == alt) {
-                    HET_CODE
-                } else {
-                    HOM_CODE
-                };
-                set_code(row, sample, code);
-            }
-            3
+            let code = if (first == alt) != (second == alt) {
+                HET_CODE
+            } else {
+                HOM_CODE
+            };
+            (code, 3)
         } else if rest[0].is_ascii_digit() && ends_at(rest, 1) {
-            for row in packed.chunks_exact_mut(row_len).take(alts.len()) {
-                set_code(row, sample, HOM_CODE);
-            }
-            1
+            (HOM_CODE, 1)
         } else {
             let column_len = memchr(b'\t', rest).unwrap_or(rest.len());
             let gt_len = memchr(b':', &rest[..column_len]).unwrap_or(column_len);
-            for (row, &(alt, _)) in packed.chunks_exact_mut(row_len).zip(alts) {
-                set_code(row, sample, call_code(&rest[..gt_len], alt)?);
-            }
-            gt_len
+            (call_code(&rest[..gt_len], alt)?, gt_len)
         };
+        set_code(row, sample, code);
         sample += 1;
         rest = match rest.get(gt_len) {
             Some(b'\t') => &rest[gt_len + 1..],
@@ -811,6 +821,9 @@ fn is_bcf_path(path: &Path) -> bool {
 
 /// A local file's uncompressed bytes, as blocks that read independently.
 struct Blocks {
+    /// Where there is a positional read, the file it reads plain windows from.
+    #[cfg(unix)]
+    file: File,
     map: Mmap,
     /// The frame of every BGZF block in file order, or `None` for a plain file,
     /// read in windows of `window` bytes.
@@ -832,6 +845,8 @@ impl Blocks {
             None
         };
         Some(Self {
+            #[cfg(unix)]
+            file,
             map,
             frames,
             window: window.max(1),
@@ -845,9 +860,34 @@ impl Blocks {
         }
     }
 
-    fn plain_block(&self, index: usize) -> &[u8] {
-        let start = index * self.window;
-        &self.map[start..(start + self.window).min(self.map.len())]
+    /// The bytes of window `index` of a plain file.
+    fn plain_range(&self, index: usize) -> Option<Range<usize>> {
+        let start = index.checked_mul(self.window)?;
+        (start < self.map.len())
+            .then(|| start..start.saturating_add(self.window).min(self.map.len()))
+    }
+
+    /// Reads window `index` of a plain file into `buffer` with one positional read,
+    /// so the text is never faulted into the map: faults on one map serialize the
+    /// threads that take them.
+    #[cfg(unix)]
+    fn read_plain(&self, index: usize, buffer: &mut Vec<u8>) -> Option<()> {
+        use std::os::unix::fs::FileExt;
+
+        let range = self.plain_range(index)?;
+        buffer.resize(range.len(), 0);
+        self.file
+            .read_exact_at(buffer, u64::try_from(range.start).ok()?)
+            .ok()
+    }
+
+    /// [`Blocks::read_plain`] where there is no positional read: a copy out of the
+    /// map.
+    #[cfg(not(unix))]
+    fn read_plain(&self, index: usize, buffer: &mut Vec<u8>) -> Option<()> {
+        buffer.clear();
+        buffer.extend_from_slice(self.map.get(self.plain_range(index)?)?);
+        Some(())
     }
 }
 
@@ -895,8 +935,8 @@ fn inflate(frame: &[u8], inflater: &mut Decompressor, block: &mut Vec<u8>) -> Op
 
 /// Reads blocks `range` in parallel, running `scan` over each block's bytes with
 /// a state of its own, and returns the blocks' bytes in order: a BGZF block
-/// inflated into its buffer, a plain window borrowed from the map. `None` when a
-/// block does not inflate or `scan` refuses one.
+/// inflated into its buffer, a plain window read into its buffer. `None` when a
+/// block does not read or `scan` refuses one.
 fn read_window<'a, S: Default + Send>(
     blocks: &'a Blocks,
     range: Range<usize>,
@@ -919,19 +959,19 @@ fn read_window<'a, S: Default + Send>(
                     && scan(buffer, state)
             })
             .all(|read| read),
-        None => states
+        None => buffers[..n]
             .par_iter_mut()
-            .zip(range.clone())
-            .all(|(state, index)| scan(blocks.plain_block(index), state)),
+            .zip(states.par_iter_mut())
+            .zip(range)
+            .all(|((buffer, state), index)| {
+                blocks.read_plain(index, buffer).is_some() && scan(buffer, state)
+            }),
     };
     if !read {
         return None;
     }
     let buffers: &'a Vec<Vec<u8>> = buffers;
-    Some(match &blocks.frames {
-        Some(_) => buffers[..n].iter().map(Vec::as_slice).collect(),
-        None => range.map(|index| blocks.plain_block(index)).collect(),
-    })
+    Some(buffers[..n].iter().map(Vec::as_slice).collect())
 }
 
 /// The first pass over one VCF file: its records' loci, and the index of its
