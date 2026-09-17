@@ -172,7 +172,13 @@ mod pool_tests {
     }
 
     fn four_person_prep(rows: usize) -> Arc<PreparationResult> {
+        prep_for_rows(&(0..rows as u64).collect::<Vec<_>>(), rows as u64)
+    }
+
+    /// A four-person preparation that scores the `required` rows of a `total`-row .bed.
+    fn prep_for_rows(required: &[u64], total: u64) -> Arc<PreparationResult> {
         let people = 4usize;
+        let rows = required.len();
         let names = vec!["S0".to_string()];
         let offsets: Vec<u64> = (0..=rows as u64).collect();
         let exact = crate::score::cells::ExactPlan::new(
@@ -188,7 +194,7 @@ mod pool_tests {
             exact,
             vec![0; rows],
             offsets,
-            (0..rows as u64).map(BimRowIndex).collect(),
+            required.iter().map(|&row| BimRowIndex(row)).collect(),
             Vec::new(),
             names,
             vec![rows as u32],
@@ -196,7 +202,7 @@ mod pool_tests {
             (0..people).map(|i| format!("I{i}")).collect(),
             people,
             people,
-            rows as u64,
+            total,
             rows,
             1,
             (0..people as u32)
@@ -346,6 +352,118 @@ mod pool_tests {
             dense_rx.recv().is_err() && sparse_rx.recv().is_err(),
             "the producer sends nothing more"
         );
+    }
+
+    /// A .bed image of one-byte rows that counts its reads and fails any read touching `bad_row`.
+    struct CountingImage {
+        image: BedImage,
+        reads: AtomicU64,
+        bad_row: Option<u64>,
+    }
+
+    impl ByteRangeSource for CountingImage {
+        fn len(&self) -> u64 {
+            self.image.len()
+        }
+
+        fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if let Some(bad) = self.bad_row
+                && offset <= 3 + bad
+                && 3 + bad < offset + dst.len() as u64
+            {
+                return Err(PipelineError::Io(format!("row {bad} is unreadable")));
+            }
+            self.image.read_at(offset, dst)
+        }
+    }
+
+    fn counting_image(rows: &[u8], bad_row: Option<u64>) -> Arc<CountingImage> {
+        let mut bytes = vec![0x6c, 0x1b, 0x01];
+        bytes.extend_from_slice(rows);
+        Arc::new(CountingImage {
+            image: BedImage(bytes),
+            reads: AtomicU64::new(0),
+            bad_row,
+        })
+    }
+
+    /// Runs a producer over the `required` rows of `source` with every row on the dense path,
+    /// giving the rows it sent, in order, and the text of the error it sent, if any.
+    fn run_producer(
+        source: Arc<CountingImage>,
+        required: &[u64],
+        total: u64,
+        read_batch: usize,
+    ) -> (Vec<Vec<u8>>, Option<String>) {
+        let pool = empty_pool(required.len());
+        for _ in 0..required.len() {
+            pool.push(Vec::new()).expect("room in the pool");
+        }
+        let (dense_tx, dense_rx) = bounded(required.len() + 1);
+        producer_thread_with_read_batch(
+            source,
+            prep_for_rows(required, total),
+            None,
+            dense_tx,
+            pool,
+            Arc::new(AtomicU64::new(0)),
+            |_: &[u8]| ComputePath::Pivot,
+            None,
+            read_batch,
+        );
+        let mut sent = Vec::new();
+        let mut error = None;
+        for item in dense_rx.try_iter() {
+            match item {
+                Ok(work_item) => sent.push(work_item.data),
+                Err(err) => error = Some(err.to_string()),
+            }
+        }
+        (sent, error)
+    }
+
+    /// Reading adjacent rows in runs gives every row the bytes one read per row gives, in
+    /// order, with far fewer reads: a long run, a run too short to share a read, a repeated
+    /// row, a gap, and a run that reaches the last row.
+    #[test]
+    fn reading_rows_in_runs_gives_the_bytes_of_one_read_per_row() {
+        let total = 300u64;
+        let rows: Vec<u8> = (0..total).map(|row| (row * 7 % 251) as u8).collect();
+        let mut required: Vec<u64> = (0..100).collect();
+        required.extend(150..160);
+        required.push(159);
+        required.extend(200..300);
+        let expected: Vec<Vec<u8>> = required.iter().map(|&row| vec![rows[row as usize]]).collect();
+        for read_batch in [1, 16, 32, 1000] {
+            let source = counting_image(&rows, None);
+            let (sent, error) = run_producer(Arc::clone(&source), &required, total, read_batch);
+            assert_eq!(error, None, "read_batch {read_batch}");
+            assert_eq!(sent, expected, "read_batch {read_batch}");
+            let reads = source.reads.load(Ordering::SeqCst) as usize;
+            if read_batch == 1 {
+                assert_eq!(reads, required.len());
+            } else {
+                assert!(reads * 4 < required.len(), "{reads} reads at read_batch {read_batch}");
+            }
+        }
+    }
+
+    /// A run that fails to read sends every row before the unreadable one and then the error,
+    /// exactly as one read per row does.
+    #[test]
+    fn a_run_that_fails_to_read_sends_what_one_read_per_row_sends() {
+        let total = 120u64;
+        let rows: Vec<u8> = (0..total).map(|row| row as u8).collect();
+        let required: Vec<u64> = (0..total).collect();
+        let bad = 70u64;
+        let one_per_row = run_producer(counting_image(&rows, Some(bad)), &required, total, 1);
+        assert_eq!(one_per_row.0.len(), bad as usize);
+        assert!(one_per_row.1.is_some(), "one read per row reports the unreadable row");
+        for read_batch in [16, 32, 64, 1000] {
+            let batched = run_producer(counting_image(&rows, Some(bad)), &required, total, read_batch);
+            assert_eq!(batched, one_per_row, "read_batch {read_batch}");
+        }
     }
 
     #[test]
@@ -756,6 +874,77 @@ fn prepare_pooled_buffer(
     Ok(buffer)
 }
 
+/// The fewest adjacent rows read with one `read_at`. A source that decodes a long read in
+/// parallel does so from sixteen whole rows on; shorter runs gain nothing from sharing a read.
+pub const PARALLEL_READ_ROWS: usize = 16;
+
+/// Reads a producer's required rows: one row per `read_at`, or, with a `read_batch` of at
+/// least [`PARALLEL_READ_ROWS`], a run of adjacent rows with one `read_at` whose rows are then
+/// handed out in order. A run that fails to read is read again one row at a time, so every
+/// row gives the bytes and the error that a one-row read gives.
+struct RowReader {
+    read_batch: usize,
+    /// The first row held in `bytes`, and how many rows it holds.
+    first: u64,
+    held: usize,
+    bytes: Vec<u8>,
+    /// Rows before this one are read one at a time, after a run that failed to read.
+    single_until: u64,
+}
+
+impl RowReader {
+    fn new(read_batch: usize) -> Self {
+        Self {
+            read_batch,
+            first: 0,
+            held: 0,
+            bytes: Vec::new(),
+            single_until: 0,
+        }
+    }
+
+    /// Fills `dst`, one row wide, with required row `i`, which lies inside `source`.
+    fn read(
+        &mut self,
+        source: &dyn ByteRangeSource,
+        required: &[BimRowIndex],
+        i: usize,
+        dst: &mut [u8],
+    ) -> Result<(), PipelineError> {
+        let row = required[i].0;
+        let width = dst.len();
+        let row_bytes = width as u64;
+        if row >= self.first && row < self.first + self.held as u64 {
+            let start = (row - self.first) as usize * width;
+            dst.copy_from_slice(&self.bytes[start..start + width]);
+            return Ok(());
+        }
+        self.held = 0;
+        if self.read_batch >= PARALLEL_READ_ROWS && row >= self.single_until {
+            let mut run = 1usize;
+            while run < self.read_batch
+                && required
+                    .get(i + run)
+                    .is_some_and(|next| next.0 == row + run as u64)
+                && 3 + (row + run as u64 + 1) * row_bytes <= source.len()
+            {
+                run += 1;
+            }
+            if run >= PARALLEL_READ_ROWS {
+                self.bytes.resize(run * width, 0);
+                if source.read_at(3 + row * row_bytes, &mut self.bytes).is_ok() {
+                    self.first = row;
+                    self.held = run;
+                    dst.copy_from_slice(&self.bytes[..width]);
+                    return Ok(());
+                }
+                self.single_until = row + run as u64;
+            }
+        }
+        source.read_at(3 + row * row_bytes, dst)
+    }
+}
+
 impl<'a> SpoolPlan<'a> {
     /// Whether the required variant at this position feeds the complex pass.
     #[inline(always)]
@@ -844,7 +1033,38 @@ pub fn producer_thread<'a, F>(
     buffer_pool: Arc<RowBufferPool>,
     variants_processed_count: Arc<AtomicU64>,
     path_decider: F,
+    spool: Option<SpoolPlan<'a>>,
+) where
+    F: Fn(&[u8]) -> ComputePath,
+{
+    producer_thread_with_read_batch(
+        source,
+        prep_result,
+        sparse_tx,
+        dense_tx,
+        buffer_pool,
+        variants_processed_count,
+        path_decider,
+        spool,
+        1,
+    );
+}
+
+/// As [`producer_thread`], reading a run of up to `read_batch` adjacent required rows with
+/// one `read_at` when at least [`PARALLEL_READ_ROWS`] of them sit together, so a source that
+/// decodes a long read on the rayon pool decodes the run's rows in parallel. Rows go out in
+/// the same order, with the same bytes and the same first error, as one read per row gives.
+#[allow(clippy::too_many_arguments)]
+pub fn producer_thread_with_read_batch<'a, F>(
+    source: Arc<dyn ByteRangeSource>,
+    prep_result: Arc<PreparationResult>,
+    sparse_tx: Option<Sender<Result<WorkItem, PipelineError>>>,
+    dense_tx: Sender<Result<WorkItem, PipelineError>>,
+    buffer_pool: Arc<RowBufferPool>,
+    variants_processed_count: Arc<AtomicU64>,
+    path_decider: F,
     mut spool: Option<SpoolPlan<'a>>,
+    read_batch: usize,
 ) where
     F: Fn(&[u8]) -> ComputePath,
 {
@@ -858,6 +1078,7 @@ pub fn producer_thread<'a, F>(
     let bytes_per_variant = prep_result.bytes_per_variant as usize;
     let bytes_per_variant_u64 = prep_result.bytes_per_variant;
     let mut local_variants_processed: u64 = 0;
+    let mut reader = RowReader::new(read_batch);
 
     match spool.as_mut() {
         Some(sp) => {
@@ -887,7 +1108,12 @@ pub fn producer_thread<'a, F>(
                     break;
                 }
 
-                if let Err(err) = source.read_at(offset, buffer.as_mut_slice()) {
+                if let Err(err) = reader.read(
+                    source.as_ref(),
+                    &prep_result.required_bim_indices,
+                    i,
+                    buffer.as_mut_slice(),
+                ) {
                     send_error(err);
                     break;
                 }
@@ -955,7 +1181,12 @@ pub fn producer_thread<'a, F>(
                     break;
                 }
 
-                if let Err(err) = source.read_at(offset, buffer.as_mut_slice()) {
+                if let Err(err) = reader.read(
+                    source.as_ref(),
+                    &prep_result.required_bim_indices,
+                    i,
+                    buffer.as_mut_slice(),
+                ) {
                     send_error(err);
                     break;
                 }

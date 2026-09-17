@@ -522,6 +522,9 @@ pub fn format_bytes(bytes: usize) -> String {
     }
 }
 
+/// Adjacent rows a local PGEN's producer reads with one call, per rayon thread.
+const PGEN_READ_ROWS_PER_THREAD: usize = 64;
+
 pub fn make_bed_buffer_pool(
     context: &PipelineContext,
 ) -> Result<Arc<io::RowBufferPool>, PipelineError> {
@@ -646,6 +649,16 @@ fn run_single_file_pipeline(
         return run_small_keep_direct_single_file(context, bed_source);
     }
     let shared_source = bed_source.byte_source();
+    // A local PGEN decodes a long read of adjacent rows on the rayon pool, so with more than
+    // one thread its producer reads rows in runs. Every other source reads one row per call.
+    let read_batch = if crate::shared::files::is_pgen_path(bed_path)
+        && bed_path.exists()
+        && rayon::current_num_threads() > 1
+    {
+        PGEN_READ_ROWS_PER_THREAD * rayon::current_num_threads()
+    } else {
+        1
+    };
 
     let channel_bound = context.work_channel_bound()?;
     let (sparse_tx, sparse_rx) = bounded::<Result<WorkItem, PipelineError>>(channel_bound);
@@ -774,7 +787,7 @@ fn run_single_file_pipeline(
                             } else {
                                 None
                             };
-                            io::producer_thread(
+                            io::producer_thread_with_read_batch(
                                 Arc::clone(&source),
                                 Arc::clone(&prep_result),
                                 Some(sparse_tx),
@@ -783,6 +796,7 @@ fn run_single_file_pipeline(
                                 producer_thread_count,
                                 path_decider,
                                 spool_plan,
+                                read_batch,
                             );
                         }
                         RunStrategy::UseComplexTree => {
@@ -809,7 +823,7 @@ fn run_single_file_pipeline(
                             } else {
                                 None
                             };
-                            io::producer_thread(
+                            io::producer_thread_with_read_batch(
                                 Arc::clone(&source),
                                 Arc::clone(&prep_result),
                                 Some(sparse_tx),
@@ -818,6 +832,7 @@ fn run_single_file_pipeline(
                                 producer_thread_count,
                                 path_decider,
                                 spool_plan,
+                                read_batch,
                             );
                         }
                     }
