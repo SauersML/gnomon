@@ -1032,8 +1032,87 @@ pub(crate) fn scan_local_pvar_rows(
 
 /// The row runs of one chunk of `.pvar` data lines, or `None` where
 /// [`scan_local_pvar_rows`] refuses a line.
+///
+/// A chunk of ASCII without a vertical tab is split on its bytes, which there
+/// hold the same whitespace as the text: a vertical tab is whitespace to `trim`
+/// and `split_whitespace` but not to their byte counterparts. Other chunks are
+/// read as text.
 fn scan_pvar_chunk(chunk: &[u8], cols: PvarCols) -> Option<Vec<PvarRowRun>> {
-    let text = str::from_utf8(chunk).ok()?;
+    if !chunk.is_ascii() || memchr::memchr(0x0b, chunk).is_some() {
+        return scan_pvar_text_chunk(str::from_utf8(chunk).ok()?, cols);
+    }
+    let last = cols
+        .chrom
+        .max(cols.id)
+        .max(cols.pos)
+        .max(cols.refa)
+        .max(cols.alt);
+    let mut runs: Vec<PvarRowRun> = Vec::new();
+    // The last raw label, and the label it normalizes to.
+    let mut label: &[u8] = &[];
+    let mut chrom = String::new();
+    for line in chunk.split(|&byte| byte == b'\n') {
+        let trimmed = line.trim_ascii();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed[0] == b'#' {
+            return None;
+        }
+        let (mut raw_chrom, mut id, mut pos, mut refa, mut alt) = (None, None, None, None, None);
+        for (column, field) in trimmed
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty())
+            .take(last + 1)
+            .enumerate()
+        {
+            if column == cols.chrom {
+                raw_chrom = Some(field);
+            }
+            if column == cols.id {
+                id = Some(field);
+            }
+            if column == cols.pos {
+                pos = Some(field);
+            }
+            if column == cols.refa {
+                refa = Some(field);
+            }
+            if column == cols.alt {
+                alt = Some(field);
+            }
+        }
+        id?;
+        refa?;
+        let raw_chrom = raw_chrom?;
+        if raw_chrom != label {
+            label = raw_chrom;
+            normalize_chrom_into(str::from_utf8(raw_chrom).ok()?, &mut chrom);
+        }
+        let pos = str::from_utf8(pos?).ok()?.parse::<u64>().ok()?;
+        let alts = alt?
+            .split(|&byte| byte == b',')
+            .map(<[u8]>::trim_ascii)
+            .filter(|alt| !alt.is_empty() && *alt != b".")
+            .count();
+        if alts == 0 {
+            continue;
+        }
+        if runs.last().is_none_or(|last| last.chrom != chrom) {
+            runs.push(PvarRowRun {
+                chrom: chrom.clone(),
+                positions: Vec::new(),
+            });
+        }
+        runs.last_mut()?
+            .positions
+            .extend(std::iter::repeat_n(pos, alts));
+    }
+    Some(runs)
+}
+
+/// [`scan_pvar_chunk`] for a chunk read as text.
+fn scan_pvar_text_chunk(text: &str, cols: PvarCols) -> Option<Vec<PvarRowRun>> {
     let mut runs: Vec<PvarRowRun> = Vec::new();
     let mut chrom = String::new();
     for line in text.split('\n') {
@@ -3651,7 +3730,8 @@ mod tests {
 
     /// The `.pvar` scan must read the rows the streaming virtual `.bim` renders, on
     /// any chunking and with or without a header, across multiallelic sites, sites
-    /// without an ALT, labels the `.bim` normalizes, blank lines and line endings.
+    /// without an ALT, labels the `.bim` normalizes, blank lines and line endings,
+    /// and on the text path, which a non-ASCII label or a vertical tab takes.
     #[test]
     fn pvar_row_scan_reads_what_the_virtual_bim_renders() {
         let with_header = concat!(
@@ -3663,6 +3743,8 @@ mod tests {
             "1\t300\trs3\tA\t.\n",
             "Chr1\t400\trs4\tA\tG,.,T\n",
             "chrM\t10\trs5\tA\tG\n",
+            "\u{1f9ec}1\t20\trs8\tA\tG\n",
+            "chrM\u{0b}30\trs9\tA\t\u{0b}T\n",
             "X\t155800000\trs6\tA\tG\n",
             "PAR2\t155900000\trs7\tC\tA",
         );

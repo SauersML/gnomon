@@ -236,7 +236,17 @@ struct PackedRows {
 struct TaskReader<'a> {
     scan: &'a VariantScan,
     cache: BlockCache,
+    cursor: Option<LineCursor>,
     record: Vec<u8>,
+}
+
+/// Where the line after the last line a task read starts.
+#[derive(Clone, Copy)]
+struct LineCursor {
+    part: usize,
+    line: u64,
+    block: usize,
+    start: usize,
 }
 
 impl<'a> TaskReader<'a> {
@@ -248,6 +258,7 @@ impl<'a> TaskReader<'a> {
                 cached: None,
                 block: Vec::new(),
             },
+            cursor: None,
             record: Vec::new(),
         }
     }
@@ -262,6 +273,7 @@ impl<'a> TaskReader<'a> {
                     read_line(
                         scan,
                         &mut self.cache,
+                        &mut self.cursor,
                         selected.part,
                         selected.record + header_lines,
                         &mut self.record,
@@ -333,14 +345,26 @@ impl BlockCache {
 }
 
 /// Copies line `line` of VCF file `part`, without its newline, into `record`.
+/// A line that starts in the block where `cursor` stands, at or after the
+/// cursor's line, is walked to from the cursor rather than from the block's
+/// first line. `cursor` then stands where the next line starts.
 fn read_line(
     scan: &VariantScan,
     cache: &mut BlockCache,
+    cursor: &mut Option<LineCursor>,
     part: usize,
     line: u64,
     record: &mut Vec<u8>,
 ) -> Option<()> {
-    let (mut block, ahead, mut start) = scan.parts[part].index.locate(line)?;
+    let (mut block, mut ahead, mut start) = scan.parts[part].index.locate(line)?;
+    if let Some(at) = *cursor
+        && at.part == part
+        && at.block == block
+        && at.line <= line
+    {
+        ahead = line - at.line;
+        start = at.start;
+    }
     let bytes = cache.read(scan, part, block)?;
     for _ in 0..ahead {
         start += memchr(b'\n', bytes.get(start..)?)? + 1;
@@ -351,6 +375,12 @@ fn read_line(
         match memchr(b'\n', rest) {
             Some(end) => {
                 record.extend_from_slice(&rest[..end]);
+                *cursor = Some(LineCursor {
+                    part,
+                    line: line + 1,
+                    block,
+                    start: start + end + 1,
+                });
                 return Some(());
             }
             None => {
@@ -475,34 +505,109 @@ fn pack_vcf_calls(
             let gt_index = samples[..format_end]
                 .split(|&byte| byte == b':')
                 .position(|key| key == b"GT")?;
-            let mut rest = &samples[format_end + 1..];
-            while !rest.is_empty() && sample < n_samples {
-                let column = match memchr(b'\t', rest) {
-                    Some(end) => {
-                        let column = &rest[..end];
-                        rest = &rest[end + 1..];
-                        column
-                    }
-                    None => std::mem::take(&mut rest),
-                };
-                let gt = if gt_index == 0 {
-                    Some(memchr(b':', column).map_or(column, |end| &column[..end]))
-                } else {
-                    column.split(|&byte| byte == b':').nth(gt_index)
-                };
-                for (row, &(alt, _)) in packed.chunks_exact_mut(row_len).zip(alts) {
-                    let code = match gt {
-                        Some(gt) => call_code(gt, alt)?,
-                        None => MISSING_CODE,
-                    };
-                    set_code(row, sample, code);
-                }
-                sample += 1;
-            }
+            let rest = &samples[format_end + 1..];
+            sample = if gt_index == 0 {
+                pack_leading_gt(rest, alts, n_samples, packed)?
+            } else {
+                pack_placed_gt(rest, gt_index, alts, n_samples, packed)?
+            };
         }
     }
     mark_missing(packed, row_len, sample..n_samples);
     Some(())
+}
+
+/// The calls of the sample columns `rest`, whose FORMAT leads with GT, packed
+/// into one row per ALT of `alts`. A column is read up to the end of its GT, and
+/// a call of one digit, or of two one-digit alleles and a separator, is coded
+/// without [`call_code`], as it codes one. Returns the number of samples read.
+fn pack_leading_gt(
+    mut rest: &[u8],
+    alts: &[(usize, Option<LocusClass>)],
+    n_samples: usize,
+    packed: &mut [u8],
+) -> Option<usize> {
+    let row_len = n_samples.div_ceil(4);
+    // Whether a GT of `len` bytes ends the field there.
+    let ends_at = |rest: &[u8], len: usize| {
+        rest.get(len)
+            .is_none_or(|&byte| byte == b'\t' || byte == b':')
+    };
+    let mut sample = 0;
+    while !rest.is_empty() && sample < n_samples {
+        let gt_len = if rest.len() >= 3
+            && rest[0].is_ascii_digit()
+            && matches!(rest[1], b'/' | b'|')
+            && rest[2].is_ascii_digit()
+            && ends_at(rest, 3)
+        {
+            let (first, second) = (usize::from(rest[0] - b'0'), usize::from(rest[2] - b'0'));
+            for (row, &(alt, _)) in packed.chunks_exact_mut(row_len).zip(alts) {
+                let code = if (first == alt) != (second == alt) {
+                    HET_CODE
+                } else {
+                    HOM_CODE
+                };
+                set_code(row, sample, code);
+            }
+            3
+        } else if rest[0].is_ascii_digit() && ends_at(rest, 1) {
+            for row in packed.chunks_exact_mut(row_len).take(alts.len()) {
+                set_code(row, sample, HOM_CODE);
+            }
+            1
+        } else {
+            let column_len = memchr(b'\t', rest).unwrap_or(rest.len());
+            let gt_len = memchr(b':', &rest[..column_len]).unwrap_or(column_len);
+            for (row, &(alt, _)) in packed.chunks_exact_mut(row_len).zip(alts) {
+                set_code(row, sample, call_code(&rest[..gt_len], alt)?);
+            }
+            gt_len
+        };
+        sample += 1;
+        rest = match rest.get(gt_len) {
+            Some(b'\t') => &rest[gt_len + 1..],
+            Some(_) => {
+                memchr(b'\t', &rest[gt_len..]).map_or(&[][..], |tab| &rest[gt_len + tab + 1..])
+            }
+            None => &[],
+        };
+    }
+    Some(sample)
+}
+
+/// [`pack_leading_gt`] for sample columns whose GT is the FORMAT key at
+/// `gt_index`, splitting every column into its fields. A column without that
+/// field has no call. Returns the number of samples read.
+fn pack_placed_gt(
+    mut rest: &[u8],
+    gt_index: usize,
+    alts: &[(usize, Option<LocusClass>)],
+    n_samples: usize,
+    packed: &mut [u8],
+) -> Option<usize> {
+    let row_len = n_samples.div_ceil(4);
+    let mut sample = 0;
+    while !rest.is_empty() && sample < n_samples {
+        let column = match memchr(b'\t', rest) {
+            Some(end) => {
+                let column = &rest[..end];
+                rest = &rest[end + 1..];
+                column
+            }
+            None => std::mem::take(&mut rest),
+        };
+        let gt = column.split(|&byte| byte == b':').nth(gt_index);
+        for (row, &(alt, _)) in packed.chunks_exact_mut(row_len).zip(alts) {
+            let code = match gt {
+                Some(gt) => call_code(gt, alt)?,
+                None => MISSING_CODE,
+            };
+            set_code(row, sample, code);
+        }
+        sample += 1;
+    }
+    Some(sample)
 }
 
 /// The packed code of one VCF GT field for ALT `alt`: missing where
@@ -1331,5 +1436,52 @@ mod tests {
         assert_eq!(index.locate(2), Some((2, 0, 7)));
         assert_eq!(index.locate(4), Some((2, 2, 7)));
         assert_eq!(index.locate(5), None);
+    }
+
+    /// A FORMAT that leads with GT is read byte by byte, and any other through its
+    /// fields: both must pack the rows `call_code` gives, whatever else a column
+    /// holds and however the line ends.
+    #[test]
+    fn leading_and_placed_gt_pack_the_codes_call_code_gives() {
+        let calls = [
+            "0/0", "0/1", "1|0", "1/1", "1", "0", "2", "./.", ".", "./1", "1/.", "", "/", "0/1/1",
+            "0/0/1", "1/2", "2|2", "1/01", "10/1", "1/10", "10", "./x", "1|",
+        ];
+        let alts = [(1, None), (2, None)];
+        // One sample more than the lines hold, which has no call.
+        let n_samples = calls.len() + 1;
+        let row_len = n_samples.div_ceil(4);
+        let mut expected = vec![0u8; alts.len() * row_len];
+        for (sample, gt) in calls.iter().enumerate() {
+            for (row, &(alt, _)) in expected.chunks_exact_mut(row_len).zip(&alts) {
+                set_code(row, sample, call_code(gt.as_bytes(), alt).unwrap());
+            }
+        }
+        mark_missing(&mut expected, row_len, calls.len()..n_samples);
+        let prefix = "1\t100\t.\tA\tC,T\t.\tPASS\t.\t";
+        let column = |format: &str, gt: &str| match format {
+            "GT" => gt.to_string(),
+            "GT:DS" => format!("{gt}:0.5,0.1"),
+            _ => format!("0.5,0.1:{gt}"),
+        };
+        for format in ["GT", "GT:DS", "DS:GT"] {
+            let columns: Vec<String> = calls.iter().map(|gt| column(format, gt)).collect();
+            for ending in ["", "\t"] {
+                let line = format!("{prefix}{format}\t{}{ending}", columns.join("\t"));
+                let mut rows = vec![0xff];
+                pack_vcf_calls(line.as_bytes(), &alts, n_samples, &mut rows).unwrap();
+                assert_eq!(rows[0], 0xff);
+                assert_eq!(&rows[1..], &expected[..], "{format}, ending {ending:?}");
+            }
+            // A GT the genotype parser refuses refuses the record.
+            let refused = format!(
+                "{prefix}{format}\t{}\t{}",
+                columns.join("\t"),
+                column(format, "0/x")
+            );
+            assert!(
+                pack_vcf_calls(refused.as_bytes(), &alts, n_samples, &mut Vec::new()).is_none()
+            );
+        }
     }
 }
