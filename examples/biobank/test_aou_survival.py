@@ -172,7 +172,7 @@ class SurvivalContractTests(unittest.TestCase):
         metrics = aou.evaluate(train, test, np.full((20, 1), .1), [1.], 20)
         self.assertEqual(metrics[0], {"group": "overall", "horizon": 1., "status": "pooled_censoring",
                                       "strata": [{"ancestry": "rare", "reason": "training_rows",
-                                                  "ipcw_weight_mass": 1.0}]})
+                                                  "ipcw_weight_mass": 1.0, "censoring_hazard_ratio": None}]})
         self.assertEqual(metrics[1]["status"], "insufficient_support")
         self.assertNotIn("brier", metrics[1])
         # Nobody is followed past two years, so nothing can stand in there.
@@ -562,13 +562,52 @@ class SurvivalContractTests(unittest.TestCase):
         np.testing.assert_allclose(weights[:2], aou.ipcw_weights(big, test.iloc[:2], 2))
         with self.assertRaises(ValueError):
             aou.ipcw_weights(train, test, 4, {})
-        # Enough rows, but nobody in C is followed past the horizon.
+        # Enough rows, but nobody in C is followed past the horizon. The pooled
+        # Breslow increments are 10 of 50 at time 1 and 20 of 40 at 1.5, so C's 20
+        # censorings expect 14; with 20 prior censorings at the pooled rate its
+        # hazard ratio is 40 / 34, and its curve is the pooled one (0.4 at 2) to that power.
         late = pd.DataFrame({"followup": [1.5] * 20, "event_code": [0] * 20, "ancestry": ["C"] * 20})
+        train = pd.concat([big, late], ignore_index=True)
+        g = aou.censoring_log_hazard_ratio(train, "C")
+        self.assertAlmostEqual(g, np.log(40 / 34))
         pooled = {}
-        weights = aou.ipcw_weights(pd.concat([big, late], ignore_index=True),
-                                   test.assign(ancestry=["A", "A", "C", "C"]), 2, pooled)
+        weights = aou.ipcw_weights(train, test.assign(ancestry=["A", "A", "C", "C"]), 2, pooled)
         self.assertEqual(pooled, {"C": "horizon_support"})
-        np.testing.assert_allclose(weights[2:], [1, 2.5])
+        np.testing.assert_allclose(weights[2:], [1, 0.4 ** -np.exp(g)])
+        # Censored early, while the pooled hazard is low, and gone before the pooled
+        # set's heavy censoring, C's modelled curve is below 0.05 at the horizon:
+        # the horizon is refused rather than weighted by the pooled curve.
+        heavy = pd.DataFrame({"followup": [1.] * 1000 + [3.] * 1000, "event_code": [0] * 1000 + [1] * 1000,
+                              "ancestry": ["A"] * 2000})
+        early = pd.DataFrame({"followup": [.5] * 200, "event_code": [0] * 200, "ancestry": ["C"] * 200})
+        train = pd.concat([heavy, early], ignore_index=True)
+        with self.assertRaisesRegex(ValueError, "modelled censoring survival") as refusal:
+            aou.ipcw_weights(train, test.assign(ancestry=["A", "A", "C", "C"]), 2, {})
+        # The pooled curve at 2 is 10/11 after C's 200 censorings at .5, which expect
+        # 200 * 200 / 2200 there, halved at 1.
+        g = aou.censoring_log_hazard_ratio(train, "C")
+        self.assertAlmostEqual(g, np.log(220 / (200 * 200 / 2200 + 20)))
+        self.assertEqual(refusal.exception.strata, [{"ancestry": "C", "reason": "horizon_support",
+                                                     "censoring_survival": (10 / 11 * .5) ** np.exp(g)}])
+        self.assertLess(refusal.exception.strata[0]["censoring_survival"], .05)
+        metrics = aou.evaluate(train, test.assign(ancestry=["A", "A", "C", "C"]), np.full((4, 1), .1), [2.], 2)
+        self.assertEqual(metrics[0]["status"], "insufficient_support")
+        self.assertEqual(metrics[0]["strata"], refusal.exception.strata)
+        # Under the reporting minimum the modelled survival is withheld, the stratum still named.
+        withheld = aou.evaluate(train, test.assign(ancestry=["A", "A", "C", "C"]), np.full((4, 1), .1), [2.], 20)
+        self.assertEqual(withheld[0]["strata"], [{"ancestry": "C", "reason": "horizon_support",
+                                                  "censoring_survival": None}])
+        # At .75 C's modelled survival, (10/11) to its hazard ratio, clears the floor, so the
+        # horizon pools C; at 2 it refuses. Both horizons of one evaluation carry their record.
+        frame = lambda d: d.assign(sex=np.arange(len(d)) % 2, age0=50., PC1=np.arange(len(d), dtype=float))
+        both = aou.evaluate(frame(train), frame(test.assign(ancestry=["A", "A", "C", "C"])),
+                            np.full((4, 2), .1), [.75, 2.], 2)
+        records = [row for row in both if row["group"] == "overall" and "strata" in row]
+        self.assertEqual([(row["horizon"], row["status"]) for row in records],
+                         [(.75, "pooled_censoring"), (2., "insufficient_support")])
+        self.assertAlmostEqual(records[0]["strata"][0]["censoring_hazard_ratio"], np.exp(g))
+        self.assertAlmostEqual(records[0]["strata"][0]["ipcw_weight_mass"], (10 / 11) ** -np.exp(g))
+        self.assertEqual(records[1]["strata"], refusal.exception.strata)
 
     def test_digest_names_pooled_censoring_strata_instead_of_an_unsupported_cell(self):
         wdl = Path(__file__).with_name("aou_results_digest.wdl").read_text()
@@ -576,8 +615,14 @@ class SurvivalContractTests(unittest.TestCase):
         metrics = {"hypertension": {"status": "completed", "models": {"pc_varying_ctn": {"metrics": [
             {"group": "overall", "horizon": 5., "status": "pooled_censoring",
              "strata": [{"ancestry": "MID", "reason": "training_rows", "ipcw_weight_mass": None},
-                        {"ancestry": "SAS", "reason": "horizon_support", "ipcw_weight_mass": .412}]},
-            {"group": "overall", "horizon": 5., "status": "ok", "n": 4000, "brier": .1}]}}}}
+                        {"ancestry": "SAS", "reason": "horizon_support", "ipcw_weight_mass": .412,
+                         "censoring_hazard_ratio": 1.37}]},
+            {"group": "overall", "horizon": 5., "status": "ok", "n": 4000, "brier": .1},
+            {"group": "overall", "horizon": 3., "status": "insufficient_support",
+             "reason": "evaluation horizon lacks censoring support in an ancestry stratum, "
+                       "and its modelled censoring survival there is below 0.05",
+             "strata": [{"ancestry": "MID", "reason": "training_rows", "censoring_survival": None},
+                        {"ancestry": "SAS", "reason": "horizon_support", "censoring_survival": .031}]}]}}}}
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             (directory / "metrics.json").write_text(json.dumps(metrics))
@@ -591,9 +636,14 @@ class SurvivalContractTests(unittest.TestCase):
                 os.chdir(previous)
             names = {path.name for path in directory.glob("digest__*.txt")}
         stage = "digest__hypertension__final__pc_varying_ctn__"
-        self.assertEqual(names, {stage + "censoring_pooled__h5__mid__training_rows.txt",
+        self.assertEqual(names, {stage + "censoring_refused__h3__mid__training_rows.txt",
+                                 stage + "censoring_refused__h3__sas__horizon_support.txt",
+                                 stage + "censoring_refused__h3__sas__horizon_support__censoring_survival__0.031.txt",
+                                 stage + "overall__h3__insufficient_support.txt",
+                                 stage + "censoring_pooled__h5__mid__training_rows.txt",
                                  stage + "censoring_pooled__h5__sas__horizon_support.txt",
                                  stage + "censoring_pooled__h5__sas__horizon_support__ipcw_weight_mass__0.412.txt",
+                                 stage + "censoring_pooled__h5__sas__horizon_support__censoring_hazard_ratio__1.37.txt",
                                  stage + "overall__h5__n__4000.txt",
                                  stage + "overall__h5__brier__0.1.txt",
                                  "digest__hypertension__status__completed.txt"})

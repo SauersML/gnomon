@@ -106,18 +106,36 @@ Loss uncertainty is conditional on fitted models and censoring estimates.
 
 Censoring uses training-only ancestry-stratified reverse Kaplan–Meier. A
 stratum with fewer than 20 training rows, or whose own censoring survival at a
-horizon is below 0.05 or has nobody followed past it, takes the pooled training
-reverse Kaplan–Meier at that horizon. The metrics carry a `pooled_censoring`
-row per horizon naming each such stratum, its reason (`training_rows`,
-`horizon_support`) and its mean IPCW weight (withheld under the reporting
-minimum); the digest emits them as `…__censoring_pooled__h<h>__<stratum>__<reason>`.
-A horizon the pooled set cannot support is still refused. Pooling assumes the
-stratum is censored like the pooled set. Where it is censored more heavily (in
-the limit, nobody in it followed past the horizon) its survivors are
-under-weighted, so its IPCW observed risk and Brier score are biased low and the
-bias leaks into every cell containing it, `overall` included. The mean IPCW
-weight is one in expectation under the right censoring model; well below one
-it shows the stratum is censored more heavily. The stratified model
+horizon is below 0.05 or has nobody followed past it, takes a proportional-hazards
+censoring model over the pooled training set at that horizon: the pooled reverse
+Kaplan–Meier raised to the stratum's censoring hazard ratio. The ratio is
+(observed + 20) / (expected + 20), where expected counts the censorings the
+stratum would show over its own follow-up at the pooled Breslow rate: the
+posterior mean under a gamma prior worth 20 censorings at the pooled rate. The 20
+is the support minimum, so a thin stratum stays near the pooled curve and one with
+many censorings takes its own level; a weaker prior let a stratum of about 16 rows
+under shared censoring cross the floor below by noise alone. The metrics carry a
+`pooled_censoring` row per horizon naming each such stratum, its reason
+(`training_rows`, `horizon_support`), its mean IPCW weight and its censoring hazard
+ratio (both withheld under the reporting minimum); the digest emits them as
+`…__censoring_pooled__h<h>__<stratum>__<reason>`.
+
+Positivity: a horizon is refused where a modelled censoring survival is below
+0.05, as where an own one is, and where the pooled set cannot support it. Below
+that floor IPCW weights exceed 20 and the horizon has no stable estimator, so a
+refusal is the correct output and a biased estimate reported as usable would be
+worse. The refusal row names each refused stratum with its reason and modelled
+censoring survival (withheld under the minimum); the digest emits
+`…__censoring_refused__h<h>__<stratum>__<reason>`. The model takes the pooled
+curve's shape: where a stratum's censoring is not proportional to the pooled
+set's its cells keep a residual bias, and where nobody in it is followed to the
+horizon its curve there is an extrapolation no censoring model can check. A
+stratum whose follow-up truly ends before the horizon is censored at a higher
+rate over the follow-up it has, so its modelled survival falls below the floor
+and the horizon is refused; nobody in a small stratum reaching the horizon by
+chance is not refused on that ground alone. The mean IPCW weight is one in
+expectation under the right censoring model; well below one it shows the
+stratum's censoring curve is too high. The stratified model
 assumes sufficient independence within those strata and does not account for
 all site, calendar-period or clinical dependence. No result from this pilot
 establishes optimal deployment accuracy. The marginal identity is a model

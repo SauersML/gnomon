@@ -57,13 +57,23 @@ task digest {
             base = [stage, slug(row["group"]), "h" + token(float(row["horizon"]))]
             if row.get("status") == "pooled_censoring":
                 # A caveat beside the horizon's cells, not a cell: stratum labels,
-                # reasons, and a mean weight the runner withholds under the minimum.
+                # reasons, and a mean weight and censoring hazard ratio the runner
+                # withholds under the minimum.
                 for stratum in row.get("strata") or []:
                     pooled = [stage, "censoring_pooled", base[2], slug(stratum["ancestry"]), slug(stratum["reason"])]
                     emit(pooled)
-                    if stratum.get("ipcw_weight_mass") is not None:
-                        emit(pooled + ["ipcw_weight_mass", token(float(stratum["ipcw_weight_mass"]))])
+                    for key in ("ipcw_weight_mass", "censoring_hazard_ratio"):
+                        if stratum.get(key) is not None:
+                            emit(pooled + [key, token(float(stratum[key]))])
                 continue
+            if row.get("status") == "insufficient_support":
+                # A horizon refused on positivity names each refused stratum, its
+                # reason, and a modelled censoring survival withheld under the minimum.
+                for stratum in row.get("strata") or []:
+                    refused = [stage, "censoring_refused", base[2], slug(stratum["ancestry"]), slug(stratum["reason"])]
+                    emit(refused)
+                    if stratum.get("censoring_survival") is not None:
+                        emit(refused + ["censoring_survival", token(float(stratum["censoring_survival"]))])
             if row.get("status") != "ok" or int(row.get("n", 0)) < MINIMUM_COUNT:
                 emit(base + ["insufficient_support"])
                 continue
