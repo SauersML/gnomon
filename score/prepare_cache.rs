@@ -2,12 +2,13 @@
 //! deliberately absent: the same BIM/weights can serve any cohort layout.
 //!
 //! A plan is named by a BLAKE3 digest of the bytes of every `.bim` and score file
-//! it was compiled from, the region filters and this build. File metadata never
+//! it was compiled from, the region filters, the block partition and this build. File metadata never
 //! stands in for bytes: timestamps can be set by anyone who can write the file, are
 //! coarse on some filesystems, lag behind writes through a shared mapping and are
 //! cached by NFS clients, so an unchanged size and modification time prove nothing
 //! about content.
 use super::FilesetPaths;
+use super::blocks::BlockPartition;
 use crate::score::types::{
     BimRowIndex, GenomicRegion, GroupedComplexRule, PipelineKind, PreparationResult,
     ScoreColumnIndex, ScoreInfo,
@@ -58,6 +59,7 @@ impl PlanCache {
         filesets: &[FilesetPaths],
         scores: &[PathBuf],
         regions: Option<&HashMap<String, GenomicRegion>>,
+        blocks: Option<&BlockPartition>,
     ) -> io::Result<Option<Self>> {
         // Plans hold arrays in their little-endian memory form.
         if cfg!(target_endian = "big") {
@@ -74,7 +76,7 @@ impl PlanCache {
         let Some(directory) = plan_directory() else {
             return Ok(None);
         };
-        let key = content_key(filesets, scores, regions)?;
+        let key = content_key(filesets, scores, regions, blocks)?;
         Ok(Some(Self {
             path: directory.join(hex::encode(key)),
             key,
@@ -123,6 +125,7 @@ fn content_key(
     filesets: &[FilesetPaths],
     scores: &[PathBuf],
     regions: Option<&HashMap<String, GenomicRegion>>,
+    blocks: Option<&BlockPartition>,
 ) -> io::Result<[u8; 32]> {
     let inputs: Vec<&Path> = filesets
         .iter()
@@ -141,6 +144,7 @@ fn content_key(
     for source in [
         &include_bytes!("prepare.rs")[..],
         include_bytes!("prepare_cache.rs"),
+        include_bytes!("prepare_blocks.rs"),
         include_bytes!("types.rs"),
     ] {
         hash.update(blake3::hash(source).as_bytes());
@@ -160,6 +164,13 @@ fn content_key(
         hash.update(&[region.chromosome]);
         hash.update(&region.start.to_le_bytes());
         hash.update(&region.end.to_le_bytes());
+    }
+    // A plan expanded over blocks is a different plan.
+    match blocks {
+        Some(partition) => partition.hash_into(&mut hash),
+        None => {
+            hash.update(&[0u8]);
+        }
     }
     Ok(*hash.finalize().as_bytes())
 }
@@ -888,6 +899,8 @@ mod tests {
             scores,
             None,
             None,
+            None,
+            None,
             super::super::BimRowOrder::Streamed,
         )
         .unwrap()
@@ -897,7 +910,7 @@ mod tests {
     fn cache_in(dir: &Path, files: &[FilesetPaths], scores: &[PathBuf]) -> PlanCache {
         PlanCache {
             path: dir.join("plans").join("plan"),
-            key: content_key(files, scores, None).unwrap(),
+            key: content_key(files, scores, None, None).unwrap(),
         }
     }
 
@@ -921,7 +934,7 @@ mod tests {
                 .num_threads(threads)
                 .build()
                 .unwrap()
-                .install(|| content_key(&files, &scores, None).unwrap())
+                .install(|| content_key(&files, &scores, None, None).unwrap())
         };
         let expected = key_with(1);
         for threads in [2, 3, 8] {
@@ -952,7 +965,7 @@ mod tests {
     fn same_size_edits_under_a_restored_timestamp_change_the_key() {
         let dir = tempfile::tempdir().unwrap();
         let (files, scores) = fixture(dir.path());
-        let original = content_key(&files, &scores, None).unwrap();
+        let original = content_key(&files, &scores, None, None).unwrap();
         for (path, from, to) in [(&files[0].bim, "A G", "A C"), (&scores[0], "0.25", "0.75")] {
             let modified = std::fs::metadata(path).unwrap().modified().unwrap();
             let text = std::fs::read_to_string(path).unwrap();
@@ -969,9 +982,9 @@ mod tests {
                 std::fs::metadata(path).unwrap().modified().unwrap(),
                 modified
             );
-            assert_ne!(content_key(&files, &scores, None).unwrap(), original);
+            assert_ne!(content_key(&files, &scores, None, None).unwrap(), original);
             std::fs::write(path, &text).unwrap();
-            assert_eq!(content_key(&files, &scores, None).unwrap(), original);
+            assert_eq!(content_key(&files, &scores, None, None).unwrap(), original);
         }
         let filtered = HashMap::from([(
             "S".into(),
@@ -982,8 +995,16 @@ mod tests {
             },
         )]);
         assert_ne!(
-            content_key(&files, &scores, Some(&filtered)).unwrap(),
+            content_key(&files, &scores, Some(&filtered), None).unwrap(),
             original
+        );
+        let chromosomes = BlockPartition::chromosomes();
+        let by_chromosome = content_key(&files, &scores, None, Some(&chromosomes)).unwrap();
+        assert_ne!(by_chromosome, original);
+        let bed = BlockPartition::from_bed_text("1\t0\t100\n").unwrap();
+        assert_ne!(
+            content_key(&files, &scores, None, Some(&bed)).unwrap(),
+            by_chromosome
         );
     }
 
@@ -1276,7 +1297,7 @@ mod tests {
         if File::create(locked.join("probe")).is_err() {
             let cache = PlanCache {
                 path: locked.join("variant-plans").join("plan"),
-                key: content_key(&files, &scores, None).unwrap(),
+                key: content_key(&files, &scores, None, None).unwrap(),
             };
             assert!(cache.save(&prep).is_err());
             assert!(cache.load().unwrap().is_none());

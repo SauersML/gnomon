@@ -41,6 +41,9 @@ mod parse;
 #[path = "prepare_scores.rs"]
 mod scores;
 
+#[path = "prepare_blocks.rs"]
+pub mod blocks;
+
 // ========================================================================================
 //              Type-driven domain model for streaming
 // ========================================================================================
@@ -312,7 +315,16 @@ impl CsrBuilder {
         &mut self,
         required: &mut Vec<BimRowIndex>,
         flags: &mut Vec<u8>,
+        row_keys: Option<&mut Vec<VariantKey>>,
     ) -> Result<(), PrepError> {
+        if row_keys
+            .as_ref()
+            .is_some_and(|keys| keys.len() != required.len())
+        {
+            return Err(PrepError::Invariant(
+                "Row keys and matched variants disagree before reordering.".to_string(),
+            ));
+        }
         if self.sparse_row_offsets.len() != required.len() + 1 || flags.len() != required.len() {
             return Err(PrepError::Invariant(format!(
                 "CSR rows ({}) and matched variants ({}) disagree before reordering.",
@@ -386,6 +398,14 @@ impl CsrBuilder {
         self.sparse_row_offsets = offsets;
         *required = indices;
         *flags = row_flags;
+        if let Some(keys) = row_keys {
+            let mut sorted_keys = Vec::new();
+            sorted_keys.try_reserve_exact(order.len()).map_err(|e| {
+                PrepError::Invariant(format!("Cannot allocate reordered row keys: {e}"))
+            })?;
+            sorted_keys.extend(order.iter().map(|&row| keys[row]));
+            *keys = sorted_keys;
+        }
         Ok(())
     }
 }
@@ -403,6 +423,8 @@ struct JoinOutputs {
     // or cleared, so sparse panels do not incur a full score-panel scan per locus.
     simple_assignments: Vec<Option<SimpleScoreAssignment>>,
     touched_columns: Vec<ScoreColumnIndex>,
+    /// The locus of every row, kept only for a block expansion after the join.
+    row_keys: Option<Vec<VariantKey>>,
 }
 
 impl JoinOutputs {
@@ -439,7 +461,20 @@ impl JoinOutputs {
             final_complex_rules: Vec::new(),
             simple_assignments,
             touched_columns,
+            row_keys: None,
         })
+    }
+
+    /// Keeps each row's locus so [`blocks::expand_plan`] can place it.
+    fn record_row_keys(&mut self) {
+        self.row_keys = Some(Vec::new());
+    }
+
+    #[inline(always)]
+    fn push_row_key(&mut self, key: VariantKey) {
+        if let Some(keys) = &mut self.row_keys {
+            keys.push(key);
+        }
     }
 
     /// Builds the plan rows of one locus from the `.bim` rows and score records
@@ -471,6 +506,7 @@ impl JoinOutputs {
                 );
                 self.required_bim_indices.push(bim.bim_row_index);
                 self.required_is_complex.push(0);
+                self.push_row_key(key);
                 self.csr_builder
                     .push_contribution(score.score_column_index, assignment)?;
                 self.csr_builder.finish_variant()?;
@@ -514,6 +550,7 @@ impl JoinOutputs {
                 self.touched_columns.sort_unstable();
                 self.required_bim_indices.push(bim.bim_row_index);
                 self.required_is_complex.push(0);
+                self.push_row_key(key);
                 for column in self.touched_columns.drain(..) {
                     let assignment = self.simple_assignments[column.0].take().unwrap();
                     self.csr_builder.push_contribution(column, assignment)?;
@@ -607,6 +644,7 @@ impl JoinOutputs {
         for bim_row_index in key_complex_indices {
             self.required_bim_indices.push(bim_row_index);
             self.required_is_complex.push(1);
+            self.push_row_key(key);
             self.csr_builder.finish_variant()?;
         }
         Ok(())
@@ -617,6 +655,7 @@ impl JoinOutputs {
         self.csr_builder.sort_rows_by_bim_index(
             &mut self.required_bim_indices,
             &mut self.required_is_complex,
+            self.row_keys.as_mut(),
         )
     }
 }
@@ -1147,6 +1186,8 @@ pub enum PrepError {
     GenomeBuildMismatch,
     DisjointChromosomes,
     AmbiguousReconciliation(String),
+    /// `--blocks` names a partition the run cannot use.
+    Blocks(String),
     Invariant(String),
 }
 
@@ -1161,16 +1202,37 @@ pub fn prepare_for_computation(
     keep_file: Option<&Path>,
     score_regions: Option<&HashMap<String, GenomicRegion>>,
 ) -> Result<PreparationResult, PrepError> {
+    prepare_for_computation_with_blocks(
+        fileset_prefixes,
+        sorted_score_files,
+        keep_file,
+        score_regions,
+        None,
+        None,
+    )
+}
+
+/// [`prepare_for_computation`], expanding every score over `blocks` when one is
+/// given (`--blocks`); `blocks_max` is the `--blocks-max` limit.
+pub fn prepare_for_computation_with_blocks(
+    fileset_prefixes: &[PathBuf],
+    sorted_score_files: &[PathBuf],
+    keep_file: Option<&Path>,
+    score_regions: Option<&HashMap<String, GenomicRegion>>,
+    blocks: Option<&blocks::BlockPartition>,
+    blocks_max: Option<usize>,
+) -> Result<PreparationResult, PrepError> {
     let filesets = build_fileset_paths(fileset_prefixes)?;
     // The plan cache only saves time. A plan that cannot be hashed, read, trusted or
     // held within this machine's memory budget is compiled again instead.
-    let cache = match cache::PlanCache::discover(&filesets, sorted_score_files, score_regions) {
-        Ok(cache) => cache,
-        Err(error) => {
-            eprintln!("> Compiled variant plans are unavailable for these inputs: {error}.");
-            None
-        }
-    };
+    let cache =
+        match cache::PlanCache::discover(&filesets, sorted_score_files, score_regions, blocks) {
+            Ok(cache) => cache,
+            Err(error) => {
+                eprintln!("> Compiled variant plans are unavailable for these inputs: {error}.");
+                None
+            }
+        };
     if let Some(cache) = &cache {
         match cache.load() {
             Ok(Some(plan)) => {
@@ -1181,6 +1243,11 @@ pub fn prepare_for_computation(
                 let all_iids = index_people(&filesets)?;
                 let total_people = all_iids.len();
                 let (subset, iids, output_to_fam) = resolve_person_subset(keep_file, all_iids)?;
+                if let Some(partition) = blocks {
+                    // A cached plan under this partition's key is already expanded.
+                    let base_scores = plan.names.len() / partition.columns_per_score();
+                    partition.check_block_budget(blocks_max, base_scores, iids.len())?;
+                }
                 return assemble_preparation(
                     plan,
                     &filesets,
@@ -1203,6 +1270,8 @@ pub fn prepare_for_computation(
         sorted_score_files,
         keep_file,
         score_regions,
+        blocks,
+        blocks_max,
         BimRowOrder::Streamed,
     )?;
     if clean && let Some(cache) = &cache {
@@ -1210,7 +1279,7 @@ pub fn prepare_for_computation(
         // under the digest taken before the compiler opened its readers. A
         // rehash that cannot run now, such as when memory has become short,
         // publishes nothing; only a different digest means the inputs changed.
-        match cache::PlanCache::discover(&filesets, sorted_score_files, score_regions) {
+        match cache::PlanCache::discover(&filesets, sorted_score_files, score_regions, blocks) {
             Ok(Some(current)) if !cache.same_inputs(&current) => {
                 return Err(PrepError::Invariant(
                     "Variant inputs changed during compilation; retry with stable inputs.".into(),
@@ -1233,6 +1302,8 @@ fn prepare_for_computation_with_retry(
     sorted_score_files: &[PathBuf],
     keep_file: Option<&Path>,
     score_regions: Option<&HashMap<String, GenomicRegion>>,
+    blocks: Option<&blocks::BlockPartition>,
+    blocks_max: Option<usize>,
     bim_row_order: BimRowOrder,
 ) -> Result<(PreparationResult, bool), PrepError> {
     // --- Stage 1: Initial setup ---
@@ -1247,6 +1318,9 @@ fn prepare_for_computation_with_retry(
     // --- Stage 2: Global metadata discovery ---
     eprintln!("> Stage 2: Discovering all score columns...");
     let score_names = parse_score_file_headers_only(sorted_score_files)?;
+    if let Some(partition) = blocks {
+        partition.check_block_budget(blocks_max, score_names.len(), final_person_iids.len())?;
+    }
     let score_name_to_col_index: AHashMap<String, ScoreColumnIndex> = score_names
         .iter()
         .enumerate()
@@ -1334,6 +1408,9 @@ fn prepare_for_computation_with_retry(
     // Build final artifacts incrementally during Stage 3 to avoid materializing
     // genome-scale intermediate maps that duplicate the final CSR/rule structures.
     let mut outputs = JoinOutputs::new(score_names.len())?;
+    if blocks.is_some() {
+        outputs.record_row_keys();
+    }
 
     // Rows already in memory, in key order and with nothing to report between
     // them, are joined as slices. Anything else walks the streams. Nothing checks
@@ -1355,6 +1432,9 @@ fn prepare_for_computation_with_retry(
             // walk the same rows the streaming way to describe them, counting
             // resolved score rows afresh.
             outputs = JoinOutputs::new(score_names.len())?;
+            if blocks.is_some() {
+                outputs.record_row_keys();
+            }
             effect_only_matches = EffectOnlyMatches::default();
             join_streams(
                 &mut bim.iter().cloned().map(Ok::<_, PrepError>).peekable(),
@@ -1396,6 +1476,8 @@ fn prepare_for_computation_with_retry(
                 sorted_score_files,
                 keep_file,
                 score_regions,
+                blocks,
+                blocks_max,
                 BimRowOrder::Sorted,
             );
         }
@@ -1420,6 +1502,7 @@ fn prepare_for_computation_with_retry(
         baseline_errors,
         score_variant_counts,
         final_complex_rules,
+        row_keys,
         ..
     } = outputs;
 
@@ -1547,7 +1630,7 @@ fn prepare_for_computation_with_retry(
     for (sum, error) in baseline_missing_sum_by_score.iter_mut().zip(baseline_errors) {
         *sum += error;
     }
-    let plan = cache::VariantPlan {
+    let mut plan = cache::VariantPlan {
         weights: sparse_weights,
         corrections: sparse_missing_corrections,
         columns: sparse_score_columns,
@@ -1564,6 +1647,20 @@ fn prepare_for_computation_with_retry(
             .map(|b| b.starting_global_index)
             .collect(),
     };
+    if let Some(partition) = blocks {
+        let expansion_start = Instant::now();
+        let row_keys = row_keys.ok_or_else(|| {
+            PrepError::Invariant("The join recorded no row keys for the block expansion.".into())
+        })?;
+        plan = blocks::expand_plan(plan, &row_keys, partition)?;
+        eprintln!(
+            "> Expanded {} score(s) into {} columns over {} in {:.2?}.",
+            plan.names.len() / partition.columns_per_score(),
+            plan.names.len(),
+            partition.describe(),
+            expansion_start.elapsed()
+        );
+    }
     Ok((
         assemble_preparation(
             plan,
@@ -1850,7 +1947,7 @@ mod tests {
         }
         let mut rows = vec![BimRowIndex(10), BimRowIndex(1), BimRowIndex(5)];
         let mut flags = vec![0, 1, 0];
-        csr.sort_rows_by_bim_index(&mut rows, &mut flags).unwrap();
+        csr.sort_rows_by_bim_index(&mut rows, &mut flags, None).unwrap();
         assert_eq!(rows, [BimRowIndex(1), BimRowIndex(5), BimRowIndex(10)]);
         assert_eq!(flags, [1, 0, 0]);
         assert_eq!(csr.sparse_row_offsets, [0, 0, 2, 3]);
@@ -2016,6 +2113,8 @@ mod tests {
                 let result = prepare_for_computation_with_retry(
                     std::slice::from_ref(&prefix),
                     std::slice::from_ref(&weights),
+                    None,
+                    None,
                     None,
                     None,
                     BimRowOrder::Streamed,
@@ -2395,7 +2494,7 @@ mod tests {
         std::fs::write(prefix.with_extension("bed"), [0x6c, 0x1b, 0x01, 0x00]).unwrap();
         let files = build_fileset_paths(std::slice::from_ref(&prefix)).unwrap();
         let Some(key) =
-            cache::PlanCache::discover(&files, std::slice::from_ref(&weights), None).unwrap()
+            cache::PlanCache::discover(&files, std::slice::from_ref(&weights), None, None).unwrap()
         else {
             return;
         };
@@ -2527,7 +2626,7 @@ mod tests {
             bed.resize(3 + people.div_ceil(4), 0);
             std::fs::write(prefix.with_extension("bed"), bed).unwrap();
             let files = build_fileset_paths(std::slice::from_ref(&prefix)).unwrap();
-            let key = cache::PlanCache::discover(&files, std::slice::from_ref(&weights), None)
+            let key = cache::PlanCache::discover(&files, std::slice::from_ref(&weights), None, None)
                 .unwrap()
                 .unwrap();
             if let Some(original) = &original_key {
@@ -2634,6 +2733,8 @@ mod tests {
         let (prep, clean) = prepare_for_computation_with_retry(
             &[prefix],
             &[first, second],
+            None,
+            None,
             None,
             None,
             BimRowOrder::Streamed,
@@ -4088,6 +4189,7 @@ impl Display for PrepError {
                 )
             }
             PrepError::AmbiguousReconciliation(s) => write!(f, "{s}"),
+            PrepError::Blocks(s) => write!(f, "--blocks: {s}"),
             PrepError::Invariant(s) => write!(f, "Internal invariant violation: {s}"),
         }
     }

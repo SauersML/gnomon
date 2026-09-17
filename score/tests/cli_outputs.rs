@@ -15,13 +15,13 @@ use tempfile::tempdir;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
-const SCORE_BIN: &str = env!("CARGO_BIN_EXE_gnomon-score");
+pub(super) const SCORE_BIN: &str = env!("CARGO_BIN_EXE_gnomon-score");
 const TERMS_BIN: &str = env!("CARGO_BIN_EXE_gnomon-terms");
 
 /// Copies the fixture fileset into `dir` as `cohort.{bed,bim,fam}` and writes a
 /// native score file `w.tsv` over every seventh variant. Returns the genotype
 /// prefix and the score file.
-fn stage_inputs(dir: &Path) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+pub(super) fn stage_inputs(dir: &Path) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/testdata");
     fs::create_dir_all(dir)?;
     for ext in ["bed", "bim", "fam"] {
@@ -70,7 +70,7 @@ fn with_suffix(prefix: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn run(binary: &str, cwd: &Path, args: &[&OsStr]) -> Output {
+pub(super) fn run(binary: &str, cwd: &Path, args: &[&OsStr]) -> Output {
     Command::new(binary)
         .current_dir(cwd)
         .args(args)
@@ -78,7 +78,7 @@ fn run(binary: &str, cwd: &Path, args: &[&OsStr]) -> Output {
         .expect("spawn gnomon")
 }
 
-fn assert_success(output: &Output) {
+pub(super) fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
         "gnomon failed with {:?}\nstderr:\n{}",

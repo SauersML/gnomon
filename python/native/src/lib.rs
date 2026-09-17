@@ -88,6 +88,8 @@ fn score(
             inferred,
             emit_components,
             None,
+            None,
+            None,
         )
     })
     .map_err(|err| PyRuntimeError::new_err(format!("gnomon score failed: {err}")))?;

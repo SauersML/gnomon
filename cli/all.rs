@@ -119,6 +119,8 @@ pub fn run(opts: AllOptions) -> Result<(), Box<dyn std::error::Error>> {
                 // infers it.
                 inferred_sex: None,
                 emit_components: false,
+                blocks: None,
+                blocks_max: None,
             })
         })
     };

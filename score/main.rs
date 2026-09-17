@@ -21,6 +21,7 @@ use gnomon::score::io::{gcs_billing_project_from_env, get_shared_runtime, load_a
 use gnomon::score::native_vcf::{self, NativeVcfScoreResult};
 use gnomon::score::pipeline::{self, MemoryBudget, PipelineContext};
 use gnomon::score::prepare;
+use gnomon::score::prepare::blocks::BlockPartition;
 use gnomon::score::reformat;
 use gnomon::score::types::{GenomicRegion, PreparationResult};
 use natord::compare;
@@ -102,6 +103,17 @@ struct Args {
     /// PREFIX's directory, instead of beside the inputs.
     #[clap(long, value_name = "PREFIX")]
     out: Option<PathBuf>,
+
+    /// Also emit per-block partial scores: `chrom` splits every score by
+    /// chromosome; a BED file (0-based, half-open, non-overlapping rows) names
+    /// the blocks. Columns `<SCORE>_b<ID>_AVG` and `_MISSING_PCT` join the
+    /// unsplit ones, and `<OUTPUT>.blocks.tsv` maps block ids to intervals.
+    #[clap(long, value_name = "chrom|BED")]
+    blocks: Option<String>,
+
+    /// The most blocks --blocks may name; required above 500.
+    #[clap(long, value_name = "N", requires = "blocks")]
+    blocks_max: Option<usize>,
 }
 
 // ========================================================================================
@@ -114,7 +126,9 @@ struct Args {
 /// Public interface for calling gnomon with explicit arguments, including a
 /// pre-computed sex to skip the internal VCF-scan sex inference. Pass `None`
 /// for `inferred_sex` to preserve the original full-scan behavior. `out` is
-/// `--out PREFIX`; `None` writes beside the inputs as before.
+/// `--out PREFIX`; `None` writes beside the inputs as before. `blocks` and
+/// `blocks_max` are `--blocks` and `--blocks-max`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_gnomon_with_args(
     input_path: PathBuf,
     score: PathBuf,
@@ -125,6 +139,8 @@ pub fn run_gnomon_with_args(
     inferred_sex: Option<InferredSexArg>,
     emit_components: bool,
     out: Option<PathBuf>,
+    blocks: Option<String>,
+    blocks_max: Option<usize>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args {
         score,
@@ -136,6 +152,8 @@ pub fn run_gnomon_with_args(
         inferred_sex,
         emit_components,
         out,
+        blocks,
+        blocks_max,
     };
     run_gnomon_impl(args)
 }
@@ -190,6 +208,16 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     if let Some(prefix) = args.out.as_deref() {
         gnomon::output::validate_out_prefix(prefix)?;
     }
+    let blocks = match args.blocks.as_deref() {
+        Some(arg) => Some(BlockPartition::parse_arg(arg).map_err(|e| format!("--blocks: {e}"))?),
+        None => None,
+    };
+    if let Some(partition) = &blocks {
+        eprintln!(
+            "> Per-block partial scores over {}; block b0000 holds variants outside every block.",
+            partition.describe()
+        );
+    }
     // Nothing behind the genotype path is not a format problem, so say that
     // before anything else runs.
     if !genotype_input_exists(&args.input_path) {
@@ -225,6 +253,13 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     if use_native_vcf {
+        if blocks.is_some() {
+            return Err(format!(
+                "--blocks scores PLINK and PGEN filesets, and VCF/BCF through --panel; convert '{}' to PLINK first (plink2 --vcf ... --make-bed).",
+                args.input_path.display()
+            )
+            .into());
+        }
         let output_path = match args.out.as_deref() {
             Some(prefix) => gnomon::output::prefixed_path(prefix, "sscore"),
             None => score_output_path(&args.input_path, Some(&out_suffix)),
@@ -328,6 +363,12 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         None => fileset_output_path(&naming_prefix, Some(&out_suffix)),
     };
     ensure_output_absent(&output_path)?;
+    let sidecar_path = blocks
+        .as_ref()
+        .map(|_| blocks_sidecar_path(&output_path));
+    if let Some(sidecar) = sidecar_path.as_deref() {
+        ensure_output_absent(sidecar)?;
+    }
 
     let (resolved_score_files, score_regions_map) = resolve_score_files(
         &args.score,
@@ -351,6 +392,8 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         args.keep.as_deref(),
         score_regions_ref,
         cache_dir.as_deref(),
+        blocks.as_ref(),
+        args.blocks_max,
     )?;
     let memory_budget = MemoryBudget::default();
     pipeline::preflight_memory(&prep_result, memory_budget)?;
@@ -375,6 +418,9 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Phase 4: Finalization & Output ---
     // After all computation is complete, this synchronous phase writes the
     // final scores to the output path chosen before preparation.
+    let block_columns = blocks
+        .as_ref()
+        .map(|partition| partition.block_column_flags(prep_result.score_names.len()));
     finalize_and_write_output(
         &output_path,
         &prep_result,
@@ -382,13 +428,23 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         &final_counts,
         score_regions_ref,
         args.emit_components,
+        block_columns.as_deref(),
     )?;
+    if let (Some(partition), Some(sidecar)) = (&blocks, sidecar_path.as_deref()) {
+        gnomon::output::write_atomically(sidecar, |writer| partition.write_sidecar(writer))?;
+        eprintln!("> Block intervals written to {}", sidecar.display());
+    }
 
     eprintln!(
         "\nSuccess! Total execution time: {:.2?}",
         overall_start_time.elapsed()
     );
     Ok(())
+}
+
+/// The `--blocks` sidecar beside an `.sscore`: `<stem>.blocks.tsv`.
+fn blocks_sidecar_path(output_path: &Path) -> PathBuf {
+    output_path.with_extension("blocks.tsv")
 }
 
 fn ensure_output_absent(output_path: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -1000,6 +1056,8 @@ fn run_preparation_phase(
     keep: Option<&Path>,
     score_regions: Option<&HashMap<String, GenomicRegion>>,
     cache_dir: Option<&Path>,
+    blocks: Option<&BlockPartition>,
+    blocks_max: Option<usize>,
 ) -> Result<Arc<PreparationResult>, Box<dyn Error + Send + Sync>> {
     if fileset_prefixes.len() > 1 {
         eprintln!(
@@ -1019,11 +1077,13 @@ fn run_preparation_phase(
     let native_score_files = normalize_score_files(score_files, cache_dir)?;
 
     // --- Run the main preparation logic with the fully normalized and sorted files ---
-    let prep = prepare::prepare_for_computation(
+    let prep = prepare::prepare_for_computation_with_blocks(
         fileset_prefixes,
         &native_score_files,
         keep,
         score_regions,
+        blocks,
+        blocks_max,
     )
     .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
@@ -1060,6 +1120,7 @@ fn finalize_and_write_native_output(
         &result.missing_counts,
         score_regions,
         emit_components,
+        None,
     )?;
 
     eprintln!("> Final output written in {:.2?}", output_start.elapsed());
@@ -1101,6 +1162,7 @@ fn fileset_output_path(fileset_prefix: &Path, name_suffix: Option<&str>) -> Path
 /// **Helper:** Handles the final file writing.
 ///
 /// This function is synchronous and takes the final results directly.
+#[allow(clippy::too_many_arguments)]
 fn finalize_and_write_output(
     out_path: &Path,
     prep_result: &Arc<PreparationResult>,
@@ -1108,6 +1170,7 @@ fn finalize_and_write_output(
     final_counts: &[u32],
     score_regions: Option<&HashMap<String, GenomicRegion>>,
     emit_components: bool,
+    block_columns: Option<&[bool]>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     eprintln!(
         "> Writing {} scores per person to {}",
@@ -1125,6 +1188,7 @@ fn finalize_and_write_output(
         final_counts,
         score_regions,
         emit_components,
+        block_columns,
     )?;
 
     eprintln!("> Final output written in {:.2?}", output_start.elapsed());
@@ -1500,6 +1564,10 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
 
 /// Writes the final calculated scores to a self-describing, tab-separated file.
 /// This function now calculates the final per-variant average and missing percentage.
+/// `block_columns[i]` marks a `--blocks` partial column, whose `_MISSING_PCT`
+/// is 100 when its block holds no variant of the score; an unsplit column
+/// without variants reports 0.
+#[allow(clippy::too_many_arguments)]
 fn write_scores_to_file(
     path: &Path,
     person_iids: &[String],
@@ -1509,6 +1577,7 @@ fn write_scores_to_file(
     missing_counts: &[u32],
     score_regions: Option<&HashMap<String, GenomicRegion>>,
     emit_components: bool,
+    block_columns: Option<&[bool]>,
 ) -> io::Result<()> {
     let num_scores = score_names.len();
 
@@ -1529,6 +1598,7 @@ fn write_scores_to_file(
             num_scores,
             emit_components,
             score_rows_per_block(person_iids, num_scores),
+            block_columns,
         )
     })
 }
@@ -1585,6 +1655,7 @@ pub struct SscoreSink<'a> {
     score_variant_counts: &'a [u32],
     num_scores: usize,
     emit_components: bool,
+    block_columns: Option<&'a [bool]>,
     rows_per_block: usize,
     blocks: Vec<Vec<u8>>,
     next_person: usize,
@@ -1593,6 +1664,7 @@ pub struct SscoreSink<'a> {
 #[allow(dead_code)]
 impl<'a> SscoreSink<'a> {
     /// Starts publishing `path` and writes the header rows.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         path: &Path,
         person_iids: &'a [String],
@@ -1600,6 +1672,7 @@ impl<'a> SscoreSink<'a> {
         score_variant_counts: &'a [u32],
         score_regions: Option<&HashMap<String, GenomicRegion>>,
         emit_components: bool,
+        block_columns: Option<&'a [bool]>,
     ) -> io::Result<Self> {
         let mut file = gnomon::output::AtomicFile::create(path)?;
         write_sscore_header(
@@ -1616,6 +1689,7 @@ impl<'a> SscoreSink<'a> {
             score_variant_counts,
             num_scores,
             emit_components,
+            block_columns,
             rows_per_block: score_rows_per_block(person_iids, num_scores),
             blocks: Vec::new(),
             next_person: 0,
@@ -1668,6 +1742,7 @@ impl<'a> SscoreSink<'a> {
             self.num_scores,
             self.emit_components,
             self.rows_per_block,
+            self.block_columns,
             &|cell, _, _| avgs[cell],
         )?;
         self.next_person = end;
@@ -1716,6 +1791,7 @@ fn write_score_rows<W: Write>(
     num_scores: usize,
     emit_components: bool,
     rows_per_block: usize,
+    block_columns: Option<&[bool]>,
 ) -> io::Result<()> {
     // The score is calculated based on the number of non-missing variants.
     // This behavior matches standard tools when mean-imputation is disabled.
@@ -1736,6 +1812,7 @@ fn write_score_rows<W: Write>(
         num_scores,
         emit_components,
         rows_per_block,
+        block_columns,
         &average,
     )
 }
@@ -1755,6 +1832,7 @@ fn write_rows_with<W: Write, A: Fn(usize, f64, u32) -> f64 + Sync>(
     num_scores: usize,
     emit_components: bool,
     rows_per_block: usize,
+    block_columns: Option<&[bool]>,
     average: &A,
 ) -> io::Result<()> {
     let n_persons = person_iids.len();
@@ -1769,6 +1847,12 @@ fn write_rows_with<W: Write, A: Fn(usize, f64, u32) -> f64 + Sync>(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Mismatched number of persons and missing count rows during final write.",
+        ));
+    }
+    if block_columns.is_some_and(|flags| flags.len() != num_scores) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Block column flags do not cover every score column during final write.",
         ));
     }
 
@@ -1794,6 +1878,7 @@ fn write_rows_with<W: Write, A: Fn(usize, f64, u32) -> f64 + Sync>(
                     missing_counts,
                     num_scores,
                     emit_components,
+                    block_columns,
                     average,
                 );
             }
@@ -1817,6 +1902,7 @@ fn format_score_rows<A: Fn(usize, f64, u32) -> f64>(
     missing_counts: &[u32],
     num_scores: usize,
     emit_components: bool,
+    block_columns: Option<&[bool]>,
     average: &A,
 ) {
     let mut ryu_buffer_score = ryu::Buffer::new();
@@ -1839,6 +1925,9 @@ fn format_score_rows<A: Fn(usize, f64, u32) -> f64>(
                 let avg_score = average(row + i, final_sum_score, variants_used);
                 let missing_pct = if total_variants_for_score > 0 {
                     (missing_count as f32 / total_variants_for_score as f32) * 100.0
+                } else if block_columns.is_some_and(|flags| flags[i]) {
+                    // A block without any variant of the score: nothing is known.
+                    100.0
                 } else {
                     0.0
                 };
@@ -2034,6 +2123,7 @@ mod output_tests {
                     3,
                     emit_components,
                     rows_per_block,
+                    None,
                 )
                 .expect("rows should be written");
                 assert!(
@@ -2048,8 +2138,18 @@ mod output_tests {
     fn score_rows_refuse_fewer_values_than_persons() {
         let (iids, counts, sums, missing) = cohort(10, 2);
         for (sums, missing) in [(&sums[..19], &missing[..]), (&sums[..], &missing[..19])] {
-            let error = write_score_rows(&mut Vec::new(), &iids, &counts, sums, missing, 2, false, 4)
-                .expect_err("too few values must be refused");
+            let error = write_score_rows(
+                &mut Vec::new(),
+                &iids,
+                &counts,
+                sums,
+                missing,
+                2,
+                false,
+                4,
+                None,
+            )
+            .expect_err("too few values must be refused");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         }
     }
@@ -2075,6 +2175,7 @@ mod output_tests {
                         3,
                         emit_components,
                         5,
+                        None,
                     )
                     .expect("block rows should be written");
                     first += n;
@@ -2127,6 +2228,7 @@ mod output_tests {
                 &missing,
                 Some(&regions),
                 emit_components,
+                None,
             )
             .expect("the whole-cohort file should be written");
             let expected = fs::read(&whole).expect("the whole-cohort file should be readable");
@@ -2141,6 +2243,7 @@ mod output_tests {
                     &counts,
                     Some(&regions),
                     emit_components,
+                    None,
                 )
                 .expect("the sink should be created");
                 let mut first = 0;
@@ -2175,7 +2278,7 @@ mod output_tests {
         let names = vec!["A".to_string(), "B".to_string()];
         let dir = tempfile::tempdir().expect("temporary directory");
         let path = dir.path().join("refused.sscore");
-        let mut sink = SscoreSink::create(&path, &iids, &names, &counts, None, false)
+        let mut sink = SscoreSink::create(&path, &iids, &names, &counts, None, false, None)
             .expect("the sink should be created");
         sink.write_values(0, &sums[..4], &sums[..4], &missing[..4])
             .expect("persons 0 and 1 should be written");
@@ -2213,7 +2316,7 @@ mod output_tests {
         let dir = tempfile::tempdir().expect("temporary directory");
         let path = dir.path().join("incomplete.sscore");
         fs::write(&path, "previous\n").expect("the previous file should be written");
-        let mut sink = SscoreSink::create(&path, &iids, &names, &counts, None, true)
+        let mut sink = SscoreSink::create(&path, &iids, &names, &counts, None, true, None)
             .expect("the sink should be created");
         sink.write_values(0, &sums[..18], &sums[..18], &missing[..18])
             .expect("nine persons should be written");
@@ -2242,6 +2345,7 @@ mod output_tests {
             &[1],
             None,
             true,
+            None,
         )
         .expect("component output should be written");
 
@@ -2253,6 +2357,52 @@ mod output_tests {
 #SCORE_VARIANT_COUNT\tPGS000001\t4\n\
 #IID\tPGS000001_SUM\tPGS000001_MISSING_CT\n\
 person-1\t6.0\t1\n"
+        );
+    }
+
+    /// An unsplit score without variants reports 0% missing as before; a block
+    /// column without variants reports 100%, and `_SUM`/`_MISSING_CT` are unchanged.
+    #[test]
+    fn an_empty_block_column_is_fully_missing() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let iids = ["p1".to_string()];
+        let names = ["S".to_string(), "S_b0000".to_string(), "S_b0001".to_string()];
+        let flags = [false, true, true];
+        let averaged = dir.path().join("averaged.sscore");
+        write_scores_to_file(
+            &averaged,
+            &iids,
+            &names,
+            &[0, 0, 2],
+            &[0.0, 0.0, 3.0],
+            &[0, 0, 1],
+            None,
+            false,
+            Some(&flags),
+        )
+        .expect("averaged output should be written");
+        assert_eq!(
+            fs::read_to_string(&averaged).unwrap(),
+            "#IID\tS_AVG\tS_MISSING_PCT\tS_b0000_AVG\tS_b0000_MISSING_PCT\tS_b0001_AVG\tS_b0001_MISSING_PCT\n\
+p1\t0.0\t0.0\t0.0\t100.0\t3.0\t50.0\n"
+        );
+        let components = dir.path().join("components.sscore");
+        write_scores_to_file(
+            &components,
+            &iids,
+            &names,
+            &[0, 0, 2],
+            &[0.0, 0.0, 3.0],
+            &[0, 0, 1],
+            None,
+            true,
+            Some(&flags),
+        )
+        .expect("component output should be written");
+        assert!(
+            fs::read_to_string(&components)
+                .unwrap()
+                .ends_with("p1\t0.0\t0\t0.0\t0\t3.0\t1\n")
         );
     }
 }

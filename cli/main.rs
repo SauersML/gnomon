@@ -80,6 +80,17 @@ struct ScoreArgs {
     /// Emit raw sums and exact counts for aggregation across scored regions.
     #[arg(long)]
     emit_components: bool,
+
+    /// Also emit per-block partial scores: `chrom` splits every score by
+    /// chromosome; a BED file (0-based, half-open, non-overlapping rows) names
+    /// the blocks. Columns `<SCORE>_b<ID>_AVG` and `_MISSING_PCT` join the
+    /// unsplit ones, and `<OUTPUT>.blocks.tsv` maps block ids to intervals.
+    #[arg(long, value_name = "chrom|BED")]
+    blocks: Option<String>,
+
+    /// The most blocks --blocks may name; required above 500.
+    #[arg(long, value_name = "N", requires = "blocks")]
+    blocks_max: Option<usize>,
 }
 
 #[derive(Args)]
@@ -633,6 +644,8 @@ fn run_score(args: ScoreArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.inferred_sex,
         args.emit_components,
         args.out,
+        args.blocks,
+        args.blocks_max,
     )
     .map_err(|err| err as Box<dyn std::error::Error>)
 }

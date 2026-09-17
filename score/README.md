@@ -78,6 +78,33 @@ Results are written to a temporary file in their destination directory
 and renamed into place once complete, so another process never reads a partial
 `.sscore`.
 
+#### Per-block partial scores
+
+`--blocks` adds, beside each score, the same weighted sum restricted to each block
+of a genomic partition: the genetic feature interface a phenotype-supervised
+calibrator needs.
+
+```
+./gnomon/target/release/gnomon score "PGS003725" arrays --blocks chrom
+./gnomon/target/release/gnomon score "PGS003725" arrays --blocks ld_blocks.bed
+```
+
+`chrom` gives one block per chromosome (ids `b0001`-`b0022`, X = `b0023`, Y = `b0024`,
+XY = `b0025`, MT = `b0026`). A BED file gives one block per row in file order
+(`chrom start end [name]`, 0-based and half-open, so a variant on a boundary belongs
+to exactly one block; rows on one chromosome must not overlap). Block `b0000` holds
+the variants outside every block, so for every person and score the block partials
+sum to the unsplit score. The columns are `<SCORE>_b<ID>_AVG` and
+`<SCORE>_b<ID>_MISSING_PCT` (`_SUM` and `_MISSING_CT` under `--emit-components`); a
+block holding no variant of a score reports `0.0` and `100.0`. The sidecar
+`<output>.blocks.tsv` maps each block id to its interval.
+
+The expansion happens when the variant plan is compiled: each variant's weight is
+routed to its score's column and to its `(score, block)` column, and the multi-score
+engine computes every partial with the arithmetic it uses for the unsplit score. The
+cost is `people x scores x (blocks + 2)` accumulator cells; more than 500 blocks
+needs `--blocks-max <n>` to proceed. Without `--blocks` nothing changes.
+
 #### Example:
 ```
 ./target/release/gnomon score ./ci_workdir/PGS004696_hmPOS_GRCh38.txt ./ci_workdir/gnomon_native_data
