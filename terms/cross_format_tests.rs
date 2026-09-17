@@ -653,3 +653,300 @@ fn relabel_female_candidate(psam: &str) -> String {
         .map(|fields| fields[iid].to_string())
         .expect("a female sample")
 }
+
+/// A GRCh38 panel of GT-only calls in every shape a GT takes here: phased and
+/// unphased diploid calls, `.` in either allele or both, haploid calls, and, with
+/// `max_ploidy` 3, triploid calls with and without a `.`. Odd samples look male.
+fn panel_vcf(seed: u64, n_samples: usize, max_ploidy: usize) -> String {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64 ^ seed;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut text = String::from("##fileformat=VCFv4.3\n");
+    for contig in ["1", "2", "22", "X", "Y"] {
+        text.push_str(&format!("##contig=<ID={contig}>\n"));
+    }
+    text.push_str("##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n");
+    text.push_str("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT");
+    for sample in 0..n_samples {
+        text.push_str(&format!("\tS{sample}"));
+    }
+    text.push('\n');
+    let mut rows: Vec<(&str, u64)> = Vec::new();
+    for (contig, count) in [("1", 900u64), ("2", 700), ("22", 500)] {
+        rows.extend((0..count).map(|i| (contig, 10_000 + i * 97)));
+    }
+    rows.extend((0..400u64).map(|i| ("X", 5_000 + i * 390_000)));
+    rows.extend((0..120u64).map(|i| ("Y", 5_000 + i * 470_000)));
+    for (contig, position) in rows {
+        text.push_str(&format!("{contig}\t{position}\t.\tA\tG\t.\tPASS\t.\tGT"));
+        for sample in 0..n_samples {
+            let roll = next();
+            let allele = |shift: u32| match (roll >> shift) % 16 {
+                0 => ".",
+                code if code % 2 == 0 => "0",
+                _ => "1",
+            };
+            let separator = |shift: u32| if (roll >> shift) % 2 == 0 { '/' } else { '|' };
+            let haploid =
+                (sample % 2 == 1 && matches!(contig, "X" | "Y")) || (roll >> 56) % 13 == 0;
+            let gt = if haploid {
+                allele(8).to_string()
+            } else if contig == "Y" {
+                "./.".to_string()
+            } else if max_ploidy == 3 && (roll >> 48) % 11 == 0 {
+                format!(
+                    "{}{}{}{}{}",
+                    allele(8),
+                    separator(4),
+                    allele(16),
+                    separator(5),
+                    allele(24)
+                )
+            } else {
+                format!("{}{}{}", allele(8), separator(4), allele(16))
+            };
+            text.push('\t');
+            text.push_str(&gt);
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// The int8 codes htslib writes for one VCF GT of one-digit alleles: an allele
+/// as `(index + 1) << 1` and `.` as 0, each with the phase bit of the `|` before
+/// it.
+fn htslib_gt_codes(gt: &str) -> Vec<i8> {
+    let mut codes = Vec::new();
+    let mut phased = 0i8;
+    let mut rest = gt;
+    loop {
+        let end = rest.find(['/', '|']).unwrap_or(rest.len());
+        let code = match &rest[..end] {
+            "." => 0,
+            allele => (allele.parse::<i8>().expect("a one-digit allele") + 1) << 1,
+        };
+        codes.push(code | phased);
+        match rest[end..].chars().next() {
+            Some(separator) => {
+                phased = i8::from(separator == '|');
+                rest = &rest[end + 1..];
+            }
+            None => return codes,
+        }
+    }
+}
+
+/// Writes the BCF htslib writes from the GT-only VCF at `vcf`, which noodles'
+/// writer does not: after the header noodles writes, each record is built by
+/// hand, a `.` after a `|` keeps its phase bit (code 1), and a call shorter than
+/// the record's widest is padded once, with int8's end-of-vector sentinel.
+fn write_htslib_bcf(vcf: &Path, bcf: &Path) {
+    use noodles_vcf::header::StringMaps;
+    use std::io::Write as _;
+
+    let mut reader = noodles_vcf::io::Reader::new(BufReader::new(fs::File::open(vcf).unwrap()));
+    let header = reader.read_header().unwrap();
+    let string_maps = StringMaps::try_from(&header).unwrap();
+    let gt_key = string_maps
+        .strings()
+        .get_index_of("GT")
+        .expect("GT in the header");
+    let mut writer = noodles_bcf::io::Writer::new(fs::File::create(bcf).unwrap());
+    writer.write_header(&header).unwrap();
+    let typed_string = |out: &mut Vec<u8>, value: &str| {
+        assert!(value.len() < 15, "a short string");
+        out.push(u8::try_from(value.len()).unwrap() << 4 | 7);
+        out.extend_from_slice(value.as_bytes());
+    };
+    let text = fs::read_to_string(vcf).unwrap();
+    for line in text.lines().filter(|line| !line.starts_with('#')) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let alleles: Vec<&str> = std::iter::once(fields[3])
+            .chain(fields[4].split(',').filter(|alt| *alt != "."))
+            .collect();
+        let calls: Vec<Vec<i8>> = fields[9..].iter().map(|gt| htslib_gt_codes(gt)).collect();
+        let ploidy = calls.iter().map(Vec::len).max().expect("samples");
+        let contig = string_maps
+            .contigs()
+            .get_index_of(fields[0])
+            .expect("contig in the header");
+        let mut site = Vec::new();
+        site.extend_from_slice(&i32::try_from(contig).unwrap().to_le_bytes());
+        site.extend_from_slice(&(fields[1].parse::<i32>().unwrap() - 1).to_le_bytes());
+        site.extend_from_slice(&i32::try_from(fields[3].len()).unwrap().to_le_bytes());
+        // A missing QUAL, the allele count over no INFO, and one FORMAT series
+        // over the sample count.
+        site.extend_from_slice(&0x7f80_0001_u32.to_le_bytes());
+        site.extend_from_slice(&(u32::try_from(alleles.len()).unwrap() << 16).to_le_bytes());
+        site.extend_from_slice(&(1u32 << 24 | u32::try_from(calls.len()).unwrap()).to_le_bytes());
+        typed_string(&mut site, fields[2]);
+        for allele in &alleles {
+            typed_string(&mut site, allele);
+        }
+        // An empty FILTER.
+        site.push(0x00);
+        let mut samples = vec![
+            0x11,
+            u8::try_from(gt_key).unwrap(),
+            u8::try_from(ploidy).unwrap() << 4 | 1,
+        ];
+        for mut call in calls {
+            call.resize(ploidy, i8::MIN + 1);
+            samples.extend(call.iter().map(|&code| code as u8));
+        }
+        let out = writer.get_mut();
+        out.write_all(&u32::try_from(site.len()).unwrap().to_le_bytes())
+            .unwrap();
+        out.write_all(&u32::try_from(samples.len()).unwrap().to_le_bytes())
+            .unwrap();
+        out.write_all(&site).unwrap();
+        out.write_all(&samples).unwrap();
+    }
+    writer.try_finish().unwrap();
+}
+
+/// The dosages score and map read from `a` and from `b` must be the same bit for
+/// bit, with a missing call NaN in both.
+fn assert_same_dosages(a: &Path, b: &Path) {
+    use crate::map::fit::VariantBlockSource as _;
+
+    let read = |path: &Path| -> (usize, Vec<u64>) {
+        let dataset = crate::map::io::GenotypeDataset::open(path, None).unwrap();
+        let mut source = dataset.block_source().unwrap();
+        let n_samples = source.n_samples();
+        let mut storage = vec![0.0; 256 * n_samples];
+        let mut bits = Vec::new();
+        loop {
+            let filled = source.next_block_into(256, &mut storage).unwrap();
+            if filled == 0 {
+                return (n_samples, bits);
+            }
+            bits.extend(storage[..filled * n_samples].iter().map(|value| {
+                if value.is_nan() {
+                    u64::MAX
+                } else {
+                    value.to_bits()
+                }
+            }));
+        }
+    };
+    let ((n_samples, left), (_, right)) = (read(a), read(b));
+    assert_eq!(
+        left.len(),
+        right.len(),
+        "{} and {}",
+        a.display(),
+        b.display()
+    );
+    if let Some(at) = left.iter().zip(&right).position(|(l, r)| l != r) {
+        panic!(
+            "{} and {} first differ at variant {}, sample {}: {:#x} and {:#x}",
+            a.display(),
+            b.display(),
+            at / n_samples,
+            at % n_samples,
+            left[at],
+            right[at]
+        );
+    }
+}
+
+/// score reads a BCF through its own genotype decoder, not the one map and terms
+/// share, so the same panel must also score alike from its VCF and its htslib BCF:
+/// the same people, missing counts and matched variants, and sums bit for bit.
+fn assert_same_scores(stage: &Path, vcf: &str) {
+    use crate::score::native_vcf::score_vcf_streaming;
+
+    let score = stage.join("panel.score.tsv");
+    let mut text = String::from("variant_id\teffect_allele\tother_allele\tpanel\n");
+    let records = vcf.lines().filter(|line| !line.starts_with('#'));
+    for (index, line) in records.enumerate().filter(|(index, _)| index % 3 == 0) {
+        let fields: Vec<&str> = line.splitn(3, '\t').collect();
+        text.push_str(&format!(
+            "{}:{}\tG\tA\t{:.2}\n",
+            fields[0],
+            fields[1],
+            (index % 7) as f64 / 4.0 - 0.75
+        ));
+    }
+    fs::write(&score, text).unwrap();
+    let run = |input: &str| {
+        score_vcf_streaming(&stage.join(input), std::slice::from_ref(&score), None, None)
+            .map_err(|err| err.to_string())
+    };
+    match (run("in.vcf"), run("in.htslib.bcf")) {
+        (Ok(from_vcf), Ok(from_bcf)) => {
+            assert!(
+                from_vcf.matched_variants > 0,
+                "{}: nothing scored",
+                stage.display()
+            );
+            assert_eq!(
+                (
+                    &from_bcf.person_iids,
+                    &from_bcf.missing_counts,
+                    from_bcf.matched_variants
+                ),
+                (
+                    &from_vcf.person_iids,
+                    &from_vcf.missing_counts,
+                    from_vcf.matched_variants
+                ),
+                "{}: score",
+                stage.display()
+            );
+            let bits = |sums: &[f64]| sums.iter().map(|sum| sum.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&from_bcf.sum_scores),
+                bits(&from_vcf.sum_scores),
+                "{}: score sums",
+                stage.display()
+            );
+        }
+        (from_vcf, from_bcf) => panic!(
+            "{}: scoring the VCF gave {from_vcf:?} and the htslib BCF {from_bcf:?}",
+            stage.display()
+        ),
+    }
+}
+
+/// A panel of partly missing calls, phased and unphased, and haploid calls gives
+/// one sex table as a VCF, as the BCF htslib writes from it, as the BCF noodles
+/// writes from it and as the .bed plink2 imports. Its VCF and htslib BCF decode to
+/// the same dosages bit for bit through the decoder map and terms share, and score
+/// alike through score's own. With triploid calls, which a .bed cannot hold, the
+/// VCF and the htslib BCF still agree on all of it. htslib writes the `.` of `1|.`
+/// as code 1, which the shared BCF decoder once read as an allele (#2373).
+#[test]
+fn partly_missing_haploid_and_triploid_calls_read_alike_from_a_vcf_and_its_htslib_bcf() {
+    let dir = tempfile::tempdir().unwrap();
+    for seed in [1u64, 2, 3] {
+        for max_ploidy in [2usize, 3] {
+            let stage = dir.path().join(format!("panel_{seed}_{max_ploidy}"));
+            let vcf = panel_vcf(seed, 12, max_ploidy);
+            assert!(
+                vcf.contains("\t1|.") && vcf.contains("\t.|1"),
+                "the panel holds phased missing alleles"
+            );
+            stage_vcf(&stage, &vcf);
+            write_htslib_bcf(&stage.join("in.vcf"), &stage.join("in.htslib.bcf"));
+            let table = infer(&stage, "vcf");
+            assert_eq!(
+                infer(&stage, "htslib.bcf"),
+                table,
+                "{}: htslib bcf",
+                stage.display()
+            );
+            if max_ploidy == 2 {
+                assert_eq!(staged_table(&stage), table, "{}: bed", stage.display());
+            }
+            assert_same_dosages(&stage.join("in.vcf"), &stage.join("in.htslib.bcf"));
+            assert_same_scores(&stage, &vcf);
+        }
+    }
+}

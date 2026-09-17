@@ -8,10 +8,11 @@
 //! decodes only the 8-bit form and panics on the others with
 //! `unhandled type`, so the readers here parse the series themselves.
 //!
-//! Each code is `(allele + 1) << 1 | phased`; a missing allele (`.`) is `0`, a
-//! sample with fewer alleles than the record's widest is padded with the
-//! width's end-of-vector sentinel, and the width's missing sentinel may stand
-//! in for a missing allele as well.
+//! Each code is `(allele + 1) << 1 | phased`, so a missing allele (`.`) is `0`,
+//! or `1` when phased, as htslib writes the `.` of `1|.`. A sample with fewer
+//! alleles than the record's widest is padded with the width's end-of-vector
+//! sentinel, and the width's missing sentinel may stand in for a missing allele
+//! as well.
 
 use std::fmt;
 
@@ -49,7 +50,9 @@ impl Width {
         };
         if value == end {
             Code::EndOfVector
-        } else if value == missing || value == 0 {
+        } else if value == missing || value >> 1 == 0 {
+            // A code whose upper bits are zero names no allele: `.` is `0`, and
+            // `1` when phased, as htslib writes the second allele of `1|.`.
             Code::MissingAllele
         } else if value < 0 {
             Code::Invalid(value)
@@ -259,15 +262,34 @@ mod tests {
     /// A sample block with one GT series (key 1) at the given width, plus a
     /// trailing int8 series (key 2) so the scan has something to skip past.
     fn block(width: u8, calls: &[&[i64]], ploidy: usize) -> Vec<u8> {
-        let (ty, eov): (u8, i64) = match width {
-            8 => (1, i64::from(i8::MIN + 1)),
-            16 => (2, i64::from(i16::MIN + 1)),
-            32 => (3, i64::from(i32::MIN + 1)),
+        let codes: Vec<Vec<i64>> = calls
+            .iter()
+            .map(|call| {
+                call.iter()
+                    .map(|&a| if a < 0 { 0 } else { (a + 1) << 1 })
+                    .collect()
+            })
+            .collect();
+        let codes: Vec<&[i64]> = codes.iter().map(Vec::as_slice).collect();
+        raw_block(width, &codes, ploidy)
+    }
+
+    /// [`block`] from raw codes rather than alleles. `i64::MIN` stands for the
+    /// width's missing sentinel, and each sample is padded to `ploidy` with the
+    /// width's end-of-vector sentinel.
+    fn raw_block(width: u8, calls: &[&[i64]], ploidy: usize) -> Vec<u8> {
+        let (ty, missing, eov): (u8, i64, i64) = match width {
+            8 => (1, i64::from(i8::MIN), i64::from(i8::MIN + 1)),
+            16 => (2, i64::from(i16::MIN), i64::from(i16::MIN + 1)),
+            32 => (3, i64::from(i32::MIN), i64::from(i32::MIN + 1)),
             _ => unreachable!(),
         };
         let mut out = vec![0x11, 1, (ploidy as u8) << 4 | ty];
         for call in calls {
-            let mut codes: Vec<i64> = call.iter().map(|&a| if a < 0 { 0 } else { (a + 1) << 1 }).collect();
+            let mut codes: Vec<i64> = call
+                .iter()
+                .map(|&code| if code == i64::MIN { missing } else { code })
+                .collect();
             codes.resize(ploidy, eov);
             for code in codes {
                 match width {
@@ -347,5 +369,56 @@ mod tests {
         out.extend(codes.iter().map(|&c| c as u8));
         let series = GenotypeSeries::find(&out, 1, 1, 1).unwrap().unwrap();
         assert_eq!(decoded(series, 1), vec![vec![Some(0), Some(1)]]);
+    }
+
+    /// Every width decodes the raw codes `calls`, padded to `ploidy`, to `expect`.
+    fn assert_every_width_decodes(calls: &[&[i64]], ploidy: usize, expect: &[Vec<Allele>]) {
+        for width in [8, 16, 32] {
+            let bytes = raw_block(width, calls, ploidy);
+            let series = GenotypeSeries::find(&bytes, 2, calls.len(), 1)
+                .unwrap()
+                .expect("GT present");
+            assert_eq!(decoded(series, calls.len()), expect, "width {width}");
+        }
+    }
+
+    /// `./.`, `0/.`, `./1`, a haploid `.` and `0/1/.` as htslib writes them
+    /// unphased: a missing allele is code 0.
+    #[test]
+    fn an_unphased_missing_allele_is_missing_at_every_width() {
+        let calls: &[&[i64]] = &[&[0, 0], &[2, 0], &[0, 4], &[0], &[2, 4, 0]];
+        let expect = [
+            vec![None, None],
+            vec![Some(0), None],
+            vec![None, Some(1)],
+            vec![None],
+            vec![Some(0), Some(1), None],
+        ];
+        assert_every_width_decodes(calls, 3, &expect);
+    }
+
+    /// `1|.`, `.|1`, `.|.` and `0|1|.` as htslib writes them: a missing allele
+    /// after a `|` is code 1, which names no allele, while `0|0` (codes 2 and 3)
+    /// still names REF twice.
+    #[test]
+    fn a_phased_missing_allele_is_missing_at_every_width() {
+        let calls: &[&[i64]] = &[&[4, 1], &[0, 5], &[0, 1], &[2, 5, 1], &[1], &[2, 3]];
+        let expect = [
+            vec![Some(1), None],
+            vec![None, Some(1)],
+            vec![None, None],
+            vec![Some(0), Some(1), None],
+            vec![None],
+            vec![Some(0), Some(0)],
+        ];
+        assert_every_width_decodes(calls, 3, &expect);
+    }
+
+    /// The width's missing sentinel in place of an allele is missing as well.
+    #[test]
+    fn the_width_missing_sentinel_is_missing_at_every_width() {
+        let calls: &[&[i64]] = &[&[i64::MIN, 4], &[4, i64::MIN], &[i64::MIN]];
+        let expect = [vec![None, Some(1)], vec![Some(1), None], vec![None]];
+        assert_every_width_decodes(calls, 2, &expect);
     }
 }
