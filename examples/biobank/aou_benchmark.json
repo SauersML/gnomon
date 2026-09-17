@@ -1,9 +1,9 @@
 {
   "seed": 20260914,
   "num_pcs": 6,
-  "max_rows_per_disease": 100000,
-  "max_rows_per_ancestry": 25000,
-  "test_fraction": 0.25,
+  "max_rows_per_disease": 150000,
+  "max_rows_per_ancestry": 47000,
+  "test_fraction": 0.5,
   "min_report_count": 20,
   "maximum_bytes_billed": 60000000000,
   "query_timeout_seconds": 300,
