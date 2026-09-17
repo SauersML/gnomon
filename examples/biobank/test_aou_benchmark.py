@@ -144,6 +144,17 @@ def test_failure_class_names_the_fixed_category_of_a_solver_message():
         assert bench.failure_class(log) == "gamerror"
 
 
+def test_failure_stage_is_the_last_marker_the_worker_printed():
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp, "fit.log")
+        for text, stage in (("Traceback...\nImportError: x\n", "before_fit"),
+                            ("gnomon_fit_started\n[3s] outer iter\nGamError: x\n", "fit"),
+                            ("gnomon_fit_started\ngnomon_fit_saved\nGamError: x\n", "predict"),
+                            ("gnomon_fit_started\ngnomon_fit_saved\ngnomon_predict_complete\n", "after_predict")):
+            log.write_text(text)
+            assert bench.failure_stage(log) == stage
+
+
 def test_table_leads_with_african_and_admixed_american_gains_and_never_prints_small_cells():
     rng = np.random.default_rng(8)
     ancestry = ["afr"] * 300 + ["amr"] * 300 + ["eur"] * 300 + ["eas"] * 15

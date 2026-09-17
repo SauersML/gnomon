@@ -376,6 +376,14 @@ def failure_class(log):
     return label
 
 
+def failure_stage(log):
+    """The last stage marker a worker printed before it stopped: a code name, never data."""
+    text = Path(log).read_bytes().decode("utf-8", errors="replace")
+    markers = re.findall(r"^gnomon_(fit_started|fit_saved|predict_complete)$", text, re.MULTILINE)
+    return {"fit_started": "fit", "fit_saved": "predict", "predict_complete": "after_predict"}.get(
+        markers[-1] if markers else "", "before_fit")
+
+
 # --------------------------------------------------------------------------- #
 # aggregate tokens
 # --------------------------------------------------------------------------- #
@@ -513,8 +521,10 @@ def run(args):
             predictions["gnomon"] = np.load(work / f"{disease}__{pgs}.npy")
             digest.emit(disease, slug(pgs), "gnomon", "status", "ok")
         else:
-            label = outcome if outcome == "timeout" else "error_" + failure_class(work / f"{disease}__{pgs}.log")
+            log = work / f"{disease}__{pgs}.log"
+            label = outcome if outcome == "timeout" else "error_" + failure_class(log)
             digest.emit(disease, slug(pgs), "gnomon", "status", label)
+            digest.emit(disease, slug(pgs), "gnomon", "failed_stage", failure_stage(log))
         report(digest, disease, pgs, test, predictions, config)
     publish_status(status, "benchmark_completed")
 
