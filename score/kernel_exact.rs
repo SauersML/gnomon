@@ -1,50 +1,86 @@
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the exact score accumulators once they land"
-    )
-)]
-
-// Exact score kernels over packed PLINK rows, for one output-person range.
+// Exact score kernels over packed PLINK rows.
 //
-// A range starts on a 32-person boundary (a whole 64-bit word of calls) and its cells are
-// two carry-free i64 limbs per person (see `exact::Split`). Each term enters a cell as an
-// integer, so tables, walks, tile sizes and the order of rows cannot change any bit.
+// A cell is one person's i64 lanes of the exact plan (see `score::cells`), `stride` lanes wide.
+// Every term enters a cell as an integer and lanes add with wrapping arithmetic, so tables,
+// walks, batch sizes, thread counts and the order of rows cannot change a single bit.
 
-use std::collections::TryReserveError;
+use crate::score::cells::LANE_WIDTH;
 use std::simd::{Simd, num::SimdUint};
 
 /// Four variants per table: a person's four two-bit calls form the table key.
-pub(crate) const VARIANTS_PER_TABLE: usize = 4;
+const VARIANTS_PER_TABLE: usize = 4;
+/// Four-variant groups built and applied together.
+const GROUPS_PER_BATCH: usize = 16;
+const M55: u64 = 0x5555_5555_5555_5555;
 
-/// Limb terms for PLINK codes [00, 01, 10, 11] of one variant and score.
-pub(crate) type TermLimbs = [(i64, i64); 4];
+/// Which people a batch scores, and where each one's calls sit in a packed row.
+#[derive(Clone, Copy)]
+pub(crate) enum People<'a> {
+    /// People `0..count`, in row order.
+    All(usize),
+    /// Kept people: byte offset and shift of each one's call, in output order.
+    Gathered { bytes: &'a [u32], shifts: &'a [u8] },
+}
 
-/// Entry `key` = the sum over the four variants of `terms[v][code of v in key]`. Prefix
-/// expansion shares partial sums: 4 + 12 + 48 + 192 additions instead of 4 per entry.
-#[inline]
-pub(crate) fn build_table(
-    terms: [&TermLimbs; VARIANTS_PER_TABLE],
-    lo: &mut [i64; 256],
-    hi: &mut [i64; 256],
-) {
-    for code in 0..4 {
-        (lo[code], hi[code]) = terms[0][code];
+impl People<'_> {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        match self {
+            Self::All(count) => *count,
+            Self::Gathered { bytes, .. } => bytes.len(),
+        }
     }
-    for variant in 1..VARIANTS_PER_TABLE {
-        let prefix = 1 << (2 * variant);
+}
+
+#[inline(always)]
+fn add_assign(dst: &mut [i64], src: &[i64]) {
+    for (d, s) in dst
+        .chunks_exact_mut(LANE_WIDTH)
+        .zip(src.chunks_exact(LANE_WIDTH))
+    {
+        (Simd::<i64, LANE_WIDTH>::from_slice(d) + Simd::<i64, LANE_WIDTH>::from_slice(s))
+            .copy_to_slice(d);
+    }
+}
+
+#[inline(always)]
+fn add_into(dst: &mut [i64], a: &[i64], b: &[i64]) {
+    for ((d, x), y) in dst
+        .chunks_exact_mut(LANE_WIDTH)
+        .zip(a.chunks_exact(LANE_WIDTH))
+        .zip(b.chunks_exact(LANE_WIDTH))
+    {
+        (Simd::<i64, LANE_WIDTH>::from_slice(x) + Simd::<i64, LANE_WIDTH>::from_slice(y))
+            .copy_to_slice(d);
+    }
+}
+
+/// Entry `key` of a group's table = Σ over its four rows of `terms[row][code of row in key]`, all
+/// lanes at once. Prefix expansion shares partial sums: 4 + 12 + 48 + 192 lane rows.
+fn build_table(terms: &[i64], group: usize, stride: usize, table: &mut [i64]) {
+    let row = |v: usize, code: usize| {
+        let at = ((group * VARIANTS_PER_TABLE + v) * 4 + code) * stride;
+        &terms[at..at + stride]
+    };
+    for code in 0..4 {
+        table[code * stride..(code + 1) * stride].copy_from_slice(row(0, code));
+    }
+    for v in 1..VARIANTS_PER_TABLE {
+        let prefix = 1usize << (2 * v);
         for code in (1..4).rev() {
-            let (add_lo, add_hi) = terms[variant][code];
+            let (head, tail) = table.split_at_mut(code * prefix * stride);
+            let add = row(v, code);
             for entry in 0..prefix {
-                lo[code * prefix + entry] = lo[entry].wrapping_add(add_lo);
-                hi[code * prefix + entry] = hi[entry].wrapping_add(add_hi);
+                add_into(
+                    &mut tail[entry * stride..(entry + 1) * stride],
+                    &head[entry * stride..(entry + 1) * stride],
+                    add,
+                );
             }
         }
-        let (add_lo, add_hi) = terms[variant][0];
+        let add = row(v, 0);
         for entry in 0..prefix {
-            lo[entry] = lo[entry].wrapping_add(add_lo);
-            hi[entry] = hi[entry].wrapping_add(add_hi);
+            add_assign(&mut table[entry * stride..(entry + 1) * stride], add);
         }
     }
 }
@@ -52,7 +88,7 @@ pub(crate) fn build_table(
 /// Table keys for 32 people per step: the butterfly transpose of four row words on eight u32
 /// lanes. `rows[k]` are whole 8-byte chunks of the same byte range; `keys.len() == 4 * rows[k].len()`.
 #[inline]
-pub(crate) fn transpose_keys(rows: [&[u8]; VARIANTS_PER_TABLE], keys: &mut [u8]) {
+fn transpose_keys(rows: [&[u8]; VARIANTS_PER_TABLE], keys: &mut [u8]) {
     let lane = |chunk: &[u8]| Simd::<u8, 8>::from_slice(chunk).cast::<u32>();
     for ((((out, c0), c1), c2), c3) in keys
         .chunks_exact_mut(32)
@@ -72,340 +108,9 @@ pub(crate) fn transpose_keys(rows: [&[u8]; VARIANTS_PER_TABLE], keys: &mut [u8])
     }
 }
 
-/// One table over a tile of people: a load per person per limb, no carries.
-#[inline]
-pub(crate) fn apply_table(
-    lo_table: &[i64; 256],
-    hi_table: &[i64; 256],
-    keys: &[u8],
-    lo: &mut [i64],
-    hi: &mut [i64],
-) {
-    for ((l, h), &key) in lo.iter_mut().zip(hi.iter_mut()).zip(keys) {
-        *l = l.wrapping_add(lo_table[key as usize]);
-        *h = h.wrapping_add(hi_table[key as usize]);
-    }
-}
-
-/// Reusable per-thread scratch for the table path.
-#[derive(Default)]
-pub(crate) struct TableScratch {
-    lo_tables: Vec<[i64; 256]>,
-    hi_tables: Vec<[i64; 256]>,
-    keys: Vec<u8>,
-    zero_tile: Vec<u8>,
-}
-
-// Fixed scratch ceilings, independent of the cohort and total variant count.
-const MAX_TABLE_GROUPS: usize = 256;
-const MAX_TILE_WORDS: usize = 256;
-const MAX_DENSE_ROWS: usize = MAX_TABLE_GROUPS * VARIANTS_PER_TABLE;
-
-fn resize_scratch<T: Clone>(
-    values: &mut Vec<T>,
-    count: usize,
-    zero: T,
-) -> Result<(), TryReserveError> {
-    if count > values.len() {
-        values.try_reserve_exact(count - values.len())?;
-        values.resize(count, zero);
-    }
-    Ok(())
-}
-
-impl TableScratch {
-    /// Reserve everything before changing any output cell. Repeated batches reuse it.
-    fn prepare(&mut self, groups: usize, tile_words: usize) -> Result<(), TryReserveError> {
-        resize_scratch(&mut self.lo_tables, groups, [0; 256])?;
-        resize_scratch(&mut self.hi_tables, groups, [0; 256])?;
-        resize_scratch(&mut self.keys, tile_words * 32, 0)?;
-        resize_scratch(&mut self.zero_tile, tile_words * 8, 0)
-    }
-}
-
-/// Cache-derived table geometry: tables for a batch of groups fill about half of L2; a tile's
-/// cells, keys and row bytes fill about half of L1.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TableGeometry {
-    pub(crate) groups_per_batch: usize,
-    pub(crate) tile_words: usize,
-}
-
-impl TableGeometry {
-    pub(crate) fn from_cache_sizes(l1_bytes: usize, l2_bytes: usize) -> Self {
-        let groups_per_batch = (l2_bytes / 2 / (256 * 16)).clamp(4, MAX_TABLE_GROUPS);
-        // Per person: 16 B of cells, 1 B of key, plus the four row bytes it shares with 3 others.
-        let tile_words = (l1_bytes / 2 / (32 * (16 + 1) + 4 * 8)).clamp(1, MAX_TILE_WORDS);
-        Self {
-            groups_per_batch,
-            tile_words,
-        }
-    }
-
-    fn for_work(self, rows: usize, people: usize) -> Self {
-        Self {
-            groups_per_batch: self
-                .groups_per_batch
-                .clamp(1, MAX_TABLE_GROUPS)
-                .min(rows.div_ceil(VARIANTS_PER_TABLE)),
-            tile_words: self
-                .tile_words
-                .clamp(1, MAX_TILE_WORDS)
-                .min(people.div_ceil(32)),
-        }
-    }
-}
-
-const M55: u64 = 0x5555_5555_5555_5555;
-/// The 64-bit pattern of a row whose every call is the code `c` (00, 01, 10 or 11).
-const CODE_PATTERN: [u64; 4] = [0, M55, 0xaaaa_aaaa_aaaa_aaaa, u64::MAX];
-
-/// Little-endian 64-bit word `w` of a packed row; bytes past the row read as code 00.
-#[inline(always)]
-fn row_word(row: &[u8], w: usize) -> u64 {
-    let start = w * 8;
-    if start + 8 <= row.len() {
-        u64::from_le_bytes(row[start..start + 8].try_into().unwrap())
-    } else {
-        let mut bytes = [0u8; 8];
-        bytes[..row.len() - start].copy_from_slice(&row[start..]);
-        u64::from_le_bytes(bytes)
-    }
-}
-
-/// The row's most common non-missing code over people `0..people` (ties prefer the lower code),
-/// and how many calls differ from it.
-#[inline]
-pub(crate) fn row_mode(row: &[u8], people: usize) -> (u8, u64) {
-    let words = people.div_ceil(32);
-    let (mut c11, mut c10, mut c01) = (0u64, 0u64, 0u64);
-    for w in 0..words {
-        let mut x = row_word(row, w);
-        if w + 1 == words && people % 32 != 0 {
-            x &= (1u64 << (2 * (people % 32))) - 1;
-        }
-        let (low, high) = (x & M55, (x >> 1) & M55);
-        c11 += u64::from((low & high).count_ones());
-        c10 += u64::from((high & !low).count_ones());
-        c01 += u64::from((low & !high).count_ones());
-    }
-    let counts = [people as u64 - c11 - c10 - c01, c01, c10, c11];
-    let mode = [0u8, 2, 3]
-        .into_iter()
-        .max_by_key(|&c| (counts[c as usize], 3 - c))
-        .unwrap();
-    (mode, people as u64 - counts[mode as usize])
-}
-
-/// Adds one row's calls for people `first_person..first_person + lo.len()` as mode-centred
-/// terms: each person who differs from `mode` receives `adjust[code]`, and every person's share
-/// of `terms[mode]` is left to the caller, who adds it once per range. Missing calls count.
-#[inline]
-pub(crate) fn walk_row(
-    row: &[u8],
-    mode: u8,
-    adjust: &TermLimbs,
-    first_person: usize,
-    lo: &mut [i64],
-    hi: &mut [i64],
-    missing: &mut [u32],
-) {
-    let people = lo.len();
-    let pattern = CODE_PATTERN[mode as usize];
-    let first_word = first_person / 32;
-    let words = people.div_ceil(32);
-    for w in 0..words {
-        let x = row_word(row, first_word + w);
-        let diff = x ^ pattern;
-        let mut exceptions = (diff | (diff >> 1)) & M55;
-        if w + 1 == words && people % 32 != 0 {
-            exceptions &= (1u64 << (2 * (people % 32))) - 1;
-        }
-        while exceptions != 0 {
-            let bit = exceptions.trailing_zeros();
-            exceptions &= exceptions - 1;
-            let code = ((x >> bit) & 3) as usize;
-            let person = w * 32 + (bit / 2) as usize;
-            lo[person] = lo[person].wrapping_add(adjust[code].0);
-            hi[person] = hi[person].wrapping_add(adjust[code].1);
-            missing[person] += u32::from(code == 1);
-        }
-    }
-}
-
-/// Counts missing calls (code 01) of one row for people `first_person..first_person + missing.len()`.
-#[inline]
-pub(crate) fn count_missing(row: &[u8], first_person: usize, missing: &mut [u32]) {
-    let people = missing.len();
-    let first_word = first_person / 32;
-    let words = people.div_ceil(32);
-    for w in 0..words {
-        let x = row_word(row, first_word + w);
-        let mut absent = x & !(x >> 1) & M55;
-        if w + 1 == words && people % 32 != 0 {
-            absent &= (1u64 << (2 * (people % 32))) - 1;
-        }
-        while absent != 0 {
-            let bit = absent.trailing_zeros();
-            absent &= absent - 1;
-            missing[w * 32 + (bit / 2) as usize] += 1;
-        }
-    }
-}
-
-/// What a row costs on this machine and input, measured on the input's own first rows: a table
-/// row costs about the same whatever its calls; a walked row costs a scan per 64-bit word plus
-/// a cost per call that differs from the row's mode. Choosing a path never changes the cells.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RowCosts {
-    pub(crate) table_row_ns: f64,
-    pub(crate) word_ns: f64,
-    pub(crate) exception_ns: f64,
-    /// A direct per-call lookup: the cheapest path when a range holds only a few people.
-    pub(crate) direct_call_ns: f64,
-}
-
-impl RowCosts {
-    #[inline(always)]
-    pub(crate) fn table_wins(&self, exceptions: u64, words: usize) -> bool {
-        self.word_ns * words as f64 + self.exception_ns * exceptions as f64 > self.table_row_ns
-    }
-
-    /// Whether every row of a `people`-person range is cheaper looked up call by call than
-    /// through any row path: a walk pays at least one word scan, a table a whole row.
-    #[inline(always)]
-    pub(crate) fn direct_wins(&self, people: usize) -> bool {
-        self.direct_call_ns * (people as f64) < self.word_ns.min(self.table_row_ns)
-    }
-}
-
-/// Adds rows `ids` call by call: each person receives the term of their own code.
-// Keep the compute loop separate from the dispatcher's allocation/error handling.
-#[inline(never)]
-fn apply_direct(
-    data: &[u8],
-    row_bytes: usize,
-    ids: &[usize],
-    terms: &[TermLimbs],
-    first_person: usize,
-    lo: &mut [i64],
-    hi: &mut [i64],
-    missing: &mut [u32],
-) {
-    for &r in ids {
-        let row = &data[r * row_bytes..(r + 1) * row_bytes];
-        for (p, ((l, h), m)) in lo
-            .iter_mut()
-            .zip(hi.iter_mut())
-            .zip(missing.iter_mut())
-            .enumerate()
-        {
-            let person = first_person + p;
-            let code = ((row[person / 4] >> (2 * (person % 4))) & 3) as usize;
-            *l = l.wrapping_add(terms[r][code].0);
-            *h = h.wrapping_add(terms[r][code].1);
-            *m += u32::from(code == 1);
-        }
-    }
-}
-
-/// Reusable per-thread scratch for `apply_rows`.
-#[derive(Default)]
-pub(crate) struct KernelScratch {
-    tables: TableScratch,
-    dense: Vec<usize>,
-}
-
-/// Adds rows `ids` to the cells of people `first_person..first_person + lo.len()`. Each row
-/// either walks the calls that differ from its mode within the range or joins a four-variant
-/// table group, whichever `costs` prices lower for that row's exceptions.
-///
-/// Limb sums stay exact: a person's final lo limb holds one lo part in `[0, 2^split)` per
-/// variant (a walked row's adjustment plus its mode share is that variant's term), so the final
-/// sums fit i64 and the wrapping intermediates are exact modulo 2^64.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_rows(
-    data: &[u8],
-    row_bytes: usize,
-    ids: &[usize],
-    terms: &[TermLimbs],
-    costs: &RowCosts,
-    geometry: TableGeometry,
-    first_person: usize,
-    scratch: &mut KernelScratch,
-    lo: &mut [i64],
-    hi: &mut [i64],
-    missing: &mut [u32],
-) -> Result<(), TryReserveError> {
-    assert_eq!(first_person % 32, 0, "person ranges start on 64-bit words");
-    assert!(lo.len() == hi.len() && lo.len() == missing.len());
-    let people = lo.len();
-    if people == 0 || ids.is_empty() {
-        return Ok(());
-    }
-    if costs.direct_wins(people) {
-        apply_direct(data, row_bytes, ids, terms, first_person, lo, hi, missing);
-        return Ok(());
-    }
-    let geometry = geometry.for_work(ids.len(), people);
-    scratch.dense.clear();
-    scratch
-        .dense
-        .try_reserve_exact(ids.len().min(MAX_DENSE_ROWS))?;
-    scratch
-        .tables
-        .prepare(geometry.groups_per_batch, geometry.tile_words)?;
-    let words = people.div_ceil(32);
-    for chunk in ids.chunks(MAX_DENSE_ROWS) {
-        scratch.dense.clear();
-        let (mut share_lo, mut share_hi) = (0i64, 0i64);
-        for &r in chunk {
-            let row = &data[r * row_bytes..(r + 1) * row_bytes];
-            let (mode, exceptions) = row_mode(&row[first_person / 4..], people);
-            if costs.table_wins(exceptions, words) {
-                scratch.dense.push(r);
-                continue;
-            }
-            let at_mode = terms[r][mode as usize];
-            let adjust =
-                terms[r].map(|(l, h)| (l.wrapping_sub(at_mode.0), h.wrapping_sub(at_mode.1)));
-            walk_row(row, mode, &adjust, first_person, lo, hi, missing);
-            share_lo = share_lo.wrapping_add(at_mode.0);
-            share_hi = share_hi.wrapping_add(at_mode.1);
-        }
-        if share_lo != 0 || share_hi != 0 {
-            for (l, h) in lo.iter_mut().zip(hi.iter_mut()) {
-                *l = l.wrapping_add(share_lo);
-                *h = h.wrapping_add(share_hi);
-            }
-        }
-        if !scratch.dense.is_empty() {
-            apply_table_rows(
-                data,
-                row_bytes,
-                &scratch.dense,
-                terms,
-                first_person,
-                geometry,
-                &mut scratch.tables,
-                lo,
-                hi,
-            )?;
-            for &r in &scratch.dense {
-                count_missing(
-                    &data[r * row_bytes..(r + 1) * row_bytes],
-                    first_person,
-                    missing,
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Transposes four calls-bytes into the four people's keys (two butterfly exchanges).
 #[inline(always)]
-pub(crate) fn transpose_calls(bytes: [u8; 4]) -> [u8; 4] {
+fn transpose_calls(bytes: [u8; 4]) -> [u8; 4] {
     let mut word = u32::from_le_bytes(bytes);
     let swap = (word ^ (word >> 6)) & 0x00cc_00cc;
     word ^= swap ^ (swap << 6);
@@ -414,10 +119,195 @@ pub(crate) fn transpose_calls(bytes: [u8; 4]) -> [u8; 4] {
     word.to_le_bytes()
 }
 
+/// Reusable per-thread scratch for [`apply_table_rows`].
+#[derive(Default)]
+pub(crate) struct TableScratch {
+    tables: Vec<i64>,
+    column_keys: Vec<u8>,
+    person_keys: Vec<u8>,
+    zero_row: Vec<u8>,
+}
+
+/// Adds `rows` packed rows to every person's cell: `terms` holds `rows × 4 × stride` lanes (the
+/// terms of codes 00, 01, 10 and 11 of each row) and `cells` holds `people × stride` lanes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_table_rows(
+    data: &[u8],
+    row_bytes: usize,
+    rows: usize,
+    terms: &[i64],
+    stride: usize,
+    people: People,
+    scratch: &mut TableScratch,
+    cells: &mut [i64],
+) {
+    let count = people.len();
+    let groups = rows.div_ceil(VARIANTS_PER_TABLE);
+    assert!(stride % LANE_WIDTH == 0 && cells.len() == count * stride);
+    assert!(terms.len() >= groups * VARIANTS_PER_TABLE * 4 * stride && data.len() >= rows * row_bytes);
+    if count == 0 || rows == 0 {
+        return;
+    }
+    scratch.zero_row.resize(row_bytes, 0);
+    scratch.tables.resize(GROUPS_PER_BATCH * 256 * stride, 0);
+    scratch.person_keys.resize(count * GROUPS_PER_BATCH, 0);
+    let key_width = row_bytes * 4;
+    if let People::All(_) = people {
+        scratch.column_keys.resize(GROUPS_PER_BATCH * key_width, 0);
+    }
+    let whole = row_bytes / 8 * 8;
+    for batch in (0..groups).step_by(GROUPS_PER_BATCH) {
+        let in_batch = (groups - batch).min(GROUPS_PER_BATCH);
+        for g in 0..in_batch {
+            let group = batch + g;
+            build_table(
+                terms,
+                group,
+                stride,
+                &mut scratch.tables[g * 256 * stride..(g + 1) * 256 * stride],
+            );
+            let source: [&[u8]; VARIANTS_PER_TABLE] = std::array::from_fn(|v| {
+                let r = group * VARIANTS_PER_TABLE + v;
+                if r < rows {
+                    &data[r * row_bytes..(r + 1) * row_bytes]
+                } else {
+                    &scratch.zero_row[..]
+                }
+            });
+            match people {
+                People::All(count) => {
+                    let keys = &mut scratch.column_keys[g * key_width..(g + 1) * key_width];
+                    transpose_keys(source.map(|r| &r[..whole]), &mut keys[..whole * 4]);
+                    for byte in whole..row_bytes {
+                        keys[byte * 4..byte * 4 + 4]
+                            .copy_from_slice(&transpose_calls(source.map(|r| r[byte])));
+                    }
+                    for (p, &key) in keys[..count].iter().enumerate() {
+                        scratch.person_keys[p * GROUPS_PER_BATCH + g] = key;
+                    }
+                }
+                People::Gathered { bytes, shifts } => {
+                    for (p, (&byte, &shift)) in bytes.iter().zip(shifts).enumerate() {
+                        let byte = byte as usize;
+                        let code = |v: usize| ((source[v][byte] >> shift) & 3) << (2 * v);
+                        scratch.person_keys[p * GROUPS_PER_BATCH + g] =
+                            code(0) | code(1) | code(2) | code(3);
+                    }
+                }
+            }
+        }
+        let tables = &scratch.tables[..in_batch * 256 * stride];
+        let keys = &scratch.person_keys;
+        // A stride of one or two SIMD widths keeps each person's accumulator in registers.
+        match stride {
+            4 => apply_stripe_4(tables, keys, in_batch, cells),
+            8 => apply_stripe_8(tables, keys, in_batch, cells),
+            _ => {
+                for (p, cell) in cells.chunks_exact_mut(stride).enumerate() {
+                    for (g, &key) in keys[p * GROUPS_PER_BATCH..p * GROUPS_PER_BATCH + in_batch]
+                        .iter()
+                        .enumerate()
+                    {
+                        let at = (g * 256 + key as usize) * stride;
+                        add_assign(cell, &tables[at..at + stride]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+macro_rules! apply_stripe {
+    ($name:ident, $lanes:literal) => {
+        /// Each person's lanes accumulated in registers over the batch's groups.
+        #[inline(always)]
+        fn $name(tables: &[i64], keys: &[u8], in_batch: usize, cells: &mut [i64]) {
+            for (p, cell) in cells.chunks_exact_mut($lanes).enumerate() {
+                let mut acc = Simd::<i64, $lanes>::from_slice(cell);
+                for (g, &key) in keys[p * GROUPS_PER_BATCH..p * GROUPS_PER_BATCH + in_batch]
+                    .iter()
+                    .enumerate()
+                {
+                    let at = (g * 256 + key as usize) * $lanes;
+                    acc += Simd::<i64, $lanes>::from_slice(&tables[at..at + $lanes]);
+                }
+                acc.copy_to_slice(cell);
+            }
+        }
+    };
+}
+apply_stripe!(apply_stripe_4, 4);
+apply_stripe!(apply_stripe_8, 8);
+
+/// Calls `visit(person, code)` for every person whose call in `row` is not 00, in person order.
+#[inline]
+pub(crate) fn for_each_call(row: &[u8], people: People, mut visit: impl FnMut(usize, u8)) {
+    match people {
+        People::All(count) => {
+            let words = count.div_ceil(32);
+            for w in 0..words {
+                let start = w * 8;
+                let mut bytes = [0u8; 8];
+                let chunk = &row[start..(start + 8).min(row.len())];
+                bytes[..chunk.len()].copy_from_slice(chunk);
+                let x = u64::from_le_bytes(bytes);
+                let mut calls = (x | (x >> 1)) & M55;
+                if w + 1 == words && count % 32 != 0 {
+                    calls &= (1u64 << (2 * (count % 32))) - 1;
+                }
+                while calls != 0 {
+                    let bit = calls.trailing_zeros();
+                    calls &= calls - 1;
+                    visit(w * 32 + (bit / 2) as usize, ((x >> bit) & 3) as u8);
+                }
+            }
+        }
+        People::Gathered { bytes, shifts } => {
+            for (p, (&byte, &shift)) in bytes.iter().zip(shifts).enumerate() {
+                let code = (row[byte as usize] >> shift) & 3;
+                if code != 0 {
+                    visit(p, code);
+                }
+            }
+        }
+    }
+}
+
+/// Calls `visit(person)` for every person whose call in `row` is missing (code 01), in order.
+#[inline]
+pub(crate) fn for_each_missing(row: &[u8], people: People, mut visit: impl FnMut(usize)) {
+    match people {
+        People::All(count) => {
+            let words = count.div_ceil(32);
+            for w in 0..words {
+                let start = w * 8;
+                let mut bytes = [0u8; 8];
+                let chunk = &row[start..(start + 8).min(row.len())];
+                bytes[..chunk.len()].copy_from_slice(chunk);
+                let x = u64::from_le_bytes(bytes);
+                let mut absent = x & !(x >> 1) & M55;
+                if w + 1 == words && count % 32 != 0 {
+                    absent &= (1u64 << (2 * (count % 32))) - 1;
+                }
+                while absent != 0 {
+                    visit(w * 32 + (absent.trailing_zeros() / 2) as usize);
+                    absent &= absent - 1;
+                }
+            }
+        }
+        People::Gathered { bytes, shifts } => {
+            for (p, (&byte, &shift)) in bytes.iter().zip(shifts).enumerate() {
+                if (row[byte as usize] >> shift) & 3 == 1 {
+                    visit(p);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::score::exact::{FixedPoint, Split};
 
     struct Rng(u64);
 
@@ -430,250 +320,92 @@ mod tests {
         }
     }
 
-    /// Rows of `people` calls; `density` in 0..=64 sets how often a call leaves the row's mode.
-    fn rows(rng: &mut Rng, count: usize, people: usize, density: u64) -> Vec<u8> {
-        let row_bytes = people.div_ceil(4);
-        let mut data = vec![0u8; count * row_bytes];
-        for r in 0..count {
-            let mode = [0u8, 2, 3][r % 3];
-            for p in 0..people {
-                let code = if rng.next() % 64 < density {
-                    (rng.next() % 4) as u8
-                } else {
-                    mode
-                };
-                data[r * row_bytes + p / 4] |= code << (2 * (p % 4));
-            }
-        }
-        data
-    }
-
-    fn naive(
-        data: &[u8],
-        row_bytes: usize,
-        terms: &[[i128; 4]],
-        people: usize,
-    ) -> (Vec<i128>, Vec<u32>) {
-        let (mut sums, mut missing) = (vec![0i128; people], vec![0u32; people]);
-        for (r, t) in terms.iter().enumerate() {
-            for p in 0..people {
-                let code = ((data[r * row_bytes + p / 4] >> (2 * (p % 4))) & 3) as usize;
-                sums[p] += t[code];
-                missing[p] += u32::from(code == 1);
-            }
-        }
-        (sums, missing)
+    fn code(row: &[u8], person: usize) -> usize {
+        ((row[person / 4] >> (2 * (person % 4))) & 3) as usize
     }
 
     #[test]
-    fn every_path_and_range_matches_the_exact_per_call_sum() {
+    fn transposed_keys_are_the_four_calls_of_each_person() {
+        let mut rng = Rng(7);
+        for people in [1usize, 31, 32, 33, 127, 200] {
+            let row_bytes = people.div_ceil(4);
+            let rows: Vec<Vec<u8>> = (0..4)
+                .map(|_| (0..row_bytes).map(|_| rng.next() as u8).collect())
+                .collect();
+            let whole = row_bytes / 8 * 8;
+            let mut keys = vec![0u8; row_bytes * 4];
+            let source: [&[u8]; 4] = std::array::from_fn(|v| &rows[v][..]);
+            transpose_keys(source.map(|r| &r[..whole]), &mut keys[..whole * 4]);
+            for byte in whole..row_bytes {
+                keys[byte * 4..byte * 4 + 4].copy_from_slice(&transpose_calls(source.map(|r| r[byte])));
+            }
+            for person in 0..people {
+                let want = (0..4).map(|v| code(&rows[v], person) << (2 * v)).sum::<usize>();
+                assert_eq!(keys[person] as usize, want, "people {people} person {person}");
+            }
+        }
+    }
+
+    #[test]
+    fn tables_match_per_call_sums_for_every_stride_and_person_layout() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-        let geometry = TableGeometry {
-            groups_per_batch: 3,
-            tile_words: 1,
-        };
-        let walk_only = RowCosts {
-            table_row_ns: f64::INFINITY,
-            word_ns: 0.0,
-            exception_ns: 0.0,
-            direct_call_ns: f64::INFINITY,
-        };
-        let tables_only = RowCosts {
-            table_row_ns: 0.0,
-            word_ns: 1.0,
-            exception_ns: 1.0,
-            direct_call_ns: f64::INFINITY,
-        };
-        let mixed = RowCosts {
-            table_row_ns: 40.0,
-            word_ns: 1.0,
-            exception_ns: 1.0,
-            direct_call_ns: f64::INFINITY,
-        };
-        let direct_only = RowCosts {
-            table_row_ns: f64::INFINITY,
-            word_ns: f64::INFINITY,
-            exception_ns: 0.0,
-            direct_call_ns: 0.0,
-        };
-        for people in [1, 3, 4, 31, 32, 33, 64, 97, 130] {
-            for density in [0, 3, 32, 64] {
-                let count = 23;
-                let data = rows(&mut rng, count, people, density);
-                let row_bytes = people.div_ceil(4);
-                let weights: Vec<f64> = (0..count)
-                    .map(|i| {
-                        ((rng.next() >> 11) as f64 / (1u64 << 53) as f64 - 0.5)
-                            * 10f64.powi(-(i as i32 % 7))
-                    })
-                    .collect();
-                let corrections: Vec<f64> = weights
-                    .iter()
-                    .enumerate()
-                    .map(|(i, w)| if i % 3 == 0 { 2.0 * w.abs() } else { 0.0 })
-                    .collect();
-                let fixed = FixedPoint::plan(
-                    weights.iter().chain(&corrections).copied(),
-                    count as u64,
-                    2,
-                    1,
-                )
-                .expect("fits");
-                let exact: Vec<[i128; 4]> = weights
-                    .iter()
-                    .zip(&corrections)
-                    .map(|(&w, &c)| {
-                        [
-                            0,
-                            -fixed.to_fixed(c),
-                            fixed.to_fixed(w),
-                            2 * fixed.to_fixed(w),
-                        ]
-                    })
-                    .collect();
-                let term_bits = exact
-                    .iter()
-                    .flatten()
-                    .map(|v| 128 - v.unsigned_abs().leading_zeros() + 1)
-                    .max()
-                    .unwrap();
-                let split = Split::plan(term_bits, count as u64).expect("two limbs");
-                let terms: Vec<TermLimbs> =
-                    exact.iter().map(|t| t.map(|v| split.parts(v))).collect();
-                let (want, want_missing) = naive(&data, row_bytes, &exact, people);
-                let ids: Vec<usize> = (0..count).collect();
-                for costs in [walk_only, tables_only, mixed, direct_only] {
-                    for first in (0..people).step_by(32) {
-                        for end in [(first + 32).min(people), people] {
-                            let n = end - first;
-                            let (mut lo, mut hi, mut missing) =
-                                (vec![0i64; n], vec![0i64; n], vec![0u32; n]);
-                            let mut scratch = KernelScratch::default();
-                            apply_rows(
-                                &data,
-                                row_bytes,
-                                &ids,
-                                &terms,
-                                &costs,
-                                geometry,
-                                first,
-                                &mut scratch,
-                                &mut lo,
-                                &mut hi,
-                                &mut missing,
-                            )
-                            .unwrap();
-                            for p in 0..n {
-                                assert_eq!(
-                                    split.join(lo[p], hi[p]),
-                                    want[first + p],
-                                    "people {people} density {density} costs {costs:?} range {first}..{end} person {p}"
-                                );
-                                assert_eq!(missing[p], want_missing[first + p]);
-                            }
-                        }
+        for (people, rows, stride) in [(1usize, 1usize, 4usize), (37, 5, 4), (64, 67, 8), (130, 13, 12), (33, 256, 8)] {
+            let row_bytes = (people + 5).div_ceil(4);
+            let data: Vec<u8> = (0..rows * row_bytes).map(|_| rng.next() as u8).collect();
+            let groups = rows.div_ceil(4);
+            let mut terms = vec![0i64; groups * 4 * 4 * stride];
+            for r in 0..rows {
+                for code in 1..4 {
+                    for lane in 0..stride {
+                        terms[(r * 4 + code) * stride + lane] = rng.next() as i64;
                     }
                 }
             }
-        }
-    }
-
-    #[test]
-    fn table_geometry_follows_cache_sizes() {
-        // EPYC 7763: 32 KiB L1d, 512 KiB L2. Tables for a batch fill half of L2.
-        let geometry = TableGeometry::from_cache_sizes(32 << 10, 512 << 10);
-        assert_eq!(geometry.groups_per_batch, 64);
-        assert_eq!(geometry.tile_words, 28);
-        // A tiny cache still yields a working geometry.
-        let tiny = TableGeometry::from_cache_sizes(1 << 10, 8 << 10);
-        assert!(tiny.groups_per_batch >= 4 && tiny.tile_words >= 1);
-    }
-
-    #[test]
-    fn simd_keys_match_scalar_transposition() {
-        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
-        let rows: Vec<Vec<u8>> = (0..4)
-            .map(|_| (0..64).map(|_| rng.next() as u8).collect())
-            .collect();
-        let mut keys = vec![0u8; 64 * 4];
-        transpose_keys(std::array::from_fn(|k| &rows[k][..]), &mut keys);
-        for byte in 0..64 {
-            assert_eq!(
-                keys[byte * 4..byte * 4 + 4],
-                transpose_calls(std::array::from_fn(|k| rows[k][byte]))
-            );
-        }
-    }
-}
-
-/// Adds the rows `ids` (groups of four; a short final group reads zero-term rows) to the cells
-/// of people `first_person..first_person + lo.len()`. Rows are packed PLINK rows of `row_bytes`
-/// bytes. The range starts on a 32-person boundary; it may end anywhere, and people past its end
-/// in the final byte are read but never written.
-#[allow(clippy::too_many_arguments)]
-// Keep table computation separate from the row classifier and scratch setup.
-#[inline(never)]
-pub(crate) fn apply_table_rows(
-    data: &[u8],
-    row_bytes: usize,
-    ids: &[usize],
-    terms: &[TermLimbs],
-    first_person: usize,
-    geometry: TableGeometry,
-    scratch: &mut TableScratch,
-    lo: &mut [i64],
-    hi: &mut [i64],
-) -> Result<(), TryReserveError> {
-    const ZERO_TERMS: TermLimbs = [(0, 0); 4];
-    assert_eq!(first_person % 32, 0, "person ranges start on 64-bit words");
-    assert_eq!(lo.len(), hi.len());
-    let people = lo.len();
-    if people == 0 || ids.is_empty() {
-        return Ok(());
-    }
-    let byte_start = first_person / 4;
-    let byte_end = byte_start + people.div_ceil(4);
-    assert!(
-        byte_end <= row_bytes,
-        "person range {first_person}+{people} exceeds {row_bytes}-byte rows"
-    );
-    let groups = ids.len().div_ceil(VARIANTS_PER_TABLE);
-    let geometry = geometry.for_work(ids.len(), people);
-    let tile_bytes = geometry.tile_words * 8;
-    scratch.prepare(geometry.groups_per_batch, geometry.tile_words)?;
-    for batch in (0..groups).step_by(geometry.groups_per_batch) {
-        let count = (groups - batch).min(geometry.groups_per_batch);
-        let member = |g: usize, k: usize| ids.get((batch + g) * VARIANTS_PER_TABLE + k);
-        for g in 0..count {
-            let t: [&TermLimbs; 4] =
-                std::array::from_fn(|k| member(g, k).map_or(&ZERO_TERMS, |&r| &terms[r]));
-            build_table(t, &mut scratch.lo_tables[g], &mut scratch.hi_tables[g]);
-        }
-        for start in (byte_start..byte_end).step_by(tile_bytes) {
-            let end = (start + tile_bytes).min(byte_end);
-            let whole = (end - start) / 8 * 8;
-            let tile_people = (start - byte_start) * 4..((end - byte_start) * 4).min(people);
-            let keys = &mut scratch.keys[..(end - start) * 4];
-            for g in 0..count {
-                let rows: [&[u8]; 4] = std::array::from_fn(|k| match member(g, k) {
-                    Some(&r) => &data[r * row_bytes + start..r * row_bytes + end],
-                    None => &scratch.zero_tile[..end - start],
-                });
-                transpose_keys(rows.map(|row| &row[..whole]), &mut keys[..whole * 4]);
-                for byte in whole..end - start {
-                    let calls = transpose_calls(rows.map(|row| row[byte]));
-                    keys[byte * 4..byte * 4 + 4].copy_from_slice(&calls);
+            // Gathered people: every other slot of the row, reversed.
+            let kept: Vec<usize> = (0..people).map(|p| (people - 1 - p) * 2 % (row_bytes * 4)).collect();
+            let bytes: Vec<u32> = kept.iter().map(|&f| (f / 4) as u32).collect();
+            let shifts: Vec<u8> = kept.iter().map(|&f| (2 * (f % 4)) as u8).collect();
+            for gathered in [false, true] {
+                let layout = if gathered {
+                    People::Gathered { bytes: &bytes, shifts: &shifts }
+                } else {
+                    People::All(people)
+                };
+                let mut cells = vec![0i64; people * stride];
+                let mut scratch = TableScratch::default();
+                apply_table_rows(&data, row_bytes, rows, &terms, stride, layout, &mut scratch, &mut cells);
+                let mut want = vec![0i64; people * stride];
+                for p in 0..people {
+                    let slot = if gathered { kept[p] } else { p };
+                    for r in 0..rows {
+                        let c = code(&data[r * row_bytes..(r + 1) * row_bytes], slot);
+                        for lane in 0..stride {
+                            want[p * stride + lane] =
+                                want[p * stride + lane].wrapping_add(terms[(r * 4 + c) * stride + lane]);
+                        }
+                    }
                 }
-                let used = tile_people.len();
-                apply_table(
-                    &scratch.lo_tables[g],
-                    &scratch.hi_tables[g],
-                    &keys[..used],
-                    &mut lo[tile_people.clone()],
-                    &mut hi[tile_people.clone()],
-                );
+                assert_eq!(cells, want, "people {people} rows {rows} stride {stride} gathered {gathered}");
             }
         }
     }
-    Ok(())
+
+    #[test]
+    fn call_walks_visit_every_nonzero_call_once() {
+        let mut rng = Rng(3);
+        for people in [1usize, 32, 45, 96] {
+            let row: Vec<u8> = (0..people.div_ceil(4) + 3).map(|_| rng.next() as u8).collect();
+            let mut seen = Vec::new();
+            for_each_call(&row, People::All(people), |p, c| seen.push((p, c as usize)));
+            let want: Vec<(usize, usize)> = (0..people)
+                .map(|p| (p, code(&row, p)))
+                .filter(|&(_, c)| c != 0)
+                .collect();
+            assert_eq!(seen, want);
+            let mut missing = Vec::new();
+            for_each_missing(&row, People::All(people), |p| missing.push(p));
+            let want: Vec<usize> = (0..people).filter(|&p| code(&row, p) == 1).collect();
+            assert_eq!(missing, want);
+        }
+    }
 }

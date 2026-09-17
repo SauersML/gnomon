@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod cells;
 pub mod complex;
 pub mod decide;
 pub mod download;
@@ -6,7 +7,6 @@ pub mod genotype_convert;
 pub mod io;
 pub(crate) mod exact;
 pub(crate) mod kernel_exact;
-pub mod kernel;
 pub mod native_vcf;
 pub mod pipeline;
 pub mod prepare;

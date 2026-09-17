@@ -55,7 +55,7 @@ pub mod batch {
     pub use crate::score::batch::*;
 }
 
-pub use score::{complex, decide, download, io, kernel, pipeline, prepare, reformat, types};
+pub use score::{complex, decide, download, io, pipeline, prepare, reformat, types};
 
 #[path = "../map/mod.rs"]
 pub mod map;

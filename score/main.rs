@@ -1116,7 +1116,9 @@ fn finalize_and_write_native_output(
         &result.person_iids,
         &result.score_names,
         &result.score_variant_counts,
-        &result.sum_scores,
+        &F64Sums {
+            sums: &result.sum_scores,
+        },
         &result.missing_counts,
         score_regions,
         emit_components,
@@ -1166,7 +1168,7 @@ fn fileset_output_path(fileset_prefix: &Path, name_suffix: Option<&str>) -> Path
 fn finalize_and_write_output(
     out_path: &Path,
     prep_result: &Arc<PreparationResult>,
-    final_scores: &[f64],
+    final_scores: &[i64],
     final_counts: &[u32],
     score_regions: Option<&HashMap<String, GenomicRegion>>,
     emit_components: bool,
@@ -1184,7 +1186,11 @@ fn finalize_and_write_output(
         &prep_result.final_person_iids,
         &prep_result.score_names,
         &prep_result.score_variant_counts,
-        final_scores,
+        &ExactCells {
+            exact: prep_result.exact(),
+            lanes: final_scores,
+            num_scores: prep_result.score_names.len(),
+        },
         final_counts,
         score_regions,
         emit_components,
@@ -1568,12 +1574,12 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
 /// is 100 when its block holds no variant of the score; an unsplit column
 /// without variants reports 0.
 #[allow(clippy::too_many_arguments)]
-fn write_scores_to_file(
+fn write_scores_to_file<V: ScoreValues>(
     path: &Path,
     person_iids: &[String],
     score_names: &[String],
     score_variant_counts: &[u32],
-    sum_scores: &[f64],
+    values: &V,
     missing_counts: &[u32],
     score_regions: Option<&HashMap<String, GenomicRegion>>,
     emit_components: bool,
@@ -1593,7 +1599,7 @@ fn write_scores_to_file(
             writer,
             person_iids,
             score_variant_counts,
-            sum_scores,
+            values,
             missing_counts,
             num_scores,
             emit_components,
@@ -1737,13 +1743,12 @@ impl<'a> SscoreSink<'a> {
             &mut self.blocks,
             &self.person_iids[first_person..end],
             self.score_variant_counts,
-            sums,
+            &Finished { sums, avgs },
             missing_counts,
             self.num_scores,
             self.emit_components,
             self.rows_per_block,
             self.block_columns,
-            &|cell, _, _| avgs[cell],
         )?;
         self.next_person = end;
         Ok(())
@@ -1765,6 +1770,97 @@ impl<'a> SscoreSink<'a> {
     }
 }
 
+/// The finished values of `.sscore` cells, laid out person × score.
+trait ScoreValues: Sync {
+    /// How many cells there are.
+    fn cells(&self) -> usize;
+    /// A cell's sum.
+    fn sum(&self, cell: usize) -> f64;
+    /// A cell's average over the variants it used; 0 when it used none.
+    fn average(&self, cell: usize, variants_used: u32) -> f64;
+}
+
+/// A compiled plan's exact integer cells: every value is the exact rational sum or average,
+/// rounded once.
+struct ExactCells<'a> {
+    exact: &'a gnomon::score::cells::ExactPlan,
+    lanes: &'a [i64],
+    num_scores: usize,
+}
+
+impl ExactCells<'_> {
+    #[inline]
+    fn score_and_lanes(&self, cell: usize) -> (usize, &[i64]) {
+        let stride = self.exact.stride();
+        let person = cell / self.num_scores;
+        (
+            cell % self.num_scores,
+            &self.lanes[person * stride..(person + 1) * stride],
+        )
+    }
+}
+
+impl ScoreValues for ExactCells<'_> {
+    fn cells(&self) -> usize {
+        self.lanes.len() / self.exact.stride() * self.num_scores
+    }
+
+    fn sum(&self, cell: usize) -> f64 {
+        let (score, lanes) = self.score_and_lanes(cell);
+        self.exact.sum(score, lanes)
+    }
+
+    fn average(&self, cell: usize, variants_used: u32) -> f64 {
+        let (score, lanes) = self.score_and_lanes(cell);
+        self.exact.average(score, lanes, variants_used)
+    }
+}
+
+/// f64 sums averaged in f64, as the native VCF scorer produces them.
+struct F64Sums<'a> {
+    sums: &'a [f64],
+}
+
+impl ScoreValues for F64Sums<'_> {
+    fn cells(&self) -> usize {
+        self.sums.len()
+    }
+
+    fn sum(&self, cell: usize) -> f64 {
+        self.sums[cell]
+    }
+
+    fn average(&self, cell: usize, variants_used: u32) -> f64 {
+        // Based on the number of non-missing variants, as standard tools compute it when
+        // mean imputation is disabled.
+        if variants_used > 0 {
+            self.sums[cell] / (variants_used as f64)
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Sums and averages finished by the caller.
+struct Finished<'a> {
+    sums: &'a [f64],
+    avgs: &'a [f64],
+}
+
+impl ScoreValues for Finished<'_> {
+    fn cells(&self) -> usize {
+        self.sums.len().min(self.avgs.len())
+    }
+
+    fn sum(&self, cell: usize) -> f64 {
+        self.sums[cell]
+    }
+
+    fn average(&self, cell: usize, _variants_used: u32) -> f64 {
+        self.avgs[cell]
+    }
+}
+
 /// Text formatted per block of `.sscore` rows. At most one block per worker
 /// thread is held at once, so the rows cost a few MiB beyond the scores
 /// themselves whatever the cohort size.
@@ -1782,62 +1878,50 @@ fn score_rows_per_block(person_iids: &[String], num_scores: usize) -> usize {
 /// `rows_per_block` rows are formatted in parallel and written in order, so the
 /// bytes are exactly those of formatting the rows one at a time.
 #[allow(clippy::too_many_arguments)]
-fn write_score_rows<W: Write>(
+fn write_score_rows<W: Write, V: ScoreValues>(
     writer: &mut W,
     person_iids: &[String],
     score_variant_counts: &[u32],
-    sum_scores: &[f64],
+    values: &V,
     missing_counts: &[u32],
     num_scores: usize,
     emit_components: bool,
     rows_per_block: usize,
     block_columns: Option<&[bool]>,
 ) -> io::Result<()> {
-    // The score is calculated based on the number of non-missing variants.
-    // This behavior matches standard tools when mean-imputation is disabled.
-    let average = |_cell: usize, sum: f64, variants_used: u32| {
-        if variants_used > 0 {
-            sum / (variants_used as f64)
-        } else {
-            0.0
-        }
-    };
     write_rows_with(
         writer,
         &mut Vec::new(),
         person_iids,
         score_variant_counts,
-        sum_scores,
+        values,
         missing_counts,
         num_scores,
         emit_components,
         rows_per_block,
         block_columns,
-        &average,
     )
 }
 
-/// [`write_score_rows`], with each cell's `_AVG` taken from `average(cell, sum,
-/// variants_used)`. `blocks` holds the formatted text of one block per worker
+/// [`write_score_rows`] with the caller's text buffers. `blocks` holds the formatted text of one block per worker
 /// thread, and is sized on first use, so a caller writing many batches of rows can
 /// keep its buffers from one batch to the next.
 #[allow(clippy::too_many_arguments)]
-fn write_rows_with<W: Write, A: Fn(usize, f64, u32) -> f64 + Sync>(
+fn write_rows_with<W: Write, V: ScoreValues>(
     writer: &mut W,
     blocks: &mut Vec<Vec<u8>>,
     person_iids: &[String],
     score_variant_counts: &[u32],
-    sum_scores: &[f64],
+    values: &V,
     missing_counts: &[u32],
     num_scores: usize,
     emit_components: bool,
     rows_per_block: usize,
     block_columns: Option<&[bool]>,
-    average: &A,
 ) -> io::Result<()> {
     let n_persons = person_iids.len();
     let needed = n_persons.saturating_mul(num_scores);
-    if sum_scores.len() < needed {
+    if values.cells() < needed {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Mismatched number of persons and score rows during final write.",
@@ -1874,12 +1958,11 @@ fn write_rows_with<W: Write, A: Fn(usize, f64, u32) -> f64 + Sync>(
                     person_iids,
                     start..end,
                     score_variant_counts,
-                    sum_scores,
+                    values,
                     missing_counts,
                     num_scores,
                     emit_components,
                     block_columns,
-                    average,
                 );
             }
         });
@@ -1893,17 +1976,16 @@ fn write_rows_with<W: Write, A: Fn(usize, f64, u32) -> f64 + Sync>(
 
 /// Appends the `.sscore` rows of `persons` to `text`.
 #[allow(clippy::too_many_arguments)]
-fn format_score_rows<A: Fn(usize, f64, u32) -> f64>(
+fn format_score_rows<V: ScoreValues>(
     text: &mut Vec<u8>,
     person_iids: &[String],
     persons: std::ops::Range<usize>,
     score_variant_counts: &[u32],
-    sum_scores: &[f64],
+    values: &V,
     missing_counts: &[u32],
     num_scores: usize,
     emit_components: bool,
     block_columns: Option<&[bool]>,
-    average: &A,
 ) {
     let mut ryu_buffer_score = ryu::Buffer::new();
     let mut ryu_buffer_missing = ryu::Buffer::new();
@@ -1911,18 +1993,17 @@ fn format_score_rows<A: Fn(usize, f64, u32) -> f64>(
         text.extend_from_slice(person_iids[person].as_bytes());
         let row = person * num_scores;
         for i in 0..num_scores {
-            let final_sum_score = sum_scores[row + i];
             let missing_count = missing_counts[row + i];
             let total_variants_for_score = score_variant_counts[i];
 
             text.push(b'\t');
             if emit_components {
-                text.extend_from_slice(ryu_buffer_score.format(final_sum_score).as_bytes());
+                text.extend_from_slice(ryu_buffer_score.format(values.sum(row + i)).as_bytes());
                 text.push(b'\t');
                 write!(text, "{missing_count}").unwrap();
             } else {
                 let variants_used = total_variants_for_score.saturating_sub(missing_count);
-                let avg_score = average(row + i, final_sum_score, variants_used);
+                let avg_score = values.average(row + i, variants_used);
                 let missing_pct = if total_variants_for_score > 0 {
                     (missing_count as f32 / total_variants_for_score as f32) * 100.0
                 } else if block_columns.is_some_and(|flags| flags[i]) {
@@ -1942,7 +2023,9 @@ fn format_score_rows<A: Fn(usize, f64, u32) -> f64>(
 
 #[cfg(test)]
 mod output_tests {
-    use super::{GenomicRegion, HashMap, SscoreSink, write_score_rows, write_scores_to_file};
+    use super::{
+        F64Sums, GenomicRegion, HashMap, SscoreSink, write_score_rows, write_scores_to_file,
+    };
     use std::fs;
 
     /// A directory scored once holds each file's `<stem>.sorted.gnomon.tsv`
@@ -2118,7 +2201,7 @@ mod output_tests {
                     &mut written,
                     &iids,
                     &counts,
-                    &sums,
+                    &F64Sums { sums: &sums },
                     &missing,
                     3,
                     emit_components,
@@ -2142,7 +2225,7 @@ mod output_tests {
                 &mut Vec::new(),
                 &iids,
                 &counts,
-                sums,
+                &F64Sums { sums },
                 missing,
                 2,
                 false,
@@ -2170,7 +2253,9 @@ mod output_tests {
                         &mut written,
                         &iids[first..first + n],
                         &counts,
-                        &sums[first * 3..(first + n) * 3],
+                        &F64Sums {
+                            sums: &sums[first * 3..(first + n) * 3],
+                        },
                         &missing[first * 3..(first + n) * 3],
                         3,
                         emit_components,
@@ -2224,7 +2309,7 @@ mod output_tests {
                 &iids,
                 &names,
                 &counts,
-                &sums,
+                &F64Sums { sums: &sums },
                 &missing,
                 Some(&regions),
                 emit_components,
@@ -2341,7 +2426,7 @@ mod output_tests {
             &["person-1".to_string()],
             &["PGS000001".to_string()],
             &[4],
-            &[6.0],
+            &F64Sums { sums: &[6.0] },
             &[1],
             None,
             true,
@@ -2374,7 +2459,9 @@ person-1\t6.0\t1\n"
             &iids,
             &names,
             &[0, 0, 2],
-            &[0.0, 0.0, 3.0],
+            &F64Sums {
+                sums: &[0.0, 0.0, 3.0],
+            },
             &[0, 0, 1],
             None,
             false,
@@ -2392,7 +2479,9 @@ p1\t0.0\t0.0\t0.0\t100.0\t3.0\t50.0\n"
             &iids,
             &names,
             &[0, 0, 2],
-            &[0.0, 0.0, 3.0],
+            &F64Sums {
+                sums: &[0.0, 0.0, 3.0],
+            },
             &[0, 0, 1],
             None,
             true,

@@ -9,6 +9,7 @@
 // algorithm to handle genome-scale data.
 
 use crate::pipeline_error::PipelineError;
+use crate::score::cells::{ExactPlan, PlanError};
 use crate::score::io::{TextSource, open_plink_text_source, open_text_source};
 use crate::score::types::{
     BimRowIndex, FilesetBoundary, GenomicRegion, GroupedComplexRule, PersonSubset, PipelineKind,
@@ -28,9 +29,6 @@ use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
 use std::sync::Arc;
 use std::time::Instant;
-
-// The number of SIMD lanes in the kernel. This MUST be kept in sync with kernel.rs.
-const LANE_COUNT: usize = 8;
 
 #[path = "prepare_cache.rs"]
 mod cache;
@@ -419,10 +417,8 @@ struct JoinOutputs {
     baseline_errors: Vec<f64>,
     score_variant_counts: Vec<u32>,
     final_complex_rules: Vec<GroupedComplexRule>,
-    // Reuse score slots across singleton loci. Only touched columns are visited
-    // or cleared, so sparse panels do not incur a full score-panel scan per locus.
-    simple_assignments: Vec<Option<SimpleScoreAssignment>>,
-    touched_columns: Vec<ScoreColumnIndex>,
+    /// The entries of the row being reconciled, reused across loci.
+    row_entries: Vec<(ScoreColumnIndex, SimpleScoreAssignment)>,
     /// The locus of every row, kept only for a block expansion after the join.
     row_keys: Option<Vec<VariantKey>>,
 }
@@ -440,17 +436,6 @@ impl JoinOutputs {
             PrepError::Invariant(format!("Cannot allocate baseline compensation: {e}"))
         })?;
         baseline_errors.resize(num_scores, 0.0f64);
-        let mut simple_assignments = Vec::new();
-        simple_assignments
-            .try_reserve_exact(num_scores)
-            .map_err(|e| {
-                PrepError::Invariant(format!("Cannot allocate score reconciliation slots: {e}"))
-            })?;
-        simple_assignments.resize(num_scores, None::<SimpleScoreAssignment>);
-        let mut touched_columns = Vec::new();
-        touched_columns.try_reserve_exact(num_scores).map_err(|e| {
-            PrepError::Invariant(format!("Cannot allocate score reconciliation columns: {e}"))
-        })?;
         Ok(Self {
             required_bim_indices: Vec::new(),
             required_is_complex: Vec::new(),
@@ -459,8 +444,7 @@ impl JoinOutputs {
             baseline_errors,
             score_variant_counts: vec![0u32; num_scores],
             final_complex_rules: Vec::new(),
-            simple_assignments,
-            touched_columns,
+            row_entries: Vec::new(),
             row_keys: None,
         })
     }
@@ -521,6 +505,7 @@ impl JoinOutputs {
         }
 
         if let [bim] = bim_group {
+            self.row_entries.clear();
             for score in score_group {
                 if !allele_pair_matches(
                     score.effect_allele.as_str(),
@@ -530,36 +515,36 @@ impl JoinOutputs {
                 ) {
                     continue;
                 }
-                let touched_columns = &mut self.touched_columns;
-                let assignment = self.simple_assignments[score.score_column_index.0]
-                    .get_or_insert_with(|| {
-                        touched_columns.push(score.score_column_index);
-                        SimpleScoreAssignment {
-                            dosage_weight: 0.0,
-                            missing_correction: 0.0,
-                        }
-                    });
-                // Input order matters for duplicate f64 additions.
+                let mut assignment = SimpleScoreAssignment {
+                    dosage_weight: 0.0,
+                    missing_correction: 0.0,
+                };
                 apply_simple_score_assignment(
-                    assignment,
+                    &mut assignment,
                     score.weight,
                     score.effect_allele.as_str() == bim.allele1.as_str(),
                 );
+                self.row_entries.push((score.score_column_index, assignment));
             }
-            if !self.touched_columns.is_empty() {
-                self.touched_columns.sort_unstable();
+            if !self.row_entries.is_empty() {
+                // Duplicate score lines stay separate entries, each one parsed weight, so the
+                // exact plan sums the written decimals rather than an f64 sum of them.
+                self.row_entries.sort_by_key(|&(column, _)| column);
                 self.required_bim_indices.push(bim.bim_row_index);
                 self.required_is_complex.push(0);
                 self.push_row_key(key);
-                for column in self.touched_columns.drain(..) {
-                    let assignment = self.simple_assignments[column.0].take().unwrap();
+                let mut previous = None;
+                for &(column, assignment) in &self.row_entries {
                     self.csr_builder.push_contribution(column, assignment)?;
                     accumulate_baseline(
                         &mut self.baseline_missing_sum_by_score[column.0],
                         &mut self.baseline_errors[column.0],
                         assignment.missing_correction,
                     );
-                    self.score_variant_counts[column.0] += 1;
+                    if previous != Some(column) {
+                        self.score_variant_counts[column.0] += 1;
+                    }
+                    previous = Some(column);
                 }
                 self.csr_builder.finish_variant()?;
             }
@@ -1392,19 +1377,6 @@ fn prepare_for_computation_with_retry(
 
     let rows_sorted_by_key = matches!(bim_rows, BimRows::Sorted(_));
 
-    let score_lane_groups = score_names.len().div_ceil(LANE_COUNT);
-    let stride = score_lane_groups.checked_mul(LANE_COUNT).ok_or_else(|| {
-        PrepError::Invariant(format!(
-            "Stride overflow while padding scores: num_scores={}, lane_count={LANE_COUNT}",
-            score_names.len()
-        ))
-    })?;
-    if stride % LANE_COUNT != 0 {
-        return Err(PrepError::Invariant(format!(
-            "Invalid padded stride {stride}: must be divisible by lane count {LANE_COUNT}."
-        )));
-    }
-
     // Build final artifacts incrementally during Stage 3 to avoid materializing
     // genome-scale intermediate maps that duplicate the final CSR/rule structures.
     let mut outputs = JoinOutputs::new(score_names.len())?;
@@ -1689,12 +1661,18 @@ fn assemble_preparation(
     }
     let num_people_to_score = final_person_iids.len();
     let num_reconciled_variants = plan.required.len();
-    let stride = plan
-        .names
-        .len()
-        .div_ceil(LANE_COUNT)
-        .checked_mul(LANE_COUNT)
-        .ok_or_else(|| PrepError::Invariant("Score stride overflow.".into()))?;
+    let exact = ExactPlan::new(
+        &plan.weights,
+        &plan.corrections,
+        &plan.columns,
+        &plan.offsets,
+        &plan.complex,
+        &plan.names,
+    )
+    .map_err(|error| match error {
+        PlanError::Invariant(message) => PrepError::Invariant(message),
+        PlanError::Unrepresentable(message) => PrepError::Parse(message),
+    })?;
     let bytes_per_variant = (total_people_in_fam as u64).div_ceil(4);
     let bytes_per_variant_usize = bytes_per_variant as usize;
     let (spool_compact_byte_index, spool_dense_map) =
@@ -1742,12 +1720,9 @@ fn assemble_preparation(
     };
 
     Ok(PreparationResult::new(
-        plan.weights,
-        plan.corrections,
+        exact,
         plan.columns,
         plan.offsets,
-        stride,
-        plan.baseline,
         plan.required,
         plan.complex,
         plan.names,
@@ -2745,12 +2720,19 @@ mod tests {
             .map(|name| prep.score_names.iter().position(|s| s == name).unwrap())
             .into();
         assert_eq!(prep.required_bim_indices, [0, 1, 2].map(BimRowIndex));
-        assert_eq!(prep.sparse_row_offsets(), &[0, 3, 4, 6]);
+        assert_eq!(prep.sparse_row_offsets(), &[0, 9, 10, 12]);
         for (row, expected) in [
             vec![
-                // f64 retains the middle 1 in 2^24 + 1 - 2^24.
-                (columns[0], 1.0f64, 0.0f64),
-                (columns[1], 0.5, 1.0),
+                // Duplicate lines stay separate entries, in input order, so exact sums use the
+                // written weights: 2^24 + 1 - 2^24 is 1 whatever f64 would retain.
+                (columns[0], 16777216.0f64, 0.0f64),
+                (columns[0], 1.0, 0.0),
+                (columns[0], -16777216.0, 0.0),
+                (columns[0], 0.0, 0.0),
+                (columns[1], 1.0, 0.0),
+                (columns[1], 0.0, 0.0),
+                (columns[1], 0.0, 0.0),
+                (columns[1], -0.5, 1.0),
                 (columns[2], -0.25, 0.5),
             ],
             vec![(columns[2], 4.0, 0.0)],
@@ -2760,7 +2742,7 @@ mod tests {
         .enumerate()
         {
             let mut expected = expected;
-            expected.sort_unstable_by_key(|x| x.0);
+            expected.sort_by_key(|x| x.0);
             let start = prep.sparse_row_offsets()[row] as usize;
             for (offset, (col, weight, correction)) in expected.into_iter().enumerate() {
                 assert_eq!(prep.sparse_score_columns()[start + offset], col as u32);
@@ -2804,9 +2786,10 @@ mod tests {
         std::fs::write(&weights, "variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.25\n1:150\tC\tT\t0.5\n1:200\tA\tAC\t-0.75\n1:250\tC\tA\t0.125\n1:300\t<DEL>\tA\t-0.125\n1:300\t<DEL>\tA\t0.375\n").unwrap();
         let prep = prepare_for_computation(&[prefix], &[weights], None, None).unwrap();
         assert_eq!(prep.required_bim_indices, [0, 1, 2, 3, 5].map(BimRowIndex));
-        assert_eq!(prep.sparse_row_offsets(), &[0, 1, 2, 3, 3, 4]);
-        assert_eq!(prep.sparse_weights(), &[0.25, -0.5, -0.75, -0.25]);
-        assert_eq!(prep.sparse_missing_corrections(), &[0.0, 1.0, 0.0, 0.5]);
+        // The two 1:300 lines stay two entries, each one written weight, flipped.
+        assert_eq!(prep.sparse_row_offsets(), &[0, 1, 2, 3, 3, 5]);
+        assert_eq!(prep.sparse_weights(), &[0.25, -0.5, -0.75, 0.125, -0.375]);
+        assert_eq!(prep.sparse_missing_corrections(), &[0.0, 1.0, 0.0, -0.25, 0.75]);
         assert_eq!(prep.baseline_missing_sum_by_score(), &[1.5]);
         assert_eq!(prep.score_variant_counts, [5]);
         assert_eq!(prep.required_is_complex(), &[0, 0, 0, 1, 0]);

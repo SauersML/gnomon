@@ -4,6 +4,7 @@
 
 // This file is ONLY for types that are SHARED BETWEEN FILES, not types that only are used in one file.
 
+use crate::score::cells::ExactPlan;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -184,12 +185,9 @@ pub struct PreparationResult {
     // --- Private, compiled data matrices ---
     // These fields are private to guarantee their invariants. They are created once
     // by the `prepare` module and can only be read by downstream modules.
-    sparse_weights: Vec<f64>,
-    sparse_missing_corrections: Vec<f64>,
+    exact: ExactPlan,
     sparse_score_columns: Vec<u32>,
     sparse_row_offsets: Vec<u64>,
-    stride: usize,
-    baseline_missing_sum_by_score: Vec<f64>,
 
     // --- Public metadata & lookup tables ---
     /// The sorted list of original `.bim` row indices for the "fast path."
@@ -245,12 +243,9 @@ impl PreparationResult {
     /// The constructor is crate-private, enforcing the "Airlock" pattern.
     /// Only the `prepare` module can construct this "proof token".
     pub fn new(
-        sparse_weights: Vec<f64>,
-        sparse_missing_corrections: Vec<f64>,
+        exact: ExactPlan,
         sparse_score_columns: Vec<u32>,
         sparse_row_offsets: Vec<u64>,
-        stride: usize,
-        baseline_missing_sum_by_score: Vec<f64>,
         required_bim_indices: Vec<BimRowIndex>,
         complex_rules: Vec<GroupedComplexRule>,
         score_names: Vec<String>,
@@ -271,12 +266,9 @@ impl PreparationResult {
         pipeline_kind: PipelineKind,
     ) -> Self {
         Self {
-            sparse_weights,
-            sparse_missing_corrections,
+            exact,
             sparse_score_columns,
             sparse_row_offsets,
-            stride,
-            baseline_missing_sum_by_score,
             required_bim_indices,
             complex_rules,
             score_names,
@@ -300,14 +292,33 @@ impl PreparationResult {
 
     // --- Public Getters for Private Data ---
 
+    /// The plan's weights as exact integers, and the rounding of finished cells.
     #[inline(always)]
-    pub fn sparse_weights(&self) -> &[f64] {
-        &self.sparse_weights
+    pub fn exact(&self) -> &ExactPlan {
+        &self.exact
     }
 
-    #[inline(always)]
-    pub fn sparse_missing_corrections(&self) -> &[f64] {
-        &self.sparse_missing_corrections
+    /// Every CSR entry's weight: the f64 it was parsed from, recovered from the exact plan.
+    pub fn sparse_weights(&self) -> Vec<f64> {
+        let columns = &self.sparse_score_columns;
+        (0..columns.len())
+            .map(|entry| self.exact.entry_weight_f64(entry, columns[entry] as usize))
+            .collect()
+    }
+
+    /// Every CSR entry's missing correction, as the join computed it.
+    pub fn sparse_missing_corrections(&self) -> Vec<f64> {
+        let columns = &self.sparse_score_columns;
+        (0..columns.len())
+            .map(|entry| self.exact.entry_correction_f64(entry, columns[entry] as usize))
+            .collect()
+    }
+
+    /// Every score's flipped-allele baseline, rounded once from its exact value.
+    pub fn baseline_missing_sum_by_score(&self) -> Vec<f64> {
+        (0..self.score_names.len())
+            .map(|score| self.exact.baseline_f64(score))
+            .collect()
     }
 
     #[inline(always)]
@@ -321,23 +332,13 @@ impl PreparationResult {
     }
 
     #[inline(always)]
-    pub fn stride(&self) -> usize {
-        self.stride
-    }
-
-    #[inline(always)]
-    pub fn baseline_missing_sum_by_score(&self) -> &[f64] {
-        &self.baseline_missing_sum_by_score
-    }
-
-    #[inline(always)]
     pub fn sparse_row_range(&self, variant_idx: ReconciledVariantIndex) -> std::ops::Range<usize> {
         let idx = variant_idx.0 as usize;
         debug_assert!(idx + 1 < self.sparse_row_offsets.len());
         let start = self.sparse_row_offsets[idx] as usize;
         let end = self.sparse_row_offsets[idx + 1] as usize;
         debug_assert!(end >= start);
-        debug_assert!(end <= self.sparse_weights.len());
+        debug_assert!(end <= self.sparse_score_columns.len());
         start..end
     }
 
@@ -346,8 +347,7 @@ impl PreparationResult {
         let range = self.sparse_row_range(reconciled_idx);
         VariantCsrView {
             score_columns: &self.sparse_score_columns[range.clone()],
-            weights: &self.sparse_weights[range.clone()],
-            missing_corrections: &self.sparse_missing_corrections[range],
+            first_entry: range.start,
         }
     }
 
@@ -420,20 +420,18 @@ pub struct ScoreColumnIndex(pub usize);
 #[repr(transparent)]
 pub struct CsrEntryIndex(pub usize);
 
-/// One matched non-zero CSR contribution for a variant.
+/// One matched CSR contribution for a variant: its score and its entry in the exact plan.
 #[derive(Debug, Clone, Copy)]
 pub struct CsrContribution {
     pub score_column: ScoreColumnIndex,
-    pub weight: f64,
-    pub missing_correction: f64,
+    pub entry: usize,
 }
 
 /// A read-only view over one variant's CSR contributions.
 #[derive(Debug, Clone, Copy)]
 pub struct VariantCsrView<'a> {
     score_columns: &'a [u32],
-    weights: &'a [f64],
-    missing_corrections: &'a [f64],
+    first_entry: usize,
 }
 
 impl<'a> VariantCsrView<'a> {
@@ -447,37 +445,15 @@ impl<'a> VariantCsrView<'a> {
         self.score_columns.len()
     }
 
-    /// Walks the three slices by index. `variant_csr_view` cuts them with one range, so
-    /// they share a length. A `Zip` of three slice iterators relies on `ZipImpl::new` and
-    /// `TrustedRandomAccessNoCoerce::size` being inlined, and builds with several codegen
-    /// units have kept both out of line: a call pair per row visit in the scoring loops.
+    /// Walks the row by index: an iterator adapter over the slice can stay out of line in
+    /// builds with several codegen units, a call per row visit in the scoring loops.
     #[inline(always)]
     pub fn iter(&self) -> impl Iterator<Item = CsrContribution> + 'a {
         let score_columns = self.score_columns;
-        let len = score_columns.len();
-        let weights = &self.weights[..len];
-        let missing_corrections = &self.missing_corrections[..len];
-        (0..len).map(move |i| CsrContribution {
+        let first_entry = self.first_entry;
+        (0..score_columns.len()).map(move |i| CsrContribution {
             score_column: ScoreColumnIndex(score_columns[i] as usize),
-            weight: weights[i],
-            missing_correction: missing_corrections[i],
+            entry: first_entry + i,
         })
-    }
-}
-
-/// A `#[repr(transparent)]` wrapper for a dosage value.
-///
-/// This type is used in the pivoted tile buffer. Its `u8` representation is
-/// compact and efficient for the pivoting process.
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct EffectAlleleDosage(pub u8);
-
-impl EffectAlleleDosage {
-    /// Creates a new dosage, asserting the value is valid in debug builds.
-    #[inline(always)]
-    pub fn new(value: u8) -> Self {
-        assert!(value <= 3, "Invalid dosage value created: {value}");
-        Self(value)
     }
 }

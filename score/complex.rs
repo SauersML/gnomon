@@ -1,4 +1,5 @@
 use crate::pipeline_error::PipelineError;
+use crate::score::cells::{ExactPlan, Target};
 use crate::score::io::BedSource;
 use crate::score::types::{
     BimRowIndex, FilesetBoundary, GroupedComplexRule, OutputPersonIndex, PreparationResult,
@@ -394,16 +395,16 @@ mod tests {
             dense[byte as usize] = compact_idx as i32;
         }
         let spool_bytes_per_variant = compact.len() as u64;
+        let names: Vec<String> = (0..num_scores).map(|i| format!("S{i}")).collect();
+        let exact = crate::score::cells::ExactPlan::new(&[], &[], &[], &[0], &rules, &names)
+            .expect("exact plan");
         PreparationResult::new(
-            Vec::new(),
-            Vec::new(),
+            exact,
             Vec::new(),
             vec![0],
-            1,
-            vec![0.0; num_scores],
             Vec::new(),
             rules,
-            (0..num_scores).map(|i| format!("S{i}")).collect(),
+            names,
             vec![0; num_scores],
             PersonSubset::Indices(sorted_kept),
             kept.iter().map(|fam_idx| format!("IID{fam_idx}")).collect(),
@@ -700,15 +701,14 @@ mod tests {
             (self.rows[bim_row_index.0 as usize][fam_idx / 4] >> ((fam_idx % 4) * 2)) & 0b11
         }
 
-        /// Accumulators as the fast path might leave them, signed zeros included.
-        fn initial_accumulators(&self, seed: u64) -> (Vec<f64>, Vec<u32>) {
+        /// Accumulators as the fast path might leave them: arbitrary lanes and counts.
+        fn initial_accumulators(&self, seed: u64, stride: usize) -> (Vec<i64>, Vec<u32>) {
             let mut rng = SplitMix64(seed ^ 0xA5A5);
             let cells = self.kept.len() * self.num_scores;
-            let scores = (0..cells)
-                .map(|_| match rng.below(5) {
-                    0 => -0.0,
-                    1 => 0.0,
-                    _ => rng.unit() * 1e3 - 500.0,
+            let scores = (0..self.kept.len() * stride)
+                .map(|_| match rng.below(3) {
+                    0 => 0,
+                    _ => rng.next() as i64,
                 })
                 .collect();
             let counts = (0..cells).map(|_| rng.below(7) as u32).collect();
@@ -790,11 +790,13 @@ mod tests {
         scenario: &Scenario,
         prep_result: &PreparationResult,
         pruned_byte: Option<usize>,
-        scores: &mut [f64],
+        scores: &mut [i64],
         counts: &mut [u32],
     ) -> FinalAggregatedCollector {
         let pipeline = ResolverPipeline::new();
         let num_scores = prep_result.score_names.len();
+        let exact = prep_result.exact();
+        let stride = exact.stride();
         let mut collector = FinalAggregatedCollector::new();
         for (person, fam_idx) in prep_result.output_idx_to_fam_idx.iter().enumerate() {
             let fam_idx = fam_idx.0 as usize;
@@ -813,7 +815,9 @@ mod tests {
                     .filter(|(bits, _)| *bits != 0b01)
                     .collect();
                 for score_info in &rule.score_applications {
-                    let cell = person * num_scores + score_info.score_column_index.0;
+                    let column = score_info.score_column_index.0;
+                    let cell = person * num_scores + column;
+                    let lanes = &mut scores[person * stride..(person + 1) * stride];
                     let matching: Vec<_> = valid
                         .iter()
                         .copied()
@@ -828,7 +832,11 @@ mod tests {
                     if matching.len() == 1 {
                         let (bits, (_, bim_a1, bim_a2)) = matching[0];
                         match Heuristic::calculate_score_dosage(bits, bim_a1, bim_a2, score_info) {
-                            Some(dosage) => scores[cell] += dosage * score_info.weight as f64,
+                            Some(dosage) => exact.add(
+                                exact.complex_target(column, score_info.weight),
+                                exact.complex_term(column, score_info.weight, dosage as u32, 1),
+                                lanes,
+                            ),
                             None => counts[cell] += 1,
                         }
                         continue;
@@ -840,7 +848,16 @@ mod tests {
                     let resolution = pipeline
                         .resolve(&context)
                         .expect("the average fallback resolves every conflict");
-                    scores[cell] += resolution.chosen_dosage * score_info.weight as f64;
+                    exact.add(
+                        exact.complex_target(column, score_info.weight),
+                        exact.complex_term(
+                            column,
+                            score_info.weight,
+                            resolution.numerator,
+                            resolution.denominator,
+                        ),
+                        lanes,
+                    );
                     let (count, samples) = collector
                         .entry(resolution.method_used)
                         .or_insert((0, Vec::new()));
@@ -903,7 +920,7 @@ mod tests {
         ] {
             let scenario = Scenario::random(seed, total_people, keep_all);
             let prep_result = scenario.prep_result();
-            let (initial_scores, initial_counts) = scenario.initial_accumulators(seed);
+            let (initial_scores, initial_counts) = scenario.initial_accumulators(seed, prep_result.exact().stride());
             let mut expected_scores = initial_scores.clone();
             let mut expected_counts = initial_counts.clone();
             let expected_warnings = reference_resolve(
@@ -952,14 +969,7 @@ mod tests {
                         limits.block_people
                     );
                     assert!(report.unresolvable.is_none(), "{context}");
-                    assert_eq!(
-                        scores.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-                        expected_scores
-                            .iter()
-                            .map(|value| value.to_bits())
-                            .collect::<Vec<_>>(),
-                        "{context}"
-                    );
+                    assert_eq!(scores, expected_scores, "{context}");
                     assert_eq!(counts, expected_counts, "{context}");
                     assert_eq!(
                         rendered(&report.warnings),
@@ -998,7 +1008,7 @@ mod tests {
                 bytes_per_spooled_variant,
                 Arc::new(dense_map),
             );
-            let (initial_scores, initial_counts) = scenario.initial_accumulators(seed);
+            let (initial_scores, initial_counts) = scenario.initial_accumulators(seed, prep_result.exact().stride());
             let mut expected_scores = initial_scores.clone();
             let mut expected_counts = initial_counts.clone();
             let expected_warnings = reference_resolve(
@@ -1026,14 +1036,7 @@ mod tests {
                 };
                 let context = format!("seed {seed}, {block_people} per block");
                 assert!(report.unresolvable.is_none(), "{context}");
-                assert_eq!(
-                    scores.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-                    expected_scores
-                        .iter()
-                        .map(|value| value.to_bits())
-                        .collect::<Vec<_>>(),
-                    "{context}"
-                );
+                assert_eq!(scores, expected_scores, "{context}");
                 assert_eq!(counts, expected_counts, "{context}");
                 assert_eq!(
                     rendered(&report.warnings),
@@ -1060,7 +1063,7 @@ mod tests {
         offsets.remove(&BimRowIndex(0));
         let resolver =
             ComplexVariantResolver::from_spool(mmap, offsets, bytes_per_spooled_variant, dense_map);
-        let (mut scores, mut counts) = scenario.initial_accumulators(11);
+        let (mut scores, mut counts) = scenario.initial_accumulators(11, prep_result.exact().stride());
         let Err(error) = resolve_rows(
             &resolver,
             &prep_result,
@@ -1101,7 +1104,7 @@ mod tests {
             }],
         }];
         let prep_result = test_prep_result(rules, 10, &scenario.kept, 1, last_variant + 1);
-        let mut scores = vec![0.0; scenario.kept.len()];
+        let mut scores = vec![0i64; scenario.kept.len() * prep_result.exact().stride()];
         let mut counts = vec![0; scenario.kept.len()];
         let Err(error) = resolve_rows(
             &resolver,
@@ -1368,6 +1371,9 @@ pub struct ResolutionContext<'a> {
 /// The successful outcome of a resolution, specifying the dosage and the rule that won.
 pub struct Resolution {
     pub chosen_dosage: f64,
+    /// The chosen dosage exactly, as numerator / denominator.
+    pub numerator: u32,
+    pub denominator: u32,
     pub method_used: Heuristic,
 }
 
@@ -1420,6 +1426,8 @@ impl Heuristic {
                 Self::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, context.score_info)?;
             Some(Resolution {
                 chosen_dosage: dosage,
+                numerator: dosage as u32,
+                denominator: 1,
                 method_used: *self,
             })
         } else {
@@ -1466,6 +1474,8 @@ impl Heuristic {
                 Self::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, context.score_info)?;
             Some(Resolution {
                 chosen_dosage: dosage,
+                numerator: dosage as u32,
+                denominator: 1,
                 method_used: *self,
             })
         } else {
@@ -1497,6 +1507,8 @@ impl Heuristic {
                 Self::calculate_score_dosage(packed_geno, bim_a1, bim_a2, context.score_info)?;
             Some(Resolution {
                 chosen_dosage: dosage,
+                numerator: dosage as u32,
+                denominator: 1,
                 method_used: *self,
             })
         } else {
@@ -1520,6 +1532,8 @@ impl Heuristic {
         if dosages.iter().all(|&d| (d - first_dosage).abs() < 1e-9) {
             Some(Resolution {
                 chosen_dosage: first_dosage,
+                numerator: first_dosage as u32,
+                denominator: 1,
                 method_used: *self,
             })
         } else {
@@ -1547,6 +1561,8 @@ impl Heuristic {
                 Self::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, context.score_info)?;
             Some(Resolution {
                 chosen_dosage: dosage,
+                numerator: dosage as u32,
+                denominator: 1,
                 method_used: *self,
             })
         } else {
@@ -1635,6 +1651,8 @@ impl Heuristic {
 
         Some(Resolution {
             chosen_dosage: final_dosage,
+            numerator: final_dosage as u32,
+            denominator: 1,
             method_used: *self,
         })
     }
@@ -1690,6 +1708,8 @@ impl Heuristic {
 
         Some(Resolution {
             chosen_dosage: inferred_dosage,
+            numerator: inferred_dosage as u32,
+            denominator: 1,
             method_used: *self,
         })
     }
@@ -1715,6 +1735,9 @@ impl Heuristic {
         let avg = sum / context.conflicting_interpretations.len() as f64;
         Some(Resolution {
             chosen_dosage: avg,
+            // Every interpretation's dosage is 0, 1 or 2, so the sum is an exact integer.
+            numerator: sum as u32,
+            denominator: context.conflicting_interpretations.len() as u32,
             method_used: *self,
         })
     }
@@ -1856,13 +1879,13 @@ const STREAMED_GROUP_BYTES: usize = 64 << 20;
 enum Outcome {
     /// No interpretation carries the score's alleles.
     Missing,
-    /// Exactly one interpretation: its dosage times the weight.
-    Add(f64),
+    /// Exactly one interpretation: its dosage times the weight, as an exact term.
+    Add(i128),
     /// Several interpretations, reconciled by a heuristic.
     Resolved {
         method: Heuristic,
         dosage: f64,
-        value: f64,
+        value: i128,
     },
     /// Several interpretations and no heuristic applies.
     Unresolvable,
@@ -1871,9 +1894,8 @@ enum Outcome {
 /// The branch-free form of an `Outcome`, applied to every person.
 #[derive(Clone, Copy)]
 struct TableEntry {
-    /// Added to the score. Outcomes that add nothing carry -0.0, the exact IEEE 754
-    /// additive identity, so the accumulator keeps its bits, sign of zero included.
-    value: f64,
+    /// The exact term added to the score; zero for outcomes that add nothing.
+    value: i128,
     /// Added to the missing count.
     missing: u32,
     /// Whether the outcome is a heuristic event to report.
@@ -1884,7 +1906,7 @@ impl From<Outcome> for TableEntry {
     fn from(outcome: Outcome) -> Self {
         match outcome {
             Outcome::Missing => Self {
-                value: -0.0,
+                value: 0,
                 missing: 1,
                 reported: false,
             },
@@ -1899,7 +1921,7 @@ impl From<Outcome> for TableEntry {
                 reported: true,
             },
             Outcome::Unresolvable => Self {
-                value: -0.0,
+                value: 0,
                 missing: 0,
                 reported: true,
             },
@@ -1912,6 +1934,7 @@ impl From<Outcome> for TableEntry {
 /// then take the single interpretation left or run the heuristic chain.
 fn resolve_outcome(
     pipeline: &ResolverPipeline,
+    exact: &ExactPlan,
     rule: &GroupedComplexRule,
     score_info: &ScoreInfo,
     matching: &[usize],
@@ -1929,7 +1952,12 @@ fn resolve_outcome(
         (None, _) => Outcome::Missing,
         (Some((packed_geno, (_, bim_a1, bim_a2))), None) => {
             match Heuristic::calculate_score_dosage(packed_geno, bim_a1, bim_a2, score_info) {
-                Some(dosage) => Outcome::Add(dosage * score_info.weight as f64),
+                Some(dosage) => Outcome::Add(exact.complex_term(
+                    score_info.score_column_index.0,
+                    score_info.weight,
+                    dosage as u32,
+                    1,
+                )),
                 None => Outcome::Missing,
             }
         }
@@ -1943,7 +1971,12 @@ fn resolve_outcome(
                 Some(resolution) => Outcome::Resolved {
                     method: resolution.method_used,
                     dosage: resolution.chosen_dosage,
-                    value: resolution.chosen_dosage * score_info.weight as f64,
+                    value: exact.complex_term(
+                        score_info.score_column_index.0,
+                        score_info.weight,
+                        resolution.numerator,
+                        resolution.denominator,
+                    ),
                 },
                 None => Outcome::Unresolvable,
             }
@@ -1955,6 +1988,8 @@ fn resolve_outcome(
 /// what every combination of genotypes on them does.
 struct ApplicationPlan {
     column: usize,
+    /// Where the application's terms go in a person's lanes.
+    target: Target,
     /// The rule's contexts whose allele pair matches the score's, in context order.
     matching: Vec<usize>,
     kind: ApplicationKind,
@@ -1963,7 +1998,7 @@ struct ApplicationPlan {
 enum ApplicationKind {
     /// One matching context and nothing to report: each person's genotype on that
     /// context selects what is added, read straight from the row.
-    Direct { values: [f64; 4], missing: [u32; 4] },
+    Direct { values: [i128; 4], missing: [u32; 4] },
     /// Indexed by the packed genotype code over `matching`, two bits per context
     /// with the first context lowest.
     Table {
@@ -1977,6 +2012,7 @@ enum ApplicationKind {
 impl ApplicationKind {
     fn new(
         pipeline: &ResolverPipeline,
+        exact: &ExactPlan,
         rule: &GroupedComplexRule,
         score_info: &ScoreInfo,
         matching: &[usize],
@@ -1986,7 +2022,7 @@ impl ApplicationKind {
         }
         if matching.len() == 1 {
             let entries: [TableEntry; 4] = std::array::from_fn(|code| {
-                resolve_outcome(pipeline, rule, score_info, matching, &[code as u8]).into()
+                resolve_outcome(pipeline, exact, rule, score_info, matching, &[code as u8]).into()
             });
             if !entries.iter().any(|entry| entry.reported) {
                 return Self::Direct {
@@ -2002,7 +2038,7 @@ impl ApplicationKind {
                 for (position, bits) in genotypes.iter_mut().enumerate() {
                     *bits = ((code >> (2 * position)) & 0b11) as u8;
                 }
-                resolve_outcome(pipeline, rule, score_info, matching, genotypes)
+                resolve_outcome(pipeline, exact, rule, score_info, matching, genotypes)
             })
             .collect();
         Self::Table {
@@ -2023,7 +2059,7 @@ struct RulePlan {
 }
 
 impl RulePlan {
-    fn new(pipeline: &ResolverPipeline, rule: &GroupedComplexRule) -> Self {
+    fn new(pipeline: &ResolverPipeline, exact: &ExactPlan, rule: &GroupedComplexRule) -> Self {
         let num_contexts = rule.possible_contexts.len();
         let mut tabulated = vec![false; num_contexts];
         let mut direct = vec![false; num_contexts];
@@ -2040,7 +2076,7 @@ impl RulePlan {
                     })
                     .map(|(context, _)| context)
                     .collect();
-                let kind = ApplicationKind::new(pipeline, rule, score_info, &matching);
+                let kind = ApplicationKind::new(pipeline, exact, rule, score_info, &matching);
                 let used = match kind {
                     ApplicationKind::Direct { .. } => &mut direct,
                     _ => &mut tabulated,
@@ -2050,6 +2086,7 @@ impl RulePlan {
                 }
                 ApplicationPlan {
                     column: score_info.score_column_index.0,
+                    target: exact.complex_target(score_info.score_column_index.0, score_info.weight),
                     matching,
                     kind,
                 }
@@ -2141,29 +2178,37 @@ struct GroupPass<'a> {
     max_contexts: usize,
     layout: &'a PersonLayout,
     pipeline: &'a ResolverPipeline,
+    exact: &'a ExactPlan,
+    stride: usize,
     num_scores: usize,
     stop: &'a AtomicBool,
 }
 
 /// What a direct application adds to one block of people.
 struct DirectApplication<'a> {
-    values: &'a [f64; 4],
+    values: &'a [i128; 4],
     missing: &'a [u32; 4],
+    exact: &'a ExactPlan,
+    target: Target,
     column: usize,
+    stride: usize,
     num_scores: usize,
 }
 
 impl DirectApplication<'_> {
     /// Adds the outcome of one person's genotype code (its low two bits).
     #[inline(always)]
-    fn add(&self, person: usize, code: u8, scores: &mut [f64], counts: &mut [u32]) {
-        let cell = person * self.num_scores + self.column;
+    fn add(&self, person: usize, code: u8, scores: &mut [i64], counts: &mut [u32]) {
         let code = usize::from(code & 0b11);
-        scores[cell] += self.values[code];
-        counts[cell] += self.missing[code];
+        self.exact.add(
+            self.target,
+            self.values[code],
+            &mut scores[person * self.stride..(person + 1) * self.stride],
+        );
+        counts[person * self.num_scores + self.column] += self.missing[code];
     }
 
-    fn add_decoded(&self, codes: &[u8], scores: &mut [f64], counts: &mut [u32]) {
+    fn add_decoded(&self, codes: &[u8], scores: &mut [i64], counts: &mut [u32]) {
         for (person, &code) in codes.iter().enumerate() {
             self.add(person, code, scores, counts);
         }
@@ -2171,8 +2216,8 @@ impl DirectApplication<'_> {
 
     /// For people who occupy consecutive two-bit slots of the row, the first of them at
     /// slot `first_slot`: whole bytes are read four people at a time.
-    fn add_packed(&self, row: &[u8], first_slot: usize, scores: &mut [f64], counts: &mut [u32]) {
-        let num_people = scores.len() / self.num_scores;
+    fn add_packed(&self, row: &[u8], first_slot: usize, scores: &mut [i64], counts: &mut [u32]) {
+        let num_people = counts.len() / self.num_scores;
         let slot = |person: usize| {
             let position = first_slot + person;
             row[position / 4] >> (2 * (position % 4))
@@ -2200,7 +2245,7 @@ impl DirectApplication<'_> {
         row: &[u8],
         bytes: &[u32],
         shifts: &[u8],
-        scores: &mut [f64],
+        scores: &mut [i64],
         counts: &mut [u32],
     ) {
         for (person, (&byte, &shift)) in bytes.iter().zip(shifts).enumerate() {
@@ -2215,11 +2260,11 @@ impl DirectApplication<'_> {
 fn evaluate_block(
     pass: &GroupPass,
     first_person: usize,
-    scores: &mut [f64],
+    scores: &mut [i64],
     counts: &mut [u32],
 ) -> BlockReport {
     let num_scores = pass.num_scores;
-    let num_people = scores.len() / num_scores;
+    let num_people = counts.len() / num_scores;
     let people = first_person..first_person + num_people;
     let bytes = &pass.layout.bytes[people.clone()];
     let shifts = &pass.layout.shifts[people.clone()];
@@ -2266,7 +2311,10 @@ fn evaluate_block(
                     let direct = DirectApplication {
                         values,
                         missing,
+                        exact: pass.exact,
+                        target: application.target,
                         column,
+                        stride: pass.stride,
                         num_scores,
                     };
                     if !rows_in_place {
@@ -2283,7 +2331,7 @@ fn evaluate_block(
                 ApplicationKind::PerPerson => {
                     let score_info = &rule.score_applications[application_idx];
                     let people_rows = scores
-                        .chunks_exact_mut(num_scores)
+                        .chunks_exact_mut(pass.stride)
                         .zip(counts.chunks_exact_mut(num_scores))
                         .enumerate();
                     for (person, (person_scores, person_counts)) in people_rows {
@@ -2296,13 +2344,14 @@ fn evaluate_block(
                         );
                         let outcome = resolve_outcome(
                             pass.pipeline,
+                            pass.exact,
                             rule,
                             score_info,
                             &application.matching,
                             &tuple,
                         );
                         let entry = TableEntry::from(outcome);
-                        person_scores[column] += entry.value;
+                        pass.exact.add(application.target, entry.value, person_scores);
                         person_counts[column] += entry.missing;
                         if entry.reported
                             && !report.record(
@@ -2333,12 +2382,12 @@ fn evaluate_block(
                 }
             };
             let people_rows = scores
-                .chunks_exact_mut(num_scores)
+                .chunks_exact_mut(pass.stride)
                 .zip(counts.chunks_exact_mut(num_scores))
                 .enumerate();
             for ((person, (person_scores, person_counts)), &code) in people_rows.zip(codes) {
                 let entry = entries[code as usize];
-                person_scores[column] += entry.value;
+                pass.exact.add(application.target, entry.value, person_scores);
                 person_counts[column] += entry.missing;
                 if entry.reported {
                     let width = application.matching.len();
@@ -2455,16 +2504,18 @@ struct ResolutionReport {
 fn resolve_rows(
     resolver: &ComplexVariantResolver,
     prep_result: &PreparationResult,
-    final_scores: &mut [f64],
+    final_scores: &mut [i64],
     final_missing_counts: &mut [u32],
     limits: ResolveLimits,
     pb: &ProgressBar,
 ) -> Result<ResolutionReport, PipelineError> {
     let rules = &prep_result.complex_rules;
     let num_scores = prep_result.score_names.len();
+    let exact = prep_result.exact();
+    let stride = exact.stride();
     let num_people = final_scores
         .len()
-        .checked_div(num_scores)
+        .checked_div(stride)
         .unwrap_or(0)
         .min(final_missing_counts.len().checked_div(num_scores).unwrap_or(0));
     let mut report = ResolutionReport {
@@ -2494,7 +2545,7 @@ fn resolve_rows(
     let pipeline = ResolverPipeline::new();
     let plans: Vec<RulePlan> = rules
         .par_iter()
-        .map(|rule| RulePlan::new(&pipeline, rule))
+        .map(|rule| RulePlan::new(&pipeline, exact, rule))
         .collect();
 
     let mapped = resolver.is_mapped();
@@ -2514,8 +2565,9 @@ fn resolve_rows(
     let mut samples: [Vec<Sample>; HEURISTIC_COUNT] = Default::default();
     let mut unresolvable: Option<Sample> = None;
     let mut storage = Vec::<u8>::new();
-    let people_scores = &mut final_scores[..num_people * num_scores];
+    let people_scores = &mut final_scores[..num_people * stride];
     let people_counts = &mut final_missing_counts[..num_people * num_scores];
+    let block_lanes = limits.block_people * stride;
     let block_cells = limits.block_people * num_scores;
 
     for group in groups {
@@ -2554,17 +2606,19 @@ fn resolve_rows(
             rows: &rows,
             layout: &layout,
             pipeline: &pipeline,
+            exact,
+            stride,
             num_scores,
             stop: &stop,
         };
         let block_reports: Vec<BlockReport> = people_scores
-            .par_chunks_mut(block_cells)
+            .par_chunks_mut(block_lanes)
             .zip(people_counts.par_chunks_mut(block_cells))
             .enumerate()
             .map(|(block, (scores, counts))| {
                 let block_report =
                     evaluate_block(&pass, block * limits.block_people, scores, counts);
-                pb.inc((scores.len() / num_scores) as u64);
+                pb.inc((counts.len() / num_scores) as u64);
                 block_report
             })
             .collect();
@@ -2652,7 +2706,7 @@ fn resolve_rows(
 pub fn resolve_complex_variants(
     resolver: &ComplexVariantResolver,
     prep_result: &Arc<PreparationResult>,
-    final_scores: &mut [f64],
+    final_scores: &mut [i64],
     final_missing_counts: &mut [u32],
 ) -> Result<(), PipelineError> {
     let num_rules = prep_result.complex_rules.len();

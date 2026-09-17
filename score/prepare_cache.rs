@@ -25,7 +25,7 @@ use std::{
 
 /// Plan format 3 retains f64 weights: a header holding the key and one BLAKE3
 /// digest per section, then little-endian arrays padded to multiples of 8 bytes.
-const MAGIC: [u8; 8] = *b"GNPLAN03";
+const MAGIC: [u8; 8] = *b"GNPLAN04";
 /// Inputs are hashed in leaves of this many bytes, so a key depends only on the
 /// bytes, never on thread count, read sizes or available memory.
 const LEAF_BYTES: u64 = 4 << 20;
@@ -610,11 +610,12 @@ impl<'a> Sections<'a> {
                 prep.score_names.len() as u64,
             ]),
             starts: Cow::Owned(starts),
-            weights: Cow::Borrowed(prep.sparse_weights()),
-            corrections: Cow::Borrowed(prep.sparse_missing_corrections()),
+            // The exact plan holds the weights; each entry's f64 is the parsed weight itself.
+            weights: Cow::Owned(prep.sparse_weights()),
+            corrections: Cow::Owned(prep.sparse_missing_corrections()),
             columns: Cow::Borrowed(prep.sparse_score_columns()),
             offsets: Cow::Borrowed(prep.sparse_row_offsets()),
-            baseline: Cow::Borrowed(prep.baseline_missing_sum_by_score()),
+            baseline: Cow::Owned(prep.baseline_missing_sum_by_score()),
             required: Cow::Owned(prep.required_bim_indices.iter().map(|r| r.0).collect()),
             flags: Cow::Borrowed(prep.required_is_complex()),
             counts: Cow::Borrowed(&prep.score_variant_counts),
@@ -1018,10 +1019,10 @@ mod tests {
         assert!(cache.load().unwrap().is_none());
         cache.save(&prep).unwrap();
         let plan = cache.load().unwrap().unwrap();
-        assert_eq!(bits(&plan.weights), bits(prep.sparse_weights()));
+        assert_eq!(bits(&plan.weights), bits(&prep.sparse_weights()));
         assert_eq!(
             bits(&plan.corrections),
-            bits(prep.sparse_missing_corrections())
+            bits(&prep.sparse_missing_corrections())
         );
         assert_eq!(plan.columns, prep.sparse_score_columns());
         assert_eq!(plan.offsets, prep.sparse_row_offsets());
@@ -1229,7 +1230,7 @@ mod tests {
         let (files, scores) = complex_fixture(dir.path());
         let prep = compile(dir.path(), &scores);
         let cache = cache_in(dir.path(), &files, &scores);
-        let expected = bits(prep.sparse_weights());
+        let expected = bits(&prep.sparse_weights());
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(|| {

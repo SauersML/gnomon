@@ -20,13 +20,12 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use gnomon::batch;
-use gnomon::kernel;
+use gnomon::score::cells::ExactPlan;
 use gnomon::types::{
     BimRowIndex, OriginalPersonIndex, OutputPersonIndex, PersonSubset, PipelineKind,
     PreparationResult, ReconciledVariantIndex,
 };
 
-use crossbeam_queue::ArrayQueue;
 use rand::seq::{SliceRandom, index};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -58,8 +57,6 @@ fn setup_benchmark_context(
     let bytes_per_variant = ((total_num_people as u64) + 3) / 4;
     let bytes_per_variant_usize = usize::try_from(bytes_per_variant)
         .expect("bytes per variant should fit into usize for benchmarking");
-    let stride = (num_scores + kernel::LANE_COUNT - 1) / kernel::LANE_COUNT * kernel::LANE_COUNT;
-
     let matrix_size = num_variants * num_scores;
     let sparse_weights = vec![1.0f64; matrix_size];
     let sparse_missing_corrections = vec![0.0f64; matrix_size];
@@ -138,16 +135,23 @@ fn setup_benchmark_context(
     };
     let spool_bytes_per_variant = spool_compact_byte_index.len() as u64;
 
+    let names: Vec<String> = (0..num_scores).map(|i| format!("score_{}", i)).collect();
+    let exact = ExactPlan::new(
+        &sparse_weights,
+        &sparse_missing_corrections,
+        &sparse_score_columns,
+        &sparse_row_offsets,
+        &[],
+        &names,
+    )
+    .expect("benchmark weights have an exact plan");
     let prep_result = PreparationResult::new(
-        sparse_weights,
-        sparse_missing_corrections,
+        exact,
         sparse_score_columns,
         sparse_row_offsets,
-        stride,
-        vec![0.0; num_scores],
         (0..num_variants as u64).map(BimRowIndex).collect(),
         vec![],
-        (0..num_scores).map(|i| format!("score_{}", i)).collect(),
+        names,
         vec![1; num_scores],
         person_subset,
         final_person_iids,
@@ -234,8 +238,11 @@ fn benchmark_the_works(c: &mut Criterion) {
                     );
 
                     let num_people_to_score = prep_result.num_people_to_score;
-                    let mut scores_out = vec![0.0f64; num_people_to_score * num_scores];
+                    let stride = prep_result.exact().stride();
+                    let mut scores_out = vec![0i64; num_people_to_score * stride];
                     let mut missing_counts_out = vec![0u32; num_people_to_score * num_scores];
+                    let layout = batch::PersonLayout::new(&prep_result);
+                    let mut terms = batch::VariantTerms::default();
 
                     group.throughput(Throughput::Elements(num_people_to_score as u64));
 
@@ -248,6 +255,8 @@ fn benchmark_the_works(c: &mut Criterion) {
                                 batch::run_variant_major_path(
                                     black_box(&variant_data),
                                     black_box(&prep_result),
+                                    black_box(&layout),
+                                    black_box(&mut terms),
                                     black_box(&mut scores_out),
                                     black_box(&mut missing_counts_out),
                                     black_box(ReconciledVariantIndex(0)),
@@ -257,7 +266,7 @@ fn benchmark_the_works(c: &mut Criterion) {
                         },
                     );
                     // --- 2. Benchmark person-major (pivot) path ---
-                    let tile_pool = Arc::new(ArrayQueue::new(4));
+                    let mut scratch = batch::DenseScratch::default();
                     let bytes_per_variant: usize = prep_result
                         .bytes_per_variant
                         .try_into()
@@ -271,10 +280,6 @@ fn benchmark_the_works(c: &mut Criterion) {
                     let reconciled_indices: Vec<_> = (0..PIVOT_PATH_BATCH_SIZE as u32)
                         .map(ReconciledVariantIndex)
                         .collect();
-                    let weights_for_batch =
-                        vec![1.0f64; PIVOT_PATH_BATCH_SIZE * prep_result.stride()];
-                    let missing_corrections_for_batch =
-                        vec![0.0f64; PIVOT_PATH_BATCH_SIZE * prep_result.stride()];
 
                     group.bench_function(
                         BenchmarkId::new(format!("Pivot__{}", id_str), freq),
@@ -282,15 +287,14 @@ fn benchmark_the_works(c: &mut Criterion) {
                             b.iter_custom(|iters| {
                                 let start = Instant::now();
                                 for _ in 0..iters {
-                                    batch::run_person_major_path(
+                                    batch::run_dense_batch(
                                         black_box(&batch_variant_data),
-                                        black_box(&weights_for_batch),
-                                        black_box(&missing_corrections_for_batch),
                                         black_box(&reconciled_indices),
                                         black_box(&prep_result),
+                                        black_box(&layout),
+                                        black_box(&mut scratch),
                                         black_box(&mut scores_out),
                                         black_box(&mut missing_counts_out),
-                                        black_box(&tile_pool),
                                     )
                                     .unwrap();
                                 }

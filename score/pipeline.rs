@@ -1,16 +1,15 @@
 use crate::adapt_plink2::GenomeBuild;
 use crate::pipeline_error::PipelineError;
-use crate::score::batch;
+use crate::score::batch::{self, DenseScratch, PersonLayout, VariantTerms};
 use crate::score::complex::{ComplexVariantResolver, resolve_complex_variants};
 use crate::score::decide::{self, DecisionContext, RunStrategy};
 use crate::score::io;
 use crate::score::types::{
-    BimRowIndex, EffectAlleleDosage, FilesetBoundary, PipelineKind, PreparationResult,
-    ReconciledVariantIndex, WorkItem,
+    BimRowIndex, FilesetBoundary, PipelineKind, PreparationResult, ReconciledVariantIndex,
+    WorkItem,
 };
 use ahash::AHashMap;
 use crossbeam_channel::{Receiver, RecvTimeoutError, bounded};
-use crossbeam_queue::ArrayQueue;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
@@ -307,8 +306,7 @@ pub fn preflight_memory(
     memory_budget: MemoryBudget,
 ) -> Result<(), PipelineError> {
     ensure_memory_floor(prep_result, memory_budget)?;
-    let result_size = checked_result_size(prep_result)?;
-    let result_bytes = result_bytes(result_size)?;
+    let result_bytes = result_bytes(prep_result)?;
     let csr_bytes = csr_bytes(prep_result)?;
     let row_bytes = usize::try_from(prep_result.bytes_per_variant).map_err(|_| {
         PipelineError::Compute(format!(
@@ -333,7 +331,7 @@ pub fn preflight_memory(
     let consumer_threads = if should_use_small_keep_direct_for_prep(prep_result) {
         0
     } else {
-        choose_consumer_threads(result_size, memory_budget)
+        choose_consumer_threads(result_bytes, memory_budget)
     };
     let accumulator_copies = if should_use_small_keep_direct_for_prep(prep_result) {
         1usize
@@ -380,9 +378,11 @@ fn should_use_bounded_accumulator(context: &PipelineContext) -> Result<bool, Pip
     if should_use_small_keep_direct(context) {
         return Ok(false);
     }
+    if context.force_bounded_accumulator {
+        return Ok(true);
+    }
     let prep_result = &context.prep_result;
-    let result_size = checked_result_size(prep_result)?;
-    let result_bytes = result_bytes(result_size)?;
+    let result_bytes = result_bytes(prep_result)?;
     let csr_bytes = csr_bytes(prep_result)?;
     let row_bytes = usize::try_from(prep_result.bytes_per_variant).map_err(|_| {
         PipelineError::Compute(format!(
@@ -404,7 +404,7 @@ fn should_use_bounded_accumulator(context: &PipelineContext) -> Result<bool, Pip
                 "I/O buffer estimate overflow: row_bytes={row_bytes}, buffers={buffer_count}"
             ))
         })?;
-    let fast_threads = choose_consumer_threads(result_size, context.memory_budget);
+    let fast_threads = choose_consumer_threads(result_bytes, context.memory_budget);
     let fast_copies = fast_threads
         .checked_mul(2)
         .and_then(|v| v.checked_add(2))
@@ -445,25 +445,23 @@ fn open_scoring_bed_source(
     )
 }
 
-fn result_bytes(result_size: usize) -> Result<usize, PipelineError> {
-    result_size
-        .checked_mul(std::mem::size_of::<f64>() + std::mem::size_of::<u32>())
+/// One accumulator: people × stride exact i64 lanes and people × scores missing counts.
+fn result_bytes(prep_result: &PreparationResult) -> Result<usize, PipelineError> {
+    let cells = checked_cells_size(prep_result)?;
+    let counts = checked_result_size(prep_result)?;
+    cells
+        .checked_mul(std::mem::size_of::<i64>())
+        .and_then(|bytes| bytes.checked_add(counts.checked_mul(std::mem::size_of::<u32>())?))
         .ok_or_else(|| PipelineError::Compute("Result byte estimate overflow.".to_string()))
 }
 
 fn csr_bytes(prep_result: &PreparationResult) -> Result<usize, PipelineError> {
+    // Each entry's exact weight, at most an i128, and its flags.
     let weights = prep_result
-        .sparse_weights()
+        .sparse_score_columns()
         .len()
-        .checked_mul(std::mem::size_of::<f64>())
+        .checked_mul(std::mem::size_of::<i128>() + 1)
         .ok_or_else(|| PipelineError::Compute("CSR weight byte estimate overflow.".to_string()))?;
-    let missing = prep_result
-        .sparse_missing_corrections()
-        .len()
-        .checked_mul(std::mem::size_of::<f64>())
-        .ok_or_else(|| {
-            PipelineError::Compute("CSR missing-correction byte estimate overflow.".to_string())
-        })?;
     let columns = prep_result
         .sparse_score_columns()
         .len()
@@ -477,8 +475,7 @@ fn csr_bytes(prep_result: &PreparationResult) -> Result<usize, PipelineError> {
             PipelineError::Compute("CSR row-offset byte estimate overflow.".to_string())
         })?;
     weights
-        .checked_add(missing)
-        .and_then(|v| v.checked_add(columns))
+        .checked_add(columns)
         .and_then(|v| v.checked_add(offsets))
         .ok_or_else(|| PipelineError::Compute("CSR byte estimate overflow.".to_string()))
 }
@@ -553,22 +550,39 @@ pub fn make_bed_buffer_pool(
     Ok(buffer_pool)
 }
 
+/// Which compute path every variant takes. Production decides per variant; tests and
+/// benchmarks force one path, which can change how fast a score is reached but never its value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Dispatch {
+    #[default]
+    Decide,
+    Dense,
+    Sparse,
+}
+
 /// Owns shared resource pools and provides a handle to the read-only preparation results.
 pub struct PipelineContext {
     pub prep_result: Arc<PreparationResult>,
-    pub tile_pool: Arc<ArrayQueue<Vec<EffectAlleleDosage>>>,
+    /// Where each scored person's calls sit in a packed row.
+    pub person_layout: Arc<PersonLayout>,
     pub memory_budget: MemoryBudget,
     pub genome_build: Option<GenomeBuild>,
+    /// The compute path of every variant; [`Dispatch::Decide`] outside tests and benchmarks.
+    pub dispatch: Dispatch,
+    /// Take the bounded accumulator whatever the memory budget; false outside tests.
+    pub force_bounded_accumulator: bool,
 }
 
 impl PipelineContext {
     /// Creates a new `PipelineContext`, allocating all necessary memory pools.
     pub fn new(prep_result: Arc<PreparationResult>) -> Self {
         Self {
+            person_layout: Arc::new(PersonLayout::new(&prep_result)),
             prep_result,
-            tile_pool: Arc::new(ArrayQueue::new(worker_ceiling() * 4)),
             memory_budget: MemoryBudget::default(),
             genome_build: None,
+            dispatch: Dispatch::Decide,
+            force_bounded_accumulator: false,
         }
     }
 
@@ -578,10 +592,12 @@ impl PipelineContext {
         genome_build: Option<GenomeBuild>,
     ) -> Self {
         Self {
+            person_layout: Arc::new(PersonLayout::new(&prep_result)),
             prep_result,
-            tile_pool: Arc::new(ArrayQueue::new(worker_ceiling() * 4)),
             memory_budget,
             genome_build,
+            dispatch: Dispatch::Decide,
+            force_bounded_accumulator: false,
         }
     }
 
@@ -598,7 +614,7 @@ impl PipelineContext {
 ///
 /// This is the primary public entry point. It is synchronous and returns the
 /// final aggregated scores and counts upon successful completion.
-pub fn run(context: &PipelineContext) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
+pub fn run(context: &PipelineContext) -> Result<(Vec<i64>, Vec<u32>), PipelineError> {
     ensure_memory_floor(&context.prep_result, context.memory_budget)?;
 
     // This match is a zero-cost abstraction. The compiler generates a simple jump
@@ -620,7 +636,7 @@ pub fn run(context: &PipelineContext) -> Result<(Vec<f64>, Vec<u32>), PipelineEr
 fn run_single_file_pipeline(
     context: &PipelineContext,
     bed_path: &Path,
-) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
+) -> Result<(Vec<i64>, Vec<u32>), PipelineError> {
     // --- 1. Setup: Memory-map the file, create channels and a shared buffer pool ---
     let bed_source = open_scoring_bed_source(context, bed_path)?;
     if should_use_small_keep_direct(context)
@@ -654,19 +670,14 @@ fn run_single_file_pipeline(
     let strategy = decide::RunStrategy::UseComplexTree;
     eprintln!("> Decision Engine Strategy: {strategy:?}");
 
-    let master_baseline = prep_result.baseline_missing_sum_by_score().to_vec();
     let use_bounded_accumulator = should_use_bounded_accumulator(context)?;
     if use_bounded_accumulator {
         eprintln!(
-            "> Using bounded RAM accumulator: one shared f64/u32 output matrix, no per-thread full-matrix copies."
+            "> Using bounded RAM accumulator: one shared exact cell and count matrix, no per-thread full-matrix copies."
         );
     }
     let mut shared_accumulator = if use_bounded_accumulator {
-        let (final_scores, final_counts) = initialize_final_output(
-            prep_result.num_people_to_score,
-            prep_result.score_names.len(),
-            &master_baseline,
-        )?;
+        let (final_scores, final_counts) = initialize_cells(prep_result)?;
         Some(Arc::new(Mutex::new((final_scores, final_counts))))
     } else {
         None
@@ -725,7 +736,7 @@ fn run_single_file_pipeline(
     // --- 3. Orchestration: Use a scoped thread for safe producer/consumer execution ---
     let run_ctx_for_closure = run_ctx;
     let strategy_for_closure = strategy;
-    let final_result: Result<(Option<(Vec<f64>, Vec<u32>)>, Option<SpoolState>), PipelineError> =
+    let final_result: Result<(Option<(Vec<i64>, Vec<u32>)>, Option<SpoolState>), PipelineError> =
         thread::scope(|s| {
             let (progress_lifetime, progress_completion) = bounded(0);
             let updater_thread_count = Arc::clone(&variants_processed_count);
@@ -748,6 +759,7 @@ fn run_single_file_pipeline(
                 let spool_enabled = should_spool;
                 let run_ctx = run_ctx_for_closure;
                 let strategy = strategy_for_closure;
+                let dispatch = context.dispatch;
 
                 move || -> Result<Option<SpoolState>, PipelineError> {
                     match strategy {
@@ -774,16 +786,20 @@ fn run_single_file_pipeline(
                             );
                         }
                         RunStrategy::UseComplexTree => {
-                            let path_decider = |variant_data: &[u8]| {
-                                let current_freq = batch::assess_variant_density_for_dispatch(
-                                    variant_data,
-                                    run_ctx.n_cohort as usize,
-                                );
-                                let variant_ctx = DecisionContext {
-                                    freq: current_freq,
-                                    ..run_ctx
-                                };
-                                decide::decide_path_with_freq(&variant_ctx)
+                            let path_decider = |variant_data: &[u8]| match dispatch {
+                                Dispatch::Dense => decide::ComputePath::Pivot,
+                                Dispatch::Sparse => decide::ComputePath::NoPivot,
+                                Dispatch::Decide => {
+                                    let current_freq = batch::assess_variant_density_for_dispatch(
+                                        variant_data,
+                                        run_ctx.n_cohort as usize,
+                                    );
+                                    let variant_ctx = DecisionContext {
+                                        freq: current_freq,
+                                        ..run_ctx
+                                    };
+                                    decide::decide_path_with_freq(&variant_ctx)
+                                }
                             };
                             let spool_plan = if spool_enabled {
                                 let state = local_spool_state
@@ -850,10 +866,7 @@ fn run_single_file_pipeline(
                 // --- 4. Aggregate final results ---
                 let (sparse_adjustments, sparse_counts) = sparse_result?;
                 let (dense_adjustments, dense_counts) = dense_result?;
-                let num_people = prep_result.num_people_to_score;
-                let num_scores = prep_result.score_names.len();
-                let (mut final_scores, mut final_counts) =
-                    initialize_final_output(num_people, num_scores, &master_baseline)?;
+                let (mut final_scores, mut final_counts) = initialize_cells(prep_result)?;
                 final_counts
                     .par_iter_mut()
                     .zip(sparse_counts)
@@ -865,11 +878,11 @@ fn run_single_file_pipeline(
                 final_scores
                     .par_iter_mut()
                     .zip(sparse_adjustments)
-                    .for_each(|(m, p)| *m += p);
+                    .for_each(|(m, p)| *m = m.wrapping_add(p));
                 final_scores
                     .par_iter_mut()
                     .zip(dense_adjustments)
-                    .for_each(|(m, p)| *m += p);
+                    .for_each(|(m, p)| *m = m.wrapping_add(p));
                 Some((final_scores, final_counts))
             };
 
@@ -979,7 +992,7 @@ fn run_single_file_pipeline(
 fn run_multi_file_pipeline(
     context: &PipelineContext,
     boundaries: &[FilesetBoundary],
-) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
+) -> Result<(Vec<i64>, Vec<u32>), PipelineError> {
     let bed_sources: Vec<io::BedSource> = boundaries
         .iter()
         .map(|b| open_scoring_bed_source(context, &b.bed_path))
@@ -1014,19 +1027,14 @@ fn run_multi_file_pipeline(
     };
     let strategy = decide::RunStrategy::UseComplexTree;
     eprintln!("> Decision Engine Strategy: {strategy:?}");
-    let master_baseline = prep_result.baseline_missing_sum_by_score().to_vec();
     let use_bounded_accumulator = should_use_bounded_accumulator(context)?;
     if use_bounded_accumulator {
         eprintln!(
-            "> Using bounded RAM accumulator: one shared f64/u32 output matrix, no per-thread full-matrix copies."
+            "> Using bounded RAM accumulator: one shared exact cell and count matrix, no per-thread full-matrix copies."
         );
     }
     let mut shared_accumulator = if use_bounded_accumulator {
-        let (final_scores, final_counts) = initialize_final_output(
-            prep_result.num_people_to_score,
-            prep_result.score_names.len(),
-            &master_baseline,
-        )?;
+        let (final_scores, final_counts) = initialize_cells(prep_result)?;
         Some(Arc::new(Mutex::new((final_scores, final_counts))))
     } else {
         None
@@ -1084,7 +1092,7 @@ fn run_multi_file_pipeline(
     // --- 3. Orchestration with multi-file producer ---
     let run_ctx_for_closure = run_ctx;
     let strategy_for_closure = strategy;
-    let final_result: Result<(Option<(Vec<f64>, Vec<u32>)>, Option<SpoolState>), PipelineError> =
+    let final_result: Result<(Option<(Vec<i64>, Vec<u32>)>, Option<SpoolState>), PipelineError> =
         thread::scope(|s| {
             let (progress_lifetime, progress_completion) = bounded(0);
             let updater_thread_count = Arc::clone(&variants_processed_count);
@@ -1107,6 +1115,7 @@ fn run_multi_file_pipeline(
                 let spool_enabled = should_spool;
                 let run_ctx = run_ctx_for_closure;
                 let strategy = strategy_for_closure;
+                let dispatch = context.dispatch;
 
                 move || -> Result<Option<SpoolState>, PipelineError> {
                     match strategy {
@@ -1134,16 +1143,20 @@ fn run_multi_file_pipeline(
                             );
                         }
                         RunStrategy::UseComplexTree => {
-                            let path_decider = |variant_data: &[u8]| {
-                                let current_freq = batch::assess_variant_density_for_dispatch(
-                                    variant_data,
-                                    run_ctx.n_cohort as usize,
-                                );
-                                let variant_ctx = DecisionContext {
-                                    freq: current_freq,
-                                    ..run_ctx
-                                };
-                                decide::decide_path_with_freq(&variant_ctx)
+                            let path_decider = |variant_data: &[u8]| match dispatch {
+                                Dispatch::Dense => decide::ComputePath::Pivot,
+                                Dispatch::Sparse => decide::ComputePath::NoPivot,
+                                Dispatch::Decide => {
+                                    let current_freq = batch::assess_variant_density_for_dispatch(
+                                        variant_data,
+                                        run_ctx.n_cohort as usize,
+                                    );
+                                    let variant_ctx = DecisionContext {
+                                        freq: current_freq,
+                                        ..run_ctx
+                                    };
+                                    decide::decide_path_with_freq(&variant_ctx)
+                                }
                             };
                             let spool_plan = if spool_enabled {
                                 let state = local_spool_state
@@ -1211,10 +1224,7 @@ fn run_multi_file_pipeline(
                 // --- 4. Aggregate final results (same as single-file) ---
                 let (sparse_adjustments, sparse_counts) = sparse_result?;
                 let (dense_adjustments, dense_counts) = dense_result?;
-                let num_people = prep_result.num_people_to_score;
-                let num_scores = prep_result.score_names.len();
-                let (mut final_scores, mut final_counts) =
-                    initialize_final_output(num_people, num_scores, &master_baseline)?;
+                let (mut final_scores, mut final_counts) = initialize_cells(prep_result)?;
                 final_counts
                     .par_iter_mut()
                     .zip(sparse_counts)
@@ -1226,11 +1236,11 @@ fn run_multi_file_pipeline(
                 final_scores
                     .par_iter_mut()
                     .zip(sparse_adjustments)
-                    .for_each(|(m, p)| *m += p);
+                    .for_each(|(m, p)| *m = m.wrapping_add(p));
                 final_scores
                     .par_iter_mut()
                     .zip(dense_adjustments)
-                    .for_each(|(m, p)| *m += p);
+                    .for_each(|(m, p)| *m = m.wrapping_add(p));
                 Some((final_scores, final_counts))
             };
 
@@ -1342,18 +1352,15 @@ fn run_multi_file_pipeline(
 fn run_small_keep_direct_single_file(
     context: &PipelineContext,
     bed_source: io::BedSource,
-) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
+) -> Result<(Vec<i64>, Vec<u32>), PipelineError> {
     eprintln!(
         "> Using small-keep direct PLINK path for {} kept individual(s).",
         context.prep_result.num_people_to_score
     );
     let prep_result = &context.prep_result;
-    let master_baseline = prep_result.baseline_missing_sum_by_score().to_vec();
-    let (mut final_scores, mut final_counts) = initialize_final_output(
-        prep_result.num_people_to_score,
-        prep_result.score_names.len(),
-        &master_baseline,
-    )?;
+    let (mut final_scores, mut final_counts) = initialize_cells(prep_result)?;
+    let (stride, num_scores) = (prep_result.exact().stride(), prep_result.score_names.len());
+    let mut terms = VariantTerms::default();
 
     let total = prep_result.num_reconciled_variants as u64;
     let pb = create_progress_bar(total, "Computing scores...");
@@ -1386,6 +1393,7 @@ fn run_small_keep_direct_single_file(
             )));
         }
 
+        terms.load(prep_result, reconciled_idx);
         for out_idx in 0..prep_result.num_people_to_score {
             let fam_idx = prep_result.output_idx_to_fam_idx[out_idx].0 as usize;
             let byte_offset = row_base
@@ -1403,13 +1411,11 @@ fn run_small_keep_direct_single_file(
                 scratch[0]
             };
             let packed = (byte >> ((fam_idx % 4) * 2)) & 0b11;
-            apply_packed_genotype(
-                prep_result,
-                reconciled_idx,
-                out_idx,
+            terms.apply(
+                prep_result.exact(),
                 packed,
-                &mut final_scores,
-                &mut final_counts,
+                &mut final_scores[out_idx * stride..(out_idx + 1) * stride],
+                &mut final_counts[out_idx * num_scores..(out_idx + 1) * num_scores],
             );
         }
 
@@ -1434,18 +1440,15 @@ fn run_small_keep_direct_multi_file(
     context: &PipelineContext,
     boundaries: &[FilesetBoundary],
     bed_sources: Vec<io::BedSource>,
-) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
+) -> Result<(Vec<i64>, Vec<u32>), PipelineError> {
     eprintln!(
         "> Using small-keep direct PLINK path for {} kept individual(s).",
         context.prep_result.num_people_to_score
     );
     let prep_result = &context.prep_result;
-    let master_baseline = prep_result.baseline_missing_sum_by_score().to_vec();
-    let (mut final_scores, mut final_counts) = initialize_final_output(
-        prep_result.num_people_to_score,
-        prep_result.score_names.len(),
-        &master_baseline,
-    )?;
+    let (mut final_scores, mut final_counts) = initialize_cells(prep_result)?;
+    let (stride, num_scores) = (prep_result.exact().stride(), prep_result.score_names.len());
+    let mut terms = VariantTerms::default();
 
     let total = prep_result.num_reconciled_variants as u64;
     let pb = create_progress_bar(total, "Computing scores...");
@@ -1494,6 +1497,7 @@ fn run_small_keep_direct_multi_file(
             )));
         }
 
+        terms.load(prep_result, reconciled_idx);
         for out_idx in 0..prep_result.num_people_to_score {
             let fam_idx = prep_result.output_idx_to_fam_idx[out_idx].0 as usize;
             let byte_offset = row_base
@@ -1512,13 +1516,11 @@ fn run_small_keep_direct_multi_file(
                 scratch[0]
             };
             let packed = (byte >> ((fam_idx % 4) * 2)) & 0b11;
-            apply_packed_genotype(
-                prep_result,
-                reconciled_idx,
-                out_idx,
+            terms.apply(
+                prep_result.exact(),
                 packed,
-                &mut final_scores,
-                &mut final_counts,
+                &mut final_scores[out_idx * stride..(out_idx + 1) * stride],
+                &mut final_counts[out_idx * num_scores..(out_idx + 1) * num_scores],
             );
         }
 
@@ -1538,37 +1540,6 @@ fn run_small_keep_direct_multi_file(
         resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
     }
     Ok((final_scores, final_counts))
-}
-
-fn apply_packed_genotype(
-    prep_result: &PreparationResult,
-    reconciled_idx: ReconciledVariantIndex,
-    out_idx: usize,
-    packed: u8,
-    final_scores: &mut [f64],
-    final_counts: &mut [u32],
-) {
-    let num_scores = prep_result.score_names.len();
-    let scores_offset = out_idx * num_scores;
-    let variant_view = prep_result.variant_csr_view(reconciled_idx);
-    match packed {
-        0b00 => {}
-        0b01 => {
-            for contribution in variant_view.iter() {
-                let col = contribution.score_column.0;
-                final_counts[scores_offset + col] += 1;
-                final_scores[scores_offset + col] -= contribution.missing_correction as f64;
-            }
-        }
-        0b10 | 0b11 => {
-            let dosage = if packed == 0b10 { 1.0 } else { 2.0 };
-            for contribution in variant_view.iter() {
-                let col = contribution.score_column.0;
-                final_scores[scores_offset + col] += contribution.weight as f64 * dosage;
-            }
-        }
-        _ => unreachable!(),
-    }
 }
 
 fn derive_spool_destination(base_path: &Path) -> (PathBuf, String) {
@@ -1632,16 +1603,15 @@ mod tests {
     use super::*;
 
     fn memory_test_prep(people: usize, scores: usize) -> PreparationResult {
+        let names: Vec<String> = (0..scores).map(|i| format!("S{i}")).collect();
         PreparationResult::new(
-            vec![],
-            vec![],
+            crate::score::cells::ExactPlan::new(&[], &[], &[], &[0], &[], &names)
+                .expect("empty plan"),
             vec![],
             vec![0],
-            scores.div_ceil(8) * 8,
-            vec![0.0; scores],
             vec![],
             vec![],
-            (0..scores).map(|i| format!("S{i}")).collect(),
+            names,
             vec![0; scores],
             crate::score::types::PersonSubset::All,
             vec![],
@@ -1767,7 +1737,13 @@ mod tests {
                             expected += weight * if row == 1 { 2.0 - dosage } else { dosage };
                         }
                     }
-                    assert_eq!(scores[out], expected, "split={split}, person={fam:?}");
+                    let stride = prep.exact().stride();
+                    assert_eq!(
+                        prep.exact()
+                            .sum(0, &scores[out * stride..(out + 1) * stride]),
+                        expected,
+                        "split={split}, person={fam:?}"
+                    );
                     assert_eq!(missing[out], expected_missing);
                 }
             }
@@ -1850,21 +1826,6 @@ struct BufferGuard<'a> {
     pool: &'a io::RowBufferPool,
 }
 
-struct DenseMiniBatchCanvas<'a> {
-    weights: &'a mut [f64],
-    missing_corrections: &'a mut [f64],
-    stride: usize,
-}
-
-impl<'a> DenseMiniBatchCanvas<'a> {
-    #[inline(always)]
-    fn set(&mut self, batch_row: usize, score_col: usize, weight: f64, missing_correction: f64) {
-        let idx = batch_row * self.stride + score_col;
-        self.weights[idx] = weight;
-        self.missing_corrections[idx] = missing_correction;
-    }
-}
-
 impl<'a> Drop for BufferGuard<'a> {
     fn drop(&mut self) {
         // When the guard is dropped, it returns its buffer to the pool at full length, so
@@ -1914,7 +1875,7 @@ impl<F: FnOnce()> Drop for ScopeGuard<F> {
     }
 }
 
-type ConsumerResult = Result<(Vec<f64>, Vec<u32>), PipelineError>;
+type ConsumerResult = Result<(Vec<i64>, Vec<u32>), PipelineError>;
 
 #[inline]
 fn reconciled_index_from_usize(i: usize) -> Result<ReconciledVariantIndex, PipelineError> {
@@ -1941,38 +1902,37 @@ fn checked_result_size(prep_result: &PreparationResult) -> Result<usize, Pipelin
 }
 
 #[inline]
-fn initialize_final_output(
-    num_people: usize,
-    num_scores: usize,
-    baseline: &[f64],
-) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
-    let result_size = num_people.checked_mul(num_scores).ok_or_else(|| {
-        PipelineError::Compute(format!(
-            "Final output size overflow: num_people={num_people} * num_scores={num_scores}"
-        ))
-    })?;
-    if baseline.len() != num_scores {
-        return Err(PipelineError::Compute(format!(
-            "Baseline length mismatch: baseline={}, num_scores={num_scores}",
-            baseline.len()
-        )));
-    }
+fn checked_cells_size(prep_result: &PreparationResult) -> Result<usize, PipelineError> {
+    prep_result
+        .num_people_to_score
+        .checked_mul(prep_result.exact().stride())
+        .ok_or_else(|| {
+            PipelineError::Compute(format!(
+                "Cell matrix size overflow: num_people_to_score={} * stride={}",
+                prep_result.num_people_to_score,
+                prep_result.exact().stride()
+            ))
+        })
+}
 
+/// Zeroed exact cells (people × stride lanes) and missing counts (people × scores).
+#[inline]
+fn initialize_cells(
+    prep_result: &PreparationResult,
+) -> Result<(Vec<i64>, Vec<u32>), PipelineError> {
+    let cells_size = checked_cells_size(prep_result)?;
+    let result_size = checked_result_size(prep_result)?;
     let mut final_scores = Vec::new();
-    final_scores.try_reserve_exact(result_size).map_err(|e| {
+    final_scores.try_reserve_exact(cells_size).map_err(|e| {
         PipelineError::Compute(format!(
-            "Failed to reserve final score matrix ({} cells): {e}",
-            result_size
+            "Failed to reserve final score matrix ({cells_size} lanes): {e}"
         ))
     })?;
-    for _ in 0..num_people {
-        final_scores.extend_from_slice(baseline);
-    }
+    final_scores.resize(cells_size, 0i64);
     let mut final_counts = Vec::new();
     final_counts.try_reserve_exact(result_size).map_err(|e| {
         PipelineError::Compute(format!(
-            "Failed to reserve final missing-count matrix ({} cells): {e}",
-            result_size
+            "Failed to reserve final missing-count matrix ({result_size} cells): {e}"
         ))
     })?;
     final_counts.resize(result_size, 0u32);
@@ -1988,10 +1948,9 @@ fn worker_ceiling() -> usize {
 }
 
 #[inline]
-fn choose_consumer_threads(result_size: usize, memory_budget: MemoryBudget) -> usize {
+fn choose_consumer_threads(bytes_per_accumulator: usize, memory_budget: MemoryBudget) -> usize {
     let cpu_cap = worker_ceiling();
 
-    let bytes_per_accumulator = result_bytes(result_size).unwrap_or(usize::MAX);
     if bytes_per_accumulator == 0 {
         return cpu_cap;
     }
@@ -2017,7 +1976,8 @@ fn process_sparse_stream(
     let _stop_producer = ScopeGuard::new(|| buffer_pool.close());
     let prep_result = &context.prep_result;
     let result_size = checked_result_size(prep_result)?;
-    let consumer_threads = choose_consumer_threads(result_size, context.memory_budget);
+    let cells_size = checked_cells_size(prep_result)?;
+    let consumer_threads = choose_consumer_threads(result_bytes(prep_result)?, context.memory_budget);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(consumer_threads)
         .build()
@@ -2032,7 +1992,8 @@ fn process_sparse_stream(
         rx.into_iter() // Convert the channel to a blocking iterator.
             .par_bridge() // Bridge it to a Rayon parallel iterator.
             .try_fold(
-                || (vec![0.0f64; result_size], vec![0u32; result_size]), // Each thread gets its own accumulator.
+                // Each thread gets its own accumulator and term scratch.
+                || (vec![0i64; cells_size], vec![0u32; result_size], VariantTerms::default()),
                 |mut acc, work_result| {
                     // The work_item and its buffer are processed within this scope.
                     // The `_guard` ensures the buffer is returned to the pool when this
@@ -2048,6 +2009,8 @@ fn process_sparse_stream(
                             // The guard holds the buffer, so we borrow it from there.
                             guard.buffer.as_ref().unwrap(),
                             prep_result,
+                            &context.person_layout,
+                            &mut acc.2,
                             &mut acc.0,
                             &mut acc.1,
                             work_item.reconciled_variant_index,
@@ -2057,12 +2020,13 @@ fn process_sparse_stream(
                 },
             )
             .try_reduce(
-                || (vec![0.0f64; result_size], vec![0u32; result_size]), // Identity for the reduction.
+                // Identity for the reduction.
+                || (vec![0i64; cells_size], vec![0u32; result_size], VariantTerms::default()),
                 |mut a, b| {
                     // Combine accumulators from two threads in parallel.
                     a.0.par_iter_mut()
                         .zip(b.0)
-                        .for_each(|(v_a, v_b)| *v_a += v_b);
+                        .for_each(|(v_a, v_b)| *v_a = v_a.wrapping_add(v_b));
                     a.1.par_iter_mut()
                         .zip(b.1)
                         .for_each(|(v_a, v_b)| *v_a += v_b);
@@ -2074,17 +2038,19 @@ fn process_sparse_stream(
     // `try_reduce` returns `Result<(scores, counts), PipelineError>`.
     // The `?` operator has already unwrapped the Result, leaving just the tuple.
     // With an identity function, try_reduce handles empty streams by returning the identity.
-    Ok(final_result)
+    let (cells, counts, _) = final_result;
+    Ok((cells, counts))
 }
 
 fn process_sparse_stream_bounded(
     rx: Receiver<Result<WorkItem, PipelineError>>,
     context: &PipelineContext,
     buffer_pool: Arc<io::RowBufferPool>,
-    accumulator: Arc<Mutex<(Vec<f64>, Vec<u32>)>>,
+    accumulator: Arc<Mutex<(Vec<i64>, Vec<u32>)>>,
 ) -> ConsumerResult {
     let _stop_producer = ScopeGuard::new(|| buffer_pool.close());
     let prep_result = &context.prep_result;
+    let mut terms = VariantTerms::default();
     for work_result in rx {
         let work_item = work_result?;
         let guard = BufferGuard {
@@ -2099,6 +2065,8 @@ fn process_sparse_stream_bounded(
             batch::run_variant_major_path(
                 guard.buffer.as_ref().unwrap(),
                 prep_result,
+                &context.person_layout,
+                &mut terms,
                 scores,
                 counts,
                 work_item.reconciled_variant_index,
@@ -2119,7 +2087,8 @@ fn process_dense_stream(
     let _stop_producer = ScopeGuard::new(|| buffer_pool.close());
     let prep_result = &context.prep_result;
     let result_size = checked_result_size(prep_result)?;
-    let consumer_threads = choose_consumer_threads(result_size, context.memory_budget);
+    let cells_size = checked_cells_size(prep_result)?;
+    let consumer_threads = choose_consumer_threads(result_bytes(prep_result)?, context.memory_budget);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(consumer_threads)
         .build()
@@ -2129,21 +2098,20 @@ fn process_dense_stream(
     let batch_iterator = ChannelBatcher::new(rx, DENSE_BATCH_SIZE);
 
     // Use the exact same fold/reduce pattern as the sparse stream, but on batches.
-    let final_result = pool.install(|| {
+    let (cells, counts, _, _, _) = pool.install(|| {
         batch_iterator
-            .par_bridge() // This is now possible and correct.
+            .par_bridge()
             .try_fold(
                 || {
                     // Per-thread accumulator initializer
                     (
-                        vec![0.0f64; result_size],
+                        vec![0i64; cells_size],
                         vec![0u32; result_size],
                         Vec::with_capacity(
                             DENSE_BATCH_SIZE * (prep_result.bytes_per_variant as usize),
                         ),
-                        Vec::<f64>::new(),
-                        Vec::<f64>::new(),
                         Vec::<ReconciledVariantIndex>::with_capacity(DENSE_BATCH_SIZE),
+                        DenseScratch::default(),
                     )
                 },
                 |mut acc, batch_result| {
@@ -2152,109 +2120,68 @@ fn process_dense_stream(
                     if batch.is_empty() {
                         return Ok(acc);
                     }
-
-                    acc.5.clear();
-                    acc.5
+                    acc.3.clear();
+                    acc.3
                         .extend(batch.iter().map(|wi| wi.reconciled_variant_index));
-
-                    let concatenated_data = &mut acc.2;
-                    concatenated_data.clear();
-
-                    {
-                        // The dense kernel reads the concatenated copy, so each source
-                        // buffer can return to the producer immediately after copying.
-                        // This removes a per-batch allocation and lets I/O overlap the
-                        // entire compute phase instead of waiting on 256 held buffers.
-                        for wi in batch {
-                            concatenated_data.extend_from_slice(&wi.data);
-                            drop(BufferGuard {
-                                buffer: Some(wi.data),
-                                pool: &buffer_pool,
-                            });
-                        }
-
-                        let stride = prep_result.stride();
-                        let matrix_len = acc.5.len() * stride;
-                        acc.3.resize(matrix_len, 0.0f64);
-                        acc.3.fill(0.0);
-                        acc.4.resize(matrix_len, 0.0f64);
-                        acc.4.fill(0.0);
-                        let mut canvas = DenseMiniBatchCanvas {
-                            weights: &mut acc.3,
-                            missing_corrections: &mut acc.4,
-                            stride,
-                        };
-                        for (batch_row_idx, &reconciled_idx) in acc.5.iter().enumerate() {
-                            let variant_view = prep_result.variant_csr_view(reconciled_idx);
-                            for contribution in variant_view.iter() {
-                                let col = contribution.score_column.0;
-                                canvas.set(
-                                    batch_row_idx,
-                                    col,
-                                    contribution.weight,
-                                    contribution.missing_correction,
-                                );
-                            }
-                        }
-
-                        batch::run_person_major_path(
-                            concatenated_data,
-                            &acc.3,
-                            &acc.4,
-                            &acc.5,
-                            prep_result,
-                            &mut acc.0,
-                            &mut acc.1,
-                            &context.tile_pool,
-                        )?;
+                    acc.2.clear();
+                    // The kernel reads the concatenated copy, so each source buffer can return
+                    // to the producer immediately after copying, letting I/O overlap compute.
+                    for wi in batch {
+                        acc.2.extend_from_slice(&wi.data);
+                        drop(BufferGuard {
+                            buffer: Some(wi.data),
+                            pool: &buffer_pool,
+                        });
                     }
-
+                    batch::run_dense_batch(
+                        &acc.2,
+                        &acc.3,
+                        prep_result,
+                        &context.person_layout,
+                        &mut acc.4,
+                        &mut acc.0,
+                        &mut acc.1,
+                    )?;
                     Ok::<_, PipelineError>(acc)
                 },
             )
             .try_reduce(
-                || {
-                    (
-                        vec![0.0; result_size],
-                        vec![0; result_size],
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                },
+                || (Vec::new(), Vec::new(), Vec::new(), Vec::new(), DenseScratch::default()),
                 |mut a, b| {
-                    a.0.par_iter_mut()
-                        .zip(b.0)
-                        .for_each(|(v_a, v_b)| *v_a += v_b);
-                    a.1.par_iter_mut()
-                        .zip(b.1)
-                        .for_each(|(v_a, v_b)| *v_a += v_b);
+                    if a.0.is_empty() {
+                        return Ok(b);
+                    }
+                    if !b.0.is_empty() {
+                        a.0.par_iter_mut()
+                            .zip(b.0)
+                            .for_each(|(v_a, v_b)| *v_a = v_a.wrapping_add(v_b));
+                        a.1.par_iter_mut()
+                            .zip(b.1)
+                            .for_each(|(v_a, v_b)| *v_a += v_b);
+                    }
                     Ok(a)
                 },
             )
     })?;
-
-    // The `?` operator unwrapped the `Result` from the reduction. If the stream was
-    // empty, `try_reduce` (on a `TryFold` iterator) returns the identity value, so
-    // `final_result` correctly contains the initial empty vectors. We just need to destructure the tuple.
-    let (scores, counts, _, _, _, _) = final_result;
-    Ok((scores, counts))
+    // An empty stream reduces to the empty identity.
+    if cells.is_empty() {
+        return initialize_cells(prep_result);
+    }
+    Ok((cells, counts))
 }
 
 fn process_dense_stream_bounded(
     rx: Receiver<Result<WorkItem, PipelineError>>,
     context: &PipelineContext,
     buffer_pool: Arc<io::RowBufferPool>,
-    accumulator: Arc<Mutex<(Vec<f64>, Vec<u32>)>>,
+    accumulator: Arc<Mutex<(Vec<i64>, Vec<u32>)>>,
 ) -> ConsumerResult {
     let _stop_producer = ScopeGuard::new(|| buffer_pool.close());
     let prep_result = &context.prep_result;
     let batch_size = bounded_dense_batch_size(&context.prep_result, context.memory_budget)?;
     let mut batch_iterator = ChannelBatcher::new(rx, batch_size);
     let mut concatenated_data = Vec::new();
-    let mut weights_for_batch = Vec::new();
-    let mut missing_corrections_for_batch = Vec::new();
+    let mut scratch = DenseScratch::default();
 
     for batch_result in &mut batch_iterator {
         let batch = batch_result?;
@@ -2281,82 +2208,26 @@ fn process_dense_stream_bounded(
                     ))
                 })?;
         }
-
-        {
-            for wi in batch {
-                concatenated_data.extend_from_slice(&wi.data);
-                drop(BufferGuard {
-                    buffer: Some(wi.data),
-                    pool: &buffer_pool,
-                });
-            }
-
-            let stride = prep_result.stride();
-            let matrix_len = reconciled_indices
-                .len()
-                .checked_mul(stride)
-                .ok_or_else(|| {
-                    PipelineError::Compute(
-                        "Dense bounded weight matrix length overflow.".to_string(),
-                    )
-                })?;
-            if weights_for_batch.capacity() < matrix_len {
-                weights_for_batch
-                    .try_reserve_exact(matrix_len - weights_for_batch.len())
-                    .map_err(|e| {
-                        PipelineError::Compute(format!(
-                            "Failed to reserve dense bounded weight matrix ({matrix_len} cells): {e}"
-                        ))
-                    })?;
-            }
-            weights_for_batch.resize(matrix_len, 0.0f64);
-            weights_for_batch.fill(0.0);
-            if missing_corrections_for_batch.capacity() < matrix_len {
-                missing_corrections_for_batch
-                    .try_reserve_exact(matrix_len - missing_corrections_for_batch.len())
-                    .map_err(|e| {
-                        PipelineError::Compute(format!(
-                            "Failed to reserve dense bounded missing-correction matrix ({matrix_len} cells): {e}"
-                        ))
-                    })?;
-            }
-            missing_corrections_for_batch.resize(matrix_len, 0.0f64);
-            missing_corrections_for_batch.fill(0.0);
-            let mut canvas = DenseMiniBatchCanvas {
-                weights: &mut weights_for_batch,
-                missing_corrections: &mut missing_corrections_for_batch,
-                stride,
-            };
-            for (batch_row_idx, &reconciled_idx) in reconciled_indices.iter().enumerate() {
-                let variant_view = prep_result.variant_csr_view(reconciled_idx);
-                for contribution in variant_view.iter() {
-                    let col = contribution.score_column.0;
-                    canvas.set(
-                        batch_row_idx,
-                        col,
-                        contribution.weight,
-                        contribution.missing_correction,
-                    );
-                }
-            }
-
-            {
-                let mut locked = accumulator.lock().map_err(|_| {
-                    PipelineError::Compute("Bounded accumulator lock was poisoned.".to_string())
-                })?;
-                let (scores, counts) = &mut *locked;
-                batch::run_person_major_path(
-                    &concatenated_data,
-                    &weights_for_batch,
-                    &missing_corrections_for_batch,
-                    &reconciled_indices,
-                    prep_result,
-                    scores,
-                    counts,
-                    &context.tile_pool,
-                )?;
-            }
+        for wi in batch {
+            concatenated_data.extend_from_slice(&wi.data);
+            drop(BufferGuard {
+                buffer: Some(wi.data),
+                pool: &buffer_pool,
+            });
         }
+        let mut locked = accumulator.lock().map_err(|_| {
+            PipelineError::Compute("Bounded accumulator lock was poisoned.".to_string())
+        })?;
+        let (scores, counts) = &mut *locked;
+        batch::run_dense_batch(
+            &concatenated_data,
+            &reconciled_indices,
+            prep_result,
+            &context.person_layout,
+            &mut scratch,
+            scores,
+            counts,
+        )?;
     }
 
     Ok((Vec::new(), Vec::new()))
@@ -2372,14 +2243,17 @@ fn bounded_dense_batch_size(
 
 fn dense_scratch_bytes(prep: &PreparationResult, variants: usize) -> Result<usize, PipelineError> {
     let row = usize::try_from(prep.bytes_per_variant).ok();
-    // Packed calls, two padded f64 weight matrices, the dosage tile, and
-    // batched work descriptors coexist. Score width matters as much as N.
+    // Packed calls, each variant's four term rows, its share of the four-variant tables (256
+    // lane rows per group, sixteen groups at a time), the people's table keys and batched work
+    // descriptors coexist. Score width matters as much as N.
+    let lane_bytes = (4 + 16) * std::mem::size_of::<i64>();
     row.and_then(|row| {
-        prep.stride()
-            .checked_mul(2 * std::mem::size_of::<f64>())
-            .and_then(|weights| row.checked_add(weights))
+        prep.exact()
+            .stride()
+            .checked_mul(lane_bytes)
+            .and_then(|terms| row.checked_add(terms))
     })
-    .and_then(|row| row.checked_add(prep.num_people_to_score.min(batch::PERSON_BLOCK_SIZE)))
+    .and_then(|row| row.checked_add(prep.num_people_to_score.div_ceil(16)))
     .and_then(|row| {
         row.checked_add(
             std::mem::size_of::<WorkItem>() + std::mem::size_of::<ReconciledVariantIndex>(),
@@ -2393,7 +2267,7 @@ fn ensure_memory_floor(
     prep: &PreparationResult,
     budget: MemoryBudget,
 ) -> Result<(), PipelineError> {
-    let output = result_bytes(checked_result_size(prep)?)?;
+    let output = result_bytes(prep)?;
     let row = usize::try_from(prep.bytes_per_variant)
         .map_err(|_| PipelineError::Compute("PLINK row width overflow.".into()))?;
     let direct = should_use_small_keep_direct_for_prep(prep);

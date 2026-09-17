@@ -1,104 +1,67 @@
 //! Exact score arithmetic.
 //!
-//! Every term a score receives is a weight times a small integer dosage (or, for
-//! the complex-variant averaging fallback, a small rational). A weight is a finite
-//! f64, so it is an integer multiple of a power of two. Per score, one binary
-//! exponent turns every term into an integer; sums of those integers are exact in
-//! i128, so the order, grouping, partition and thread count of the accumulation
-//! cannot change a single bit of the result. Floating point appears once, when a
-//! finished sum is rounded to f64 for output.
-
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the exact score accumulators once they land"
-    )
-)]
+//! Every term a score receives is a weight times a small integer dosage (or, for the
+//! complex-variant averaging fallback, a small rational). A weight is held at its shortest
+//! round-trip decimal form, so per score one power of ten, times the least common multiple
+//! of its averaging denominators, turns every term into an integer. Sums of those integers
+//! cannot depend on the order, grouping, partition or thread count of the accumulation.
+//! Floating point appears once, when a finished sum is rounded to f64 for output.
 
 /// One score's fixed point: a cell holding `v` means `v * 2^exp / scale`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FixedPoint {
     pub(crate) exp: i32,
-    /// Least common multiple of the averaging denominators; 1 without complex averaging.
-    pub(crate) scale: u64,
-}
-
-/// A finite nonzero f64 as (odd signed mantissa, exponent).
-fn f64_parts(value: f64) -> Option<(i64, i32)> {
-    let bits = value.to_bits();
-    let field = ((bits >> 52) & 0x7ff) as i32;
-    let fraction = (bits & ((1u64 << 52) - 1)) as i64;
-    let (mantissa, exp) = if field == 0 {
-        (fraction, -1074)
-    } else {
-        (fraction | (1i64 << 52), field - 1075)
-    };
-    if mantissa == 0 {
-        return None;
-    }
-    let tz = mantissa.trailing_zeros() as i32;
-    let odd = mantissa >> tz;
-    Some((if bits >> 63 == 1 { -odd } else { odd }, exp + tz))
+    pub(crate) scale: u128,
 }
 
 impl FixedPoint {
-    /// The exponent that makes every coefficient an integer, if a cell can hold
-    /// `terms` of them at up to `max_multiplier` each without overflow. `None` for
-    /// non-finite coefficients or a range wider than i128.
-    pub(crate) fn plan(
-        coefficients: impl IntoIterator<Item = f64>,
-        terms: u64,
-        max_multiplier: u64,
-        scale: u64,
-    ) -> Option<Self> {
-        if scale == 0 {
-            return None;
-        }
-        let (mut low, mut high) = (i32::MAX, i32::MIN);
-        for value in coefficients {
-            if !value.is_finite() {
-                return None;
-            }
-            if let Some((mantissa, exp)) = f64_parts(value) {
-                low = low.min(exp);
-                high = high.max(exp + (64 - mantissa.unsigned_abs().leading_zeros()) as i32);
-            }
-        }
-        if low == i32::MAX {
-            return Some(Self { exp: 0, scale });
-        }
-        let bound = u128::from(terms.max(1))
-            .checked_mul(u128::from(max_multiplier.max(1)))?
-            .checked_mul(u128::from(scale))?;
-        let headroom = 128 - bound.leading_zeros() as i32;
-        (high - low + headroom < 127).then_some(Self { exp: low, scale })
-    }
-
-    /// `value * 2^-exp * scale` exactly. The value must have been seen by `plan`.
+    /// `v * 2^exp / (scale * divisor)`, correctly rounded; 0 when `divisor` is 0. A planned
+    /// scale leaves room for any u32 divisor, so the product fits u128.
     #[inline]
-    pub(crate) fn to_fixed(&self, value: f64) -> i128 {
-        f64_parts(value).map_or(0, |(mantissa, exp)| {
-            (i128::from(mantissa) << (exp - self.exp)) * i128::from(self.scale)
-        })
-    }
-
-    /// `v * 2^exp / scale`, correctly rounded (ties to even).
-    pub(crate) fn to_f64(&self, v: i128) -> f64 {
-        round_quotient(v, self.exp, u128::from(self.scale))
-    }
-
-    /// `v * 2^exp / (scale * divisor)`, correctly rounded; 0 when `divisor` is 0.
-    pub(crate) fn quotient(&self, v: i128, divisor: u64) -> f64 {
+    pub(crate) fn quotient(&self, v: i128, divisor: u32) -> f64 {
         if divisor == 0 {
             return 0.0;
         }
-        round_quotient(v, self.exp, u128::from(self.scale) * u128::from(divisor))
+        let q = self.scale * u128::from(divisor);
+        if self.exp <= 0 && self.exp > -53 && v.unsigned_abs() < 1u128 << 53 {
+            let shift = self.exp.unsigned_abs();
+            if q < 1u128 << (53 - shift) {
+                // Both operands are exact doubles, so the one division rounds correctly.
+                return v as f64 / (q << shift) as f64;
+            }
+        }
+        round_quotient(v, self.exp, q)
     }
 }
 
+/// `value = digits * 10^exponent` from the shortest round-trip form of a finite `value`,
+/// with trailing zeros folded into the exponent. Zero is `(0, 0)`.
+pub(crate) fn shortest_decimal(value: f64) -> (i64, i32) {
+    if value == 0.0 {
+        return (0, 0);
+    }
+    let mut buffer = ryu::Buffer::new();
+    let text = buffer.format_finite(value.abs());
+    let (mantissa, mut exponent) = match text.split_once('e') {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().unwrap_or(0)),
+        None => (text, 0),
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    exponent -= fraction.len() as i32;
+    // A shortest form has at most 17 significant digits, plus leading zeros, so i64 holds them.
+    let mut digits = integer
+        .bytes()
+        .chain(fraction.bytes())
+        .fold(0i64, |digits, byte| digits * 10 + i64::from(byte - b'0'));
+    while digits % 10 == 0 {
+        digits /= 10;
+        exponent += 1;
+    }
+    (if value < 0.0 { -digits } else { digits }, exponent)
+}
+
 /// Two carry-free i64 limbs for one score: `v = hi * 2^bits + lo`, with `lo` in `[0, 2^bits)`.
-/// A cell receives at most one term per variant, so for `terms` variants whose integers need
+/// A cell receives at most one term per entry, so for `terms` entries whose integers need
 /// `term_bits` bits (sign included) neither limb's running sum can overflow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Split {
@@ -141,7 +104,7 @@ fn round_quotient(v: i128, exp: i32, q: u128) -> f64 {
     }
     let negative = v < 0;
     // Normalise the dividend to 128 bits. A 64-bit denominator leaves at least 64
-    // significant quotient bits; a wider scale * divisor needs more division bits.
+    // significant quotient bits; a wider denominator needs more division bits.
     let shift = v.unsigned_abs().leading_zeros();
     let a = v.unsigned_abs() << shift;
     let mut e = exp - shift as i32;
@@ -282,29 +245,55 @@ mod tests {
     }
 
     #[test]
-    fn planned_coefficients_round_trip_and_sums_ignore_order() {
-        let weights: Vec<f64> = (0..4096)
-            .map(|i| ((i * 7919 % 10007) as f64 - 5003.0) * 1.37e-7)
-            .chain([0.123456789, -3.5e-5, 2.0, 7.0])
-            .collect();
-        let plan = FixedPoint::plan(weights.iter().copied(), 4100, 2, 1).expect("fits");
-        for &w in &weights {
-            assert_eq!(plan.to_f64(plan.to_fixed(w)), w);
+    fn the_one_division_path_agrees_with_long_division() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for case in 0..200_000 {
+            let magnitude = (rng.next() >> (11 + case % 40)) as i128;
+            let v = if rng.next() & 1 == 1 { -magnitude } else { magnitude };
+            let places = (rng.next() % 12) as u32;
+            let multiple = [1u128, 2, 6, 12, 60][case % 5];
+            let fixed = FixedPoint {
+                exp: -(places as i32),
+                scale: 5u128.pow(places) * multiple,
+            };
+            let divisor = [1u32, 2, 3, 7, 20_000, 1_000_003][case % 6];
+            assert_eq!(
+                fixed.quotient(v, divisor).to_bits(),
+                round_quotient(v, fixed.exp, fixed.scale * u128::from(divisor)).to_bits(),
+                "v={v} places={places} multiple={multiple} divisor={divisor}"
+            );
         }
-        let forward: i128 = weights.iter().map(|&w| plan.to_fixed(w)).sum();
-        let backward: i128 = weights.iter().rev().map(|&w| plan.to_fixed(w)).sum();
-        assert_eq!(forward, backward);
-        assert!(FixedPoint::plan([1e300, 1e-300], 4, 2, 1).is_none());
-        assert!(FixedPoint::plan([f64::NAN], 4, 2, 1).is_none());
-        assert_eq!(plan.quotient(forward, 0), 0.0);
     }
 
     #[test]
-    fn impossible_bounds_are_rejected_without_wrapping() {
-        assert!(FixedPoint::plan([1.0], u64::MAX, u64::MAX, u64::MAX).is_none());
-        assert!(FixedPoint::plan([1.0], 1, 1, 0).is_none());
-        assert!(Split::plan(1, u64::MAX).is_none());
-        assert!(Split::plan(u32::MAX, 1).is_none());
+    fn shortest_forms_recover_written_decimals() {
+        for (value, want) in [
+            (0.123456, (123456, -6)),
+            (-0.5, (-5, -1)),
+            (1.0, (1, 0)),
+            (1500.0, (15, 2)),
+            (1e-7, (1, -7)),
+            (-3.25e-12, (-325, -14)),
+            (0.1 + 0.2, (30000000000000004, -17)),
+            (5e-324, (5, -324)),
+            (0.0, (0, 0)),
+        ] {
+            assert_eq!(shortest_decimal(value), want, "{value:e}");
+        }
+        // Every decimal written with up to 15 significant digits comes back as written; with more
+        // digits the double may not hold the written value.
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..100_000 {
+            let digits = (rng.next() % 999_999_999_999_999) as i64 + 1;
+            let exponent = (rng.next() % 40) as i32 - 30;
+            let text = format!("{digits}e{exponent}");
+            let (got_digits, got_exponent) = shortest_decimal(text.parse().unwrap());
+            let mut want = (digits, exponent);
+            while want.0 % 10 == 0 {
+                want = (want.0 / 10, want.1 + 1);
+            }
+            assert_eq!((got_digits, got_exponent), want, "{text}");
+        }
     }
 
     #[test]
@@ -317,11 +306,21 @@ mod tests {
         assert_eq!(plan.quotient(1 << 100, 2), 2f64.powi(-34));
         let plan = FixedPoint {
             exp: 0,
-            scale: u64::MAX,
+            scale: u128::from(u64::MAX),
         };
-        assert_eq!(plan.quotient(i128::MAX, u64::MAX), 0.5);
-        assert_eq!(plan.quotient(i128::MIN, u64::MAX), -0.5);
-        assert_eq!(plan.quotient(0, u64::MAX), 0.0);
+        // Seven whole denominators come back exactly, and (2^127 - 1) / ((2^64 - 1)(2^32 - 1)) =
+        // 2^31 + 1/2 + about 2^-32, which rounds to 2^31 + 1/2.
+        let whole = i128::try_from(u128::from(u64::MAX) * u128::from(u32::MAX) * 7).unwrap();
+        assert_eq!(plan.quotient(whole, u32::MAX), 7.0);
+        assert_eq!(plan.quotient(i128::MAX, u32::MAX), 2147483648.5);
+        assert_eq!(plan.quotient(0, u32::MAX), 0.0);
+        assert_eq!(plan.quotient(12345, 0), 0.0);
+    }
+
+    #[test]
+    fn impossible_splits_are_rejected_without_wrapping() {
+        assert!(Split::plan(1, u64::MAX).is_none());
+        assert!(Split::plan(u32::MAX, 1).is_none());
     }
 
     #[test]

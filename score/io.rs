@@ -173,16 +173,24 @@ mod pool_tests {
 
     fn four_person_prep(rows: usize) -> Arc<PreparationResult> {
         let people = 4usize;
+        let names = vec!["S0".to_string()];
+        let offsets: Vec<u64> = (0..=rows as u64).collect();
+        let exact = crate::score::cells::ExactPlan::new(
+            &vec![1.0; rows],
+            &vec![0.0; rows],
+            &vec![0; rows],
+            &offsets,
+            &[],
+            &names,
+        )
+        .expect("exact plan");
         Arc::new(PreparationResult::new(
-            vec![1.0; rows],
-            vec![0.0; rows],
+            exact,
             vec![0; rows],
-            (0..=rows as u64).collect(),
-            8,
-            vec![0.0],
+            offsets,
             (0..rows as u64).map(BimRowIndex).collect(),
             Vec::new(),
-            vec!["S0".to_string()],
+            names,
             vec![rows as u32],
             PersonSubset::All,
             (0..people).map(|i| format!("I{i}")).collect(),
