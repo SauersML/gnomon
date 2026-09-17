@@ -4605,17 +4605,16 @@ where
         });
     }
 
-    let mut values = Vec::with_capacity(keep);
-    let mut vectors = Mat::zeros(n, keep);
-    for idx in 0..keep {
-        values.push(outcome.values[idx]);
-        for row in 0..n {
-            vectors[(row, idx)] = outcome.vectors[(row, idx)];
-        }
-    }
-    let factor_products = outcome
-        .factor_products
-        .map(|products| Mat::from_fn(products.nrows(), keep, |row, col| products[(row, col)]));
+    let values = outcome.values[..keep].to_vec();
+    // Narrowed in place: a copy would hold a second `n × keep` beside the
+    // solver's vectors at the fit's high-water mark.
+    let mut vectors = outcome.vectors;
+    vectors.truncate(n, keep);
+    let factor_products = outcome.factor_products.map(|mut products| {
+        let rows = products.nrows();
+        products.truncate(rows, keep);
+        products
+    });
 
     Ok(Eigenpairs {
         values,

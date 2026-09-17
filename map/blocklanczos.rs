@@ -470,7 +470,9 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
         let max_depth = budget_depth.min(projected_depth);
         let max_dim = max_depth * width;
 
-        let mut blocks: Vec<Mat<f64>> = vec![start.clone()];
+        // The start block moves into the basis: a restart replaces it before
+        // this line runs again, so a copy would only hold a second `n × width`.
+        let mut blocks: Vec<Mat<f64>> = vec![std::mem::replace(&mut start, Mat::new())];
         // The projection, in full storage: `h[(i·b + r, l·b + c)]` is entry
         // `(r, c)` of `H_il`. Column block `l` is written once, at step `l`, and
         // never revised — which is what makes the residual identity below a
@@ -703,8 +705,17 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
             };
 
             if converged || complete {
-                let (outcome, _) = finish(&blocks, images.as_deref(), &current, width, n, restarts);
-                return Ok(outcome);
+                // The trailing block would seed the next pass; the vectors are
+                // combinations of the blocks before it.
+                blocks.truncate(depth + 1);
+                return Ok(finish_returning(
+                    &blocks,
+                    images.as_deref(),
+                    &current,
+                    width,
+                    n,
+                    restarts,
+                ));
             }
 
             if exhausted {
@@ -752,8 +763,15 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
                 && params.stop_when_unresolvable
                 && boundary_unresolvable(&boundary_history, &relative, &theta, output, passes, &params)
             {
-                let (outcome, _) = finish(&blocks, images.as_deref(), &current, width, n, restarts);
-                return Ok(outcome);
+                blocks.truncate(depth + 1);
+                return Ok(finish_returning(
+                    &blocks,
+                    images.as_deref(),
+                    &current,
+                    width,
+                    n,
+                    restarts,
+                ));
             }
 
             stage = Some(current);
@@ -776,8 +794,14 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
         // The pass ceiling stopped the depth loop. The basis is still alive
         // here and about to be dropped, so this is the last chance to lift.
         if let Some(current) = stage.as_ref() {
-            let (outcome, _) = finish(&blocks, images.as_deref(), current, width, n, restarts);
-            best = Some(outcome);
+            best = Some(finish_returning(
+                &blocks,
+                images.as_deref(),
+                current,
+                width,
+                n,
+                restarts,
+            ));
         }
         break;
     }
@@ -807,6 +831,36 @@ fn finish(
     let guard = stage.coefficients.ncols();
     let retained = lift_ritz_vectors(blocks, stage.coefficients.as_ref(), guard, width, n);
     let vectors = leading_columns(&retained, stage.output);
+    (outcome(images, stage, vectors, width, restarts), retained)
+}
+
+/// [`finish`] where the solver returns and no restart wants the guard band: its
+/// lift is narrowed to the returned columns in place rather than copied from.
+/// With the trailing block already let go by the caller, that is two
+/// `n × width` matrices fewer at the fit's high-water mark.
+fn finish_returning(
+    blocks: &[Mat<f64>],
+    images: Option<&[Mat<f64>]>,
+    stage: &Stage,
+    width: usize,
+    n: usize,
+    restarts: usize,
+) -> BlockKrylovOutcome {
+    let guard = stage.coefficients.ncols();
+    let mut vectors = lift_ritz_vectors(blocks, stage.coefficients.as_ref(), guard, width, n);
+    vectors.truncate(n, stage.output.min(guard));
+    outcome(images, stage, vectors, width, restarts)
+}
+
+/// The outcome for the Ritz `vectors` of `stage`, with `Xᵀ·vectors` lifted from
+/// the factor images beside them.
+fn outcome(
+    images: Option<&[Mat<f64>]>,
+    stage: &Stage,
+    vectors: Mat<f64>,
+    width: usize,
+    restarts: usize,
+) -> BlockKrylovOutcome {
     let factor_products = images.and_then(|images| {
         debug_assert_eq!(images.len() * width, stage.coefficients.nrows());
         images.first().map(|first| {
@@ -819,7 +873,7 @@ fn finish(
             )
         })
     });
-    let outcome = BlockKrylovOutcome {
+    BlockKrylovOutcome {
         values: stage.values.clone(),
         vectors,
         passes: stage.passes,
@@ -831,8 +885,7 @@ fn finish(
         certified_components: stage.certified,
         truncation_splits_cluster: stage.splits_cluster,
         factor_products,
-    };
-    (outcome, retained)
+    }
 }
 
 /// How many leading Ritz pairs have to converge *together* for the requested
