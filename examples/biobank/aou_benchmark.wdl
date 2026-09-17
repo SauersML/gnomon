@@ -14,12 +14,13 @@ workflow aou_benchmark {
     Array[File] score_files
     String runtime_image
     String status_uri
+    Boolean support_only = false
   }
   call bench { input:
     sources=sources, config=config, wheelhouse_archive=wheelhouse_archive,
     ancestry_predictions=ancestry_predictions, relatedness_prune=relatedness_prune,
     features_uri=features_uri, score_files=score_files, runtime_image=runtime_image,
-    status_uri=status_uri
+    status_uri=status_uri, support_only=support_only
   }
   output { Array[File] tokens = bench.tokens }
 }
@@ -35,6 +36,7 @@ task bench {
     Array[File] score_files
     String runtime_image
     String status_uri
+    Boolean support_only
   }
   command <<<
     set -euo pipefail
@@ -62,7 +64,7 @@ task bench {
     if ! timeout --kill-after=10s 40m work/venv/bin/python aou_benchmark.py run \
         --config "~{config}" --ancestry "~{ancestry_predictions}" --prune "~{relatedness_prune}" \
         --features-uri "~{features_uri}" --scores work/scores --status-uri "~{status_uri}" \
-        --output digest --work work/bench; then
+        --output digest --work work/bench ~{if support_only then "--support-only" else ""}; then
       python aou_status.py "~{status_uri}" failed_benchmark
       exit 1
     fi

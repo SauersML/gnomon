@@ -196,3 +196,29 @@ def test_table_suppresses_a_cell_below_the_minimum_even_if_a_token_carries_it():
     assert table.number("m1.5em05") == -1.5e-05
     row = next(line for line in table.render(names).split("### ")[1].splitlines() if line.startswith("| hyper"))
     assert "insufficient support" in row and "12" not in row
+
+
+def test_support_counts_every_eligible_participant_before_the_cap_and_suppresses_small_groups():
+    rng = np.random.default_rng(9)
+    ancestry = ["afr"] * 3000 + ["eur"] * 5000 + ["mid"] * 30
+    n = len(ancestry)
+    base = pd.DataFrame({"person_id": [str(i) for i in range(n)], "ancestry": ancestry})
+    scores = {"PGS000001": pd.DataFrame({"person_id": base.person_id, "PGS000001": rng.normal(size=n)})}
+    cases = set(base.person_id[rng.random(n) < 0.3])
+    config = {"seed": 3, "max_rows_per_disease": 3000, "max_rows_per_ancestry": 1000, "test_fraction": 0.25}
+    scored = bench.scored_participants(base, cases, scores)
+    assert bench.disease_cohort(base, cases, scores, config).ancestry.value_counts().to_dict() == {"afr": 1000,
+                                                                                                "eur": 1000,
+                                                                                                "mid": 30}
+    with tempfile.TemporaryDirectory() as tmp:
+        digest = bench.Digest(tmp)
+        bench.report_support(digest, "hypertension", scored, 20)
+        names = sorted(p.name for p in Path(tmp).iterdir())
+    afr_cases = int(scored.y[scored.ancestry == "afr"].sum())
+    assert "digest__hypertension__support__ancestry_afr__eligible__3000.txt" in names
+    assert f"digest__hypertension__support__ancestry_afr__cases__{afr_cases}.txt" in names
+    assert "digest__hypertension__support__ancestry_mid__insufficient_support.txt" in names
+    assert not any("ancestry_mid" in name and "insufficient" not in name for name in names)
+    text = table.render(names)
+    assert text.startswith("### Eligible support before the per-ancestry cap")
+    assert "| hypertension | AFR | 3,000 |" in text and "| MID |" not in text

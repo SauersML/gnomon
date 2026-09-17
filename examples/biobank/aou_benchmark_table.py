@@ -30,8 +30,8 @@ def number(text):
 
 
 def parse(names):
-    """Score facts, per-method cells and paired deltas from digest object names."""
-    scores, cells, deltas = {}, {}, {}
+    """Score facts, per-method cells, paired deltas and pre-cap support from digest object names."""
+    scores, cells, deltas, support = {}, {}, {}, {}
     for raw in names:
         name = raw.strip().rsplit("/", 1)[-1]
         if not (name.startswith("digest__") and name.endswith(".txt")):
@@ -40,6 +40,10 @@ def parse(names):
         if len(parts) < 3 or parts[1] == "cohort":
             continue
         disease, pgs, rest = parts[0], parts[1], parts[2:]
+        if pgs == "support":
+            if len(rest) == 3 and rest[1] in ("eligible", "cases"):
+                support.setdefault((disease, rest[0]), {})[rest[1]] = number(rest[2])
+            continue
         facts = scores.setdefault((disease, pgs), {})
         if rest[0] == "development" and len(rest) == 2:
             facts["development"] = rest[1]
@@ -51,7 +55,18 @@ def parse(names):
         elif len(rest) == 4 and rest[0] != "all":
             method, group, metric, value = rest
             cells.setdefault((disease, pgs, method, group), {})[metric] = number(value)
-    return scores, cells, deltas
+    return scores, cells, deltas, support
+
+
+def support_table(support, minimum=MINIMUM):
+    rows = ["| disease | ancestry | eligible participants | cases |", "| --- | --- | --- | --- |"]
+    for (disease, group), found in sorted(support.items()):
+        n, cases = found.get("eligible"), found.get("cases")
+        if n is None or cases is None or min(cases, n - cases) < minimum:
+            continue
+        rows.append(f"| {disease.replace('_', ' ')} | {group.removeprefix('ancestry_').upper()} "
+                    f"| {int(n):,} | {int(cases):,} |")
+    return "\n".join(rows)
 
 
 def difference(deltas, key):
@@ -97,8 +112,10 @@ def table(scores, cells, deltas, group, minimum=MINIMUM):
 
 
 def render(names, minimum=MINIMUM):
-    scores, cells, deltas = parse(names)
+    scores, cells, deltas, support = parse(names)
     sections = []
+    if support:
+        sections.append("### Eligible support before the per-ancestry cap\n\n" + support_table(support, minimum))
     for kind, groups in (("headline", HEADLINE), ("comparator", COMPARATORS)):
         for group, title in groups:
             sections.append(f"### Held-out gains in {title} ({kind})\n\n"

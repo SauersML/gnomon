@@ -136,9 +136,10 @@ def benchmark(wb, args):
         relatedness_prune=required_env("AOU_RELATEDNESS_PRUNE_URI"),
         features_uri=required_env("AOU_SHARED_FEATURES_URI"),
         score_files=score_files, runtime_image=required_env("AOU_RUNTIME_IMAGE"),
-        status_uri=f"{wb.bucket}/workflow-checkpoints/benchmark-{key}-{name[-15:]}.tar.gz").items()}
-    wb.run_workflow(name, f"{uri}/{wdl.name}", "Score method benchmark", inputs, folder,
-                    storage_capacity=50)
+        status_uri=f"{wb.bucket}/workflow-checkpoints/benchmark-{key}-{name[-15:]}.tar.gz",
+        support_only=args.support_only).items()}
+    display = "Score method benchmark support" if args.support_only else "Score method benchmark"
+    wb.run_workflow(name, f"{uri}/{wdl.name}", display, inputs, folder, storage_capacity=50)
 
 
 def diagnostic(wb, stem, display_name, values):
@@ -192,8 +193,11 @@ def finish(wb, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    for command, handler in (("score-training", score_training), ("benchmark", benchmark)):
-        sub.add_parser(command).set_defaults(handler=handler)
+    sub.add_parser("score-training").set_defaults(handler=score_training)
+    child = sub.add_parser("benchmark")
+    child.add_argument("--support-only", action="store_true",
+                       help="count eligible participants and cases per ancestry, then stop before any fit")
+    child.set_defaults(handler=benchmark)
     for command, handler in (("scoring-diagnostic", scoring_diagnostic), ("fit-diagnostic", fit_diagnostic)):
         child = sub.add_parser(command)
         child.add_argument("--checkpoint", help="checkpoint URI instead of .aou-workflow/current-checkpoint-uri")

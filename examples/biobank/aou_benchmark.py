@@ -127,11 +127,16 @@ def load_sscore(path, pgs):
     return scores
 
 
-def disease_cohort(base, case_ids, scores, config):
+def scored_participants(base, case_ids, scores):
+    """Every eligible participant with all of a disease's scores, and their outcome."""
     df = base
     for pgs, frame in scores.items():
         df = df.merge(frame, on="person_id", validate="one_to_one")
-    df = df.assign(y=df.person_id.isin(case_ids).astype(float))
+    return df.assign(y=df.person_id.isin(case_ids).astype(float))
+
+
+def disease_cohort(base, case_ids, scores, config):
+    df = scored_participants(base, case_ids, scores)
     order = df.person_id.map(lambda x: stable_hash(config["seed"], "benchmark-sample", x))
     # Outcome-blind within each ancestry: a common ancestry is capped so the rarer
     # ones, where a European-trained score gains least, keep their support.
@@ -428,6 +433,19 @@ def audit_groups(test):
     return groups
 
 
+def report_support(digest, disease, scored, minimum):
+    """Eligible participants and cases per ancestry before any cap: the support a
+    per-ancestry cap can draw on, so it is sized to what exists."""
+    for label in sorted(scored.ancestry.unique()):
+        y = scored.y.to_numpy(float)[(scored.ancestry == label).to_numpy()]
+        n, cases = len(y), int(y.sum())
+        if min(cases, n - cases) < minimum:
+            digest.emit(disease, "support", f"ancestry_{label}", "insufficient_support")
+            continue
+        digest.emit(disease, "support", f"ancestry_{label}", "eligible", token(n))
+        digest.emit(disease, "support", f"ancestry_{label}", "cases", token(cases))
+
+
 def report(digest, disease, pgs, test, predictions, config):
     y = test.y.to_numpy(float)
     minimum = config["min_report_count"]
@@ -486,7 +504,11 @@ def run(args):
     staged = {}
     for disease, spec in config["diseases"].items():
         scores = {pgs: load_sscore(args.scores / f"{pgs}.sscore", pgs) for pgs in spec["scores"]}
-        cohort = disease_cohort(base, cases.get(code_to_id[spec["snomed_code"]], set()), scores, config)
+        case_ids = cases.get(code_to_id[spec["snomed_code"]], set())
+        report_support(digest, disease, scored_participants(base, case_ids, scores), config["min_report_count"])
+        if args.support_only:
+            continue
+        cohort = disease_cohort(base, case_ids, scores, config)
         n, n_cases = len(cohort), int(cohort.y.sum())
         if min(n_cases, n - n_cases) < config["min_report_count"]:
             digest.emit(disease, "cohort", "insufficient_support")
@@ -504,6 +526,9 @@ def run(args):
             staged[(disease, pgs)] = (cohort.loc[cohort.is_test].reset_index(drop=True),
                                       {m: p[cohort.is_test.to_numpy()] for m, p in predictions.items()})
 
+    if args.support_only:
+        publish_status(status, "benchmark_support_completed")
+        return
     publish_status(status, "benchmark_fitting")
     params = work / "gnomon_params.json"
     params.write_text(json.dumps({"num_pcs": config["num_pcs"], "centers": config["gnomon_centers"]}))
@@ -537,6 +562,8 @@ def main():
         bench.add_argument(f"--{name}", type=Path, required=True)
     bench.add_argument("--features-uri", required=True)
     bench.add_argument("--status-uri", required=True)
+    bench.add_argument("--support-only", action="store_true",
+                       help="emit eligible participants and cases per ancestry, then stop before any fit")
     worker = sub.add_parser("gnomon-fit")
     for name in ("frame", "params", "output"):
         worker.add_argument(f"--{name}", type=Path, required=True)
