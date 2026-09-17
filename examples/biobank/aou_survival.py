@@ -476,73 +476,13 @@ def censor_km(train):
     return times, np.cumprod(1 - fraction)
 
 
-# Prior weight on a stratum's censoring hazard ratio, in censorings at the pooled
-# rate: the 20-row support minimum, so a stratum's own censoring moves its ratio
-# halfway from the pooled set's only once it has about that many censorings.
-CENSORING_PRIOR_CENSORINGS = 20
-
-
-def censoring_log_hazard_ratio(train, ancestry):
-    """A stratum's censoring log hazard ratio against the pooled training set.
-
-    Proportional hazards over the pooled baseline: the pooled Breslow increments
-    of the censoring hazard, every log hazard ratio at zero, give the censorings
-    the stratum would show over its own follow-up if it were censored like
-    everyone. The ratio is the posterior mean under a gamma prior worth
-    CENSORING_PRIOR_CENSORINGS censorings at the pooled rate,
-    (observed + prior) / (expected + prior): a stratum with few censorings stays
-    near the pooled curve, and one with many approaches observed / expected."""
-    times, inverse, counts = np.unique(train.followup.to_numpy(float), return_inverse=True,
-                                       return_counts=True)
-    censored = train.event_code.to_numpy(int) == 0
-    mine = train.ancestry.astype(str).eq(str(ancestry)).to_numpy()
-    def at_risk(rows, censorings):
-        # Events at a censoring time leave the risk set first, as in censor_km.
-        return np.cumsum(rows[::-1])[::-1] - (rows - censorings)
-    all_censored = np.bincount(inverse, weights=censored, minlength=len(times))
-    pooled_risk = at_risk(counts, all_censored)
-    increments = np.divide(all_censored, pooled_risk, out=np.zeros_like(all_censored),
-                           where=pooled_risk > 0)
-    my_censored = np.bincount(inverse, weights=mine & censored, minlength=len(times))
-    observed = float(my_censored.sum())
-    expected = float(at_risk(np.bincount(inverse, weights=mine, minlength=len(times)), my_censored) @ increments)
-    return float(np.log((observed + CENSORING_PRIOR_CENSORINGS) / (expected + CENSORING_PRIOR_CENSORINGS)))
-
-
-def censoring_curve(train, ancestry, horizon, pooled):
-    """The reverse Kaplan-Meier curve (times, survival) that weights a test stratum.
-
-    The stratum's own curve, when it has at least 20 training rows and its
-    censoring survival at the horizon is estimable. Otherwise, when `pooled` is
-    a dict, the pooled training curve raised to the stratum's censoring hazard
-    ratio stands in, refused like an own curve when it is below 0.05 at the
-    horizon, and the stratum's name is recorded in `pooled` against the reason
-    (`training_rows` or `horizon_support`), the caveat the report carries; when
-    `pooled` is None the shortfall is fatal.
-
-    The model takes the pooled curve's shape and the stratum's level over its
-    own follow-up. Where the stratum's censoring is not proportional to the
-    pooled set's, and above all where nobody in it is followed to the horizon,
-    its curve there is an extrapolation and its IPCW cells are biased."""
-    reference = train.loc[train.ancestry == ancestry]
-    if len(reference) < 20:
-        problem, reason = "insufficient training support for ancestry-specific censoring", "training_rows"
-    elif censor_km_at(reference, horizon) < 0.05 or not (reference.followup > horizon).any():
-        problem, reason = "evaluation horizon lacks censoring support in an ancestry stratum", "horizon_support"
-    else:
-        return censor_km(reference)
-    if pooled is None:
-        raise ValueError(problem)
-    if censor_km_at(train, horizon) < 0.05 or not (train.followup > horizon).any():
-        raise ValueError(f"{problem}, and the pooled training set lacks it too")
-    times, survival = censor_km(train)
-    survival = survival ** np.exp(censoring_log_hazard_ratio(train, ancestry))
-    at_horizon = float(np.r_[1.0, survival][np.searchsorted(times, horizon, side="right")])
-    if at_horizon < 0.05:
-        raise CensoringRefusal(f"{problem}, and its modelled censoring survival there is below 0.05",
-                               [{"ancestry": str(ancestry), "reason": reason, "censoring_survival": at_horizon}])
-    pooled[str(ancestry)] = reason
-    return times, survival
+# The censoring model's constants, fixed before its Monte Carlo (gnomon#2338): prior
+# strengths, in censorings at the pooled rate, for a stratum's level over its whole
+# follow-up and for each interval's ratio around that level; the number of intervals
+# of equal pooled censoring mass; the positivity floor and the one-sided 95% normal
+# quantile of its upper bound.
+CENSORING_LEVEL_PRIOR, CENSORING_INTERVAL_PRIOR, CENSORING_INTERVALS = 1.0, 1.0, 20
+POSITIVITY_FLOOR, ONE_SIDED_95 = 0.05, 1.6448536269514722
 
 
 def censor_km_at(reference, horizon):
@@ -550,41 +490,169 @@ def censor_km_at(reference, horizon):
     return float(np.r_[1.0, km_g][np.searchsorted(km_t, horizon, side="right")])
 
 
+def censoring_model(train):
+    """Every training ancestry stratum's censoring survival over the pooled training set.
+
+    The pooled reverse Kaplan-Meier increments dL_k are grouped into CENSORING_INTERVALS
+    intervals of equal pooled censoring mass. A stratum's censorings O_j in interval j,
+    against E_j, the censorings its own risk set would show at the pooled rate, give its
+    censoring ratio with two levels of Poisson-gamma shrinkage: the level
+    R = (O + A) / (E + A) over its whole follow-up, and theta_j = (O_j + a R) / (E_j + a),
+    A and a the level and interval priors. Its survival is
+    G(t) = prod over t_k <= t of (1 - dL_k) ** theta_j(k). A well-supported interval takes
+    about the stratum's own ratio; a sparse one borrows the stratum's own level, not the
+    pooled set's, and inside an interval the pooled curve's shape."""
+    censored = train.event_code.to_numpy(int) == 0
+    times, inverse, counts = np.unique(train.followup.to_numpy(float), return_inverse=True, return_counts=True)
+    def at_risk(rows, censorings):
+        # Events at a censoring time leave the risk set first, as in censor_km.
+        return np.cumsum(rows[::-1])[::-1] - (rows - censorings)
+    d_all = np.bincount(inverse, weights=censored, minlength=len(times))
+    n_all = at_risk(counts, d_all)
+    dl = np.divide(d_all, n_all, out=np.zeros_like(d_all), where=n_all > 0)
+    with np.errstate(divide="ignore"):
+        ell = np.where(dl > 0, np.log1p(-dl), 0.0)
+    interval = np.minimum(((np.cumsum(d_all) - d_all) * CENSORING_INTERVALS // max(d_all.sum(), 1)).astype(int),
+                          CENSORING_INTERVALS - 1)
+    one_hot = np.zeros((len(times), CENSORING_INTERVALS))
+    one_hot[np.arange(len(times)), interval] = ell
+    remaining = n_all - d_all
+    model = {"times": times, "interval": interval, "d": d_all,
+             "inv_remaining": np.divide(1.0, remaining, out=np.zeros_like(remaining), where=remaining > 0),
+             # cumulative[m, j]: log(1 - dL_k) summed over the first m times that fall in interval j.
+             "cumulative": np.vstack([np.zeros(CENSORING_INTERVALS), np.cumsum(one_hot, axis=0)]),
+             "log_g_pooled": np.r_[0.0, np.cumsum(ell)], "strata": {}}
+    labels = train.ancestry.to_numpy()
+    for label in np.unique(labels):
+        mine = labels == label
+        d_s = np.bincount(inverse, weights=mine & censored, minlength=len(times))
+        n_s = at_risk(np.bincount(inverse, weights=mine, minlength=len(times)), d_s)
+        observed = np.bincount(interval, weights=d_s, minlength=CENSORING_INTERVALS)
+        expected = np.bincount(interval, weights=n_s * dl, minlength=CENSORING_INTERVALS)
+        level = (observed.sum() + CENSORING_LEVEL_PRIOR) / (expected.sum() + CENSORING_LEVEL_PRIOR)
+        scale = expected + CENSORING_INTERVAL_PRIOR
+        ratio = (observed + CENSORING_INTERVAL_PRIOR * level) / scale
+        model["strata"][label] = {
+            "d": d_s, "level": level, "ratio": ratio, "inv_scale": 1.0 / scale,
+            "kappa": CENSORING_INTERVAL_PRIOR / (expected.sum() + CENSORING_LEVEL_PRIOR),
+            "share": np.divide(n_s, n_all, out=np.zeros_like(n_s), where=n_all > 0),
+            "log_g": np.r_[0.0, np.cumsum(ratio[interval] * ell)]}
+    return model
+
+
+def censoring_log_survival_variance(model, ancestry, position):
+    """Delta-method variance of a stratum's log censoring survival at a time-grid position,
+    over the training censoring counts d_{u,k}, each taken as Poisson with variance d_{u,k}
+    and carried through the pooled increments, the expected counts, the level and the
+    interval ratios."""
+    stratum, j = model["strata"][ancestry], model["interval"]
+    theta = stratum["ratio"][j]
+    base = np.where(np.arange(len(j)) < position, -theta * model["inv_remaining"], 0.0)
+    level = model["cumulative"][position] * stratum["inv_scale"]
+    spread = stratum["kappa"] * level.sum()
+    own = level[j] + spread
+    cross = stratum["share"] * (theta * level[j] + stratum["level"] * spread)
+    return float(np.sum((base + own - cross)**2 * stratum["d"] + (base - cross)**2 * (model["d"] - stratum["d"])))
+
+
+def censoring_standard_error(model, test, positions, contribution, count):
+    """Standard error the censoring model's estimation adds to sum(contribution) / count,
+    contribution a participant's IPCW weight times their loss and zero outside the cell,
+    by the delta method over the same counts as censoring_log_survival_variance."""
+    j, size = model["interval"], len(model["times"])
+    labels = test.ancestry.to_numpy()
+    base, own = np.zeros(size), {}
+    for ancestry in np.unique(labels):
+        rows = labels == ancestry
+        c = contribution[rows]
+        # after[k]: the contribution of participants whose weight includes time k.
+        after = np.cumsum(np.bincount(positions[rows], weights=c, minlength=size + 1)[::-1])[::-1][1:]
+        stratum = model["strata"].get(ancestry)
+        if stratum is None:
+            base += after * model["inv_remaining"]
+            continue
+        level = (c[:, None] * model["cumulative"][positions[rows]]).sum(axis=0) * stratum["inv_scale"]
+        spread = stratum["kappa"] * level.sum()
+        theta = stratum["ratio"][j]
+        base += (theta * (after * model["inv_remaining"] + stratum["share"] * level[j])
+                 + stratum["share"] * stratum["level"] * spread)
+        own[ancestry] = level[j] + spread
+    variance = sum(float(np.sum((base - own.get(ancestry, 0.0))**2 * stratum["d"]))
+                   for ancestry, stratum in model["strata"].items())
+    return float(np.sqrt(variance)) / count
+
+
+def censoring_support(train, ancestry, horizon):
+    """(problem, reason) where a stratum's own reverse Kaplan-Meier cannot carry a horizon,
+    else None: under 20 training rows, or own censoring survival below the floor there or
+    nobody followed past it."""
+    reference = train.loc[train.ancestry == ancestry]
+    if len(reference) < 20:
+        return "insufficient training support for ancestry-specific censoring", "training_rows"
+    if censor_km_at(reference, horizon) < POSITIVITY_FLOOR or not (reference.followup > horizon).any():
+        return "evaluation horizon lacks censoring support in an ancestry stratum", "horizon_support"
+    return None
+
+
 class CensoringRefusal(ValueError):
-    """A horizon refused on positivity: in each stratum of `strata`, a record of
-    its ancestry, reason and modelled censoring survival at the horizon, the
-    censoring model can stand in for no stable weight."""
+    """A horizon refused on positivity: in each stratum of `strata`, a record of its
+    ancestry, reason, modelled censoring survival at the horizon and that value's upper
+    bound, the censoring model can stand in for no stable weight."""
     def __init__(self, message, strata):
         super().__init__(message)
         self.strata = strata
 
 
-def ipcw_weights(train, test, horizon, pooled=None):
-    result = np.zeros(len(test))
-    refused = []
+def censoring_weights(model, train, test, horizon, pooled=None):
+    """IPCW weights at a horizon from the censoring model, and each participant's position
+    on its time grid, which the censoring standard errors need.
+
+    A horizon the pooled training set cannot support is refused. So is one where, for any
+    test stratum, the upper one-sided 95% bound on the modelled censoring survival at the
+    horizon is below POSITIVITY_FLOOR: weights there would pass 20 with no stable
+    estimator. Refusing on the bound rather than the point estimate refuses only where
+    positivity confidently fails, so a stratum just under the floor by noise reports
+    instead of the refusal selecting the replicates where its estimate came out high.
+    Every refused stratum is named with its reason and both values. A stratum without
+    its own reverse Kaplan-Meier support is recorded in `pooled` against its reason, the
+    caveat the report carries; with `pooled` None that shortfall is fatal."""
+    if censor_km_at(train, horizon) < POSITIVITY_FLOOR or not (train.followup > horizon).any():
+        raise ValueError("evaluation horizon lacks censoring support in the pooled training set")
+    t = test.followup.to_numpy(float)
+    event = (test.event_code.to_numpy(int) != 0) & (t <= horizon)
+    past = t > horizon
+    at_horizon = int(np.searchsorted(model["times"], horizon, side="right"))
+    positions = np.zeros(len(test), int)
+    positions[event] = np.searchsorted(model["times"], t[event], side="left")
+    positions[past] = at_horizon
+    weights, refused = np.zeros(len(test)), []
     for ancestry in test.ancestry.unique():
-        try:
-            km_t, km_g = censoring_curve(train, ancestry, horizon, pooled)
-        except CensoringRefusal as refusal:
-            # Name every refused stratum, not only the first one met.
-            refused.append(refusal)
+        support = censoring_support(train, ancestry, horizon)
+        if support is not None and pooled is None:
+            raise ValueError(support[0])
+        stratum = model["strata"].get(ancestry)
+        log_g = stratum["log_g"] if stratum else model["log_g_pooled"]
+        log_h = float(log_g[at_horizon])
+        bound = log_h + (ONE_SIDED_95 * np.sqrt(censoring_log_survival_variance(model, ancestry, at_horizon))
+                         if stratum else 0.0)
+        if not np.exp(bound) >= POSITIVITY_FLOOR:
+            refused.append({"ancestry": str(ancestry), "reason": support[1] if support else "modelled_survival",
+                            "censoring_survival": float(np.exp(log_h)),
+                            "censoring_survival_upper": float(np.exp(bound))})
             continue
-        def g_at(t, side):
-            idx = np.searchsorted(km_t, t, side=side)
-            return np.r_[1.0, km_g][idx]
-        mask = test.ancestry.eq(ancestry).to_numpy()
-        t = test.followup.to_numpy(float)
-        observed = (test.event_code.to_numpy(int) != 0) & (t <= horizon)
-        g_horizon = float(g_at(horizon, "right"))
-        g_event = g_at(t[mask & observed], "left")
-        if (g_event < 0.05).any():
-            raise ValueError("event-time censoring weights are unstable")
-        result[mask & observed] = 1 / g_event
-        result[mask & (t > horizon)] = 1 / g_horizon
+        if support is not None:
+            pooled[str(ancestry)] = support[1]
+        rows = test.ancestry.eq(ancestry).to_numpy() & (event | past)
+        weights[rows] = np.exp(-log_g[positions[rows]])
     if refused:
-        raise CensoringRefusal(str(refused[0]), sorted((s for refusal in refused for s in refusal.strata),
-                                                      key=lambda s: s["ancestry"]))
-    return result
+        raise CensoringRefusal("evaluation horizon lacks censoring support in an ancestry stratum: the upper 95% "
+                               "bound on its modelled censoring survival is below 0.05",
+                               sorted(refused, key=lambda s: s["ancestry"]))
+    return weights, positions
+
+
+def ipcw_weights(train, test, horizon, pooled=None):
+    return censoring_weights(censoring_model(train), train, test, horizon, pooled)[0]
 
 
 def weighted_auc(score, target, weights):
@@ -602,22 +670,26 @@ def weighted_auc(score, target, weights):
 
 
 def evaluation_cells(train, test, risk, horizons, min_count):
-    """Yield one (horizon index, horizon, label, mask, weights, targets) per reportable
-    audit cell, or a status row for cells that cannot be reported."""
+    """Yield one (horizon index, horizon, label, mask, weights, targets, censoring_se) per
+    reportable audit cell, censoring_se(values) the standard error the censoring model's
+    estimation adds to the mean of values over the cell, or a status row for cells that
+    cannot be reported."""
     def reportable(ancestry):
         # Numbers drawn from a stratum's own rows are withheld under the reporting minimum.
         return min(test.ancestry.astype(str).eq(ancestry).sum(),
                    train.ancestry.astype(str).eq(ancestry).sum()) >= min_count
+    model = censoring_model(train)
     for j, horizon in enumerate(horizons):
         pooled = {}
         try:
-            weights = ipcw_weights(train, test, horizon, pooled)
+            weights, positions = censoring_weights(model, train, test, horizon, pooled)
         except CensoringRefusal as refusal:
-            # Refused on positivity: each refused stratum is named with its reason
-            # and its modelled censoring survival at the horizon.
+            # Refused on positivity: each refused stratum is named with its reason, its
+            # modelled censoring survival at the horizon and that value's upper bound.
             yield {"group": "overall", "horizon": horizon, "status": "insufficient_support",
                    "reason": str(refusal),
-                   "strata": [dict(s, censoring_survival=s["censoring_survival"] if reportable(s["ancestry"]) else None)
+                   "strata": [dict(s, **{key: s[key] if reportable(s["ancestry"]) else None
+                                         for key in ("censoring_survival", "censoring_survival_upper")})
                               for s in refusal.strata]}
             continue
         except ValueError as error:
@@ -625,20 +697,22 @@ def evaluation_cells(train, test, risk, horizons, min_count):
                    "status": "insufficient_support", "reason": str(error)}
             continue
         if pooled:
-            # The horizon is reported, with the strata whose censoring weights
-            # came from the pooled training curve raised to their censoring hazard
-            # ratio named beside it. Under the right censoring model a stratum's
-            # mean IPCW weight is one in expectation; well below one, its censoring
-            # curve is too high at the horizon and its cells are biased low. Both
-            # numbers are withheld under the reporting minimum.
+            # The horizon is reported, with the strata that lack their own reverse
+            # Kaplan-Meier support named beside it: their censoring rests on the model
+            # with little of their own data there. Under the right censoring model a
+            # stratum's mean IPCW weight is one in expectation; well below one, its
+            # censoring curve is too high at the horizon and its cells are biased low.
+            # The mean weight and the stratum's censoring level, its hazard ratio over
+            # its whole follow-up, are withheld under the reporting minimum.
             strata = []
             for ancestry, reason in sorted(pooled.items()):
                 mask = test.ancestry.astype(str).eq(ancestry).to_numpy()
+                stratum = model["strata"].get(ancestry)
                 strata.append({"ancestry": ancestry, "reason": reason,
                                "ipcw_weight_mass": float(weights[mask].mean())
                                if mask.sum() >= min_count else None,
-                               "censoring_hazard_ratio": float(np.exp(censoring_log_hazard_ratio(train, ancestry)))
-                               if reportable(ancestry) else None})
+                               "censoring_hazard_ratio": float(stratum["level"])
+                               if stratum is not None and reportable(ancestry) else None})
             yield {"group": "overall", "horizon": horizon, "status": "pooled_censoring",
                    "strata": strata}
         y = ((test.event_code == 1) & (test.followup <= horizon)).to_numpy(float)
@@ -654,7 +728,17 @@ def evaluation_cells(train, test, risk, horizons, min_count):
             if min(n, disease, noncase) < min_count:
                 yield {"group": label, "horizon": horizon, "status": "insufficient_support"}
                 continue
-            yield j, horizon, label, mask, weights[mask], y[mask]
+            def censoring_se(values, mask=mask, positions=positions):
+                contribution = np.zeros(len(test))
+                contribution[mask] = values
+                return censoring_standard_error(model, test, positions, contribution, int(mask.sum()))
+            yield j, horizon, label, mask, weights[mask], y[mask], censoring_se
+
+
+def interval_bounds(name, mean, test_standard_error, censoring_standard_error):
+    """The 95% interval of a cell's value from its test-sampling and censoring standard errors."""
+    half = 1.959963984540054 * float(np.hypot(test_standard_error, censoring_standard_error))
+    return {f"{name}_95_lower": mean - half, f"{name}_95_upper": mean + half}
 
 
 def evaluate(train, test, risk, horizons, min_count):
@@ -663,33 +747,49 @@ def evaluate(train, test, risk, horizons, min_count):
         if isinstance(cell, dict):
             rows.append(cell)
             continue
-        j, horizon, label, mask, w, target = cell
+        j, horizon, label, mask, w, target, censoring_se = cell
         p = risk[mask, j]
+        groups = test.loc[mask, "split_group"]
+        brier = loss_summary(w * (target - p)**2, groups)
+        observed = loss_summary(w * target, groups)
+        brier_censoring, observed_censoring = censoring_se(w * (target - p)**2), censoring_se(w * target)
         rows.append({"group": label, "horizon": horizon, "status": "ok", "n": int(mask.sum()),
                      "observed_disease_events": int(np.sum(target[w > 0])),
-                     **loss_summary(w * (target - p)**2, test.loc[mask, "split_group"]),
+                     **brier, "brier_censoring_standard_error": brier_censoring,
+                     **interval_bounds("brier", brier["brier"], brier["brier_standard_error"], brier_censoring),
                      "ipcw_auc": weighted_auc(p, target, w),
                      "mean_predicted_risk": float(p.mean()),
-                     "ipcw_observed_risk": float(np.mean(w * target)),
-                     "mean_risk_discrepancy": float(p.mean() - np.mean(w * target))})
+                     "ipcw_observed_risk": observed["brier"],
+                     "ipcw_observed_risk_standard_error": observed["brier_standard_error"],
+                     "ipcw_observed_risk_censoring_standard_error": observed_censoring,
+                     **interval_bounds("ipcw_observed_risk", observed["brier"], observed["brier_standard_error"],
+                                       observed_censoring),
+                     "mean_risk_discrepancy": float(p.mean() - observed["brier"]),
+                     "ipcw_weight_n_eff": float(w.sum()**2 / np.sum(w**2))})
     return rows
 
 
 def incremental_value(train, test, risk_full, risk_null, horizons, min_count):
     """Paired comparison of the score model against the no-score model on the
-    same held-out participants: the Brier difference with its group-robust
-    standard error, and the IPCW AUC difference. Cells follow the full model."""
+    same held-out participants: the Brier difference with its group-robust and
+    censoring standard errors and 95% interval, and the IPCW AUC difference. Cells
+    follow the full model."""
     rows = []
     for cell in evaluation_cells(train, test, risk_full, horizons, min_count):
         if isinstance(cell, dict):
             rows.append(cell)
             continue
-        j, horizon, label, mask, w, target = cell
+        j, horizon, label, mask, w, target, censoring_se = cell
         p_full, p_null = risk_full[mask, j], risk_null[mask, j]
-        paired = loss_summary(w * ((target - p_full)**2 - (target - p_null)**2), test.loc[mask, "split_group"])
+        difference = w * ((target - p_full)**2 - (target - p_null)**2)
+        paired = loss_summary(difference, test.loc[mask, "split_group"])
+        difference_censoring = censoring_se(difference)
         rows.append({"group": label, "horizon": horizon, "status": "ok", "n": int(mask.sum()),
                      "brier_difference": paired["brier"],
                      "brier_difference_standard_error": paired["brier_standard_error"],
+                     "brier_difference_censoring_standard_error": difference_censoring,
+                     **interval_bounds("brier_difference", paired["brier"], paired["brier_standard_error"],
+                                       difference_censoring),
                      "auc_difference": weighted_auc(p_full, target, w) - weighted_auc(p_null, target, w)})
     return rows
 
@@ -1197,14 +1297,15 @@ def run(args):
         "score_transform": "externally fitted PC-conditional CTN; frozen latent scores",
         "reference_ctn_sha256": [digest(path) for path in args.reference_ctn],
         "orthogonality_claim": False,
-        "uncertainty": "group-robust Brier intervals conditional on fitted models and training censoring estimates",
-        "censoring_model": "training-only reverse Kaplan-Meier stratified by reported genetic ancestry; "
-                           "a stratum with fewer than 20 training rows or without censoring support at a "
-                           "horizon takes the pooled training reverse Kaplan-Meier raised to its censoring "
-                           "hazard ratio, (observed + 20) / (expected + 20) censorings at the pooled Breslow "
-                           "rate, named with its reason, mean IPCW weight and hazard ratio in that horizon's "
-                           "pooled_censoring row; a horizon where a modelled censoring survival is below 0.05 "
-                           "is refused, each refused stratum named with its modelled survival",
+        "uncertainty": "group-robust test-sampling standard errors conditional on fitted models, and the "
+                       "censoring model's delta-method standard error; 95% intervals combine both",
+        "censoring_model": "training-only two-level Poisson-gamma censoring model by reported genetic ancestry "
+                           "over the pooled reverse Kaplan-Meier, 20 intervals of equal pooled censoring mass: "
+                           "level R = (O + 1) / (E + 1), interval ratio (O_j + R) / (E_j + 1), survival "
+                           "prod (1 - dL)^ratio; a horizon is refused where the upper one-sided 95% bound on a "
+                           "stratum's modelled censoring survival is below 0.05, each refused stratum named with "
+                           "its reason, survival and bound; strata without their own reverse Kaplan-Meier support "
+                           "are named in the horizon's pooled_censoring row with their mean IPCW weight and level",
     })
     checkpoint.publish()
     if not args.prepare_only and not args.smoke_only:

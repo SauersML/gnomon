@@ -102,40 +102,81 @@ Metrics include horizon-specific IPCW Brier score with group-robust uncertainty,
 mean-risk discrepancy, and fixed risk-bin calibration. Audits cover ancestry,
 sex, age bands and training-defined PC neighborhoods, including points outside
 their support. Sparse cells are suppressed, not certified as calibrated.
-Loss uncertainty is conditional on fitted models and censoring estimates.
+Loss uncertainty is conditional on fitted models; the censoring model's own
+estimation error is carried as a separate standard error in every reported cell.
 
-Censoring uses training-only ancestry-stratified reverse Kaplan–Meier. A
-stratum with fewer than 20 training rows, or whose own censoring survival at a
-horizon is below 0.05 or has nobody followed past it, takes a proportional-hazards
-censoring model over the pooled training set at that horizon: the pooled reverse
-Kaplan–Meier raised to the stratum's censoring hazard ratio. The ratio is
-(observed + 20) / (expected + 20), where expected counts the censorings the
-stratum would show over its own follow-up at the pooled Breslow rate: the
-posterior mean under a gamma prior worth 20 censorings at the pooled rate. The 20
-is the support minimum, so a thin stratum stays near the pooled curve and one with
-many censorings takes its own level; a weaker prior let a stratum of about 16 rows
-under shared censoring cross the floor below by noise alone. The metrics carry a
-`pooled_censoring` row per horizon naming each such stratum, its reason
-(`training_rows`, `horizon_support`), its mean IPCW weight and its censoring hazard
-ratio (both withheld under the reporting minimum); the digest emits them as
-`…__censoring_pooled__h<h>__<stratum>__<reason>`.
+Censoring uses a training-only model of every reported-ancestry stratum over the
+pooled training set. The pooled reverse Kaplan–Meier increments are grouped into
+20 intervals of equal pooled censoring mass. In each, a stratum's censorings O_j
+are set against E_j, the censorings its own risk set would show at the pooled
+rate, with two levels of Poisson–gamma shrinkage: the stratum's level
+R = (O + A) / (E + A) over its whole follow-up, and the interval ratio
+θ_j = (O_j + a·R) / (E_j + a), with A = a = 1 censoring at the pooled rate. Its
+censoring survival is G(t) = ∏ (1 − dΛ_pool)^θ_j over the pooled times up to t. A
+well-supported interval takes about the stratum's own ratio; a sparse one borrows
+the stratum's own level rather than the pooled set's, so a large stratum censored
+differently is not pulled toward everyone else, and a thin one still has a defined
+curve. A, a and the 20 intervals were fixed before the Monte Carlo below and not
+tuned to it.
 
-Positivity: a horizon is refused where a modelled censoring survival is below
-0.05, as where an own one is, and where the pooled set cannot support it. Below
-that floor IPCW weights exceed 20 and the horizon has no stable estimator, so a
-refusal is the correct output and a biased estimate reported as usable would be
-worse. The refusal row names each refused stratum with its reason and modelled
-censoring survival (withheld under the minimum); the digest emits
-`…__censoring_refused__h<h>__<stratum>__<reason>`. The model takes the pooled
-curve's shape: where a stratum's censoring is not proportional to the pooled
-set's its cells keep a residual bias, and where nobody in it is followed to the
-horizon its curve there is an extrapolation no censoring model can check. A
-stratum whose follow-up truly ends before the horizon is censored at a higher
-rate over the follow-up it has, so its modelled survival falls below the floor
-and the horizon is refused; nobody in a small stratum reaching the horizon by
-chance is not refused on that ground alone. The mean IPCW weight is one in
-expectation under the right censoring model; well below one it shows the
-stratum's censoring curve is too high. The stratified model
+Positivity: a horizon is refused where the pooled training set cannot support it
+(pooled censoring survival below 0.05, or nobody followed past it), or where, for
+any test stratum, the upper one-sided 95% bound on its modelled censoring survival
+at the horizon is below 0.05. Below that floor IPCW weights exceed 20 and the
+horizon has no stable estimator, so a refusal is the correct output. Refusing on
+the upper bound rather than the point estimate refuses only where positivity
+confidently fails: a stratum whose estimate sits just under the floor by noise
+reports, instead of the refusal selecting the samples where its estimate came out
+high and biasing every reported cell low. The refusal row names each refused
+stratum with its reason, modelled censoring survival and upper bound (both withheld
+under the reporting minimum); the digest emits
+`…__censoring_refused__h<h>__<stratum>__<reason>`. A reported horizon carries a
+`pooled_censoring` row naming the strata without their own reverse Kaplan–Meier
+support (under 20 training rows, own censoring survival below 0.05 or nobody
+followed past the horizon), whose censoring rests on the model with little of their
+own data there, with the reason, mean IPCW weight and censoring level R (both
+withheld under the minimum); the digest emits
+`…__censoring_pooled__h<h>__<stratum>__<reason>`. The mean IPCW weight is one in
+expectation under the right censoring model; well below one it shows the stratum's
+censoring curve is too high.
+
+Every reported cell carries the standard error the censoring model's estimation
+adds, by a delta method over every training censoring count taken as Poisson and
+carried through the pooled increments, the expected counts, the level and the
+interval ratios; the 95% interval that combines it with the group-robust
+test-sampling error; and the Kish effective sample size of its IPCW weights. The
+metrics and digest carry them as `brier_censoring_standard_error`,
+`brier_95_lower`, `brier_95_upper`, the same three for `ipcw_observed_risk` beside
+its `ipcw_observed_risk_standard_error`, the same three for `brier_difference`,
+and `ipcw_weight_n_eff`.
+
+Validation (gnomon#2338): a planted-censoring Monte Carlo of 400 replicates of a
+100,000-row cohort with the pilot's ancestry shares, in three scenarios (shared
+censoring; two strata losing contact three times as fast; two strata with no
+follow-up past 4.5 years), set the model against the planted censoring survival on
+the same replicates in 48 reportable cells, each for the Brier score and observed
+risk. The censoring interval covered the oracle value in 92.3–96.8% of replicates
+and the total interval the population value in 91.4–96.8%, with ratios of empirical
+to delta-method standard deviation 0.90–1.07. The no-follow-up 5-year horizon was
+refused in 400 of 400 replicates, and shared censoring refused 2 of 400. The
+5-year bias of the fast-losing stratum fell from −0.0063 under the previous rule
+(own reverse Kaplan–Meier where supported, a pooled stand-in refused on its point
+estimate otherwise) to −0.0006, within Monte Carlo error, and its refusals from 248
+to 61. Squared error was no worse than the previous rule's beyond 2 Monte Carlo
+errors except in the four cells described below.
+
+Acceptance was on a multiple-testing basis. Bias against the oracle exceeded 2
+Monte Carlo errors in 6 of the 96 comparisons, at 2.0–2.3 errors, against about
+4–5 expected by chance at that threshold. Three were shared-censoring 5-year
+cells at +2.0–2.1, the overall one exactly where the previous rule sits on the same
+draws. The other three are a known small bias: where a stratum's censoring ratio
+climbs toward a follow-up cutoff (the planted end of follow-up at 4.5 years),
+shrinking its intervals toward its level smooths the climb, so its 3-year observed
+risk comes out about +0.0003 above the oracle (+2.3 Monte Carlo errors, about 0.25%
+of the risk) and the overall cell by +2.1–2.2 errors, and its squared error at 1
+and 3 years exceeds its own reverse Kaplan–Meier's by 3.0–3.7 errors (about 0.4% in
+root-mean-square error at 3 years). The bias scales with the interval prior a: one
+such cell at a = 0.5, six at a = 2. The stratified model
 assumes sufficient independence within those strata and does not account for
 all site, calendar-period or clinical dependence. No result from this pilot
 establishes optimal deployment accuracy. The marginal identity is a model

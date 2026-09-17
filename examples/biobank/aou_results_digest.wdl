@@ -35,7 +35,12 @@ task digest {
     MINIMUM_COUNT = 20
     ALLOWED = ("n", "observed_disease_events", "brier", "brier_standard_error", "ipcw_auc",
                "mean_predicted_risk", "ipcw_observed_risk", "mean_risk_discrepancy",
-               "brier_difference", "brier_difference_standard_error", "auc_difference")
+               "brier_difference", "brier_difference_standard_error", "auc_difference",
+               "brier_censoring_standard_error", "brier_95_lower", "brier_95_upper",
+               "ipcw_observed_risk_standard_error", "ipcw_observed_risk_censoring_standard_error",
+               "ipcw_observed_risk_95_lower", "ipcw_observed_risk_95_upper", "ipcw_weight_n_eff",
+               "brier_difference_censoring_standard_error", "brier_difference_95_lower",
+               "brier_difference_95_upper")
 
     def token(value):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -68,12 +73,14 @@ task digest {
                 continue
             if row.get("status") == "insufficient_support":
                 # A horizon refused on positivity names each refused stratum, its
-                # reason, and a modelled censoring survival withheld under the minimum.
+                # reason, and a modelled censoring survival and upper bound withheld
+                # under the minimum.
                 for stratum in row.get("strata") or []:
                     refused = [stage, "censoring_refused", base[2], slug(stratum["ancestry"]), slug(stratum["reason"])]
                     emit(refused)
-                    if stratum.get("censoring_survival") is not None:
-                        emit(refused + ["censoring_survival", token(float(stratum["censoring_survival"]))])
+                    for key in ("censoring_survival", "censoring_survival_upper"):
+                        if stratum.get(key) is not None:
+                            emit(refused + [key, token(float(stratum[key]))])
             if row.get("status") != "ok" or int(row.get("n", 0)) < MINIMUM_COUNT:
                 emit(base + ["insufficient_support"])
                 continue
