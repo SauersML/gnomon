@@ -2492,6 +2492,14 @@ mod tests {
         let plain = dir.path().join("messy.vcf");
         std::fs::write(&plain, &text)?;
         assert_scan_reproduces_the_reader(&plain, &[1, 7, 64, 4096, 1 << 20])?;
+        // Without the unselected MT record and the newline ahead of it, the file
+        // ends on a selected Y record that the second pass reads to the end of the
+        // file.
+        let (without_mt, mt) = text.trim_end_matches('\n').rsplit_once('\n').unwrap();
+        assert!(mt.starts_with("MT\t"), "{mt}");
+        let unterminated = dir.path().join("unterminated.vcf");
+        std::fs::write(&unterminated, without_mt)?;
+        assert_scan_reproduces_the_reader(&unterminated, &[1, 7, 4096, 1 << 20])?;
         for block_len in [7, 257, 65_536] {
             let compressed = dir.path().join(format!("messy_{block_len}.vcf.gz"));
             std::fs::write(&compressed, bgzf(text.as_bytes(), block_len))?;

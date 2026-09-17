@@ -7,12 +7,15 @@
 //! These two passes read the bytes as the files hold them:
 //!
 //! 1. The blocks of each file (its BGZF blocks, or windows of a plain file) are
-//!    inflated or read in parallel batches, and the records are walked in order for
-//!    their chromosome, position and ALT count. Each block keeps how many records
-//!    start ahead of it and where its own first record starts.
-//! 2. Only the blocks holding selected records are read again. The GT calls of
-//!    each selected row become one packed PLINK 1 row, which the packed counters
-//!    of `sex_counts` add up.
+//!    inflated or read in parallel batches, and each worker reads the chromosome,
+//!    position and ALT count of every record that lies inside its block. The
+//!    records are then taken in order, with the ones that cross a block boundary
+//!    pieced together. The index keeps how many records start ahead of each block
+//!    and where in its block each record starts.
+//! 2. Only the selected records are read again: each selected line of a plain VCF
+//!    with one positional read, and the blocks holding the selected records of
+//!    any other file. The GT calls of each selected row become one packed PLINK 1
+//!    row, which the packed counters of `sex_counts` add up.
 //!
 //! A pass accepts only what the record reader reads the same way. Anything else
 //! (a remote file, text that is not ASCII or holds a carriage return, a malformed
@@ -38,9 +41,7 @@ use crate::terms::sex_counts::{
     EvidenceCounter, EvidenceCounts, HET_CODE, LocusClass, MISSING_CODE,
 };
 
-/// Bytes per window of a plain file's map, as many as a BGZF block holds. The
-/// second pass finds a line by walking from the first line that starts in its
-/// window, so the window bounds the bytes walked per selected line.
+/// Bytes per window of a plain file, as many as a BGZF block holds.
 const PLAIN_WINDOW_BYTES: usize = 1 << 16;
 /// Blocks each rayon worker reads per batch of the first pass.
 const BLOCKS_PER_WORKER: usize = 64;
@@ -53,8 +54,6 @@ const BGZF_HEADER_LEN: usize = 18;
 const BGZF_TRAILER_LEN: usize = 8;
 const BGZF_MAX_BLOCK_LEN: usize = 1 << 16;
 
-/// The first-start offset of a block in which nothing starts.
-const NO_START: u32 = u32::MAX;
 /// A packed call that is neither missing nor heterozygous.
 const HOM_CODE: u8 = 0b11;
 
@@ -235,17 +234,7 @@ struct PackedRows {
 struct TaskReader<'a> {
     scan: &'a VariantScan,
     cache: BlockCache,
-    cursor: Option<LineCursor>,
     record: Vec<u8>,
-}
-
-/// Where the line after the last line a task read starts.
-#[derive(Clone, Copy)]
-struct LineCursor {
-    part: usize,
-    line: u64,
-    block: usize,
-    start: usize,
 }
 
 impl<'a> TaskReader<'a> {
@@ -257,7 +246,6 @@ impl<'a> TaskReader<'a> {
                 cached: None,
                 block: Vec::new(),
             },
-            cursor: None,
             record: Vec::new(),
         }
     }
@@ -272,7 +260,6 @@ impl<'a> TaskReader<'a> {
                     read_line(
                         scan,
                         &mut self.cache,
-                        &mut self.cursor,
                         selected.part,
                         selected.record + header_lines,
                         &mut self.record,
@@ -346,43 +333,37 @@ impl BlockCache {
     }
 }
 
-/// Copies line `line` of VCF file `part`, without its newline, into `record`.
-/// A line that starts in the block where `cursor` stands, at or after the
-/// cursor's line, is walked to from the cursor rather than from the block's
-/// first line. `cursor` then stands where the next line starts.
+/// Copies line `line` of VCF file `part`, without its newline, into `record`. A
+/// plain file's line is one positional read, up to where the next line starts or
+/// the file ends; a BGZF file's line is read out of the blocks it lies in.
 fn read_line(
     scan: &VariantScan,
     cache: &mut BlockCache,
-    cursor: &mut Option<LineCursor>,
     part: usize,
     line: u64,
     record: &mut Vec<u8>,
 ) -> Option<()> {
-    let (mut block, mut ahead, mut start) = scan.parts[part].index.locate(line)?;
-    if let Some(at) = *cursor
-        && at.part == part
-        && at.block == block
-        && at.line <= line
-    {
-        ahead = line - at.line;
-        start = at.start;
-    }
-    let bytes = cache.read(scan, part, block)?;
-    for _ in 0..ahead {
-        start += memchr(b'\n', bytes.get(start..)?)? + 1;
-    }
+    let scanned = &scan.parts[part];
+    let (mut block, mut start) = scanned.index.locate(line)?;
     record.clear();
+    if scanned.blocks.frames.is_none() {
+        let begin = scanned.blocks.plain_offset(block, start)?;
+        let end = match scanned.index.locate(line.checked_add(1)?) {
+            Some((next, next_start)) => scanned.blocks.plain_offset(next, next_start)?,
+            None => scanned.blocks.map.len(),
+        };
+        scanned.blocks.read_plain_span(begin..end, record)?;
+        // The last line of a file may end without a newline.
+        if record.last() == Some(&b'\n') {
+            record.pop();
+        }
+        return Some(());
+    }
     loop {
         let rest = cache.read(scan, part, block)?.get(start..)?;
         match memchr(b'\n', rest) {
             Some(end) => {
                 record.extend_from_slice(&rest[..end]);
-                *cursor = Some(LineCursor {
-                    part,
-                    line: line + 1,
-                    block,
-                    start: start + end + 1,
-                });
                 return Some(());
             }
             None => {
@@ -390,7 +371,7 @@ fn read_line(
                 block += 1;
                 start = 0;
                 // The last line of a file may end without a newline.
-                if block == scan.parts[part].blocks.len() {
+                if block == scanned.blocks.len() {
                     return Some(());
                 }
             }
@@ -407,16 +388,7 @@ fn read_bcf_record(
     record: u64,
     out: &mut Vec<u8>,
 ) -> Option<usize> {
-    let (block, ahead, mut start) = scan.parts[part].index.locate(record)?;
-    let bytes = cache.read(scan, part, block)?;
-    // Every record ahead of this one in its block starts and ends in the block.
-    for _ in 0..ahead {
-        let (site_len, samples_len) = record_lengths(bytes.get(start..)?)?;
-        start = start
-            .checked_add(8)?
-            .checked_add(site_len)?
-            .checked_add(samples_len)?;
-    }
+    let (block, start) = scan.parts[part].index.locate(record)?;
     out.clear();
     let (block, start) = copy_span(scan, cache, part, block, start, 8, out)?;
     let (site_len, samples_len) = record_lengths(out)?;
@@ -834,34 +806,28 @@ fn series_are_readable(mut src: &[u8], sample_count: usize, header: &vcf::Header
 struct BlockIndex {
     /// The items starting ahead of each block.
     before: Vec<u64>,
-    /// Each block's first item start, or `NO_START`.
-    first: Vec<u32>,
+    /// Where each item starts, in the block it starts in.
+    starts: Vec<u32>,
 }
 
 impl BlockIndex {
     fn begin_block(&mut self, items: u64) {
         self.before.push(items);
-        self.first.push(NO_START);
     }
 
     /// Notes an item starting at `offset` of the current block.
     fn start(&mut self, offset: usize) {
-        if let Some(first) = self.first.last_mut()
-            && *first == NO_START
-        {
-            *first = offset as u32;
-        }
+        self.starts.push(offset as u32);
     }
 
-    /// The block item `item` starts in, how many items start in that block ahead
-    /// of it, and where the block's first item starts.
-    fn locate(&self, item: u64) -> Option<(usize, u64, usize)> {
+    /// The block item `item` starts in, and where in that block it starts.
+    fn locate(&self, item: u64) -> Option<(usize, usize)> {
+        let start = *self.starts.get(usize::try_from(item).ok()?)?;
         let block = self
             .before
             .partition_point(|&before| before <= item)
             .checked_sub(1)?;
-        let first = self.first[block];
-        (first != NO_START).then(|| (block, item - self.before[block], first as usize))
+        Some((block, start as usize))
     }
 }
 
@@ -956,26 +922,38 @@ impl Blocks {
             .then(|| start..start.saturating_add(self.window).min(self.map.len()))
     }
 
-    /// Reads window `index` of a plain file into `buffer` with one positional read,
+    /// Where offset `start` of window `index` of a plain file lies in the file.
+    fn plain_offset(&self, index: usize, start: usize) -> Option<usize> {
+        index.checked_mul(self.window)?.checked_add(start)
+    }
+
+    /// Reads window `index` of a plain file into `buffer`.
+    fn read_plain(&self, index: usize, buffer: &mut Vec<u8>) -> Option<()> {
+        self.read_plain_span(self.plain_range(index)?, buffer)
+    }
+
+    /// Reads bytes `range` of a plain file into `buffer` with one positional read,
     /// so the text is never faulted into the map: faults on one map serialize the
     /// threads that take them.
     #[cfg(unix)]
-    fn read_plain(&self, index: usize, buffer: &mut Vec<u8>) -> Option<()> {
+    fn read_plain_span(&self, range: Range<usize>, buffer: &mut Vec<u8>) -> Option<()> {
         use std::os::unix::fs::FileExt;
 
-        let range = self.plain_range(index)?;
+        if range.start > range.end || range.end > self.map.len() {
+            return None;
+        }
         buffer.resize(range.len(), 0);
         self.file
             .read_exact_at(buffer, u64::try_from(range.start).ok()?)
             .ok()
     }
 
-    /// [`Blocks::read_plain`] where there is no positional read: a copy out of the
-    /// map.
+    /// [`Blocks::read_plain_span`] where there is no positional read: a copy out of
+    /// the map.
     #[cfg(not(unix))]
-    fn read_plain(&self, index: usize, buffer: &mut Vec<u8>) -> Option<()> {
+    fn read_plain_span(&self, range: Range<usize>, buffer: &mut Vec<u8>) -> Option<()> {
         buffer.clear();
-        buffer.extend_from_slice(self.map.get(self.plain_range(index)?)?);
+        buffer.extend_from_slice(self.map.get(range)?);
         Some(())
     }
 }
@@ -1068,29 +1046,95 @@ fn read_window<'a, S: Default + Send>(
 fn scan_vcf(blocks: &Blocks, builder: &mut LociBuilder) -> Option<(BlockIndex, u64)> {
     let batch = rayon::current_num_threads().max(1) * BLOCKS_PER_WORKER;
     let mut buffers = Vec::new();
-    let mut newlines: Vec<Vec<u32>> = Vec::new();
+    let mut scanned: Vec<TextBlock> = Vec::new();
     let mut walker = TextWalker::default();
     let mut index = BlockIndex::default();
     for start in (0..blocks.len()).step_by(batch) {
         let range = start..(start + batch).min(blocks.len());
-        let views = read_window(blocks, range, &mut buffers, &mut newlines, scan_text_block)?;
-        for (block, ends) in views.iter().zip(&newlines) {
-            walker.walk(block, ends, &mut index, builder)?;
+        let views = read_window(blocks, range, &mut buffers, &mut scanned, scan_text_block)?;
+        for (block, text) in views.iter().zip(&scanned) {
+            walker.walk(block, text, &mut index, builder)?;
         }
     }
     walker.finish(builder)?;
     Some((index, walker.header_lines))
 }
 
-/// Finds the line ends of one block of VCF text, refusing a block that is not
-/// ASCII or holds a carriage return, which the record reader strips from some
-/// fields and not others.
-fn scan_text_block(block: &[u8], newlines: &mut Vec<u32>) -> bool {
-    newlines.clear();
+/// One block of VCF text as a worker of the first pass reads it.
+#[derive(Default)]
+struct TextBlock {
+    /// Where each line end of the block is.
+    newlines: Vec<u32>,
+    /// Each line between two of the block's line ends, in order: every line but
+    /// the ones that end at its first line end or continue past its last.
+    lines: Vec<TextLine>,
+}
+
+/// What the first pass reads from one line of VCF text: the fields of a record
+/// up to its ALT, where the line holds them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TextLine {
+    /// A line starting with '#', and whether it is the column header.
+    Hash { column_header: bool },
+    /// A record's CHROM, at bytes `label` of the line, its POS and its ALT count.
+    Record {
+        label: Range<usize>,
+        position: u64,
+        alts: usize,
+    },
+    /// A line that is neither: fewer than eight fields, or a POS the key scan
+    /// does not read.
+    Refused,
+}
+
+/// Reads `line`, or its first seven tabs and what comes before them.
+fn summarize(line: &[u8]) -> TextLine {
+    if line.first() == Some(&b'#') {
+        return TextLine::Hash {
+            column_header: line.starts_with(b"#CHROM"),
+        };
+    }
+    let mut tabs = [0usize; 7];
+    let mut count = 0;
+    for (offset, &byte) in line.iter().enumerate() {
+        if byte == b'\t' {
+            tabs[count] = offset;
+            count += 1;
+            if count == 7 {
+                break;
+            }
+        }
+    }
+    if count < 7 {
+        return TextLine::Refused;
+    }
+    // The key scan reads CHROM, POS, ID, REF and then ALT, the fifth field.
+    match parse_position(&line[tabs[0] + 1..tabs[1]]) {
+        Some(position) => TextLine::Record {
+            label: 0..tabs[0],
+            position,
+            alts: alt_count(&line[tabs[3] + 1..tabs[4]]),
+        },
+        None => TextLine::Refused,
+    }
+}
+
+/// Finds the line ends of one block of VCF text and reads each line that lies
+/// between two of them, refusing a block that is not ASCII or holds a carriage
+/// return, which the record reader strips from some fields and not others.
+fn scan_text_block(block: &[u8], text: &mut TextBlock) -> bool {
+    text.newlines.clear();
+    text.lines.clear();
     if !is_plain_ascii(block) {
         return false;
     }
-    newlines.extend(memchr_iter(b'\n', block).map(|end| end as u32));
+    text.newlines
+        .extend(memchr_iter(b'\n', block).map(|end| end as u32));
+    text.lines.extend(
+        text.newlines
+            .windows(2)
+            .map(|ends| summarize(&block[ends[0] as usize + 1..ends[1] as usize])),
+    );
     true
 }
 
@@ -1124,31 +1168,78 @@ impl TextWalker {
     fn walk(
         &mut self,
         block: &[u8],
-        newlines: &[u32],
+        text: &TextBlock,
         index: &mut BlockIndex,
         builder: &mut LociBuilder,
     ) -> Option<()> {
         index.begin_block(self.lines);
-        let mut position = 0;
-        let mut ends = newlines.iter();
-        while position < block.len() {
-            if !self.in_line {
-                index.start(position);
-                self.lines += 1;
-                self.in_line = true;
-                self.prefix.clear();
-                self.tabs = 0;
+        let Some(&first_end) = text.newlines.first() else {
+            // No line ends in the block, which starts a line or continues one.
+            if !block.is_empty() {
+                self.start_line(0, index);
+                self.take_prefix(block);
             }
-            let end = ends.next().map_or(block.len(), |&end| end as usize);
-            self.take_prefix(&block[position..end]);
-            if end < block.len() {
-                self.end_line(builder)?;
-                position = end + 1;
-            } else {
-                position = end;
-            }
+            return Some(());
+        };
+        // The line that ends at the block's first line end may have started in an
+        // earlier block.
+        self.start_line(0, index);
+        self.take_prefix(&block[..first_end as usize]);
+        self.end_line(builder)?;
+        for (line, &end) in text.lines.iter().zip(&text.newlines) {
+            let start = end as usize + 1;
+            index.start(start);
+            self.lines += 1;
+            self.read_line(line, &block[start..], builder)?;
+        }
+        let tail = *text.newlines.last()? as usize + 1;
+        if tail < block.len() {
+            self.start_line(tail, index);
+            self.take_prefix(&block[tail..]);
         }
         Some(())
+    }
+
+    /// Starts a line at `offset` of the current block, unless one is under way.
+    fn start_line(&mut self, offset: usize, index: &mut BlockIndex) {
+        if !self.in_line {
+            index.start(offset);
+            self.lines += 1;
+            self.in_line = true;
+            self.prefix.clear();
+            self.tabs = 0;
+        }
+    }
+
+    /// Reads a line that has ended, as [`summarize`] read it from `bytes`, which
+    /// start with the line.
+    fn read_line(
+        &mut self,
+        line: &TextLine,
+        bytes: &[u8],
+        builder: &mut LociBuilder,
+    ) -> Option<()> {
+        match line {
+            // The header is every line up to the column header, all starting with
+            // '#'.
+            TextLine::Hash { column_header } if !self.past_header => {
+                self.header_lines += 1;
+                self.past_header = *column_header;
+                Some(())
+            }
+            // The record reader needs eight fields, and reads a '#' line after the
+            // header as a record.
+            TextLine::Record {
+                label,
+                position,
+                alts,
+            } if self.past_header => builder.record(
+                str::from_utf8(&bytes[label.clone()]).ok()?,
+                *position,
+                *alts,
+            ),
+            _ => None,
+        }
     }
 
     /// Adds a piece of the current line to its prefix, up to the seventh tab.
@@ -1168,30 +1259,13 @@ impl TextWalker {
         }
     }
 
-    /// Reads the line that just ended.
+    /// Reads the line that just ended, from its prefix.
     fn end_line(&mut self, builder: &mut LociBuilder) -> Option<()> {
         self.in_line = false;
-        let line = &self.prefix;
-        if !self.past_header {
-            // The header is every line up to the column header, all starting
-            // with '#'.
-            if line.first() != Some(&b'#') {
-                return None;
-            }
-            self.header_lines += 1;
-            self.past_header = line.starts_with(b"#CHROM");
-            return Some(());
-        }
-        // The record reader needs eight fields, and reads a '#' line after the
-        // header as a record.
-        if self.tabs < 7 || line.first() == Some(&b'#') {
-            return None;
-        }
-        let mut fields = line.split(|&byte| byte == b'\t');
-        let label = str::from_utf8(fields.next()?).ok()?;
-        let position = parse_position(fields.next()?)?;
-        let alts = alt_count(fields.nth(2)?);
-        builder.record(label, position, alts)
+        let prefix = std::mem::take(&mut self.prefix);
+        let read = self.read_line(&summarize(&prefix), &prefix, builder);
+        self.prefix = prefix;
+        read
     }
 
     /// Ends the file, whose last line may lack a newline.
@@ -1559,11 +1633,14 @@ mod tests {
         index.begin_block(2);
         index.begin_block(2);
         index.start(7);
+        index.start(30);
+        index.start(61);
         index.begin_block(5);
-        assert_eq!(index.locate(0), Some((0, 0, 0)));
-        assert_eq!(index.locate(1), Some((0, 1, 0)));
-        assert_eq!(index.locate(2), Some((2, 0, 7)));
-        assert_eq!(index.locate(4), Some((2, 2, 7)));
+        assert_eq!(index.locate(0), Some((0, 0)));
+        assert_eq!(index.locate(1), Some((0, 10)));
+        assert_eq!(index.locate(2), Some((2, 7)));
+        assert_eq!(index.locate(3), Some((2, 30)));
+        assert_eq!(index.locate(4), Some((2, 61)));
         assert_eq!(index.locate(5), None);
     }
 
