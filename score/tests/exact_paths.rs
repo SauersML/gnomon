@@ -815,3 +815,83 @@ fn a_banded_score_of_one_band_prints_its_exact_scores() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn a_repeated_variant_is_refused_from_vcf_and_scored_once_from_plink() -> TestResult {
+    // Two records of 1:100 A/G, then 1:200 C/T. Per record, each person's PLINK code: 00 two A1,
+    // 01 missing, 10 one of each, 11 two A2. The copies agree or one is missing, so PLINK input
+    // has one dose per person to score; VCF input cannot tell which record a row scores.
+    let dir = tempfile::tempdir()?;
+    let calls: [[u8; 3]; 3] = [[2, 1, 0], [2, 3, 0], [3, 3, 2]];
+    let fam: String = (0..3)
+        .map(|person| format!("F I{person} 0 0 0 -9\n"))
+        .collect();
+    fs::write(dir.path().join("cohort.fam"), fam)?;
+    fs::write(
+        dir.path().join("cohort.bim"),
+        "1 a 0 100 A G\n1 b 0 100 A G\n1 c 0 200 C T\n",
+    )?;
+    let mut bed = vec![0x6c, 0x1b, 0x01];
+    for row in &calls {
+        bed.push(
+            row.iter()
+                .enumerate()
+                .fold(0u8, |byte, (i, &call)| byte | (call << (2 * i))),
+        );
+    }
+    fs::write(dir.path().join("cohort.bed"), bed)?;
+    let gt = |call: u8| ["0/0", "./.", "0/1", "1/1"][usize::from(call)];
+    let mut vcf = String::from(
+        "##fileformat=VCFv4.2\n##contig=<ID=1>\n\
+         ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+         #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tI0\tI1\tI2\n",
+    );
+    let sites = [
+        ("a", 100, "A", "G"),
+        ("b", 100, "A", "G"),
+        ("c", 200, "C", "T"),
+    ];
+    for (row, (id, pos, reference, alternate)) in calls.iter().zip(sites) {
+        let samples: Vec<&str> = row.iter().map(|&call| gt(call)).collect();
+        let samples = samples.join("\t");
+        vcf.push_str(&format!(
+            "1\t{pos}\t{id}\t{reference}\t{alternate}\t.\tPASS\t.\tGT\t{samples}\n"
+        ));
+    }
+    fs::write(dir.path().join("cohort.vcf"), vcf)?;
+    let score = dir.path().join("weights.tsv");
+    fs::write(
+        &score,
+        "variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.5\n1:200\tT\tC\t1\n",
+    )?;
+    let score_input = |input: &str| {
+        Command::new(SCORE_BIN)
+            .current_dir(dir.path())
+            .env("GNOMON_CACHE_DIR", dir.path().join("cache"))
+            .arg("--out")
+            .arg(dir.path().join(input.replace('.', "_")))
+            .arg("--emit-components")
+            .arg(&score)
+            .arg(dir.path().join(input))
+            .output()
+    };
+    let output = score_input("cohort")?;
+    assert_success(&output);
+    let rows = sscore_rows(&dir.path().join("cohort.sscore"))?;
+    // 1:100 once per person: one of each, the one called copy's two G, no G; then 1:200's T.
+    for (row, want) in rows.iter().zip([0.5 + 2.0, 1.0 + 2.0, 1.0]) {
+        assert_eq!(row[1].parse::<f64>()?, want, "PLINK: {row:?}");
+    }
+    assert_eq!(rows.len(), 3);
+    let output = score_input("cohort.vcf")?;
+    assert!(
+        !output.status.success(),
+        "the repeated VCF record was scored"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("More than one record at 1:100 carries the alleles A and G"),
+        "{stderr}"
+    );
+    Ok(())
+}

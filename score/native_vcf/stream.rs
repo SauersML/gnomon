@@ -931,6 +931,7 @@ mod tests {
         let mut score = String::from("variant_id\teffect_allele\tother_allele\tScoreA\tScoreB\n");
         let mut position = 1000usize;
         let mut layout = 0usize;
+        let mut alt = "G";
         for record in 0..records {
             // Every tenth record repeats the position ahead of it in the same layout, so a
             // REF-effect row there never meets a DS-only record, which has no REF dosage.
@@ -943,7 +944,17 @@ mod tests {
             } else {
                 "22"
             };
-            let alt = draws.pick(&["G", "G", "G,T", "T"]);
+            // A repeated position is a split site: its record carries none of the ALTs of the
+            // record before it, as two records of one scored allele pair are refused.
+            alt = if record % 10 == 3 {
+                match alt {
+                    "G" => "T",
+                    "T" => "G",
+                    _ => "C",
+                }
+            } else {
+                draws.pick(&["G", "G", "G,T", "T"])
+            };
             let alt_count = alt.split(',').count();
             let format = match layout {
                 0 => "GT:DS",

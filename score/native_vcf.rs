@@ -244,6 +244,9 @@ struct RecordAccumulator<'a> {
     totals: ScoreTotals,
     pending: PendingPosition,
     effect_only_matches: EffectOnlyMatches,
+    /// Per rule, whether an allele taken so far matched it first among its position's rules:
+    /// a second such allele is a second record of the same allele pair.
+    claimed: Vec<bool>,
 }
 
 impl<'a> RecordAccumulator<'a> {
@@ -254,6 +257,7 @@ impl<'a> RecordAccumulator<'a> {
             totals: ScoreTotals::new(num_people, score_names.len(), rules_by_key),
             pending: PendingPosition::default(),
             effect_only_matches: EffectOnlyMatches::default(),
+            claimed: vec![false; rules_by_key.rules.len()],
         }
     }
 
@@ -283,6 +287,16 @@ impl<'a> RecordAccumulator<'a> {
             }
         }
         for allele in &mut decoded.alleles[..decoded.allele_count] {
+            if std::mem::replace(&mut self.claimed[allele.first_rule], true) {
+                let rule = &rules_by_key.rules[allele.first_rule];
+                return Err(repeated_pair_error(
+                    &decoded.chromosome,
+                    decoded.position,
+                    rules_by_key.allele(rule.effect_allele),
+                    rules_by_key.allele(rule.other_allele),
+                )
+                .into());
+            }
             self.totals.add_allele(
                 std::mem::take(&mut allele.matched_rules),
                 std::mem::take(&mut allele.column),
@@ -410,6 +424,9 @@ struct DecodedAllele {
     /// The allele's ALT ordinal, from 0.
     alt_offset: usize,
     matched_rules: Vec<MatchedRule>,
+    /// The first rule the allele matched, as an index into every position's rules; the allele
+    /// pair it names is the allele's. Unused at an `effect_only` position.
+    first_rule: usize,
     /// One dosage per kept person, in output order.
     column: DosageColumn,
     /// The column's scale, once it has been normalized where it was decoded.
@@ -1204,10 +1221,12 @@ impl PendingPosition {
             })
             .collect();
 
+        // A rule's allele pair scores one row; a second row carrying it repeats the variant.
+        let mut taken = vec![false; rules.len()];
         for (row, allele) in &mut self.alleles {
             let (ref_allele, alt_allele) = &self.rows[*row];
             let mut matched = Vec::new();
-            for (rule, decision) in rules.iter().zip(&decisions) {
+            for (index, (rule, decision)) in rules.iter().zip(&decisions).enumerate() {
                 let effect_allele = rules_by_key.allele(rule.effect_allele);
                 let effect_is_ref = match *decision {
                     OtherAlleleMatch::Pair => pair_orientation(
@@ -1222,6 +1241,14 @@ impl PendingPosition {
                     _ => None,
                 };
                 if let Some(effect_is_ref) = effect_is_ref {
+                    if std::mem::replace(&mut taken[index], true) {
+                        return Err(repeated_pair_error(
+                            &self.chromosome,
+                            key.1,
+                            effect_allele,
+                            rules_by_key.allele(rule.other_allele),
+                        ));
+                    }
                     matched.extend(rules_by_key.applications(rule).iter().map(|application| {
                         MatchedRule {
                             score_index: application.score_index,
@@ -1347,9 +1374,10 @@ fn decode_scored_fields(
         return Ok(());
     };
     let pos = start? as u32;
-    let Some(score_rules) = rules_by_key.get(&(chr, pos)) else {
+    let Some(&(rules_start, rules_end)) = rules_by_key.ranges.get(&(chr, pos)) else {
         return Ok(());
     };
+    let score_rules = &rules_by_key.rules[rules_start..rules_end];
     decoded.position = pos;
     decoded.key = Some((chr, pos));
     decoded.chromosome.clear();
@@ -1368,7 +1396,7 @@ fn decode_scored_fields(
         decoded,
     );
     for (alt_offset, alt_allele) in alt_alleles.iter().enumerate() {
-        let Some(matched_rules) = rules_for_allele(
+        let Some((matched_rules, first_rule)) = rules_for_allele(
             rules_by_key,
             score_rules,
             decoded.effect_only,
@@ -1396,6 +1424,7 @@ fn decode_scored_fields(
         )?;
         allele.scale = Some(allele.column.normalize());
         allele.matched_rules = matched_rules;
+        allele.first_rule = rules_start + first_rule;
         decoded.allele_count += 1;
     }
     Ok(())
@@ -1423,16 +1452,16 @@ fn decode_rows(
     }
 }
 
-/// The rules scoring `(ref_allele, alt_allele)`, merged, or `None` when no rule may.
-/// At an `effect_only` position the rules are matched once every record there has
-/// been read, so an allele some rule may score gets no rules yet.
+/// The rules scoring `(ref_allele, alt_allele)`, merged, with the first of `score_rules` among
+/// them, or `None` when no rule may. At an `effect_only` position the rules are matched once
+/// every record there has been read, so an allele some rule may score gets no rules yet.
 fn rules_for_allele(
     rules_by_key: &ScoreRules,
     score_rules: &[ScoreRule],
     effect_only: bool,
     ref_allele: &str,
     alt_allele: &str,
-) -> Option<Vec<MatchedRule>> {
+) -> Option<(Vec<MatchedRule>, usize)> {
     if effect_only {
         let may_score = score_rules.iter().any(|rule| {
             let effect_allele = rules_by_key.allele(rule.effect_allele);
@@ -1449,10 +1478,11 @@ fn rules_for_allele(
                 OtherAlleleMatch::SeveralRows | OtherAlleleMatch::NoRow => false,
             }
         });
-        return may_score.then(Vec::new);
+        return may_score.then(|| (Vec::new(), 0));
     }
-    let matched = match_rules_for_allele(rules_by_key, score_rules, ref_allele, alt_allele);
-    (!matched.is_empty()).then_some(matched)
+    let (matched, first_rule) =
+        match_rules_for_allele(rules_by_key, score_rules, ref_allele, alt_allele);
+    (!matched.is_empty()).then_some((matched, first_rule))
 }
 
 /// Decodes the dosages a BCF `record` contributes to its matched rules into
@@ -1472,9 +1502,10 @@ fn decode_scored_bcf_record(
         return Ok(());
     };
     let pos = start?.get() as u32;
-    let Some(score_rules) = rules_by_key.get(&(chr, pos)) else {
+    let Some(&(rules_start, rules_end)) = rules_by_key.ranges.get(&(chr, pos)) else {
         return Ok(());
     };
+    let score_rules = &rules_by_key.rules[rules_start..rules_end];
     decoded.position = pos;
     decoded.key = Some((chr, pos));
     decoded.chromosome.clear();
@@ -1486,7 +1517,7 @@ fn decode_scored_bcf_record(
     let alt_alleles = alternate_bases.iter().collect::<Result<Vec<_>, _>>()?;
     decode_rows(rules_by_key, score_rules, ref_allele, &alt_alleles, decoded);
     for (alt_offset, alt_allele) in alt_alleles.iter().enumerate() {
-        let Some(matched_rules) = rules_for_allele(
+        let Some((matched_rules, first_rule)) = rules_for_allele(
             rules_by_key,
             score_rules,
             decoded.effect_only,
@@ -1515,6 +1546,7 @@ fn decode_scored_bcf_record(
         )?;
         allele.scale = Some(allele.column.normalize());
         allele.matched_rules = matched_rules;
+        allele.first_rule = rules_start + first_rule;
         decoded.allele_count += 1;
     }
     Ok(())
@@ -1524,6 +1556,14 @@ fn ref_effect_error(score_name: &str, chromosome: &str, position: u32) -> String
     format!(
         "Cannot score REF-effect rule for score '{}' at {}:{} without a complete REF dosage (DS requires genotype ploidy and all ALT dosages).",
         score_name, chromosome, position,
+    )
+}
+
+/// The error for a second record carrying an allele pair that score rows name: which record a
+/// row scores is unknown, and scoring both would count the variant twice.
+fn repeated_pair_error(chromosome: &str, position: u32, allele: &str, other_allele: &str) -> String {
+    format!(
+        "More than one record at {chromosome}:{position} carries the alleles {other_allele} and {allele}, which a score row names, so which record the row scores is unknown. Remove the duplicate records, for example with bcftools norm --rm-dup exact."
     )
 }
 
@@ -1829,18 +1869,21 @@ fn read_score_headers(
     Ok(headers)
 }
 
+/// The rules of `rules` scoring `(ref_allele, alt_allele)`, merged, and the index in `rules` of
+/// the first of them.
 fn match_rules_for_allele(
     rules_by_key: &ScoreRules,
     rules: &[ScoreRule],
     ref_allele: &str,
     alt_allele: &str,
-) -> Vec<MatchedRule> {
+) -> (Vec<MatchedRule>, usize) {
     let capacity = rules
         .iter()
         .map(|rule| rule.applications.1 - rule.applications.0)
         .sum();
     let mut matched = Vec::with_capacity(capacity);
-    for rule in rules {
+    let mut first_rule = None;
+    for (index, rule) in rules.iter().enumerate() {
         let effect_allele = rules_by_key.allele(rule.effect_allele);
         let other_allele = rules_by_key.allele(rule.other_allele);
         let Some(effect_is_ref) =
@@ -1848,6 +1891,7 @@ fn match_rules_for_allele(
         else {
             continue;
         };
+        first_rule.get_or_insert(index);
         for application in rules_by_key.applications(rule) {
             matched.push(MatchedRule {
                 score_index: application.score_index,
@@ -1857,7 +1901,7 @@ fn match_rules_for_allele(
             });
         }
     }
-    merge_matched_rules(matched)
+    (merge_matched_rules(matched), first_rule.unwrap_or(0))
 }
 
 /// Whether the effect allele is the REF, when a rule's allele pair is `(ref_allele,
@@ -3609,6 +3653,78 @@ mod tests {
             error.to_string().contains("1:100 are not adjacent"),
             "{error}"
         );
+    }
+
+    /// `text` as a plain VCF, a BGZF VCF in small blocks and a BCF, in `dir`.
+    fn cohort_files(dir: &Path, text: &str) -> [PathBuf; 3] {
+        use noodles_vcf::variant::io::Write as _;
+
+        let vcf = dir.join("cohort.vcf");
+        let bgzf = dir.join("cohort.vcf.gz");
+        let bcf = dir.join("cohort.bcf");
+        std::fs::write(&vcf, text).expect("write vcf");
+        std::fs::write(&bgzf, bgzf_bytes(text.as_bytes(), 64)).expect("write bgzf vcf");
+        let mut reader = VcfReader::new(BufReader::new(File::open(&vcf).expect("open vcf")));
+        let header = reader.read_header().expect("vcf header");
+        let mut writer = noodles_bcf::io::Writer::new(File::create(&bcf).expect("create bcf"));
+        writer.write_header(&header).expect("bcf header");
+        let mut record = noodles_vcf::variant::RecordBuf::default();
+        while reader
+            .read_record_buf(&header, &mut record)
+            .expect("vcf record")
+            != 0
+        {
+            writer
+                .write_variant_record(&header, &record)
+                .expect("bcf record");
+        }
+        writer.try_finish().expect("finish bcf");
+        [vcf, bgzf, bcf]
+    }
+
+    /// Records repeating an allele pair that a score row names are refused by name from plain
+    /// VCF, BGZF VCF and BCF: adjacent, apart, with REF and ALT swapped, and at a position where
+    /// another row names no single other allele. A repeated pair no row names still scores.
+    #[test]
+    fn records_repeating_a_scored_allele_pair_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let header = "##fileformat=VCFv4.2\n##contig=<ID=1>\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             ##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"ALT dosage\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\n";
+        let first = "1\t100\ta\tA\tG\t.\tPASS\t.\tGT:DS\t0|1:0.9\t0|0:0.1\n";
+        let second = "1\t100\tb\tA\tG\t.\tPASS\t.\tGT:DS\t1|1:1.8\t0|1:1.2\n";
+        let swapped = "1\t100\tb\tG\tA\t.\tPASS\t.\tGT:DS\t1|1:1.8\t0|1:1.2\n";
+        let other = "1\t200\tc\tC\tT\t.\tPASS\t.\tGT:DS\t0|1:1\t1|1:2\n";
+        let unscored = "1\t300\td\tT\tC\t.\tPASS\t.\tGT:DS\t0|1:1\t1|1:2\n";
+        let pairs = "variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.5\n1:200\tT\tC\t1\n";
+        let with_effect_only = "variant_id\teffect_allele\tother_allele\tS\n\
+             1:100\tG\tA\t0.5\n1:100\tT\t.\t2\n1:200\tT\tC\t1\n";
+        let score_path = dir.path().join("score.gnomon.tsv");
+        for (case, body, scores) in [
+            ("adjacent", [first, second, other].concat(), pairs),
+            ("apart", [first, other, second].concat(), pairs),
+            ("swapped", [first, swapped, other].concat(), pairs),
+            ("effect-only position", [first, second, other].concat(), with_effect_only),
+        ] {
+            std::fs::write(&score_path, scores).expect("write score");
+            for path in cohort_files(dir.path(), &format!("{header}{body}")) {
+                let error = score_vcf_streaming(&path, std::slice::from_ref(&score_path), None, None)
+                    .expect_err(case);
+                assert!(
+                    error
+                        .to_string()
+                        .contains("More than one record at 1:100 carries the alleles A and G"),
+                    "{case}, {path:?}: {error}"
+                );
+            }
+        }
+        std::fs::write(&score_path, pairs).expect("write score");
+        for path in cohort_files(dir.path(), &format!("{header}{first}{other}{unscored}{unscored}")) {
+            let result = score_vcf_streaming(&path, std::slice::from_ref(&score_path), None, None)
+                .expect("a repeated pair no row names scores");
+            assert_eq!(result.sums(), [1.45, 2.05], "{path:?}");
+        }
     }
 
     #[test]
