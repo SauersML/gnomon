@@ -204,17 +204,31 @@ impl<T: Send> Iterator for ChannelBatcher<T> {
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryBudget {
     max_ram_bytes: usize,
+    resident_bytes: usize,
 }
 
 impl MemoryBudget {
     fn auto() -> Self {
         let max_ram_bytes = default_max_ram_bytes().max(1);
-        Self { max_ram_bytes }
+        // Free pages the allocator kept from preparation are not held: return them first, so the
+        // reading counts what this process holds, not what its allocator happened to keep.
+        crate::memory::release_free_heap();
+        let resident_bytes = usize::try_from(crate::memory::resident_bytes()).unwrap_or(usize::MAX);
+        Self {
+            max_ram_bytes,
+            resident_bytes,
+        }
     }
 
     #[inline]
     pub fn max_ram_bytes(self) -> usize {
         self.max_ram_bytes
+    }
+
+    /// What this process held when the budget was read, which the budget itself does not charge.
+    #[inline]
+    pub fn resident_bytes(self) -> usize {
+        self.resident_bytes
     }
 }
 
@@ -305,7 +319,7 @@ pub fn preflight_memory(
     prep_result: &PreparationResult,
     memory_budget: MemoryBudget,
 ) -> Result<(), PipelineError> {
-    ensure_memory_floor(prep_result, memory_budget)?;
+    ensure_memory_floor(prep_result, memory_budget, InputCharge::UNOPENED)?;
     let result_bytes = result_bytes(prep_result)?;
     let csr_bytes = csr_bytes(prep_result)?;
     let row_bytes = usize::try_from(prep_result.bytes_per_variant).map_err(|_| {
@@ -618,7 +632,11 @@ impl PipelineContext {
 /// This is the primary public entry point. It is synchronous and returns the
 /// final aggregated scores and counts upon successful completion.
 pub fn run(context: &PipelineContext) -> Result<(Vec<i64>, Vec<u32>), PipelineError> {
-    ensure_memory_floor(&context.prep_result, context.memory_budget)?;
+    ensure_memory_floor(
+        &context.prep_result,
+        context.memory_budget,
+        InputCharge::UNOPENED,
+    )?;
 
     // This match is a zero-cost abstraction. The compiler generates a simple jump
     // to the correct function based on the enum variant, and it's impossible
@@ -642,6 +660,8 @@ fn run_single_file_pipeline(
 ) -> Result<(Vec<i64>, Vec<u32>), PipelineError> {
     // --- 1. Setup: Memory-map the file, create channels and a shared buffer pool ---
     let bed_source = open_scoring_bed_source(context, bed_path)?;
+    let input = InputCharge::of(&context.prep_result, std::slice::from_ref(&bed_source));
+    ensure_memory_floor(&context.prep_result, context.memory_budget, input)?;
     if should_use_small_keep_direct(context)
         || (context.prep_result.num_people_to_score <= SMALL_KEEP_DIRECT_THRESHOLD
             && bed_source.mmap().is_some())
@@ -685,9 +705,7 @@ fn run_single_file_pipeline(
 
     let use_bounded_accumulator = should_use_bounded_accumulator(context)?;
     if use_bounded_accumulator {
-        eprintln!(
-            "> Using bounded RAM accumulator: one shared exact cell and count matrix, no per-thread full-matrix copies."
-        );
+        announce_bounded_accumulator(prep_result, context.memory_budget, input)?;
     }
     let mut shared_accumulator = if use_bounded_accumulator {
         let (final_scores, final_counts) = initialize_cells(prep_result)?;
@@ -860,6 +878,7 @@ fn run_single_file_pipeline(
                                 context,
                                 Arc::clone(&buffer_pool),
                                 dense_accumulator,
+                                input,
                             )
                         },
                     )
@@ -1012,6 +1031,8 @@ fn run_multi_file_pipeline(
         .iter()
         .map(|b| open_scoring_bed_source(context, &b.bed_path))
         .collect::<Result<_, _>>()?;
+    let input = InputCharge::of(&context.prep_result, &bed_sources);
+    ensure_memory_floor(&context.prep_result, context.memory_budget, input)?;
     let any_remote = bed_sources.iter().any(|s| s.mmap().is_none());
     if should_use_small_keep_direct(context)
         || (context.prep_result.num_people_to_score <= SMALL_KEEP_DIRECT_THRESHOLD && !any_remote)
@@ -1044,9 +1065,7 @@ fn run_multi_file_pipeline(
     eprintln!("> Decision Engine Strategy: {strategy:?}");
     let use_bounded_accumulator = should_use_bounded_accumulator(context)?;
     if use_bounded_accumulator {
-        eprintln!(
-            "> Using bounded RAM accumulator: one shared exact cell and count matrix, no per-thread full-matrix copies."
-        );
+        announce_bounded_accumulator(prep_result, context.memory_budget, input)?;
     }
     let mut shared_accumulator = if use_bounded_accumulator {
         let (final_scores, final_counts) = initialize_cells(prep_result)?;
@@ -1218,6 +1237,7 @@ fn run_multi_file_pipeline(
                                 context,
                                 Arc::clone(&buffer_pool),
                                 dense_accumulator,
+                                input,
                             )
                         },
                     )
@@ -1655,16 +1675,19 @@ mod tests {
     fn memory_floor_rejects_huge_outputs_without_allocating_them() {
         let budget = MemoryBudget {
             max_ram_bytes: 64 * 1024 * 1024,
+            resident_bytes: 0,
         };
-        assert!(ensure_memory_floor(&memory_test_prep(500_000, 1000), budget).is_err());
-        assert!(ensure_memory_floor(&memory_test_prep(usize::MAX, 2), budget).is_err());
-        assert!(ensure_memory_floor(&memory_test_prep(64, 4), budget).is_ok());
+        let unopened = InputCharge::UNOPENED;
+        assert!(ensure_memory_floor(&memory_test_prep(500_000, 1000), budget, unopened).is_err());
+        assert!(ensure_memory_floor(&memory_test_prep(usize::MAX, 2), budget, unopened).is_err());
+        assert!(ensure_memory_floor(&memory_test_prep(64, 4), budget, unopened).is_ok());
     }
 
     #[test]
     fn bounded_dense_batches_include_wide_weight_matrices() {
         let budget = MemoryBudget {
             max_ram_bytes: 64 * 1024 * 1024,
+            resident_bytes: 0,
         };
         let wide = memory_test_prep(64, 10_000);
         let batch = bounded_dense_batch_size(&wide, budget).unwrap();
@@ -1675,6 +1698,404 @@ mod tests {
             bounded_dense_batch_size(&memory_test_prep(64, 1), budget).unwrap(),
             DENSE_BATCH_SIZE
         );
+    }
+
+    /// Bounded consumers take what the budget leaves after the floor, the memory the process
+    /// already holds beyond the plan and the input rows it maps, one private matrix, its scratch
+    /// and its thread's stack each, and never more than the pool is wide. The CSR preparation
+    /// left resident is charged once, by the floor.
+    #[test]
+    fn bounded_dense_consumers_fit_the_budget_left_after_the_floor() {
+        let prep = memory_test_prep(10_000, 16);
+        let csr = prep.csr_heap_bytes();
+        for mebibytes in [1usize, 4, 16, 64, 256, 1024, 1 << 20] {
+            for (held, mapped) in [
+                (0usize, 0usize),
+                (3 << 20, 0),
+                (40 << 20, 0),
+                (3 << 20, 5 << 20),
+            ] {
+                let budget = MemoryBudget {
+                    max_ram_bytes: mebibytes << 20,
+                    resident_bytes: csr + held,
+                };
+                let input = InputCharge {
+                    mapped,
+                    prefetch: true,
+                };
+                let consumers = bounded_dense_consumers(&prep, budget, input).unwrap();
+                let private = result_bytes(&prep).unwrap()
+                    + dense_scratch_bytes(&prep, bounded_dense_batch_size(&prep, budget).unwrap())
+                        .unwrap()
+                    + thread_stack_bytes();
+                let charged = memory_floor_bytes(&prep, budget, input).unwrap() + held + mapped;
+                let at = format!("{mebibytes} MiB, {held} held, {mapped} mapped");
+                assert!(consumers >= 1 && consumers <= worker_ceiling(), "{at}");
+                if consumers > 1 {
+                    assert!(
+                        charged + (consumers - 1) * private <= budget.max_ram_bytes(),
+                        "{at}"
+                    );
+                }
+                if consumers < worker_ceiling() {
+                    assert!(
+                        charged + consumers * private > budget.max_ram_bytes(),
+                        "{at}"
+                    );
+                }
+                if held == 0 {
+                    let below = MemoryBudget {
+                        resident_bytes: csr / 2,
+                        ..budget
+                    };
+                    assert_eq!(
+                        bounded_dense_consumers(&prep, below, input).unwrap(),
+                        consumers,
+                        "{at}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// ensure_memory_floor charges what the bounded plan charges before any consumer: the floor,
+    /// the memory held beyond the plan and the input rows read through a memory map. One byte
+    /// below that sum it refuses and names each part, where the floor alone fit; at the sum and
+    /// one byte above, it admits the run.
+    #[test]
+    fn memory_floor_refuses_one_byte_below_the_floor_held_and_mapped_memory() {
+        let prep = memory_test_prep(10_000, 16);
+        let csr = prep.csr_heap_bytes();
+        // Held memory this large puts the boundary where the floor no longer grows with the
+        // budget (I/O buffers, batch size and prefetch are all at their caps).
+        let held = 64usize << 30;
+        let mapped = 16usize << 20;
+        let input = InputCharge {
+            mapped,
+            prefetch: true,
+        };
+        let at = |max_ram_bytes| MemoryBudget {
+            max_ram_bytes,
+            resident_bytes: csr + held,
+        };
+        // The least budget that holds its own floor, the held memory and the mapped rows.
+        let mut boundary = held + mapped;
+        for _ in 0..64 {
+            let next = memory_floor_bytes(&prep, at(boundary), input).unwrap() + held + mapped;
+            if next == boundary {
+                break;
+            }
+            boundary = next;
+        }
+        assert_eq!(
+            memory_floor_bytes(&prep, at(boundary), input).unwrap() + held + mapped,
+            boundary
+        );
+        assert!(ensure_memory_floor(&prep, at(boundary), input).is_ok());
+        assert!(ensure_memory_floor(&prep, at(boundary + 1), input).is_ok());
+
+        let below = at(boundary - 1);
+        assert!(memory_floor_bytes(&prep, below, input).unwrap() <= below.max_ram_bytes());
+        match ensure_memory_floor(&prep, below, input) {
+            Err(PipelineError::Compute(refusal)) => {
+                assert!(refusal.contains(&format_bytes(held)), "{refusal}");
+                assert!(refusal.contains(&format_bytes(mapped)), "{refusal}");
+                assert!(
+                    refusal.contains(&format_bytes(below.max_ram_bytes())),
+                    "{refusal}"
+                );
+            }
+            _ => panic!(
+                "a budget one byte below the floor, held memory and mapped rows was admitted"
+            ),
+        }
+        // A resident reading of only the CSR holds nothing beyond the plan.
+        let csr_only = MemoryBudget {
+            resident_bytes: csr,
+            ..below
+        };
+        assert!(ensure_memory_floor(&prep, csr_only, input).is_ok());
+        // A run that maps no rows does not need their share.
+        assert!(ensure_memory_floor(&prep, below, InputCharge::UNOPENED).is_ok());
+    }
+
+    /// The floor charges the CSR at the bytes its vectors hold: 13 an entry here (an i64 weight,
+    /// its flags and a u32 column) where the i128 worst case charges 21, and a resident reading
+    /// of exactly those bytes holds nothing beyond the plan.
+    #[test]
+    fn the_csr_is_charged_at_the_bytes_it_holds() {
+        let (prep, ..) = bound_panel(64, 4096, [(1 << 53) - 1, 3]);
+        let entries = prep.sparse_score_columns().len();
+        let offsets = prep.sparse_row_offsets().len() * std::mem::size_of::<u64>();
+        let entry = std::mem::size_of::<i64>() + 1 + std::mem::size_of::<u32>();
+        let csr = prep.csr_heap_bytes();
+        assert!(csr >= entries * entry + offsets, "{csr}");
+        assert!(csr <= entries * (entry + 1) + offsets + 4096, "{csr}");
+        assert!(csr < csr_bytes(&prep).unwrap());
+        let at = |resident_bytes| MemoryBudget {
+            max_ram_bytes: 64 << 20,
+            resident_bytes,
+        };
+        assert_eq!(held_beyond_plan(&prep, at(csr)), 0);
+        assert_eq!(held_beyond_plan(&prep, at(csr + 1)), 1);
+    }
+
+    /// Only a source that may read through a planned prefetch window is charged one: before the
+    /// sources open, and while any of them serves no map.
+    #[test]
+    fn the_prefetch_window_is_charged_only_while_a_source_may_take_one() {
+        // 16,384 people pack into 4,096-byte rows; 4,096 needed rows take a local prefetch budget.
+        let mut prep = memory_test_prep(16_384, 1);
+        prep.required_bim_indices = (0..4096).map(crate::score::types::BimRowIndex).collect();
+        let budget = MemoryBudget {
+            max_ram_bytes: 1 << 30,
+            resident_bytes: 0,
+        };
+        let window = io::local_prefetch_budget(&prep, budget);
+        assert!(window > 0);
+        let mapped = InputCharge {
+            mapped: 0,
+            prefetch: false,
+        };
+        assert_eq!(
+            memory_floor_bytes(&prep, budget, InputCharge::UNOPENED).unwrap(),
+            memory_floor_bytes(&prep, budget, mapped).unwrap() + window
+        );
+    }
+
+    /// A memory map is charged the rows a run needs, at most the mapped sources' length, and a
+    /// source that does not serve reads from a map is charged nothing.
+    #[test]
+    fn mapped_row_bytes_charge_needed_rows_up_to_the_mapped_length() {
+        // Eight people pack into two bytes a row; the file holds the header and three rows.
+        let mut prep = memory_test_prep(8, 1);
+        let file = tempfile::Builder::new().suffix(".bed").tempfile().unwrap();
+        std::fs::write(file.path(), [0x6c, 0x1b, 0x01, 0, 0, 0, 0, 0, 0]).unwrap();
+        let mapped = io::open_bed_source(file.path(), None).unwrap();
+        assert!(mapped.mapped_rows().is_some());
+        prep.required_bim_indices = (0..2).map(crate::score::types::BimRowIndex).collect();
+        assert_eq!(mapped_row_bytes(&prep, std::slice::from_ref(&mapped)), 4);
+        prep.required_bim_indices = (0..10).map(crate::score::types::BimRowIndex).collect();
+        assert_eq!(mapped_row_bytes(&prep, std::slice::from_ref(&mapped)), 9);
+
+        struct Unmapped;
+        impl io::ByteRangeSource for Unmapped {
+            fn len(&self) -> u64 {
+                9
+            }
+
+            fn read_at(&self, _offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
+                dst.fill(0);
+                Ok(())
+            }
+        }
+        let unmapped = io::BedSource::from_byte_source(Arc::new(Unmapped));
+        assert!(unmapped.mapped_rows().is_none());
+        assert_eq!(mapped_row_bytes(&prep, std::slice::from_ref(&unmapped)), 0);
+
+        // Only a source that serves no map may take a prefetch window.
+        let of = InputCharge::of(&prep, std::slice::from_ref(&mapped));
+        assert_eq!((of.mapped, of.prefetch), (9, false));
+        let of = InputCharge::of(&prep, &[mapped, unmapped]);
+        assert_eq!((of.mapped, of.prefetch), (9, true));
+    }
+
+    /// Two scores over `rows` rows, every row weighing `unit[score]`: integers below 2^53, so each
+    /// weight's shortest decimal is the integer itself and the oracle's arithmetic is the plan's.
+    /// Person 0 carries two effect alleles everywhere, so its totals are the largest the plan
+    /// bounds. Gives the plan, the packed rows, and each person's correctly rounded totals and
+    /// missing counts.
+    fn bound_panel(
+        people: usize,
+        rows: usize,
+        unit: [i128; 2],
+    ) -> (PreparationResult, Vec<u8>, Vec<u64>, Vec<u32>) {
+        use crate::score::types::{OriginalPersonIndex, OutputPersonIndex, PersonSubset};
+        let scores = 2;
+        let weights: Vec<f64> = (0..rows).flat_map(|_| unit.map(|w| w as f64)).collect();
+        let columns: Vec<u32> = (0..rows).flat_map(|_| [0u32, 1]).collect();
+        let offsets: Vec<u64> = (0..=rows as u64).map(|row| 2 * row).collect();
+        let names: Vec<String> = (0..scores).map(|s| format!("S{s}")).collect();
+        let exact = crate::score::cells::ExactPlan::new(
+            &weights,
+            &vec![0.0; weights.len()],
+            &columns,
+            &offsets,
+            &[],
+            &names,
+        )
+        .expect("exact plan");
+        let row_bytes = people.div_ceil(4);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut data = vec![0u8; rows * row_bytes];
+        let (mut sums, mut missing) = (vec![0i128; people * scores], vec![0u32; people * scores]);
+        for row in 0..rows {
+            for person in 0..people {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let code = if person == 0 {
+                    3
+                } else {
+                    (state >> 32) as u8 & 3
+                };
+                data[row * row_bytes + person / 4] |= code << (2 * (person % 4));
+                for (score, &weight) in unit.iter().enumerate() {
+                    let cell = person * scores + score;
+                    match code {
+                        1 => missing[cell] += 1,
+                        dose => sums[cell] += i128::from([0, 0, 1, 2][dose as usize]) * weight,
+                    }
+                }
+            }
+        }
+        let rounded = sums
+            .iter()
+            .map(|sum| sum.to_string().parse::<f64>().unwrap().to_bits())
+            .collect();
+        let prep = PreparationResult::new(
+            exact,
+            columns,
+            offsets,
+            (0..rows as u64).map(BimRowIndex).collect(),
+            Vec::new(),
+            names,
+            vec![rows as u32; scores],
+            PersonSubset::All,
+            (0..people).map(|p| format!("P{p}")).collect(),
+            people,
+            people,
+            rows as u64,
+            rows,
+            row_bytes as u64,
+            (0..people)
+                .map(|p| Some(OutputPersonIndex(p as u32)))
+                .collect(),
+            (0..people).map(|p| OriginalPersonIndex(p as u32)).collect(),
+            vec![0; rows],
+            Vec::new(),
+            Vec::new(),
+            0,
+            PipelineKind::SingleFile(PathBuf::from("panel.bed")),
+        );
+        (prep, data, rounded, missing)
+    }
+
+    fn rounded_totals(prep: &PreparationResult, cells: &[i64]) -> Vec<u64> {
+        let (scores, stride) = (prep.score_names.len(), prep.exact().stride());
+        (0..cells.len() / stride * scores)
+            .map(|cell| {
+                let person = cell / scores;
+                prep.exact()
+                    .sum(
+                        cell % scores,
+                        &cells[person * stride..(person + 1) * stride],
+                    )
+                    .to_bits()
+            })
+            .collect()
+    }
+
+    /// Adds a panel's rows serially, and again split at `cuts`: the first range into the shared
+    /// cells, and each other range into a private consumer's cells merged into them. The merged
+    /// cells must equal the serial ones bit for bit and give the exact oracle's totals and counts.
+    fn check_private_merge(rows: usize, unit: [i128; 2], cuts: &[usize]) {
+        let (prep, data, want_totals, want_missing) = bound_panel(37, rows, unit);
+        let layout = PersonLayout::new(&prep);
+        let row_bytes = prep.bytes_per_variant as usize;
+        let indices: Vec<ReconciledVariantIndex> =
+            (0..rows as u32).map(ReconciledVariantIndex).collect();
+        let add = |range: std::ops::Range<usize>, cells: &mut (Vec<i64>, Vec<u32>)| {
+            let mut scratch = DenseScratch::default();
+            for start in range.clone().step_by(3) {
+                let end = (start + 3).min(range.end);
+                batch::run_dense_batch(
+                    &data[start * row_bytes..end * row_bytes],
+                    &indices[start..end],
+                    &prep,
+                    &layout,
+                    &mut scratch,
+                    &mut cells.0,
+                    &mut cells.1,
+                )
+                .unwrap();
+            }
+        };
+        let mut serial = initialize_cells(&prep).unwrap();
+        add(0..rows, &mut serial);
+        let shared = Mutex::new(initialize_cells(&prep).unwrap());
+        let ends: Vec<usize> = cuts.iter().copied().chain([rows]).collect();
+        add(0..ends[0], &mut *shared.lock().unwrap());
+        for range in ends.windows(2) {
+            let mut private = initialize_cells(&prep).unwrap();
+            add(range[0]..range[1], &mut private);
+            merge_bounded_cells(&shared, private.0, private.1).unwrap();
+        }
+        let merged = shared.into_inner().unwrap();
+        assert_eq!(merged, serial);
+        assert_eq!(rounded_totals(&prep, &merged.0), want_totals);
+        assert_eq!(merged.1, want_missing);
+    }
+
+    /// At the edge of one limb: 512 rows of 2^53 - 1 sum, twice, to 2^63 - 1,024 in the first
+    /// score, and rows of 2^53 take the second just past it into two limbs.
+    #[test]
+    fn private_consumers_merge_exactly_at_the_plan_bound() {
+        check_private_merge(512, [(1 << 53) - 1, 1 << 53], &[128, 300]);
+    }
+
+    /// A stream whose total passes 2^63 many times over: 4,096 rows of 2^53 - 1 give person 0
+    /// about 2^66, which the plan holds in two carry-free limbs, and each of four private
+    /// consumers alone adds about 2^64 before it merges.
+    #[test]
+    fn private_consumers_merge_exactly_past_two_to_the_63() {
+        check_private_merge(4096, [(1 << 53) - 1, 3], &[512, 1536, 2560, 3584]);
+    }
+
+    /// The bounded dense consumer, running every consumer an ample budget allows, reads a whole
+    /// stream sent one row at a time, whose totals pass 2^63, and gives the exact totals.
+    #[test]
+    fn bounded_dense_consumers_score_a_stream_exactly() {
+        let (people, rows) = (37, 4096);
+        let (prep, data, want_totals, want_missing) = bound_panel(people, rows, [(1 << 53) - 1, 3]);
+        let row_bytes = prep.bytes_per_variant as usize;
+        let prep = Arc::new(prep);
+        let budget = MemoryBudget {
+            max_ram_bytes: 1 << 40,
+            resident_bytes: 0,
+        };
+        assert_eq!(
+            bounded_dense_consumers(&prep, budget, InputCharge::UNOPENED).unwrap(),
+            worker_ceiling()
+        );
+        let context = PipelineContext::with_budget(Arc::clone(&prep), budget, None);
+        let accumulator = Arc::new(Mutex::new(initialize_cells(&prep).unwrap()));
+        let pool = Arc::new(io::RowBufferPool::new(rows, 0));
+        let (tx, rx) = bounded(1);
+        let result = thread::scope(|s| {
+            s.spawn(move || {
+                for row in 0..rows {
+                    let item = WorkItem {
+                        data: data[row * row_bytes..(row + 1) * row_bytes].to_vec(),
+                        reconciled_variant_index: ReconciledVariantIndex(row as u32),
+                    };
+                    if tx.send(Ok(item)).is_err() {
+                        break;
+                    }
+                }
+            });
+            process_dense_stream_bounded(
+                rx,
+                &context,
+                pool,
+                Arc::clone(&accumulator),
+                InputCharge::UNOPENED,
+            )
+        });
+        assert!(result.is_ok());
+        let cells = accumulator.lock().unwrap();
+        assert_eq!(rounded_totals(&prep, &cells.0), want_totals);
+        assert_eq!(cells.1, want_missing);
     }
 
     #[test]
@@ -2188,22 +2609,189 @@ fn process_dense_stream_bounded(
     context: &PipelineContext,
     buffer_pool: Arc<io::RowBufferPool>,
     accumulator: Arc<Mutex<(Vec<i64>, Vec<u32>)>>,
+    input: InputCharge,
 ) -> ConsumerResult {
     let _stop_producer = ScopeGuard::new(|| buffer_pool.close());
     let prep_result = &context.prep_result;
-    let batch_size = bounded_dense_batch_size(&context.prep_result, context.memory_budget)?;
-    let mut batch_iterator = ChannelBatcher::new(rx, batch_size);
+    let batch_size = bounded_dense_batch_size(prep_result, context.memory_budget)?;
+    let consumers = bounded_dense_consumers(prep_result, context.memory_budget, input)?;
+    // The first consumer adds into the shared cells under the lock; every other one adds into
+    // private cells the budget has room for and merges them when the stream ends.
+    thread::scope(|s| {
+        let private: Vec<_> = (1..consumers)
+            .map(|_| {
+                let rx = rx.clone();
+                let buffer_pool = Arc::clone(&buffer_pool);
+                let accumulator = Arc::clone(&accumulator);
+                s.spawn(move || {
+                    let _stop_producer = ScopeGuard::new(|| buffer_pool.close());
+                    let mut cells = DenseCells::Private(None);
+                    consume_dense_batches(rx, context, &buffer_pool, batch_size, &mut cells)?;
+                    match cells {
+                        DenseCells::Private(Some((scores, counts))) => {
+                            merge_bounded_cells(&accumulator, scores, counts)
+                        }
+                        _ => Ok(()),
+                    }
+                })
+            })
+            .collect();
+        let first = consume_dense_batches(
+            rx,
+            context,
+            &buffer_pool,
+            batch_size,
+            &mut DenseCells::Shared(&accumulator),
+        );
+        // A stopped consumer closes the pool, so the producer and every other consumer end too.
+        if first.is_err() {
+            buffer_pool.close();
+        }
+        private.into_iter().fold(first, |result, handle| {
+            let joined = handle
+                .join()
+                .map_err(|_| PipelineError::Compute("A dense consumer panicked.".to_string()))
+                .and_then(|consumed| consumed);
+            result.and(joined)
+        })
+    })?;
+    Ok((Vec::new(), Vec::new()))
+}
+
+/// The bounded accumulator's memory plan: the floor every bounded run needs (of it, what the
+/// score plan's tables hold), the memory this process already holds beyond the plan that floor
+/// counts, the input rows it reads through memory maps, one private dense consumer's cells, batch
+/// scratch and thread stack, and how many dense consumers the budget holds.
+struct BoundedPlan {
+    floor: usize,
+    csr: usize,
+    resident: usize,
+    mapped: usize,
+    private: usize,
+    consumers: usize,
+}
+
+fn bounded_plan(
+    prep: &PreparationResult,
+    budget: MemoryBudget,
+    input: InputCharge,
+) -> Result<BoundedPlan, PipelineError> {
+    let floor = memory_floor_bytes(prep, budget, input)?;
+    let resident = held_beyond_plan(prep, budget);
+    let private = result_bytes(prep)?
+        .checked_add(dense_scratch_bytes(
+            prep,
+            bounded_dense_batch_size(prep, budget)?,
+        )?)
+        .and_then(|v| v.checked_add(thread_stack_bytes()))
+        .ok_or_else(|| PipelineError::Compute("Dense consumer size overflow.".into()))?;
+    let spare = budget
+        .max_ram_bytes()
+        .saturating_sub(floor.saturating_add(resident).saturating_add(input.mapped));
+    Ok(BoundedPlan {
+        floor,
+        csr: prep.csr_heap_bytes(),
+        resident,
+        mapped: input.mapped,
+        private,
+        consumers: (1 + spare / private.max(1)).min(worker_ceiling()),
+    })
+}
+
+/// Dense consumers the bounded accumulator runs. The first adds into the shared cells; each
+/// other one holds a private cell matrix, its batch scratch and its own thread's stack, paid from
+/// what the budget leaves after the floor, the memory this process already holds and the input
+/// rows it maps.
+fn bounded_dense_consumers(
+    prep: &PreparationResult,
+    budget: MemoryBudget,
+    input: InputCharge,
+) -> Result<usize, PipelineError> {
+    Ok(bounded_plan(prep, budget, input)?.consumers)
+}
+
+/// Says how a bounded run accumulates: one consumer on the shared cells, how many beside it the
+/// budget gives private cells, and what the plan charged against the budget.
+fn announce_bounded_accumulator(
+    prep: &PreparationResult,
+    budget: MemoryBudget,
+    input: InputCharge,
+) -> Result<(), PipelineError> {
+    let plan = bounded_plan(prep, budget, input)?;
+    match plan.consumers {
+        1 => eprintln!(
+            "> Using bounded RAM accumulator: one shared exact cell and count matrix, no per-thread full-matrix copies."
+        ),
+        consumers => eprintln!(
+            "> Using bounded RAM accumulator: {consumers} dense consumers, the first adding into one shared exact cell and count matrix and each other into a private matrix merged when the stream ends."
+        ),
+    }
+    eprintln!(
+        "> Bounded plan: {} budget, {} floor ({} of it the score plan's tables), {} already resident beyond the plan, {} of input rows read through a memory map, {} per private dense consumer.",
+        format_bytes(budget.max_ram_bytes()),
+        format_bytes(plan.floor),
+        format_bytes(plan.csr),
+        format_bytes(plan.resident),
+        format_bytes(plan.mapped),
+        format_bytes(plan.private)
+    );
+    Ok(())
+}
+
+/// Adds a consumer's private cells and counts into the shared accumulator. Lanes add with
+/// wrapping arithmetic: a lane of a partial sum is exact modulo 2^64 as the shared lane is, and
+/// the plan bounds the lane's total over every row, so the merged lane is that exact total
+/// whichever consumer added which rows.
+fn merge_bounded_cells(
+    accumulator: &Mutex<(Vec<i64>, Vec<u32>)>,
+    cells: Vec<i64>,
+    counts: Vec<u32>,
+) -> Result<(), PipelineError> {
+    let mut locked = accumulator.lock().map_err(|_| {
+        PipelineError::Compute("Bounded accumulator lock was poisoned.".to_string())
+    })?;
+    let (scores, missing) = &mut *locked;
+    scores
+        .par_iter_mut()
+        .zip(cells)
+        .for_each(|(m, p)| *m = m.wrapping_add(p));
+    missing
+        .par_iter_mut()
+        .zip(counts)
+        .for_each(|(m, p)| *m += p);
+    Ok(())
+}
+
+/// Where a bounded dense consumer adds its batches: the shared cells, under their lock, or
+/// private cells it allocates at its first batch.
+enum DenseCells<'a> {
+    Shared(&'a Mutex<(Vec<i64>, Vec<u32>)>),
+    Private(Option<(Vec<i64>, Vec<u32>)>),
+}
+
+/// Scores a dense stream's batches into `cells`, each batch's rows concatenated and every buffer
+/// back in the pool first, so I/O overlaps compute. Shared and private consumers score through
+/// this one call of the kernel.
+fn consume_dense_batches(
+    rx: Receiver<Result<WorkItem, PipelineError>>,
+    context: &PipelineContext,
+    buffer_pool: &io::RowBufferPool,
+    batch_size: usize,
+    cells: &mut DenseCells<'_>,
+) -> Result<(), PipelineError> {
+    let prep_result = &context.prep_result;
     let mut concatenated_data = Vec::new();
+    let mut reconciled_indices = Vec::new();
     let mut scratch = DenseScratch::default();
 
-    for batch_result in &mut batch_iterator {
+    for batch_result in ChannelBatcher::new(rx, batch_size) {
         let batch = batch_result?;
         if batch.is_empty() {
             continue;
         }
 
-        let reconciled_indices: Vec<ReconciledVariantIndex> =
-            batch.iter().map(|wi| wi.reconciled_variant_index).collect();
+        reconciled_indices.clear();
+        reconciled_indices.extend(batch.iter().map(|wi| wi.reconciled_variant_index));
         concatenated_data.clear();
         let needed_len = batch
             .len()
@@ -2225,13 +2813,27 @@ fn process_dense_stream_bounded(
             concatenated_data.extend_from_slice(&wi.data);
             drop(BufferGuard {
                 buffer: Some(wi.data),
-                pool: &buffer_pool,
+                pool: buffer_pool,
             });
         }
-        let mut locked = accumulator.lock().map_err(|_| {
-            PipelineError::Compute("Bounded accumulator lock was poisoned.".to_string())
-        })?;
-        let (scores, counts) = &mut *locked;
+        let mut shared = None;
+        let (scores, counts) = match cells {
+            DenseCells::Shared(accumulator) => {
+                let locked = shared.insert(accumulator.lock().map_err(|_| {
+                    PipelineError::Compute("Bounded accumulator lock was poisoned.".to_string())
+                })?);
+                let (scores, counts) = &mut **locked;
+                (scores, counts)
+            }
+            DenseCells::Private(private) => {
+                let owned = match private.take() {
+                    Some(owned) => owned,
+                    None => initialize_cells(prep_result)?,
+                };
+                let (scores, counts) = private.insert(owned);
+                (scores, counts)
+            }
+        };
         batch::run_dense_batch(
             &concatenated_data,
             &reconciled_indices,
@@ -2243,7 +2845,7 @@ fn process_dense_stream_bounded(
         )?;
     }
 
-    Ok((Vec::new(), Vec::new()))
+    Ok(())
 }
 
 fn bounded_dense_batch_size(
@@ -2276,10 +2878,88 @@ fn dense_scratch_bytes(prep: &PreparationResult, variants: usize) -> Result<usiz
     .ok_or_else(|| PipelineError::Compute("Dense scoring scratch size overflow.".into()))
 }
 
+/// The memory this process already holds beyond the plan the floor counts. The budget is read
+/// after preparation, so what preparation left resident is not in its free memory but counts
+/// toward the peak. The CSR is resident too, and the floor already charges it at the bytes it
+/// holds.
+fn held_beyond_plan(prep: &PreparationResult, budget: MemoryBudget) -> usize {
+    budget
+        .resident_bytes()
+        .saturating_sub(prep.csr_heap_bytes())
+}
+
+/// What a run's input sources add to its memory: the rows it reads through memory maps, and
+/// whether some source reads through a planned prefetch window instead, which a source that
+/// serves its rows from a map never allocates.
+#[derive(Clone, Copy, Debug)]
+struct InputCharge {
+    mapped: usize,
+    prefetch: bool,
+}
+
+impl InputCharge {
+    /// Before the sources open: no mapped rows, and room for a prefetch window.
+    const UNOPENED: Self = Self {
+        mapped: 0,
+        prefetch: true,
+    };
+
+    fn of(prep: &PreparationResult, sources: &[io::BedSource]) -> Self {
+        Self {
+            mapped: mapped_row_bytes(prep, sources),
+            prefetch: sources.iter().any(|source| source.mapped_rows().is_none()),
+        }
+    }
+}
+
+/// The input bytes a run reads through memory maps: the rows it needs, at most the length of the
+/// sources that serve reads from a map. Touched mapped pages count toward the process's resident
+/// memory, and the budget, read before any row is, does not charge them.
+fn mapped_row_bytes(prep: &PreparationResult, sources: &[io::BedSource]) -> usize {
+    let mapped = sources
+        .iter()
+        .filter(|source| source.mapped_rows().is_some())
+        .fold(0u64, |total, source| total.saturating_add(source.len()));
+    let needed = u64::try_from(prep.required_bim_indices.len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(prep.bytes_per_variant);
+    usize::try_from(needed.min(mapped)).unwrap_or(usize::MAX)
+}
+
+/// Refuses a run whose floor, held memory and mapped input rows together exceed the budget, the
+/// same charge the bounded plan makes before it adds any consumer. Until the run's sources are
+/// open, `input` maps no rows and leaves room for a prefetch window.
 fn ensure_memory_floor(
     prep: &PreparationResult,
     budget: MemoryBudget,
+    input: InputCharge,
 ) -> Result<(), PipelineError> {
+    let floor = memory_floor_bytes(prep, budget, input)?;
+    let held = held_beyond_plan(prep, budget);
+    let required = floor.saturating_add(held).saturating_add(input.mapped);
+    if required > budget.max_ram_bytes() {
+        return Err(PipelineError::Compute(format!(
+            "Scoring requires at least {} for {} people and {} scores ({} to score, {} this process already holds and {} of input rows read through a memory map), exceeding the {} memory budget even with bounded accumulation. Reduce the kept cohort or score panel.",
+            format_bytes(required),
+            prep.num_people_to_score,
+            prep.score_names.len(),
+            format_bytes(floor),
+            format_bytes(held),
+            format_bytes(input.mapped),
+            format_bytes(budget.max_ram_bytes())
+        )));
+    }
+    Ok(())
+}
+
+/// The least memory scoring needs: one output, the CSR at the bytes it holds, the I/O buffers,
+/// the local prefetch window when a source may read through one, one dense consumer's batch
+/// scratch and the stacks of the threads scoring starts.
+fn memory_floor_bytes(
+    prep: &PreparationResult,
+    budget: MemoryBudget,
+    input: InputCharge,
+) -> Result<usize, PipelineError> {
     let output = result_bytes(prep)?;
     let row = usize::try_from(prep.bytes_per_variant)
         .map_err(|_| PipelineError::Compute("PLINK row width overflow.".into()))?;
@@ -2294,21 +2974,29 @@ fn ensure_memory_floor(
     } else {
         dense_scratch_bytes(prep, bounded_dense_batch_size(prep, budget)?)?
     };
-    let required = csr_bytes(prep)
-        .ok()
-        .and_then(|csr| output.checked_add(csr))
+    let prefetch = if input.prefetch {
+        io::local_prefetch_budget(prep, budget)
+    } else {
+        0
+    };
+    output
+        .checked_add(prep.csr_heap_bytes())
         .and_then(|v| v.checked_add(row.checked_mul(buffers)?))
         .and_then(|v| v.checked_add(scratch))
-        .and_then(|v| v.checked_add(io::local_prefetch_budget(prep, budget)))
-        .ok_or_else(|| PipelineError::Compute("Minimum scoring memory size overflow.".into()))?;
-    if required > budget.max_ram_bytes() {
-        return Err(PipelineError::Compute(format!(
-            "Scoring requires at least {} for {} people and {} scores, exceeding the {} memory budget even with bounded accumulation. Reduce the kept cohort or score panel.",
-            format_bytes(required),
-            prep.num_people_to_score,
-            prep.score_names.len(),
-            format_bytes(budget.max_ram_bytes())
-        )));
-    }
-    Ok(())
+        .and_then(|v| v.checked_add(prefetch))
+        .and_then(|v| v.checked_add(SCORING_THREADS.checked_mul(thread_stack_bytes())?))
+        .ok_or_else(|| PipelineError::Compute("Minimum scoring memory size overflow.".into()))
+}
+
+/// The threads every scoring run starts after the budget is read: the producer and the progress
+/// monitor. Each private dense consumer is one more.
+const SCORING_THREADS: usize = 2;
+
+/// The stack a thread scoring starts may touch: std's default for a spawned thread, 2 MiB, or
+/// `RUST_MIN_STACK` when it is set. Its pages count toward the peak like any other.
+fn thread_stack_bytes() -> usize {
+    std::env::var("RUST_MIN_STACK")
+        .ok()
+        .and_then(|bytes| bytes.parse().ok())
+        .unwrap_or(2 << 20)
 }

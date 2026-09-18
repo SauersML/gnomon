@@ -630,6 +630,31 @@ impl ExactPlan {
         (self.weights[entry], self.flags[entry] & FLIPPED != 0)
     }
 
+    /// The bytes this plan holds on the heap: its per-entry vectors at their capacity, the wide
+    /// weights' buckets and control bytes, and each score's bands.
+    pub fn heap_bytes(&self) -> usize {
+        let wide = match self.wide.capacity() {
+            0 => 0,
+            capacity => (capacity + 1)
+                .saturating_mul(8)
+                .div_ceil(7)
+                .next_power_of_two()
+                .saturating_mul(std::mem::size_of::<(usize, i128)>() + 1)
+                .saturating_add(16),
+        };
+        let bands = self
+            .scores
+            .iter()
+            .map(|score| score.bands.capacity() * std::mem::size_of::<Band>())
+            .sum::<usize>();
+        (self.weights.capacity() * std::mem::size_of::<i64>())
+            .saturating_add(wide)
+            .saturating_add(self.flags.capacity())
+            .saturating_add(self.entry_band.capacity())
+            .saturating_add(self.scores.capacity() * std::mem::size_of::<ScoreArithmetic>())
+            .saturating_add(bands)
+    }
+
     #[inline(always)]
     fn weight(&self, entry: usize) -> i128 {
         match self.weights[entry] {

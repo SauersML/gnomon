@@ -331,6 +331,14 @@ impl PreparationResult {
         &self.sparse_row_offsets
     }
 
+    /// The bytes the CSR holds on the heap: the exact plan, the columns and the row offsets.
+    pub fn csr_heap_bytes(&self) -> usize {
+        self.exact
+            .heap_bytes()
+            .saturating_add(self.sparse_score_columns.capacity() * std::mem::size_of::<u32>())
+            .saturating_add(self.sparse_row_offsets.capacity() * std::mem::size_of::<u64>())
+    }
+
     #[inline(always)]
     pub fn sparse_row_range(&self, variant_idx: ReconciledVariantIndex) -> std::ops::Range<usize> {
         let idx = variant_idx.0 as usize;

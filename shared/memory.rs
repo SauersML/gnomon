@@ -40,6 +40,37 @@ pub fn memory_bytes() -> (u64, u64) {
     host
 }
 
+/// This process's resident memory in bytes, or 0 when it cannot be read.
+///
+/// A budget read after preparation plans only what comes next, but the memory preparation left
+/// resident still counts toward the process's peak; a plan that fills its budget charges it.
+pub fn resident_bytes() -> u64 {
+    let pid = sysinfo::Pid::from_u32(std::process::id());
+    let mut system = System::new();
+    if !system.refresh_process(pid) {
+        return 0;
+    }
+    system.process(pid).map_or(0, sysinfo::Process::memory)
+}
+
+/// Returns the pages the allocator holds free to the system (glibc `malloc_trim`).
+///
+/// glibc keeps freed memory resident, in amounts that depend on allocation order and on how many
+/// threads allocated: after the same preparation of 50,000 people and 512 scores, one run held
+/// 172 MiB at the budget line and another 324 MiB. A resident reading taken after this counts
+/// what the process holds.
+pub fn release_free_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+}
+
 /// Why [`cgroup_bounds`] could not bound this process.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
