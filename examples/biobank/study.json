@@ -39,10 +39,10 @@
   "compute": {
     "total_threads": null,
     "threads": {
-      "ours": {"binary": 4, "survival": 4},
-      "competitor": {"binary": 1, "survival": 1},
-      "predict": 2,
-      "evaluate": 1
+      "fit": {"binary": {"ours": 4, "shipped": 4, "default": 1},
+              "survival": {"ours": 8, "shipped": 8, "shared": 2, "default": 2}},
+      "predict": {"binary": {"default": 1}, "survival": {"ours": 4, "shipped": 4, "default": 1}},
+      "evaluate": {"binary": {"default": 1}, "survival": {"default": 1}}
     },
     "job_timeout_seconds": 900,
     "scoring_timeout_seconds": 600,

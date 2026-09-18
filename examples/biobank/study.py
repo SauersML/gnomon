@@ -566,8 +566,14 @@ class Study:
             groups[axis] = chosen
         return groups
 
+    def budget(self, stage, kind, variant):
+        """A job's thread budget from study.json compute.threads[stage][kind]: the
+        variant's own entry ("shared" for the shared competing fits), else
+        "default". The speed lanes tune these without code changes."""
+        table = self.config["compute"]["threads"][stage][kind]
+        return int(table.get(variant, table["default"]))
+
     def stage_fits(self):
-        threads = self.config["compute"]["threads"]
         jobs, scheduled = [], set()
         for disease in self.diseases:
             slug = disease.slug
@@ -576,7 +582,7 @@ class Study:
                 plan = [("shared", c) for c in self.shared_components(kind)]
                 plan += [(v, c) for v in self.variants(kind) for c in self.own_components(kind, v)]
                 for variant, component in plan:
-                    ours = variant in ("ours", "shared")
+                    threads = self.budget("fit", kind, variant)
                     for fit in self.fits(slug, kind, None if variant == "shared" else variant):
                         step = self.fit_step(slug, kind, variant, fit, component)
                         if self.checkpoint.done(step):
@@ -585,38 +591,44 @@ class Study:
                         reuse = fit != "pooled" and self.config["logo"].get("reuse_pooled", False)
                         self.checkpoint.begin(step)
                         scheduled.add(step)
-                        # Longest first: our model, survival, pooled, most rows.
-                        priority = rows * (8 if ours else 1) * (2 if kind == "survival" else 1) \
-                            * (2 if fit == "pooled" else 1)
+                        # Longest first: the budget stands for the fit's cost (marginal
+                        # slope over location-scale and competitors), then survival,
+                        # pooled over LOGO, and more rows.
+                        priority = rows * threads * (2 if kind == "survival" else 1) * (2 if fit == "pooled" else 1)
                         jobs.append(self.job(step, {
                             "type": "fit", "disease": slug, "kind": kind, "variant": variant, "fit": fit,
                             "component": component, "frame": f"features/{slug}/{kind}.parquet",
                             "reference": pooled if reuse else None,
-                        }, threads["ours" if ours else "competitor"][kind], priority,
-                            deps=[pooled] if reuse and pooled in scheduled else ()))
+                        }, threads, priority, deps=[pooled] if reuse and pooled in scheduled else ()))
         self.pool(jobs, "fits", "fit.json")
 
     def fit_ok(self, slug, kind, variant, fit):
         return all(read_json(self.path(step) / "fit.json")["status"] == "ok"
                    for step in self.model_dirs(slug, kind, variant, fit).values())
 
+    def predict_step(self, slug, kind, variant, fit):
+        return f"predict/{slug}/{kind}/{variant}/{fit_slug(fit)}"
+
     def stage_predict(self):
+        """One job per fitted model: it predicts that model's rows once, every
+        horizon in one call, and evaluation reuses the saved arrays (a survival
+        marginal-slope prediction is the costliest step per row)."""
         jobs = []
         for disease in self.diseases:
             for kind in KINDS:
+                rows = read_json(self.path(f"features/{disease.slug}") / "plan.json")[kind]["test_rows"]
                 for variant in self.variants(kind):
-                    step = f"predict/{disease.slug}/{kind}/{variant}"
-                    if self.checkpoint.done(step):
-                        continue
-                    fits = {fit: self.model_dirs(disease.slug, kind, variant, fit)
-                            for fit in self.fits(disease.slug, kind, variant)
-                            if self.fit_ok(disease.slug, kind, variant, fit)}
-                    self.checkpoint.begin(step)
-                    jobs.append(self.job(step, {"type": "predict", "disease": disease.slug, "kind": kind,
-                                                "variant": variant, "fits": fits,
-                                                "frame": f"features/{disease.slug}/{kind}.parquet"},
-                                         self.config["compute"]["threads"]["predict"],
-                                         priority=len(fits) * (4 if variant == "ours" else 1)))
+                    threads = self.budget("predict", kind, variant)
+                    for fit in self.fits(disease.slug, kind, variant):
+                        step = self.predict_step(disease.slug, kind, variant, fit)
+                        if self.checkpoint.done(step) or not self.fit_ok(disease.slug, kind, variant, fit):
+                            continue
+                        self.checkpoint.begin(step)
+                        jobs.append(self.job(step, {"type": "predict", "disease": disease.slug, "kind": kind,
+                                                    "variant": variant, "fit": fit,
+                                                    "models": self.model_dirs(disease.slug, kind, variant, fit),
+                                                    "frame": f"features/{disease.slug}/{kind}.parquet"},
+                                             threads, priority=threads * (rows if fit == "pooled" else rows / 4)))
         self.pool(jobs, "predict", "predict.json")
 
     def stage_evaluate(self):
@@ -629,11 +641,18 @@ class Study:
                 step = f"evaluate/{disease.slug}/{kind}"
                 if self.checkpoint.done(step):
                     continue
+                predictions = {}
+                for variant in self.variants(kind):
+                    for fit in self.fits(disease.slug, kind, variant):
+                        step_ = self.predict_step(disease.slug, kind, variant, fit)
+                        record = self.path(step_) / "predict.json"
+                        if record.is_file() and read_json(record)["status"] == "ok":
+                            predictions.setdefault(variant, {})[fit] = step_
                 self.checkpoint.begin(step)
                 jobs.append(self.job(step, {"type": "evaluate", "disease": disease.slug, "kind": kind,
-                                            "variants": self.variants(kind),
+                                            "predictions": predictions,
                                             "frame": f"features/{disease.slug}/{kind}.parquet"},
-                                     self.config["compute"]["threads"]["evaluate"],
+                                     self.budget("evaluate", kind, "default"),
                                      priority=2 if kind == "survival" else 1))
         self.pool(jobs, "evaluate", "evaluate.json")
 
@@ -732,12 +751,14 @@ class Study:
                         rows.append({"scope": "fit_failures", "item": f"{disease.slug}.{kind}.{variant}.{component}",
                                      **{digest.label(name): count for name, count in categories.items()}})
                 for variant in self.variants(kind):
-                    record = read_json(self.path(f"predict/{disease.slug}/{kind}/{variant}") / "predict.json")
-                    outcomes = list(record.get("fits", {}).values())
+                    records = [read_json(self.path(self.predict_step(disease.slug, kind, variant, fit)) / "predict.json")
+                               for fit in self.fits(disease.slug, kind, variant)
+                               if (self.path(self.predict_step(disease.slug, kind, variant, fit)) / "predict.json").is_file()]
+                    seconds = sorted(r.get("predict_seconds", r["wall_seconds"]) for r in records) or [0.0]
                     rows.append({"scope": "predict", "item": f"{disease.slug}.{kind}.{variant}",
-                                 "status": record["status"], "wall_seconds": record["wall_seconds"],
-                                 "ok": sum(o["status"] == "ok" for o in outcomes),
-                                 "failed": sum(o["status"] != "ok" for o in outcomes)})
+                                 "ok": sum(r["status"] == "ok" for r in records),
+                                 "failed": sum(r["status"] != "ok" for r in records),
+                                 "max_seconds": seconds[-1], "cpu_seconds": round(sum(r["cpu_seconds"] for r in records), 1)})
                 record = read_json(self.path(f"evaluate/{disease.slug}/{kind}") / "evaluate.json")
                 rows.append({"scope": "evaluate", "item": f"{disease.slug}.{kind}", "status": record["status"],
                              "category": record.get("category", "none"), "wall_seconds": record["wall_seconds"]})
@@ -872,40 +893,30 @@ def verify_provenance(frame, fit, record):
 
 
 def run_predict(spec, config, models):
-    """Every fit of one disease, model and variant predicts its outer-test rows
-    from the saved models, as a deployment would; all arrays go in one file."""
+    """One fitted model predicts its rows (outer test; LOGO: its held-out
+    group's outer test) from its saved components, as a deployment would, every
+    horizon in one call. Evaluation reuses these arrays and never predicts."""
     root = Path(spec["root"])
     out = root / spec["step"]
-    kind, variant = spec["kind"], spec["variant"]
+    kind, variant, fit = spec["kind"], spec["variant"], spec["fit"]
     frame = load_frame(root / spec["frame"])
     test = frame.loc[frame.test].reset_index(drop=True)
     horizons = spec["horizons"]
-    record, arrays = {"status": "ok", "fits": {}}, {}
-    for fit, steps in spec["fits"].items():
-        started = time.perf_counter()
-        try:
-            standardizations = [verify_provenance(frame, fit, read_json(root / step / "fit.json"))
-                                for step in steps.values()]
-            index = np.flatnonzero(held_out(test, fit) if fit != "pooled" else np.ones(len(test), dtype=bool))
-            data = model_frame(test.iloc[index], kind, standardizations[0], predict=True)
-            prediction = models.predict(kind, variant, {c: root / s for c, s in steps.items()}, data,
-                                        config["models"].get(kind, {}), horizons)
-            risk = np.asarray(prediction["risk"], dtype=float)
-            shape = (len(index),) if kind == "binary" else (len(index), len(horizons))
-            if risk.shape != shape or not np.isfinite(risk).all() or (risk < 0).any() or (risk > 1).any():
-                raise ValueError("predicted risks must be finite probabilities of the expected shape")
-        except Exception as error:
-            text = traceback.format_exc()
-            print(text, flush=True)
-            record["fits"][fit] = {"status": "error", "category": failure_category(text.encode())}
-            print(f"study_predict_failed {fit} {type(error).__name__}", flush=True)
-            continue
-        arrays[f"{fit_slug(fit)}__index"] = index
-        for name, value in prediction.items():
-            arrays[f"{fit_slug(fit)}__{name}"] = np.asarray(value, dtype=float)
-        record["fits"][fit] = {"status": "ok", "seconds": round(time.perf_counter() - started, 3)}
-    np.savez(out / "predictions.npz", **arrays)
-    write_json(out / "predict.json", record)
+    standardizations = [verify_provenance(frame, fit, read_json(root / step / "fit.json"))
+                        for step in spec["models"].values()]
+    index = np.flatnonzero(held_out(test, fit) if fit != "pooled" else np.ones(len(test), dtype=bool))
+    data = model_frame(test.iloc[index], kind, standardizations[0], predict=True)
+    started = time.perf_counter()
+    prediction = models.predict(kind, variant, {c: root / s for c, s in spec["models"].items()}, data,
+                                config["models"].get(kind, {}), horizons)
+    seconds = time.perf_counter() - started
+    risk = np.asarray(prediction["risk"], dtype=float)
+    shape = (len(index),) if kind == "binary" else (len(index), len(horizons))
+    if risk.shape != shape or not np.isfinite(risk).all() or (risk < 0).any() or (risk > 1).any():
+        raise ValueError("predicted risks must be finite probabilities of the expected shape")
+    np.savez(out / "predictions.npz", index=index,
+             **{name: np.asarray(value, dtype=float) for name, value in prediction.items()})
+    write_json(out / "predict.json", {"status": "ok", "predict_seconds": round(seconds, 3), "rows": int(len(index))})
 
 
 def run_evaluate(spec, config, models):
@@ -923,22 +934,17 @@ def run_evaluate(spec, config, models):
                                           on="person_id", how="left", validate="one_to_one")
     horizons = spec["horizons"]
     shape = (len(test),) if kind == "binary" else (len(test), len(horizons))
+    # Every model's saved prediction, predicted once: pooled over all outer-test
+    # rows, a LOGO fit over its held-out group's.
     predictions, slopes = {}, {}
-    for variant in spec["variants"]:
-        directory = root / f"predict/{spec['disease']}/{kind}/{variant}"
-        record = read_json(directory / "predict.json")
-        if record["status"] != "ok":
-            continue
-        saved = np.load(directory / "predictions.npz")
-        for fit, outcome in record["fits"].items():
-            if outcome["status"] != "ok":
-                continue
-            index = saved[f"{fit_slug(fit)}__index"]
+    for variant, fits in spec["predictions"].items():
+        for fit, step in fits.items():
+            saved = np.load(root / step / "predictions.npz")
             predictions[(variant, fit)] = np.full(shape, np.nan)
-            predictions[(variant, fit)][index] = saved[f"{fit_slug(fit)}__risk"]
-            if f"{fit_slug(fit)}__slope" in saved:
+            predictions[(variant, fit)][saved["index"]] = saved["risk"]
+            if "slope" in saved:
                 slopes[(variant, fit)] = np.full(len(test), np.nan)
-                slopes[(variant, fit)][index] = saved[f"{fit_slug(fit)}__slope"]
+                slopes[(variant, fit)][saved["index"]] = saved["slope"]
     # Per-person slopes (d probit risk / dz) feed slope recovery where evaluate takes them.
     extra = {"slopes": slopes} if slopes and "slopes" in inspect.signature(evaluate.evaluate).parameters else {}
     rows = evaluate.evaluate(kind, test, predictions, horizons, config, train=train, truth=truth, **extra)
