@@ -6,7 +6,8 @@ use std::io::{self, Write};
 use gam::probability::normal_cdf;
 use ndarray::Array1;
 
-use crate::calibrate::model::LinkFunction;
+use crate::calibrate::model::{LinkFunction, SurvivalPrediction};
+use crate::calibrate::survival_data::SurvivalPredictionData;
 
 /// Columns of the binary table. calibrate's binary model is gam's Bernoulli
 /// marginal-slope fit, whose mean is `Φ(η)` whichever binary link the
@@ -17,6 +18,9 @@ pub const BINARY_PREDICTION_HEADER: &str = "sample_id\thull_signed_distance\tpro
 /// Columns of the continuous (Gaussian location-scale) table.
 pub const CONTINUOUS_PREDICTION_HEADER: &str =
     "sample_id\thull_signed_distance\tprediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95";
+
+/// Columns of the survival table.
+pub const SURVIVAL_PREDICTION_HEADER: &str = "sample_id\tage_entry\tage_exit\tcumulative_hazard_entry\tcumulative_hazard_exit\tcumulative_incidence_entry\tcumulative_incidence_exit\tconditional_risk\tlogit_risk\tlogit_risk_standard_error";
 
 const Z_975: f64 = 1.959964;
 
@@ -87,6 +91,38 @@ pub fn write_predictions(
                 &[sample_id, &signed_distance[index], &mean[index], &se, &lower, &upper],
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Writes the survival prediction table: one row per sample, under its
+/// identifier, in input order.
+pub fn write_survival_predictions(
+    out: &mut impl Write,
+    data: &SurvivalPredictionData,
+    prediction: &SurvivalPrediction,
+) -> io::Result<()> {
+    writeln!(out, "{SURVIVAL_PREDICTION_HEADER}")?;
+    for index in 0..prediction.conditional_risk.len() {
+        let se = prediction
+            .logit_risk_se
+            .as_ref()
+            .map_or_else(|| "NA".to_string(), |values| values[index].to_string());
+        write_row(
+            out,
+            &[
+                &data.sample_ids[index] as &dyn Display,
+                &data.age_entry[index],
+                &data.age_exit[index],
+                &prediction.cumulative_hazard_entry[index],
+                &prediction.cumulative_hazard_exit[index],
+                &prediction.cumulative_incidence_entry[index],
+                &prediction.cumulative_incidence_exit[index],
+                &prediction.conditional_risk[index],
+                &prediction.logit_risk[index],
+                &se,
+            ],
+        )?;
     }
     Ok(())
 }

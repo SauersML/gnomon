@@ -51,6 +51,9 @@ pub struct SurvivalTrainingBundle {
 /// Owned arrays backing `SurvivalPredictionInputs` alongside the raw covariates.
 #[derive(Debug)]
 pub struct SurvivalPredictionData {
+    /// Each row's identifier: the `sample_id` column exactly as written, or the row
+    /// number from 1 when the file has none.
+    pub sample_ids: Vec<String>,
     pub age_entry: Array1<f64>,
     pub age_exit: Array1<f64>,
     pub event_target: Array1<u8>,
@@ -118,7 +121,7 @@ pub fn load_survival_training_data(
     path: &str,
     num_pcs: usize,
 ) -> Result<SurvivalTrainingBundle, SurvivalDataError> {
-    let arrays = read_survival_arrays(path, num_pcs)?;
+    let arrays = read_survival_arrays(path, num_pcs, false)?;
 
     validate_survival_inputs(
         arrays.age_entry.view(),
@@ -158,7 +161,7 @@ pub fn load_survival_prediction_data(
     path: &str,
     num_pcs: usize,
 ) -> Result<SurvivalPredictionData, SurvivalDataError> {
-    let arrays = read_survival_arrays(path, num_pcs)?;
+    let arrays = read_survival_arrays(path, num_pcs, true)?;
 
     validate_survival_inputs(
         arrays.age_entry.view(),
@@ -173,6 +176,7 @@ pub fn load_survival_prediction_data(
     )?;
 
     Ok(SurvivalPredictionData {
+        sample_ids: arrays.sample_ids,
         age_entry: arrays.age_entry,
         age_exit: arrays.age_exit,
         event_target: arrays.event_target,
@@ -286,6 +290,8 @@ pub fn load_survival_prediction_covariates(
 
 #[derive(Debug)]
 struct SurvivalArrays {
+    /// Empty unless the caller asked for identifiers.
+    sample_ids: Vec<String>,
     age_entry: Array1<f64>,
     age_exit: Array1<f64>,
     event_target: Array1<u8>,
@@ -307,7 +313,12 @@ fn reject_extra_covariates(df: &DataFrame, used_columns: &HashSet<String>) -> Re
     Ok(())
 }
 
-fn read_survival_arrays(path: &str, num_pcs: usize) -> Result<SurvivalArrays, SurvivalDataError> {
+/// `identifiers` reads the `sample_id` column; training leaves it unread.
+fn read_survival_arrays(
+    path: &str,
+    num_pcs: usize,
+    identifiers: bool,
+) -> Result<SurvivalArrays, SurvivalDataError> {
     let df = read_tabular(path)?;
     let name_map = build_case_insensitive_map(
         df.get_column_names()
@@ -384,8 +395,14 @@ fn read_survival_arrays(path: &str, num_pcs: usize) -> Result<SurvivalArrays, Su
     }
 
     reject_extra_covariates(&df, &used_columns)?;
+    let sample_ids = if identifiers {
+        extract_sample_ids(&df, &name_map)?
+    } else {
+        Vec::new()
+    };
 
     Ok(SurvivalArrays {
+        sample_ids,
         age_entry,
         age_exit,
         event_target,
@@ -397,6 +414,30 @@ fn read_survival_arrays(path: &str, num_pcs: usize) -> Result<SurvivalArrays, Su
         extra_static_covariates: Array2::zeros((n, 0)),
         extra_static_names: Vec::new(),
     })
+}
+
+/// The rows' identifiers: the `sample_id` column (any case) exactly as written, or row
+/// numbers from 1 when the file has none.
+fn extract_sample_ids(
+    df: &DataFrame,
+    name_map: &HashMap<String, String>,
+) -> Result<Vec<String>, SurvivalDataError> {
+    let Some(actual) = name_map.get("sample_id") else {
+        return Ok((1..=df.height()).map(|row| row.to_string()).collect());
+    };
+    let column = df.column(actual)?.cast(&DataType::String)?;
+    if column.null_count() > 0 {
+        return Err(SurvivalDataError::MissingValues(actual.clone()));
+    }
+    Ok(column.str()?.into_no_null_iter().map(str::to_owned).collect())
+}
+
+/// The header fields of a tab-separated file.
+fn tsv_header(path: &Path) -> Result<Vec<String>, SurvivalDataError> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::BufReader::new(File::open(path)?).read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\n', '\r']).split('\t').map(str::to_string).collect())
 }
 
 fn read_tabular(path: &str) -> Result<DataFrame, SurvivalDataError> {
@@ -414,9 +455,17 @@ fn read_tabular(path: &str) -> Result<DataFrame, SurvivalDataError> {
                 .map_err(SurvivalDataError::from)
         }
         _ => {
+            // Identifiers are read as text, so 000123 keeps its zeros.
+            let mut schema = Schema::with_capacity(1);
+            if let Some(name) =
+                tsv_header(path)?.into_iter().find(|name| name.eq_ignore_ascii_case("sample_id"))
+            {
+                schema.with_column(name.into(), DataType::String);
+            }
             let file = File::open(path)?;
             CsvReadOptions::default()
                 .with_has_header(true)
+                .with_schema_overwrite(Some(std::sync::Arc::new(schema)))
                 .map_parse_options(|options| options.with_separator(b'\t'))
                 .into_reader_with_file_handle(file)
                 .finish()
@@ -615,5 +664,45 @@ mod tests {
             SurvivalDataError::Validation(SurvivalError::ConflictingEvents) => {}
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn survival_predictions_keep_each_rows_sample_id() {
+        use crate::calibrate::model::SurvivalPrediction;
+        use crate::calibrate::output::write_survival_predictions;
+
+        let ids = ["000123", "sample-A", "9007199254740993"];
+        let mut df = sample_dataframe();
+        df.with_column(Series::new("Sample_ID".into(), ids.to_vec())).expect("add identifiers");
+        let file = write_tsv(&df);
+        let data = load_survival_prediction_data(file.path().to_str().expect("path"), 2)
+            .expect("load prediction data");
+        assert_eq!(data.sample_ids, ids);
+
+        let risks = Array1::from(vec![0.1, 0.2, 0.3]);
+        let prediction = SurvivalPrediction {
+            cumulative_hazard_entry: risks.clone(),
+            cumulative_hazard_exit: risks.clone(),
+            cumulative_incidence_entry: risks.clone(),
+            cumulative_incidence_exit: risks.clone(),
+            conditional_risk: risks.clone(),
+            logit_risk: risks,
+            logit_risk_se: None,
+            logit_risk_design: None,
+        };
+        let mut table = Vec::new();
+        write_survival_predictions(&mut table, &data, &prediction).expect("write the table");
+        let table = String::from_utf8(table).expect("utf-8");
+        let written: Vec<&str> = table
+            .lines()
+            .skip(1)
+            .map(|line| line.split('\t').next().unwrap_or(""))
+            .collect();
+        assert_eq!(written, ids);
+
+        let unnamed = write_tsv(&sample_dataframe());
+        let data = load_survival_prediction_data(unnamed.path().to_str().expect("path"), 2)
+            .expect("load prediction data without identifiers");
+        assert_eq!(data.sample_ids, ["1", "2", "3"]);
     }
 }

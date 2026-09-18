@@ -11,14 +11,12 @@ use gnomon::calibrate::data::{detect_link_function, load_prediction_data, load_t
 use gnomon::calibrate::estimate::{train_model, train_survival_model};
 use gnomon::calibrate::model::{BasisConfig, SmoothConfig};
 use gnomon::calibrate::model::SurvivalModelConfig;
-use gnomon::calibrate::model::SurvivalPrediction;
 use gnomon::calibrate::model::SurvivalRiskType;
 use gnomon::calibrate::model::SurvivalTimeWiggleConfig;
 use gnomon::calibrate::model::{LatentLaw, ModelConfig, ModelFamily, TrainedModel};
-use gnomon::calibrate::output::write_predictions;
+use gnomon::calibrate::output::{write_predictions, write_survival_predictions};
 use gnomon::calibrate::survival_data::{
-    SurvivalPredictionData, has_survival_columns, load_survival_prediction_data,
-    load_survival_training_data,
+    has_survival_columns, load_survival_prediction_data, load_survival_training_data,
 };
 use gnomon::map::LdWindow;
 use gnomon::map::main as map_cli;
@@ -1044,7 +1042,11 @@ fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
             )?;
 
             let output_path = "predictions.tsv";
-            save_survival_predictions(output_path, &data, &prediction)?;
+            write_survival_predictions(
+                &mut std::fs::File::create(output_path)?,
+                &data,
+                &prediction,
+            )?;
             println!("Predictions saved to: {output_path}");
         }
     }
@@ -1060,75 +1062,6 @@ fn calculate_range(data: ArrayView1<f64>) -> (f64, f64) {
         .iter()
         .fold(f64::NEG_INFINITY, |acc, &value| acc.max(value));
     (min_val, max_val)
-}
-
-fn write_tsv_row(
-    file: &mut std::fs::File,
-    base_fields: &[&dyn std::fmt::Display],
-    uncalibrated: Option<&dyn std::fmt::Display>,
-    tail_fields: &[&dyn std::fmt::Display],
-) -> Result<(), std::io::Error> {
-    use std::io::Write;
-
-    let mut first = true;
-    for field in base_fields {
-        if !first {
-            write!(file, "\t")?;
-        }
-        write!(file, "{field}")?;
-        first = false;
-    }
-    if let Some(uncalibrated_value) = uncalibrated {
-        write!(file, "\t{uncalibrated_value}")?;
-    }
-    for field in tail_fields {
-        write!(file, "\t{field}")?;
-    }
-    writeln!(file)?;
-    Ok(())
-}
-
-fn save_survival_predictions(
-    output_path: &str,
-    data: &SurvivalPredictionData,
-    prediction: &SurvivalPrediction,
-) -> Result<(), std::io::Error> {
-    use std::io::Write;
-
-    let mut file = std::fs::File::create(output_path)?;
-    writeln!(
-        file,
-        "sample_id\tage_entry\tage_exit\tcumulative_hazard_entry\tcumulative_hazard_exit\tcumulative_incidence_entry\tcumulative_incidence_exit\tconditional_risk\tlogit_risk\tlogit_risk_standard_error"
-    )?;
-
-    for index in 0..prediction.conditional_risk.len() {
-        let sample_id = (index + 1).to_string();
-        let se = prediction
-            .logit_risk_se
-            .as_ref()
-            .map(|values| values[index].to_string())
-            .unwrap_or_else(|| "NA".to_string());
-
-        write_tsv_row(
-            &mut file,
-            &[
-                &sample_id as &dyn std::fmt::Display,
-                &data.age_entry[index],
-                &data.age_exit[index],
-                &prediction.cumulative_hazard_entry[index],
-                &prediction.cumulative_hazard_exit[index],
-                &prediction.cumulative_incidence_entry[index],
-                &prediction.cumulative_incidence_exit[index],
-                &prediction.conditional_risk[index],
-                &prediction.logit_risk[index],
-                &se,
-            ],
-            None,
-            &[],
-        )?;
-    }
-
-    Ok(())
 }
 
 fn format_duration_ago(seconds: u64) -> String {
