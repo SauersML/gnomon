@@ -113,7 +113,11 @@ refused before fitting. `--survival-time-wiggle*` therefore requires
 
 Survival calibration accepts score, sex, and the configured PCs. Extra static
 covariates are rejected because the prediction API has no corresponding inputs.
-Competing events are censoring events for this net, cause-specific model.
+Competing events are censoring events for this net, cause-specific model, so a
+survival prediction's `net_risk_entry` and `net_risk_exit` are `1 − exp(−H)` of
+the target event's cause-specific hazard: net risk, the risk under independent
+censoring by the competing event, not the cumulative incidence that the competing
+event lowers (#2384).
 
 ## Penalties and smoothing selection
 

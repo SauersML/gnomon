@@ -383,7 +383,9 @@ struct TrainArgs {
 
 #[derive(Args)]
 struct InferArgs {
-    /// Path to test TSV file with score,PC1,PC2,... columns (no phenotype needed)
+    /// Path to test TSV file with score,PC1,PC2,... columns (no phenotype needed). A
+    /// survival model writes net risk (net_risk_entry, net_risk_exit): the competing
+    /// event is treated as independent censoring, so it is not cumulative incidence
     test_data: String,
 
     /// Path to the complete trained calibration model (.json)

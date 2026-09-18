@@ -75,6 +75,11 @@ passing either flag is an error that names
 ### `infer`
 Apply a previously trained calibration model to new samples and saves predictions
 as `predictions.tsv`.
+For a binary model the table holds `probit_index` (the model's mean is
+`Φ(probit_index)`) and `prediction`; for a survival model it holds each row's
+`sample_id`, the cumulative hazards, `net_risk_entry`/`net_risk_exit` (net risk
+under independent censoring by the competing event, not cumulative incidence) and
+`conditional_risk`.
 
 Required arguments:
 - `test_data`: path to a TSV file with score and PC columns.

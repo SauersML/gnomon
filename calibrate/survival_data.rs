@@ -683,8 +683,8 @@ mod tests {
         let prediction = SurvivalPrediction {
             cumulative_hazard_entry: risks.clone(),
             cumulative_hazard_exit: risks.clone(),
-            cumulative_incidence_entry: risks.clone(),
-            cumulative_incidence_exit: risks.clone(),
+            net_risk_entry: risks.clone(),
+            net_risk_exit: risks.clone(),
             conditional_risk: risks.clone(),
             logit_risk: risks,
             logit_risk_se: None,
@@ -699,6 +699,9 @@ mod tests {
             .map(|line| line.split('\t').next().unwrap_or(""))
             .collect();
         assert_eq!(written, ids);
+        let header = table.lines().next().expect("header");
+        assert!(header.contains("\tnet_risk_entry\tnet_risk_exit\t"), "{header}");
+        assert!(!header.contains("cumulative_incidence"), "{header}");
 
         let unnamed = write_tsv(&sample_dataframe());
         let data = load_survival_prediction_data(unnamed.path().to_str().expect("path"), 2)

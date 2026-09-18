@@ -19,8 +19,10 @@ pub const BINARY_PREDICTION_HEADER: &str = "sample_id\thull_signed_distance\tpro
 pub const CONTINUOUS_PREDICTION_HEADER: &str =
     "sample_id\thull_signed_distance\tprediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95";
 
-/// Columns of the survival table.
-pub const SURVIVAL_PREDICTION_HEADER: &str = "sample_id\tage_entry\tage_exit\tcumulative_hazard_entry\tcumulative_hazard_exit\tcumulative_incidence_entry\tcumulative_incidence_exit\tconditional_risk\tlogit_risk\tlogit_risk_standard_error";
+/// Columns of the survival table. `net_risk_*` is `1 − exp(−H)` of the target
+/// event's cause-specific hazard: the risk were the competing event censoring
+/// independent of it, not its cumulative incidence (#2384).
+pub const SURVIVAL_PREDICTION_HEADER: &str = "sample_id\tage_entry\tage_exit\tcumulative_hazard_entry\tcumulative_hazard_exit\tnet_risk_entry\tnet_risk_exit\tconditional_risk\tlogit_risk\tlogit_risk_standard_error";
 
 const Z_975: f64 = 1.959964;
 
@@ -116,8 +118,8 @@ pub fn write_survival_predictions(
                 &data.age_exit[index],
                 &prediction.cumulative_hazard_entry[index],
                 &prediction.cumulative_hazard_exit[index],
-                &prediction.cumulative_incidence_entry[index],
-                &prediction.cumulative_incidence_exit[index],
+                &prediction.net_risk_entry[index],
+                &prediction.net_risk_exit[index],
                 &prediction.conditional_risk[index],
                 &prediction.logit_risk[index],
                 &se,

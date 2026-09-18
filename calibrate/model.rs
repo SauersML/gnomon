@@ -139,8 +139,11 @@ pub struct PredictDetailed {
 pub struct SurvivalPrediction {
     pub cumulative_hazard_entry: Array1<f64>,
     pub cumulative_hazard_exit: Array1<f64>,
-    pub cumulative_incidence_entry: Array1<f64>,
-    pub cumulative_incidence_exit: Array1<f64>,
+    /// `1 − exp(−H)` of the target event's cause-specific hazard at entry and
+    /// exit: net risk, the risk were the competing event censoring independent
+    /// of it, not the cumulative incidence the competing event lowers (#2384).
+    pub net_risk_entry: Array1<f64>,
+    pub net_risk_exit: Array1<f64>,
     pub conditional_risk: Array1<f64>,
     pub logit_risk: Array1<f64>,
     pub logit_risk_se: Option<Array1<f64>>,
@@ -543,13 +546,13 @@ fn survival_risks_from_hazards(
         conditional_risk[index] = -(-delta).exp_m1();
         logit_risk[index] = delta + conditional_risk[index].ln();
     }
-    let cumulative_incidence_entry = cumulative_hazard_entry.mapv(|hazard| -(-hazard).exp_m1());
-    let cumulative_incidence_exit = cumulative_hazard_exit.mapv(|hazard| -(-hazard).exp_m1());
+    let net_risk_entry = cumulative_hazard_entry.mapv(|hazard| -(-hazard).exp_m1());
+    let net_risk_exit = cumulative_hazard_exit.mapv(|hazard| -(-hazard).exp_m1());
     Ok(SurvivalPrediction {
         cumulative_hazard_entry,
         cumulative_hazard_exit,
-        cumulative_incidence_entry,
-        cumulative_incidence_exit,
+        net_risk_entry,
+        net_risk_exit,
         conditional_risk,
         logit_risk,
         logit_risk_se: None,
@@ -571,6 +574,18 @@ mod tests {
         assert!((result.conditional_risk[1] - 0.6321205588285577).abs() < 1e-15);
         assert!((result.logit_risk[1] - 0.541324854612918).abs() < 1e-14);
         assert_eq!(result.logit_risk[2], 1000.0);
+    }
+
+    #[test]
+    fn net_risk_is_one_minus_the_survival_of_the_cause_specific_hazard() {
+        let result = survival_risks_from_hazards(array![0.0, 0.5, 2.0], array![1e-18, 1.5, 700.0])
+            .expect("risks");
+        for (hazard, risk) in [(0.0f64, result.net_risk_entry[0]), (0.5, result.net_risk_entry[1])] {
+            assert_eq!(risk, -(-hazard).exp_m1());
+        }
+        assert_eq!(result.net_risk_exit[0], 1e-18);
+        assert_eq!(result.net_risk_exit[1], -(-1.5f64).exp_m1());
+        assert_eq!(result.net_risk_exit[2], 1.0);
     }
 
     #[test]
