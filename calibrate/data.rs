@@ -14,7 +14,8 @@
 //! - Training and prediction share schema validation and predictor extraction.
 //!   Training-only requirements do not constrain prediction batches.
 
-use ndarray::{Array1, Array2};
+use crate::calibrate::model::LinkFunction;
+use ndarray::{Array1, Array2, ArrayView1};
 use polars::prelude::*;
 use std::collections::HashSet;
 use std::fs::File;
@@ -89,6 +90,11 @@ pub enum DataError {
         "Non-finite values (NaN or Infinity) were found in the required column '{0}'. This tool requires all data to be finite."
     )]
     NonFiniteValuesFound(String),
+
+    #[error(
+        "The 'phenotype' column holds only the two values {low} and {high}. Code a binary phenotype 0/1 (recode PLINK's 1/2); any other coding would be fitted as a continuous trait."
+    )]
+    TwoValuedPhenotypeNotZeroOne { low: f64, high: f64 },
 }
 
 /// Loads and validates data specifically for model training.
@@ -105,6 +111,29 @@ pub fn load_training_data(path: &str, num_pcs: usize) -> Result<TrainingData, Da
         pcs,
         weights,
     })
+}
+
+/// The link a training phenotype is fitted with: binary (the Bernoulli
+/// marginal-slope fit) exactly when every value is 0 or 1 and both occur,
+/// continuous (the Gaussian location-scale fit) otherwise. A phenotype with
+/// exactly two distinct values other than 0 and 1 is refused rather than fitted
+/// as continuous: it is a binary trait in another coding.
+pub fn detect_link_function(phenotype: ArrayView1<f64>) -> Result<LinkFunction, DataError> {
+    let mut distinct: Vec<f64> = Vec::with_capacity(3);
+    for &value in phenotype {
+        if !distinct.contains(&value) {
+            distinct.push(value);
+            if distinct.len() > 2 {
+                return Ok(LinkFunction::Identity);
+            }
+        }
+    }
+    distinct.sort_by(f64::total_cmp);
+    match distinct[..] {
+        [low, high] if low == 0.0 && high == 1.0 => Ok(LinkFunction::Logit),
+        [low, high] => Err(DataError::TwoValuedPhenotypeNotZeroOne { low, high }),
+        _ => Ok(LinkFunction::Identity),
+    }
 }
 
 /// Loads and validates data specifically for prediction.
@@ -608,5 +637,27 @@ mod tests {
             }
             _ => panic!("Expected InsufficientRows error"),
         }
+    }
+
+    #[test]
+    fn only_a_zero_one_phenotype_is_binary() {
+        use ndarray::array;
+        assert!(matches!(
+            detect_link_function(array![0.0, 1.0, 1.0, 0.0].view()),
+            Ok(LinkFunction::Logit)
+        ));
+        // A continuous trait in [0, 2) truncates to {0, 1} as integers; it stays continuous.
+        assert!(matches!(
+            detect_link_function(array![0.25, 1.5, 0.75, 1.99, 0.0].view()),
+            Ok(LinkFunction::Identity)
+        ));
+        assert!(matches!(
+            detect_link_function(array![1.0, 2.0, 2.0, 1.0].view()),
+            Err(DataError::TwoValuedPhenotypeNotZeroOne { low, high }) if low == 1.0 && high == 2.0
+        ));
+        assert!(matches!(
+            detect_link_function(array![0.0, 1.0, 0.5].view()),
+            Ok(LinkFunction::Identity)
+        ));
     }
 }

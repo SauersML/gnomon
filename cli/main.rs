@@ -8,7 +8,7 @@ use clap::{Args, Parser};
 use clap::{CommandFactory, Subcommand};
 use gam::probability::normal_cdf;
 use gnomon::adapt_plink2::GenomeBuild;
-use gnomon::calibrate::data::{load_prediction_data, load_training_data};
+use gnomon::calibrate::data::{detect_link_function, load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::{train_model, train_survival_model};
 use gnomon::calibrate::model::{BasisConfig, SmoothConfig};
 use gnomon::calibrate::model::SurvivalModelConfig;
@@ -25,7 +25,6 @@ use gnomon::map::main as map_cli;
 use gnomon::terms::{infer_sex_to_tsv, infer_sex_to_tsv_at};
 use infer_sex::GenomeBuild as SexGenomeBuild;
 use ndarray::{Array1, ArrayView1};
-use std::collections::HashSet;
 use std::env;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -878,7 +877,7 @@ fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
                 data.pcs.ncols()
             );
 
-            let link_function = detect_link_function(&data.y);
+            let link_function = detect_link_function(data.y.view())?;
             println!("Auto-detected link function: {link_function:?}");
 
             let pgs_range = calculate_range(data.p.view());
@@ -1051,15 +1050,6 @@ fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-fn detect_link_function(phenotype: &Array1<f64>) -> LinkFunction {
-    let unique_values: HashSet<_> = phenotype.iter().map(|&value| value as i64).collect();
-    if unique_values.len() == 2 {
-        LinkFunction::Logit
-    } else {
-        LinkFunction::Identity
-    }
 }
 
 fn calculate_range(data: ArrayView1<f64>) -> (f64, f64) {
