@@ -42,7 +42,22 @@ pub(crate) fn shortest_decimal(value: f64) -> (i64, i32) {
         return (0, 0);
     }
     let mut buffer = ryu::Buffer::new();
-    let text = buffer.format_finite(value.abs());
+    let (digits, exponent) = parse_shortest(buffer.format_finite(value.abs()));
+    (if value < 0.0 { -digits } else { digits }, exponent)
+}
+
+/// [`shortest_decimal`] for the shortest decimal that reads back as the same f32.
+pub(crate) fn shortest_decimal_f32(value: f32) -> (i64, i32) {
+    if value == 0.0 {
+        return (0, 0);
+    }
+    let mut buffer = ryu::Buffer::new();
+    let (digits, exponent) = parse_shortest(buffer.format_finite(value.abs()));
+    (if value < 0.0 { -digits } else { digits }, exponent)
+}
+
+/// A nonnegative shortest form as ryu writes it, as `(digits, exponent)` with trailing zeros folded.
+fn parse_shortest(text: &str) -> (i64, i32) {
     let (mantissa, mut exponent) = match text.split_once('e') {
         Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().unwrap_or(0)),
         None => (text, 0),
@@ -58,7 +73,7 @@ pub(crate) fn shortest_decimal(value: f64) -> (i64, i32) {
         digits /= 10;
         exponent += 1;
     }
-    (if value < 0.0 { -digits } else { digits }, exponent)
+    (digits, exponent)
 }
 
 /// Two carry-free i64 limbs for one score: `v = hi * 2^bits + lo`, with `lo` in `[0, 2^bits)`.

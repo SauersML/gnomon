@@ -1,3 +1,7 @@
+use crate::score::cells::{
+    add_limbs, compare_limbs, limbs_of, round_decimal, round_long, shift_decimal, subtract_limbs,
+};
+use crate::score::exact::{FixedPoint, shortest_decimal_hinted};
 use crate::score::prepare::{
     EffectOnlyMatches, OtherAlleleMatch, names_no_single_other_allele, resolve_other_allele,
 };
@@ -21,20 +25,70 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::simd::cmp::{SimdPartialEq, SimdPartialOrd};
-use std::simd::{Select, simd_swizzle, u8x16, u8x32, u8x64};
+use std::simd::cmp::{SimdOrd, SimdPartialEq, SimdPartialOrd};
+use std::simd::num::{SimdInt, SimdUint};
+use std::simd::{Mask, Select, i64x8, simd_swizzle, u8x8, u8x16, u8x32, u8x64, u64x8};
 
 mod crc;
+mod dosage;
 mod stream;
+
+use dosage::{Dose, diploid_reference, dosage_from_values, gp_from_values, parse_dose, plain_decimal};
 
 #[derive(Debug)]
 pub struct NativeVcfScoreResult {
     pub person_iids: Vec<String>,
     pub score_names: Vec<String>,
     pub score_variant_counts: Vec<u32>,
-    pub sum_scores: Vec<f64>,
     pub missing_counts: Vec<u32>,
     pub matched_variants: usize,
+    /// Each person's exact sum of each score, at `10^places` of that score.
+    cells: Vec<i128>,
+    places: Vec<u32>,
+    /// The wide parts of the cells whose value left i128.
+    spills: AHashMap<usize, Wide>,
+}
+
+impl NativeVcfScoreResult {
+    /// The correctly rounded sum of cell `cell`, laid out person × score.
+    pub fn sum(&self, cell: usize) -> f64 {
+        self.round(cell, 1)
+    }
+
+    /// The correctly rounded average of cell `cell` over `used` variants; 0 when none were used.
+    pub fn average(&self, cell: usize, used: u32) -> f64 {
+        if used == 0 { 0.0 } else { self.round(cell, used) }
+    }
+
+    /// Every cell's correctly rounded sum, person × score.
+    pub fn sums(&self) -> Vec<f64> {
+        (0..self.cells.len()).map(|cell| self.sum(cell)).collect()
+    }
+
+    fn round(&self, cell: usize, divisor: u32) -> f64 {
+        let places = self.places[cell % self.score_names.len()];
+        match self.spills.get(&cell) {
+            None => {
+                let value = self.cells[cell];
+                let fixed = 5u128
+                    .checked_pow(places)
+                    .filter(|scale| scale.checked_mul(u128::from(u32::MAX)).is_some())
+                    .map(|scale| FixedPoint {
+                        exp: -(places as i32),
+                        scale,
+                    });
+                match fixed {
+                    Some(fixed) => fixed.quotient(value, divisor),
+                    None => round_long(&[(value, places as i32)], u128::from(divisor)),
+                }
+            }
+            Some(wide) => {
+                let mut total = wide.clone();
+                total.add(&Wide::of(self.cells[cell]));
+                round_decimal(total.negative, &total.limbs, places as i32, u128::from(divisor))
+            }
+        }
+    }
 }
 
 /// One native score row, as spans into its `ScoreRules` buffers.
@@ -48,7 +102,9 @@ struct ScoreRule {
 #[derive(Debug, Clone, Copy)]
 struct ScoreApplication {
     score_index: usize,
-    weight: f64,
+    /// The weight's shortest round-trip decimal: `digits × 10^exponent`.
+    digits: i64,
+    exponent: i32,
 }
 
 /// Every native score row with at least one weight, found by position.
@@ -151,7 +207,9 @@ impl ScoreRulesBuilder {
 #[derive(Debug, Clone, Copy)]
 struct MatchedRule {
     score_index: usize,
-    weight: f64,
+    /// The weight's shortest round-trip decimal: `digits × 10^exponent`.
+    digits: i64,
+    exponent: i32,
     effect_is_ref: bool,
 }
 
@@ -193,7 +251,7 @@ impl<'a> RecordAccumulator<'a> {
         Self {
             rules_by_key,
             score_names,
-            totals: ScoreTotals::new(num_people, score_names.len()),
+            totals: ScoreTotals::new(num_people, score_names.len(), rules_by_key),
             pending: PendingPosition::default(),
             effect_only_matches: EffectOnlyMatches::default(),
         }
@@ -228,6 +286,7 @@ impl<'a> RecordAccumulator<'a> {
             self.totals.add_allele(
                 std::mem::take(&mut allele.matched_rules),
                 std::mem::take(&mut allele.column),
+                allele.scale.take(),
                 |score_index| {
                     ref_effect_error(
                         &score_names[score_index],
@@ -253,7 +312,7 @@ impl<'a> RecordAccumulator<'a> {
             &mut self.effect_only_matches,
             &mut self.totals,
         )?;
-        self.totals.apply();
+        self.totals.finish();
         self.effect_only_matches.report();
         Ok(self.totals)
     }
@@ -267,9 +326,12 @@ fn native_result(
     input_path: &Path,
 ) -> Result<NativeVcfScoreResult, Box<dyn Error + Send + Sync>> {
     let ScoreTotals {
-        sum_scores,
+        cells,
         missing_counts,
         score_variant_counts,
+        weight_places,
+        dosage_places,
+        spills,
         ..
     } = totals;
 
@@ -292,9 +354,15 @@ fn native_result(
         person_iids,
         score_names,
         score_variant_counts,
-        sum_scores,
         missing_counts,
         matched_variants,
+        cells,
+        places: weight_places
+            .iter()
+            .zip(&dosage_places)
+            .map(|(&weight, &dosage)| weight as u32 + u32::from(dosage))
+            .collect(),
+        spills: spills.into_iter().flatten().collect(),
     })
 }
 
@@ -344,6 +412,20 @@ struct DecodedAllele {
     matched_rules: Vec<MatchedRule>,
     /// One dosage per kept person, in output order.
     column: DosageColumn,
+    /// The column's scale, once it has been normalized where it was decoded.
+    scale: Option<ColumnScale>,
+}
+
+/// A decoded column's decimal places and largest doses.
+#[derive(Clone, Copy, Debug, Default)]
+struct ColumnScale {
+    /// The most decimal places any dose has.
+    places: u8,
+    /// The largest dose of the ALT allele and of REF, at `places`, with every dose at `places`;
+    /// for hard calls, the most copies. `None` when a dose leaves i64 at `places`.
+    largest: Option<[u128; 2]>,
+    /// Whether some person has a dosage without a REF dosage.
+    incomplete_ref: bool,
 }
 
 /// The code of a person without a hard call in `DosageColumn::Calls`. No real
@@ -354,14 +436,116 @@ const MISSING_CALL: u8 = 0xff;
 enum DosageColumn {
     /// Hard calls, each `alt | ref << 4` allele copies, or `MISSING_CALL`.
     Calls(Vec<u8>),
-    /// `[alt, ref]` dosages. A NaN ALT dosage is a missing dosage, and a NaN
+    /// `[alt, ref]` exact dosages. A missing ALT dosage is a missing dosage, and a missing
     /// REF dosage one that genotype ploidy and every ALT dosage could not complete.
-    Dosages(Vec<[f64; 2]>),
+    Dosages(Doses),
 }
 
 impl Default for DosageColumn {
     fn default() -> Self {
         Self::Calls(Vec::new())
+    }
+}
+
+/// Every kept person's `[alt, ref]` exact dosages, with digits and places held apart so that
+/// adding a column reads sixteen bytes a person.
+#[derive(Default)]
+struct Doses {
+    digits: Vec<[i64; 2]>,
+    /// Each dose's decimal places; u8::MAX, with zero digits, for a missing dose.
+    places: Vec<[u8; 2]>,
+}
+
+impl Doses {
+    fn clear(&mut self) {
+        self.digits.clear();
+        self.places.clear();
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        self.digits.reserve(additional);
+        self.places.reserve(additional);
+    }
+
+    #[inline(always)]
+    fn push(&mut self, [alt, reference]: [Dose; 2]) {
+        self.digits.push([alt.digits, reference.digits]);
+        self.places.push([alt.places, reference.places]);
+    }
+
+    /// The fewest and most decimal places of any present dose, the largest ALT and REF digits, and
+    /// whether some person has an ALT dosage without a REF dosage. Four people a step without a
+    /// branch: a missing dose is zero digits at u8::MAX places, which leaves every extreme but
+    /// `most` alone, and its mask keeps it out of `most`.
+    fn extremes(&self) -> (u8, u8, [u64; 2], bool) {
+        let alt_side = Mask::<i64, 8>::from_array([true, false, true, false, true, false, true, false]);
+        let digit_steps = self.digits.as_flattened().chunks_exact(8);
+        let place_steps = self.places.as_flattened().chunks_exact(8);
+        let stepped = digit_steps.len() * 4;
+        let (mut fewest_lanes, mut most_lanes) = (u8x8::splat(u8::MAX), u8x8::splat(0));
+        let (mut alt_lanes, mut ref_lanes) = (u64x8::splat(0), u64x8::splat(0));
+        let mut incomplete_ref = false;
+        for (digits, places) in digit_steps.zip(place_steps) {
+            let places = u8x8::from_slice(places);
+            let present = places.simd_ne(u8x8::splat(u8::MAX));
+            fewest_lanes = fewest_lanes.simd_min(places);
+            most_lanes = most_lanes.simd_max(present.select(places, u8x8::splat(0)));
+            // A wrapping |i64::MIN| is i64::MIN, which reads as 2^63: its unsigned magnitude.
+            let magnitudes = i64x8::from_slice(digits).abs().cast::<u64>();
+            alt_lanes = alt_lanes.simd_max(alt_side.select(magnitudes, u64x8::splat(0)));
+            ref_lanes = ref_lanes.simd_max((!alt_side).select(magnitudes, u64x8::splat(0)));
+            let present = present.to_bitmask();
+            incomplete_ref |= (present & !(present >> 1) & 0x55) != 0;
+        }
+        let (mut fewest, mut most) = (fewest_lanes.reduce_min(), most_lanes.reduce_max());
+        let mut largest = [alt_lanes.reduce_max(), ref_lanes.reduce_max()];
+        for (digits, places) in self.digits[stepped..].iter().zip(&self.places[stepped..]) {
+            for side in 0..2 {
+                let present = u8::from(places[side] != u8::MAX).wrapping_neg();
+                fewest = fewest.min(places[side]);
+                most = most.max(places[side] & present);
+                largest[side] = largest[side].max(digits[side].unsigned_abs());
+            }
+            incomplete_ref |= (places[0] != u8::MAX) & (places[1] == u8::MAX);
+        }
+        (fewest, most, largest, incomplete_ref)
+    }
+
+    /// Every person's dosages, as pushed.
+    #[cfg(test)]
+    fn pairs(&self) -> Vec<[Dose; 2]> {
+        let dose = |digits: i64, places: u8| Dose { digits, places };
+        self.digits
+            .iter()
+            .zip(&self.places)
+            .map(|(digits, places)| [dose(digits[0], places[0]), dose(digits[1], places[1])])
+            .collect()
+    }
+
+    /// Pads the column with missing dosages to `len` people.
+    fn resize_missing(&mut self, len: usize) {
+        self.digits.resize(len, [0; 2]);
+        self.places.resize(len, [u8::MAX; 2]);
+    }
+
+    /// Brings every present dose to `places` and gives the largest of each side there, or `None`
+    /// once a dose leaves i64; the doses brought to `places` by then keep their value.
+    fn rescale(&mut self, places: u8) -> Option<[u128; 2]> {
+        let mut largest = [0u128; 2];
+        for (digits, dose_places) in self.digits.iter_mut().zip(self.places.iter_mut()) {
+            for side in 0..2 {
+                if dose_places[side] == u8::MAX {
+                    continue;
+                }
+                if dose_places[side] != places {
+                    let power = 10i64.checked_pow(u32::from(places - dose_places[side]))?;
+                    digits[side] = digits[side].checked_mul(power)?;
+                    dose_places[side] = places;
+                }
+                largest[side] = largest[side].max(u128::from(digits[side].unsigned_abs()));
+            }
+        }
+        Some(largest)
     }
 }
 
@@ -379,9 +563,9 @@ impl DosageColumn {
     }
 
     /// The column, emptied, as dosages.
-    fn dosages(&mut self) -> &mut Vec<[f64; 2]> {
+    fn dosages(&mut self) -> &mut Doses {
         if let Self::Calls(_) = self {
-            *self = Self::Dosages(Vec::new());
+            *self = Self::Dosages(Doses::default());
         }
         let Self::Dosages(dosages) = self else {
             unreachable!("the column holds dosages");
@@ -390,46 +574,204 @@ impl DosageColumn {
         dosages
     }
 
-    /// Whether some person has a dosage without a REF dosage.
-    fn has_incomplete_ref(&self) -> bool {
+    /// Brings every dose to the column's most decimal places and gives its scale. Runs where the
+    /// column was decoded, so the accumulating thread only reads the result.
+    fn normalize(&mut self) -> ColumnScale {
         match self {
-            Self::Calls(_) => false,
-            Self::Dosages(dosages) => dosages
-                .iter()
-                .any(|&[alt, reference]| !alt.is_nan() && reference.is_nan()),
+            Self::Calls(codes) => {
+                let (mut alt, mut reference) = (0u8, 0u8);
+                for &code in codes.iter() {
+                    let present = if code == MISSING_CALL { 0 } else { code };
+                    alt = alt.max(present & 0x0f);
+                    reference = reference.max(present >> 4);
+                }
+                ColumnScale {
+                    places: 0,
+                    largest: Some([u128::from(alt), u128::from(reference)]),
+                    incomplete_ref: false,
+                }
+            }
+            Self::Dosages(doses) => {
+                let (fewest, most, largest, incomplete_ref) = doses.extremes();
+                let largest = if fewest < most {
+                    doses.rescale(most)
+                } else {
+                    Some(largest.map(u128::from))
+                };
+                ColumnScale {
+                    places: most,
+                    largest,
+                    incomplete_ref,
+                }
+            }
         }
     }
 }
 
-/// Per-person score sums and missing counts, and each score's matched variants.
+/// Per-person exact score sums and missing counts, and each score's matched variants.
+///
+/// A cell holds its person's sum of one score at `10^places`: the most decimal places the
+/// score's weights need, plus the most any dosage the score has taken carried. A dosage with more
+/// places rescales the score's cells first, and a value that leaves i128 moves into a wide
+/// integer, so no term is rounded; a value is rounded once, at output.
 struct ScoreTotals {
     num_scores: usize,
-    sum_scores: Vec<f64>,
+    cells: Vec<i128>,
+    /// What each cell has taken since its score's last flush. Terms add here without a check:
+    /// the bounds of the terms since the flush sum to at most `LANE_LIMIT`.
+    lanes: Vec<i64>,
+    /// Per score, the sum of the bounds of the terms its lanes have taken since the last flush.
+    headroom: Vec<u128>,
     missing_counts: Vec<u32>,
     score_variant_counts: Vec<u32>,
+    weight_places: Vec<i32>,
+    dosage_places: Vec<u8>,
+    /// People per range when the cells are split across the rayon pool.
+    range_people: usize,
+    /// Each range's wide cell parts: a cell's value is its i128 plus its entry here, if any.
+    spills: Vec<AHashMap<usize, Wide>>,
     /// Alleles counted in `score_variant_counts` whose terms are not yet in the
-    /// sums, in input order.
+    /// cells, in input order.
     unapplied: Vec<ScoredAllele>,
 }
 
-/// One scored allele's merged rules and every kept person's dosage of it.
+/// A signed integer too wide for i128, in base-10^9 limbs, least significant first.
+#[derive(Clone, Debug, Default)]
+struct Wide {
+    negative: bool,
+    limbs: Vec<u32>,
+}
+
+impl Wide {
+    fn of(value: i128) -> Self {
+        Self {
+            negative: value < 0,
+            limbs: limbs_of(value.unsigned_abs()),
+        }
+    }
+
+    fn add(&mut self, other: &Wide) {
+        if self.negative == other.negative {
+            add_limbs(&mut self.limbs, &other.limbs);
+        } else if compare_limbs(&self.limbs, &other.limbs) == std::cmp::Ordering::Less {
+            self.limbs = subtract_limbs(&other.limbs, &self.limbs);
+            self.negative = other.negative;
+        } else {
+            self.limbs = subtract_limbs(&self.limbs, &other.limbs);
+        }
+        if self.limbs.is_empty() {
+            self.negative = false;
+        }
+    }
+
+    fn scale(&mut self, digits: u32) {
+        shift_decimal(&mut self.limbs, digits);
+    }
+}
+
+/// One scored allele's rules at their scores' scales, and every kept person's dosage of it.
 struct ScoredAllele {
-    matched_rules: Vec<MatchedRule>,
-    /// The distinct scores of `matched_rules`, each counted once for a missing dosage.
+    rules: Vec<ExactRule>,
+    /// The distinct scores of `rules`, each counted once for a missing dosage.
     missing_scores: Vec<usize>,
-    /// For hard calls, each rule's weight times 0 through 14 copies, and a zero
-    /// at index 15, which is where a missing call's nibble points.
-    call_terms: Vec<[f64; 16]>,
     column: DosageColumn,
 }
 
+/// The most the terms added to a score's lanes between two flushes may sum to, in magnitude, so
+/// that no lane leaves i64.
+const LANE_LIMIT: u128 = i64::MAX as u128;
+
+/// A matched rule's weight at its score's scale.
+struct ExactRule {
+    score_index: usize,
+    effect_is_ref: bool,
+    digits: i64,
+    /// The power of ten that puts `digits` at the score's weight places.
+    shift: u32,
+    /// `digits × 10^shift`, when it fits i128.
+    scaled: Option<i128>,
+    /// The largest term this rule adds for any person, when it is at most `LANE_LIMIT`: the rule
+    /// then adds into the lanes, and otherwise into the cells.
+    bound: Option<u128>,
+    /// The weight at the score's scale, times a dose at the column's decimal places, is a term.
+    weight: i64,
+    /// For hard calls, the term of each count of copies; fifteen, `MISSING_CALL`'s, adds zero.
+    call_terms: [i64; 16],
+}
+
+fn pow10(digits: u32) -> Option<i128> {
+    10i128.checked_pow(digits)
+}
+
+/// Adds `term` to a cell, moving the cell's value into its wide part when the sum leaves i128.
+#[inline(always)]
+fn add_term(cell: &mut i128, index: usize, spill: &mut AHashMap<usize, Wide>, term: i128) {
+    match cell.checked_add(term) {
+        Some(sum) => *cell = sum,
+        None => spill
+            .entry(index)
+            .or_default()
+            .add(&Wide::of(std::mem::replace(cell, term))),
+    }
+}
+
+/// Adds a term too wide for i128: `rule`'s weight times `dose_digits × 10^dose_shift`.
+#[cold]
+fn add_wide_term(
+    index: usize,
+    spill: &mut AHashMap<usize, Wide>,
+    rule: &ExactRule,
+    dose_digits: i64,
+    dose_shift: u32,
+) {
+    let mut term = Wide::of(i128::from(rule.digits) * i128::from(dose_digits));
+    term.scale(rule.shift + dose_shift);
+    spill.entry(index).or_default().add(&term);
+}
+
+/// Adds `rule`'s weight times `dose_digits × 10^dose_shift` to a cell, exactly at any size.
+#[inline]
+fn add_exact(
+    cell: &mut i128,
+    index: usize,
+    spill: &mut AHashMap<usize, Wide>,
+    rule: &ExactRule,
+    dose_digits: i64,
+    dose_shift: u32,
+) {
+    let term = rule
+        .scaled
+        .and_then(|weight| weight.checked_mul(i128::from(dose_digits)))
+        .and_then(|term| term.checked_mul(pow10(dose_shift)?));
+    match term {
+        Some(term) => add_term(cell, index, spill, term),
+        None => add_wide_term(index, spill, rule, dose_digits, dose_shift),
+    }
+}
+
 impl ScoreTotals {
-    fn new(num_people: usize, num_scores: usize) -> Self {
+    fn new(num_people: usize, num_scores: usize, rules_by_key: &ScoreRules) -> Self {
+        let mut weight_places = vec![0i32; num_scores];
+        for application in &rules_by_key.applications {
+            let places = &mut weight_places[application.score_index];
+            *places = (*places).max(-application.exponent);
+        }
+        let range_people = num_people
+            .div_ceil(rayon::current_num_threads().max(1) * RANGES_PER_WORKER)
+            .max(MIN_PEOPLE_PER_RANGE);
         Self {
             num_scores,
-            sum_scores: vec![0.0f64; num_people * num_scores],
+            cells: vec![0i128; num_people * num_scores],
+            lanes: vec![0i64; num_people * num_scores],
+            headroom: vec![0u128; num_scores],
             missing_counts: vec![0u32; num_people * num_scores],
             score_variant_counts: vec![0u32; num_scores],
+            weight_places,
+            dosage_places: vec![0u8; num_scores],
+            range_people,
+            spills: (0..num_people.div_ceil(range_people))
+                .map(|_| AHashMap::new())
+                .collect(),
             unapplied: Vec::new(),
         }
     }
@@ -437,15 +779,17 @@ impl ScoreTotals {
     /// Counts the allele once in each score it scores, and queues each rule's
     /// weight times every kept person's dosage of its effect allele for
     /// [`ScoreTotals::apply`]. A REF-effect rule fails when some person's dosage
-    /// has no REF dosage.
+    /// has no REF dosage. `scale` is the column's, when it was normalized where it was decoded.
     fn add_allele(
         &mut self,
         matched_rules: Vec<MatchedRule>,
-        column: DosageColumn,
+        mut column: DosageColumn,
+        scale: Option<ColumnScale>,
         ref_effect_error: impl Fn(usize) -> String,
     ) -> Result<(), String> {
+        let scale = scale.unwrap_or_else(|| column.normalize());
         if let Some(rule) = matched_rules.iter().find(|rule| rule.effect_is_ref)
-            && column.has_incomplete_ref()
+            && scale.incomplete_ref
         {
             return Err(ref_effect_error(rule.score_index));
         }
@@ -459,118 +803,321 @@ impl ScoreTotals {
         if matched_rules.is_empty() {
             return Ok(());
         }
-        let call_terms = match column {
-            DosageColumn::Calls(_) => matched_rules
-                .iter()
-                .map(|rule| {
-                    let mut terms = [0.0f64; 16];
-                    for (copies, term) in (0u8..15).zip(&mut terms) {
-                        *term = rule.weight * f64::from(copies);
-                    }
-                    terms
-                })
-                .collect(),
-            DosageColumn::Dosages(_) => Vec::new(),
-        };
+        // A dosage with more decimal places than a score has taken rescales that score, after
+        // the queued alleles are added at the old scale.
+        let places = scale.places;
+        let growing: Vec<usize> = missing_scores
+            .iter()
+            .copied()
+            .filter(|&score| places > self.dosage_places[score])
+            .collect();
+        if !growing.is_empty() {
+            self.apply();
+            for score in growing {
+                self.rescale(score, places);
+            }
+        }
+        let calls = matches!(column, DosageColumn::Calls(_));
+        let mut rules: Vec<ExactRule> = matched_rules
+            .iter()
+            .map(|rule| self.exact_rule(rule, places, scale.largest, calls))
+            .collect();
+        // A score whose lanes cannot take this allele's bounds is flushed first. The rules of a
+        // score whose bounds alone pass the limit add into the cells.
+        let mut bounds = Vec::with_capacity(missing_scores.len());
+        let mut full = Vec::new();
+        for group in rules.chunk_by_mut(|a, b| a.score_index == b.score_index) {
+            let score = group[0].score_index;
+            let bound = group.iter().filter_map(|rule| rule.bound).sum::<u128>();
+            if bound > LANE_LIMIT {
+                group.iter_mut().for_each(|rule| rule.bound = None);
+                continue;
+            }
+            if self.headroom[score] + bound > LANE_LIMIT {
+                full.push(score);
+            }
+            bounds.push((score, bound));
+        }
+        if !full.is_empty() {
+            self.apply();
+            self.flush(&full);
+        }
+        for (score, bound) in bounds {
+            self.headroom[score] += bound;
+        }
         self.unapplied.push(ScoredAllele {
-            matched_rules,
+            rules,
             missing_scores,
-            call_terms,
             column,
         });
         Ok(())
     }
 
-    /// Adds the terms of every queued allele to the sums, over ranges of people
-    /// on the rayon pool. Each cell takes its terms in input order, so the sums
-    /// do not depend on how the people are split.
+    /// `rule` at its score's scale, for a column whose doses are at `places` decimal places and
+    /// whose largest dose of each side, when known, is `largest`.
+    fn exact_rule(
+        &self,
+        rule: &MatchedRule,
+        places: u8,
+        largest: Option<[u128; 2]>,
+        calls: bool,
+    ) -> ExactRule {
+        let score = rule.score_index;
+        // A score's weight places are at least any of its weights' own, so the shift is nonnegative.
+        let shift = (self.weight_places[score] + rule.exponent) as u32;
+        let scaled = pow10(shift).and_then(|power| i128::from(rule.digits).checked_mul(power));
+        // A score's dosage places are at least any column's it has taken.
+        let weight = scaled
+            .zip(pow10(u32::from(self.dosage_places[score] - places)))
+            .and_then(|(weight, power)| i64::try_from(weight.checked_mul(power)?).ok());
+        let side = usize::from(rule.effect_is_ref);
+        let bound = weight
+            .zip(largest)
+            .and_then(|(weight, largest)| u128::from(weight.unsigned_abs()).checked_mul(largest[side]))
+            .filter(|&bound| bound <= LANE_LIMIT);
+        let mut call_terms = [0i64; 16];
+        if let (true, Some(weight), Some(_)) = (calls, weight, bound) {
+            // No call holds more copies than `largest`, so the terms it can reach fit.
+            for (copies, term) in call_terms.iter_mut().enumerate().take(15) {
+                *term = weight.checked_mul(copies as i64).unwrap_or(0);
+            }
+        }
+        ExactRule {
+            score_index: score,
+            effect_is_ref: rule.effect_is_ref,
+            digits: rule.digits,
+            shift,
+            scaled,
+            bound,
+            weight: weight.unwrap_or(0),
+            call_terms,
+        }
+    }
+
+    /// Moves the lanes of `scores` into their cells.
+    fn flush(&mut self, scores: &[usize]) {
+        // A score without headroom taken has nothing in its lanes.
+        let scores: Vec<usize> = scores
+            .iter()
+            .copied()
+            .filter(|&score| self.headroom[score] > 0)
+            .collect();
+        if scores.is_empty() {
+            return;
+        }
+        let scores = &scores[..];
+        let num_scores = self.num_scores;
+        let range_cells = self.range_people * num_scores;
+        self.cells
+            .par_chunks_mut(range_cells)
+            .zip(self.lanes.par_chunks_mut(range_cells))
+            .zip(self.spills.par_iter_mut())
+            .enumerate()
+            .for_each(|(range, ((cells, lanes), spill))| {
+                let people = cells
+                    .chunks_exact_mut(num_scores)
+                    .zip(lanes.chunks_exact_mut(num_scores));
+                for (person, (cells, lanes)) in people.enumerate() {
+                    for &score in scores {
+                        let index = range * range_cells + person * num_scores + score;
+                        let lane = std::mem::take(&mut lanes[score]);
+                        add_term(&mut cells[score], index, spill, i128::from(lane));
+                    }
+                }
+            });
+        for &score in scores {
+            self.headroom[score] = 0;
+        }
+    }
+
+    /// Adds every queued allele and moves every lane into its cell.
+    fn finish(&mut self) {
+        self.apply();
+        let scores: Vec<usize> = (0..self.num_scores).collect();
+        self.flush(&scores);
+    }
+
+    /// Multiplies every cell of `score` by the powers of ten that bring it to `places` dosage places.
+    fn rescale(&mut self, score: usize, places: u8) {
+        self.flush(&[score]);
+        let digits = u32::from(places - self.dosage_places[score]);
+        let factor = pow10(digits);
+        let num_scores = self.num_scores;
+        let range_cells = self.range_people * num_scores;
+        self.cells
+            .par_chunks_mut(range_cells)
+            .zip(self.spills.par_iter_mut())
+            .enumerate()
+            .for_each(|(range, (cells, spill))| {
+                for (offset, cell) in cells.iter_mut().enumerate().skip(score).step_by(num_scores) {
+                    let index = range * range_cells + offset;
+                    if let Some(wide) = spill.get_mut(&index) {
+                        wide.scale(digits);
+                    }
+                    match factor.and_then(|factor| cell.checked_mul(factor)) {
+                        Some(value) => *cell = value,
+                        None => {
+                            let mut wide = Wide::of(std::mem::take(cell));
+                            wide.scale(digits);
+                            spill.entry(index).or_default().add(&wide);
+                        }
+                    }
+                }
+            });
+        self.dosage_places[score] = places;
+    }
+
+    /// Adds the terms of every queued allele to the cells, over ranges of people
+    /// on the rayon pool. Integer sums do not depend on how the people are split.
     fn apply(&mut self) {
         if self.unapplied.is_empty() {
             return;
         }
         let num_scores = self.num_scores;
-        let num_people = self.sum_scores.len() / num_scores;
-        let range_people = num_people
-            .div_ceil(rayon::current_num_threads().max(1) * RANGES_PER_WORKER)
-            .max(MIN_PEOPLE_PER_RANGE);
+        let range_people = self.range_people;
         let range_cells = range_people * num_scores;
         let alleles = &self.unapplied;
-        self.sum_scores
+        let dosage_places = &self.dosage_places;
+        self.cells
             .par_chunks_mut(range_cells)
+            .zip(self.lanes.par_chunks_mut(range_cells))
             .zip(self.missing_counts.par_chunks_mut(range_cells))
+            .zip(self.spills.par_iter_mut())
             .enumerate()
-            .for_each(|(range, (sums, missing))| {
+            .for_each(|(range, (((cells, lanes), missing), spill))| {
                 for allele in alleles {
-                    allele.apply(range * range_people, num_scores, sums, missing);
+                    allele.apply(
+                        range * range_people,
+                        range * range_cells,
+                        num_scores,
+                        dosage_places,
+                        Accumulators {
+                            cells,
+                            lanes,
+                            missing,
+                            spill,
+                        },
+                    );
                 }
             });
         self.unapplied.clear();
     }
 }
 
+/// Adds one term per person to one score's lanes, and counts the people it gives as missing.
+#[inline(always)]
+fn add_one_score<T>(
+    values: impl Iterator<Item = T>,
+    score: usize,
+    num_scores: usize,
+    lanes: &mut [i64],
+    missing: &mut [u32],
+    term: impl Fn(T) -> (i64, bool),
+) {
+    if num_scores == 1 {
+        for ((value, lane), count) in values.zip(lanes.iter_mut()).zip(missing.iter_mut()) {
+            let (term, absent) = term(value);
+            *lane = lane.wrapping_add(term);
+            *count += u32::from(absent);
+        }
+    } else {
+        let slots = lanes.iter_mut().zip(missing.iter_mut()).skip(score).step_by(num_scores);
+        for (value, (lane, count)) in values.zip(slots) {
+            let (term, absent) = term(value);
+            *lane = lane.wrapping_add(term);
+            *count += u32::from(absent);
+        }
+    }
+}
+
+/// One range's cells, lanes, missing counts and wide cell parts, laid out person × score.
+struct Accumulators<'a> {
+    cells: &'a mut [i128],
+    lanes: &'a mut [i64],
+    missing: &'a mut [u32],
+    spill: &'a mut AHashMap<usize, Wide>,
+}
+
 impl ScoredAllele {
-    /// Adds this allele's terms for the people from `first_person` on, whose
-    /// cells `sums` and `missing` hold.
-    fn apply(&self, first_person: usize, num_scores: usize, sums: &mut [f64], missing: &mut [u32]) {
-        let people = first_person..first_person + sums.len() / num_scores;
-        match (&self.column, &self.matched_rules[..]) {
-            (DosageColumn::Calls(codes), [rule]) if num_scores == 1 => {
-                // Each term is the product `call_terms` holds for the call's copies, formed
-                // here so the loop vectorizes. A missing call adds zero, which leaves a sum
-                // that starts at +0.0 unchanged, and counts once.
+    /// Adds this allele's terms for the people from `first_person` on, whose accumulators, from
+    /// global cell `first_cell`, `into` holds.
+    fn apply(
+        &self,
+        first_person: usize,
+        first_cell: usize,
+        num_scores: usize,
+        dosage_places: &[u8],
+        into: Accumulators<'_>,
+    ) {
+        let Accumulators {
+            cells,
+            lanes,
+            missing,
+            spill,
+        } = into;
+        let people = first_person..first_person + missing.len() / num_scores;
+        // One rule adding into lanes needs no branch: a missing call's copies are fifteen, whose
+        // term is zero, and a missing dose's digits are zero.
+        match (&self.column, &self.rules[..]) {
+            (DosageColumn::Calls(codes), [rule]) if rule.bound.is_some() => {
                 let shift = if rule.effect_is_ref { 4 } else { 0 };
-                for ((&code, sum), count) in codes[people].iter().zip(sums).zip(missing) {
-                    let absent = code == MISSING_CALL;
-                    let copies = f64::from((code >> shift) & 0x0f);
-                    *sum += if absent { 0.0 } else { rule.weight * copies };
-                    *count += u32::from(absent);
-                }
+                let persons = codes[people].iter().copied();
+                add_one_score(persons, rule.score_index, num_scores, lanes, missing, |code| {
+                    let term = rule.call_terms[usize::from((code >> shift) & 0x0f)];
+                    (term, code == MISSING_CALL)
+                });
+            }
+            (DosageColumn::Dosages(doses), [rule]) if rule.bound.is_some() => {
+                let side = usize::from(rule.effect_is_ref);
+                let persons = doses.digits[people.clone()].iter().zip(&doses.places[people]);
+                add_one_score(persons, rule.score_index, num_scores, lanes, missing, |(digits, places)| {
+                    (rule.weight.wrapping_mul(digits[side]), places[0] == u8::MAX)
+                });
             }
             (DosageColumn::Calls(codes), rules) => {
-                let cells = sums
-                    .chunks_exact_mut(num_scores)
-                    .zip(missing.chunks_exact_mut(num_scores));
-                for (&code, (sums, missing)) in codes[people].iter().zip(cells) {
+                for (offset, &code) in codes[people].iter().enumerate() {
+                    let base = offset * num_scores;
                     if code == MISSING_CALL {
                         for &score_index in &self.missing_scores {
-                            missing[score_index] += 1;
+                            missing[base + score_index] += 1;
                         }
                         continue;
                     }
-                    for (rule, terms) in rules.iter().zip(&self.call_terms) {
-                        let copies = if rule.effect_is_ref {
-                            code >> 4
+                    for rule in rules {
+                        let copies = if rule.effect_is_ref { code >> 4 } else { code & 0x0f };
+                        let index = base + rule.score_index;
+                        if rule.bound.is_some() {
+                            let term = rule.call_terms[usize::from(copies)];
+                            lanes[index] = lanes[index].wrapping_add(term);
                         } else {
-                            code & 0x0f
-                        };
-                        sums[rule.score_index] += terms[usize::from(copies)];
+                            let shift = u32::from(dosage_places[rule.score_index]);
+                            let cell = &mut cells[index];
+                            add_exact(cell, first_cell + index, spill, rule, i64::from(copies), shift);
+                        }
                     }
                 }
             }
-            (DosageColumn::Dosages(dosages), [rule]) if num_scores == 1 => {
-                // A missing dosage adds zero, which leaves a sum that starts at +0.0
-                // unchanged, so the loop needs no branch.
-                let side = usize::from(rule.effect_is_ref);
-                for ((dosage, sum), count) in dosages[people].iter().zip(sums).zip(missing) {
-                    let absent = dosage[0].is_nan();
-                    *sum += if absent { 0.0 } else { rule.weight * dosage[side] };
-                    *count += u32::from(absent);
-                }
-            }
-            (DosageColumn::Dosages(dosages), _) => {
-                let cells = sums
-                    .chunks_exact_mut(num_scores)
-                    .zip(missing.chunks_exact_mut(num_scores));
-                for (dosage, (sums, missing)) in dosages[people].iter().zip(cells) {
-                    if dosage[0].is_nan() {
+            (DosageColumn::Dosages(doses), rules) => {
+                let persons = doses.digits[people.clone()].iter().zip(&doses.places[people]);
+                for (offset, (digits, places)) in persons.enumerate() {
+                    let base = offset * num_scores;
+                    if places[0] == u8::MAX {
                         for &score_index in &self.missing_scores {
-                            missing[score_index] += 1;
+                            missing[base + score_index] += 1;
                         }
                         continue;
                     }
-                    for rule in &self.matched_rules {
-                        sums[rule.score_index] +=
-                            rule.weight * dosage[usize::from(rule.effect_is_ref)];
+                    for rule in rules {
+                        let side = usize::from(rule.effect_is_ref);
+                        let index = base + rule.score_index;
+                        if rule.bound.is_some() {
+                            let term = rule.weight.wrapping_mul(digits[side]);
+                            lanes[index] = lanes[index].wrapping_add(term);
+                        } else {
+                            let shift = u32::from(dosage_places[rule.score_index] - places[side]);
+                            let cell = &mut cells[index];
+                            add_exact(cell, first_cell + index, spill, rule, digits[side], shift);
+                        }
                     }
                 }
             }
@@ -678,7 +1225,8 @@ impl PendingPosition {
                     matched.extend(rules_by_key.applications(rule).iter().map(|application| {
                         MatchedRule {
                             score_index: application.score_index,
-                            weight: application.weight,
+                            digits: application.digits,
+                            exponent: application.exponent,
                             effect_is_ref,
                         }
                     }));
@@ -687,6 +1235,7 @@ impl PendingPosition {
             totals.add_allele(
                 merge_matched_rules(matched),
                 std::mem::take(&mut allele.column),
+                allele.scale.take(),
                 |score_index| ref_effect_error(&score_names[score_index], &self.chromosome, key.1),
             )?;
         }
@@ -845,6 +1394,7 @@ fn decode_scored_fields(
                 })
             },
         )?;
+        allele.scale = Some(allele.column.normalize());
         allele.matched_rules = matched_rules;
         decoded.allele_count += 1;
     }
@@ -963,6 +1513,7 @@ fn decode_scored_bcf_record(
                 })
             },
         )?;
+        allele.scale = Some(allele.column.normalize());
         allele.matched_rules = matched_rules;
         decoded.allele_count += 1;
     }
@@ -1000,7 +1551,7 @@ fn load_score_rules(
     // non-empty key columns is malformed and skipped, an `N` other allele
     // pairs with no record and is skipped, a blank weight means the score does
     // not use the row, a weight that is not a finite number fails the run, and
-    // weights are read as f64 so the sums are the sums of the written numbers.
+    // a weight is its shortest round-trip decimal, which the exact sums add as written.
     for header in &headers {
         let path = &header.path;
         let mut reader = open_text_reader(path)?;
@@ -1018,6 +1569,7 @@ fn load_score_rules(
             .map(|score_name| score_regions.and_then(|regions| regions.get(score_name)))
             .collect();
 
+        let mut places_hint = 0usize;
         while reader.read_line(&mut line)? != 0 {
             line_number += 1;
             let trimmed = line.trim_end();
@@ -1096,9 +1648,11 @@ fn load_score_rules(
                     continue;
                 }
 
+                let (digits, exponent) = shortest_decimal_hinted(weight, &mut places_hint);
                 rules.push_application(ScoreApplication {
                     score_index,
-                    weight,
+                    digits,
+                    exponent,
                 });
             }
             if rules.applications.len() > applications_start {
@@ -1297,7 +1851,8 @@ fn match_rules_for_allele(
         for application in rules_by_key.applications(rule) {
             matched.push(MatchedRule {
                 score_index: application.score_index,
-                weight: application.weight,
+                digits: application.digits,
+                exponent: application.exponent,
                 effect_is_ref,
             });
         }
@@ -1322,31 +1877,17 @@ fn pair_orientation(
     }
 }
 
-/// Every rule at a position scoring one allele, with the weights of rules in the same
-/// score and orientation summed in rule order.
+/// Every rule at a position scoring one allele, the rules of one score and orientation adjacent
+/// and in rule order. Duplicates stay separate rules: each is one written weight, added exactly.
 fn merge_matched_rules(mut matched: Vec<MatchedRule>) -> Vec<MatchedRule> {
     matched.sort_by_key(|rule| (rule.score_index, rule.effect_is_ref));
-    let mut unique_len = 0usize;
-    for read_idx in 0..matched.len() {
-        let rule = matched[read_idx];
-        if unique_len > 0
-            && matched[unique_len - 1].score_index == rule.score_index
-            && matched[unique_len - 1].effect_is_ref == rule.effect_is_ref
-        {
-            matched[unique_len - 1].weight += rule.weight;
-        } else {
-            matched[unique_len] = rule;
-            unique_len += 1;
-        }
-    }
-    matched.truncate(unique_len);
     matched
 }
 
 #[derive(Debug, Clone, Copy)]
 struct DecodedAltDosage {
-    alt_dosage: f64,
-    ref_dosage: Option<f64>,
+    alt_dosage: Dose,
+    ref_dosage: Option<Dose>,
 }
 
 /// Visits each kept person's dosage for ALT `alt_index` in a record's samples
@@ -1490,7 +2031,7 @@ fn vcf_gt_ds_dosages(
     alt_count: usize,
     kept_indices: &[usize],
     ref_effect_error: &impl Fn() -> Option<String>,
-    dosages: &mut Vec<[f64; 2]>,
+    dosages: &mut Doses,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let Some((key::GENOTYPE, "DS")) = samples
         .split_once('\t')
@@ -1522,8 +2063,10 @@ fn vcf_gt_ds_dosages(
         {
             let ds = &bytes[pos + 4..];
             let len = ds.iter().position(|&byte| byte == b'\t').unwrap_or(ds.len());
-            if let Some(value) = plain_decimal(&ds[..len]).filter(|&value| 2.0 - value >= -1e-6) {
-                dosages.push([value, (2.0 - value).max(0.0)]);
+            if let Some((alt, reference)) = plain_decimal(&ds[..len])
+                .and_then(|alt| diploid_reference(alt).map(|reference| (alt, reference)))
+            {
+                dosages.push([alt, reference]);
                 pos = (pos + 5 + len).min(bytes.len());
                 sample_idx += 1;
                 continue;
@@ -1539,7 +2082,7 @@ fn vcf_gt_ds_dosages(
         )?);
         sample_idx += 1;
     }
-    dosages.resize(kept_indices.len(), [f64::NAN; 2]);
+    dosages.resize_missing(kept_indices.len());
     Ok(true)
 }
 
@@ -1548,9 +2091,9 @@ fn vcf_gt_ds_dosages(
 fn dosage_pair(
     dosage: Option<DecodedAltDosage>,
     ref_effect_error: &impl Fn() -> Option<String>,
-) -> Result<[f64; 2], Box<dyn Error + Send + Sync>> {
+) -> Result<[Dose; 2], Box<dyn Error + Send + Sync>> {
     match dosage {
-        None => Ok([f64::NAN; 2]),
+        None => Ok([Dose::MISSING; 2]),
         Some(DecodedAltDosage {
             alt_dosage,
             ref_dosage: Some(ref_dosage),
@@ -1560,7 +2103,7 @@ fn dosage_pair(
             ref_dosage: None,
         }) => match ref_effect_error() {
             Some(message) => Err(message.into()),
-            None => Ok([alt_dosage, f64::NAN]),
+            None => Ok([alt_dosage, Dose::MISSING]),
         },
     }
 }
@@ -1628,8 +2171,12 @@ fn vcf_gt_calls(
                 Some(DecodedAltDosage {
                     alt_dosage,
                     ref_dosage: Some(ref_dosage),
-                }) if alt_dosage <= 14.0 && ref_dosage <= 14.0 => {
-                    alt_dosage as u8 | (ref_dosage as u8) << 4
+                }) if alt_dosage.places == 0
+                    && ref_dosage.places == 0
+                    && alt_dosage.digits <= 14
+                    && ref_dosage.digits <= 14 =>
+                {
+                    alt_dosage.digits as u8 | (ref_dosage.digits as u8) << 4
                 }
                 Some(_) => return Ok(false),
             }
@@ -1675,6 +2222,9 @@ fn diploid_call_codes(block: &[u8], alt_index: usize) -> Option<[u8; 16]> {
 /// Decodes every kept person's dosage of ALT `alt_index` from a BCF `record` into
 /// `column`, as [`for_each_bcf_dosage_best`] visits them, with `ref_effect_error`
 /// as in [`decode_vcf_column`].
+// Kept out of line: inlined into the decode workers, its sixteen-person block copies left as
+// Vec::extend_from_slice and memmove calls (100-score BCF row: 2.3% and +4.5% of cycles).
+#[inline(never)]
 fn decode_bcf_column(
     record: &noodles_bcf::Record,
     header: &noodles_vcf::Header,
@@ -2195,10 +2745,7 @@ impl<'r> BcfDosageFields<'r> {
                 }
                 BcfFieldText::Values(_) => {
                     let values = ds.sample_values(sample).map(|value| match value {
-                        BcfValue::Value(dosage) if !dosage.is_finite() => {
-                            Err("Dosage must be finite".into())
-                        }
-                        BcfValue::Value(dosage) => Ok(Some(dosage)),
+                        BcfValue::Value(dosage) => Dose::from_f32(dosage).map(Some),
                         _ => Ok(None),
                     });
                     dosage_from_values(values, alt_index, alt_count, ploidy)?
@@ -2217,7 +2764,10 @@ impl<'r> BcfDosageFields<'r> {
             };
             if let Some(actual_len) = actual_len {
                 let parts = gp.sample_values(sample).map(|value| match value {
-                    BcfValue::Value(probability) => Ok(Some(probability)),
+                    BcfValue::Value(probability) if !probability.is_finite() => {
+                        Err("GP probabilities must be finite and between zero and one".into())
+                    }
+                    BcfValue::Value(probability) => Dose::from_f32(probability).map(Some),
                     _ => Ok(None),
                 });
                 let parsed = gp_from_values(actual_len, parts, alt_index, alt_count, ploidy)?;
@@ -2229,24 +2779,24 @@ impl<'r> BcfDosageFields<'r> {
         let Some(gt) = self.gt else {
             return Ok(None);
         };
-        let mut dosage = 0.0f64;
-        let mut ref_dosage = 0.0f64;
+        let mut dosage = 0u8;
+        let mut ref_dosage = 0u8;
         let mut ploidy = 0u8;
         for allele in gt.genotype_alleles(sample) {
             let Some(allele) = allele else {
                 return Ok(None);
             };
             if allele == alt_index {
-                dosage += 1.0;
+                dosage += 1;
             }
             if allele == 0 {
-                ref_dosage += 1.0;
+                ref_dosage += 1;
             }
             ploidy = ploidy.checked_add(1).ok_or("genotype ploidy overflow")?;
         }
         Ok((ploidy > 0).then_some(DecodedAltDosage {
-            alt_dosage: dosage,
-            ref_dosage: Some(ref_dosage),
+            alt_dosage: Dose::copies(dosage),
+            ref_dosage: Some(Dose::copies(ref_dosage)),
         }))
     }
 }
@@ -2344,7 +2894,8 @@ fn write_sample_value(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     match value {
         SeriesValue::Integer(value) => write!(out, "{value}")?,
-        SeriesValue::Float(value) => write!(out, "{}", f64::from(value))?,
+        // An f32 by the shortest decimal that reads back as the same f32, as the typed route reads it.
+        SeriesValue::Float(value) => write!(out, "{value}")?,
         SeriesValue::Character(value) => out.push(value),
         SeriesValue::String(value) => out.push_str(value.as_ref()),
         SeriesValue::Genotype(genotype) => {
@@ -2376,7 +2927,7 @@ fn write_sample_value(
                     out.push(',');
                 }
                 match value? {
-                    Some(value) => write!(out, "{}", f64::from(value))?,
+                    Some(value) => write!(out, "{value}")?,
                     None => out.push('.'),
                 }
             }
@@ -2503,58 +3054,11 @@ fn parse_vcf_dosage_field(
         return Ok(None);
     }
     dosage_from_values(
-        field.split(',').map(parse_numeric_str),
+        field.split(',').map(parse_dose),
         alt_index,
         alt_count,
         ploidy,
     )
-}
-
-/// The DS rules for one sample's values, in field order, each already read as a
-/// finite number or `None` for a missing value.
-fn dosage_from_values<I>(
-    values: I,
-    alt_index: usize,
-    alt_count: usize,
-    ploidy: Option<u8>,
-) -> Result<Option<DecodedAltDosage>, Box<dyn Error + Send + Sync>>
-where
-    I: Iterator<Item = Result<Option<f64>, Box<dyn Error + Send + Sync>>>,
-{
-    if alt_index == 0 || alt_index > alt_count {
-        return Err("ALT allele index is out of range".into());
-    }
-    let mut alt_dosage = None;
-    let mut total_alt_dosage = Some(0.0);
-    let mut count = 0;
-    for (offset, value) in values.enumerate() {
-        let dosage = value?;
-        if dosage.is_some_and(|dosage| dosage < 0.0) {
-            return Err("DS dosage must be nonnegative".into());
-        }
-        if offset + 1 == alt_index {
-            alt_dosage = dosage;
-        }
-        total_alt_dosage = total_alt_dosage.zip(dosage).map(|(sum, value)| sum + value);
-        count += 1;
-    }
-    if count != alt_count {
-        return Err(format!(
-            "DS field has {count} values, expected {alt_count} alternate allele dosages"
-        )
-        .into());
-    }
-    let ref_dosage = ploidy
-        .zip(total_alt_dosage)
-        .map(|(ploidy, total)| f64::from(ploidy) - total);
-    if ref_dosage.is_some_and(|dosage| dosage < -1e-6) {
-        return Err("DS alternate dosages exceed genotype ploidy".into());
-    }
-    Ok(alt_dosage.map(|alt_dosage| DecodedAltDosage {
-        alt_dosage,
-        // Permit decimal rounding at the dosage boundary without a negative count.
-        ref_dosage: ref_dosage.map(|dosage| dosage.max(0.0)),
-    }))
 }
 
 fn parse_vcf_gp(
@@ -2566,13 +3070,20 @@ fn parse_vcf_gp(
     if field.is_empty() || field == "." {
         return Ok(None);
     }
-    let parts = field.split(',').map(|part| {
-        if part == "." {
-            Ok(None)
-        } else {
-            Ok(Some(part.parse::<f64>()?))
-        }
-    });
+    let parts = field
+        .split(',')
+        .map(|part| -> Result<Option<Dose>, Box<dyn Error + Send + Sync>> {
+            if part == "." {
+                return Ok(None);
+            }
+            let probability = part.parse::<f64>()?;
+            if !probability.is_finite() {
+                return Err("GP probabilities must be finite and between zero and one".into());
+            }
+            plain_decimal(part.as_bytes())
+                .map_or_else(|| Dose::from_f64(probability), Ok)
+                .map(Some)
+        });
     gp_from_values(
         field.split(',').count(),
         parts,
@@ -2580,120 +3091,6 @@ fn parse_vcf_gp(
         alt_count,
         ploidy,
     )
-}
-
-/// The GP rules for one sample's `actual_len` probabilities, in field order, each
-/// already read as a number or `None` for a missing value.
-fn gp_from_values<I>(
-    actual_len: usize,
-    mut parts: I,
-    alt_index: usize,
-    alt_count: usize,
-    ploidy: Option<u8>,
-) -> Result<Option<DecodedAltDosage>, Box<dyn Error + Send + Sync>>
-where
-    I: Iterator<Item = Result<Option<f64>, Box<dyn Error + Send + Sync>>>,
-{
-    if alt_index == 0 || alt_index > alt_count {
-        return Err(format!(
-            "ALT allele index {alt_index} is out of range for {alt_count} alternate alleles"
-        )
-        .into());
-    }
-
-    let allele_count = alt_count.checked_add(1).ok_or("GP allele count overflow")?;
-    let diploid_len = allele_count
-        .checked_add(1)
-        .and_then(|next| allele_count.checked_mul(next))
-        .map(|n| n / 2)
-        .ok_or("GP allele count overflow")?;
-    let ploidy = match ploidy {
-        Some(ploidy) => ploidy,
-        None if actual_len == allele_count => 1,
-        None if actual_len == diploid_len => 2,
-        None => return Err(format!("GP field has {actual_len} values; cannot determine haploid or diploid ploidy for {alt_count} alternate alleles").into()),
-    };
-    let expected_len = match ploidy {
-        1 => allele_count,
-        2 => diploid_len,
-        _ => {
-            return Err(format!(
-                "GP dosage decoding requires haploid or diploid genotypes, got ploidy {ploidy}"
-            )
-            .into());
-        }
-    };
-    if actual_len != expected_len {
-        return Err(format!("GP field has {actual_len} values, expected {expected_len} for ploidy {ploidy} and {alt_count} alternate alleles").into());
-    }
-    let mut dosage = 0.0f64;
-    let mut ref_dosage = 0.0f64;
-    for second in 0..allele_count {
-        let first_count = if ploidy == 1 { 1 } else { second + 1 };
-        for first in 0..first_count {
-            let Some(probability) = parts.next().expect("GP cardinality was validated")? else {
-                return Ok(None);
-            };
-            if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
-                return Err("GP probabilities must be finite and between zero and one".into());
-            }
-            let copies =
-                usize::from(ploidy == 2 && first == alt_index) + usize::from(second == alt_index);
-            dosage += probability * copies as f64;
-            let ref_copies = usize::from(ploidy == 2 && first == 0) + usize::from(second == 0);
-            ref_dosage += probability * ref_copies as f64;
-        }
-    }
-    Ok(Some(DecodedAltDosage {
-        alt_dosage: dosage,
-        ref_dosage: Some(ref_dosage),
-    }))
-}
-
-fn parse_numeric_str(text: &str) -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
-    if let Some(value) = plain_decimal(text.as_bytes()) {
-        return Ok(Some(value));
-    }
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed == "." {
-        Ok(None)
-    } else {
-        let value = trimmed.parse::<f64>()?;
-        if !value.is_finite() {
-            return Err("Dosage must be finite".into());
-        }
-        Ok(Some(value))
-    }
-}
-
-/// The value of `bytes` when they are a plain decimal of at most fifteen digits,
-/// without sign, exponent or space: its digits as an integer divided by a power
-/// of ten. Both operands are exact and IEEE division rounds correctly, so the
-/// quotient is the correctly rounded value `str::parse` returns.
-fn plain_decimal(bytes: &[u8]) -> Option<f64> {
-    const POWERS_OF_TEN: [f64; 16] = [
-        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
-    ];
-    let mut mantissa = 0u64;
-    let mut digits = 0usize;
-    let mut fraction_digits = None;
-    for &byte in bytes {
-        if byte.is_ascii_digit() {
-            digits += 1;
-            if digits > 15 {
-                return None;
-            }
-            mantissa = mantissa * 10 + u64::from(byte - b'0');
-            if let Some(count) = &mut fraction_digits {
-                *count += 1;
-            }
-        } else if byte == b'.' && fraction_digits.is_none() {
-            fraction_digits = Some(0usize);
-        } else {
-            return None;
-        }
-    }
-    (digits > 0).then(|| mantissa as f64 / POWERS_OF_TEN[fraction_digits.unwrap_or(0)])
 }
 
 fn parse_vcf_genotype(
@@ -2704,8 +3101,8 @@ fn parse_vcf_genotype(
         return Ok(None);
     }
 
-    let mut dosage = 0.0f64;
-    let mut ref_dosage = 0.0f64;
+    let mut dosage = 0u8;
+    let mut ref_dosage = 0u8;
     let mut ploidy = 0u8;
     let bytes = field.as_bytes();
     let mut idx = 0;
@@ -2721,10 +3118,10 @@ fn parse_vcf_genotype(
                 }
                 let allele = field[start..idx].parse::<usize>()?;
                 if allele == alt_index {
-                    dosage += 1.0;
+                    dosage += 1;
                 }
                 if allele == 0 {
-                    ref_dosage += 1.0;
+                    ref_dosage += 1;
                 }
                 ploidy = ploidy.checked_add(1).ok_or("genotype ploidy overflow")?;
             }
@@ -2736,8 +3133,8 @@ fn parse_vcf_genotype(
         Ok(None)
     } else {
         Ok(Some(DecodedAltDosage {
-            alt_dosage: dosage,
-            ref_dosage: Some(ref_dosage),
+            alt_dosage: Dose::copies(dosage),
+            ref_dosage: Some(Dose::copies(ref_dosage)),
         }))
     }
 }
@@ -2916,6 +3313,48 @@ mod tests {
     use std::io::{Cursor, Write};
 
     #[test]
+    fn column_extremes_match_one_dose_at_a_time() {
+        let mut state = 0x2354_e47e_0000_0001u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for people in 0..40usize {
+            for _ in 0..50 {
+                let mut doses = Doses::default();
+                for _ in 0..people {
+                    // Missing doses, both i64 extremes, and short digits at up to 19 places.
+                    let dose = |bits: u64, spread: u64| {
+                        let places = (spread % 20) as u8;
+                        match bits % 7 {
+                            0 => Dose::MISSING,
+                            1 => Dose { digits: i64::MIN, places },
+                            2 => Dose { digits: i64::MAX, places },
+                            _ => Dose { digits: (bits >> 8) as i64 % 1_000_000 - 500_000, places },
+                        }
+                    };
+                    let (a, b, c, d) = (next(), next(), next(), next());
+                    doses.push([dose(a, b), dose(c, d)]);
+                }
+                let mut want = (u8::MAX, 0u8, [0u64; 2], false);
+                for [alt, reference] in doses.pairs() {
+                    for (side, dose) in [alt, reference].into_iter().enumerate() {
+                        want.0 = want.0.min(dose.places);
+                        if dose.places != u8::MAX {
+                            want.1 = want.1.max(dose.places);
+                        }
+                        want.2[side] = want.2[side].max(dose.digits.unsigned_abs());
+                    }
+                    want.3 |= alt.places != u8::MAX && reference.places == u8::MAX;
+                }
+                assert_eq!(doses.extremes(), want, "people {people}");
+            }
+        }
+    }
+
+    #[test]
     fn multiallelic_ref_dosage_excludes_every_alternate_allele() {
         let dir = tempfile::tempdir().expect("tempdir");
         let vcf_path = dir.path().join("cohort.vcf");
@@ -2964,7 +3403,7 @@ mod tests {
                 score_vcf_streaming(&vcf_path, std::slice::from_ref(&score_path), None, None)
                     .unwrap_or_else(|err| panic!("{format} {samples}: {err}"));
             assert_eq!(result.score_names, ["AltG", "RefA"]);
-            for (actual, expected) in result.sum_scores.iter().zip(expected) {
+            for (actual, expected) in result.sums().iter().zip(expected) {
                 assert!(
                     (actual - expected).abs() < 1e-12,
                     "{format} {samples}: {actual} != {expected}"
@@ -2993,7 +3432,7 @@ mod tests {
         let partial = parse_vcf_dosage_field("0.5,.", 1, 2, Some(2))
             .expect("parse partial dosage")
             .expect("selected ALT dosage");
-        assert_eq!(partial.alt_dosage, 0.5);
+        assert_eq!(partial.alt_dosage, Dose { digits: 5, places: 1 });
         assert_eq!(partial.ref_dosage, None);
     }
 
@@ -3012,7 +3451,7 @@ mod tests {
         )
         .expect("write score");
         let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
-        assert_eq!(result.sum_scores, [11.0]);
+        assert_eq!(result.sums(), [11.0]);
         assert_eq!(result.score_variant_counts, [2]);
         assert_eq!(result.matched_variants, 2);
     }
@@ -3071,7 +3510,7 @@ mod tests {
             let vcf = score_vcf_streaming(&vcf_path, std::slice::from_ref(&score_path), None, None)
                 .expect("score vcf");
             let bcf = score_vcf_streaming(&bcf_path, &[score_path], None, None).expect("score bcf");
-            assert_eq!(vcf.sum_scores, bcf.sum_scores, "{name}");
+            assert_eq!(vcf.sums(), bcf.sums(), "{name}");
             assert_eq!(vcf.score_variant_counts, bcf.score_variant_counts, "{name}");
             assert_eq!(vcf.missing_counts, bcf.missing_counts, "{name}");
             vcf
@@ -3081,7 +3520,7 @@ mod tests {
             "pairs.tsv",
             "1:100\tA\tG\t0.5\n1:200\tT\tC\t-0.25\n1:400\tT\tC\t2\n1:500\tA\tG\t0.125\n",
         );
-        assert_eq!(pairs.sum_scores, [2.25, 2.125]);
+        assert_eq!(pairs.sums(), [2.25, 2.125]);
         assert_eq!(pairs.score_variant_counts, [4]);
         // The same weights with the other allele unknown or listed as candidates, plus an
         // ambiguous locus and one the genotypes lack.
@@ -3089,7 +3528,7 @@ mod tests {
             "effect_only.tsv",
             "1:100\tA\t.\t0.5\n1:200\tT\t.\t-0.25\n1:300\tA\t.\t9\n1:400\tT\tC/G\t2\n1:500\tA\tG/T\t0.125\n1:600\tA\t.\t7\n",
         );
-        assert_eq!(effect_only.sum_scores, pairs.sum_scores);
+        assert_eq!(effect_only.sums(), pairs.sums());
         assert_eq!(effect_only.score_variant_counts, pairs.score_variant_counts);
         assert_eq!(effect_only.missing_counts, pairs.missing_counts);
 
@@ -3099,7 +3538,7 @@ mod tests {
             "skipped.tsv",
             "1:100\tC\t.\t1\n1:300\tA\t.\t1\n1:400\tT\tA/G\t1\n1:500\tA\tG\t1\n",
         );
-        assert_eq!(skipped.sum_scores, [2.0, 1.0]);
+        assert_eq!(skipped.sums(), [2.0, 1.0]);
         assert_eq!(skipped.score_variant_counts, [1]);
     }
 
@@ -3141,7 +3580,7 @@ mod tests {
         let expected = score_vcf_streaming(&vcf_path, &[pairs_path], None, None).expect("pairs");
         let actual =
             score_vcf_streaming(&vcf_path, &[effect_only_path], None, None).expect("effect only");
-        assert_eq!(actual.sum_scores, expected.sum_scores);
+        assert_eq!(actual.sums(), expected.sums());
         assert_eq!(actual.score_variant_counts, expected.score_variant_counts);
         assert_eq!(expected.score_variant_counts, [2 * positions as u32]);
     }
@@ -3198,8 +3637,8 @@ mod tests {
 
         let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
         assert_eq!(result.score_variant_counts, [1]);
-        assert!((result.sum_scores[0] - 1.1).abs() < 1e-9);
-        assert!((result.sum_scores[1] - 0.2).abs() < 1e-9);
+        assert!((result.sums()[0] - 1.1).abs() < 1e-9);
+        assert!((result.sums()[1] - 0.2).abs() < 1e-9);
     }
 
     #[test]
@@ -3228,7 +3667,7 @@ mod tests {
 
         let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
         assert_eq!(result.score_variant_counts, [1]);
-        assert_eq!(result.sum_scores, [0.5]);
+        assert_eq!(result.sums(), [0.5]);
     }
 
     #[test]
@@ -3270,7 +3709,7 @@ mod tests {
         assert_eq!(result.score_names, vec!["ScoreA"]);
         assert_eq!(result.score_variant_counts, [2]);
         assert_eq!(result.missing_counts, [0, 0, 1]);
-        assert_eq!(result.sum_scores, [0.0, 1.5, 2.0]);
+        assert_eq!(result.sums(), [0.0, 1.5, 2.0]);
         assert_eq!(result.matched_variants, 2);
     }
 
@@ -3313,7 +3752,7 @@ mod tests {
         assert_eq!(result.score_names, vec!["ScoreA"]);
         assert_eq!(result.score_variant_counts, [2]);
         assert_eq!(result.missing_counts, [0, 1]);
-        assert_eq!(result.sum_scores, [2.5, 2.0]);
+        assert_eq!(result.sums(), [2.5, 2.0]);
         assert_eq!(result.matched_variants, 2);
     }
 
@@ -3344,7 +3783,7 @@ mod tests {
         let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
         assert_eq!(result.score_variant_counts, [1]);
         assert_eq!(result.missing_counts, [0, 1]);
-        assert_eq!(result.sum_scores, [0.0, 0.0]);
+        assert_eq!(result.sums(), [0.0, 0.0]);
         assert_eq!(result.matched_variants, 1);
     }
 
@@ -3375,7 +3814,7 @@ mod tests {
         let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
         assert_eq!(result.score_variant_counts, [2]);
         assert_eq!(result.missing_counts, [0, 0, 0]);
-        assert_eq!(result.sum_scores, [1.0, 10.0, 11.0]);
+        assert_eq!(result.sums(), [1.0, 10.0, 11.0]);
         assert_eq!(result.matched_variants, 2);
     }
 
@@ -3411,8 +3850,8 @@ mod tests {
         let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
         assert_eq!(result.score_variant_counts, [2]);
         assert_eq!(result.missing_counts, [0, 0]);
-        assert!((result.sum_scores[0] - 2.5).abs() < 1e-12);
-        assert!((result.sum_scores[1] - 16.2).abs() < 1e-12);
+        assert!((result.sums()[0] - 2.5).abs() < 1e-12);
+        assert!((result.sums()[1] - 16.2).abs() < 1e-12);
         assert_eq!(result.matched_variants, 2);
     }
 
@@ -3453,7 +3892,7 @@ mod tests {
         let result =
             score_vcf_streaming(&vcf_path, &[score_path], None, Some(&regions)).expect("score");
         assert_eq!(result.score_variant_counts, [1]);
-        assert_eq!(result.sum_scores, [1.0]);
+        assert_eq!(result.sums(), [1.0]);
         assert_eq!(result.matched_variants, 1);
     }
 
@@ -3487,7 +3926,7 @@ mod tests {
         let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
         assert_eq!(result.score_names, vec!["ScoreA", "ScoreB"]);
         assert_eq!(result.score_variant_counts, [1, 1]);
-        assert_eq!(result.sum_scores, [0.5, 2.0, 1.0, 4.0]);
+        assert_eq!(result.sums(), [0.5, 2.0, 1.0, 4.0]);
     }
 
     #[test]
@@ -3516,7 +3955,7 @@ mod tests {
         let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
         assert_eq!(result.score_variant_counts, [1]);
         assert_eq!(result.missing_counts, [0, 0]);
-        assert_eq!(result.sum_scores, [2.0, 0.0]);
+        assert_eq!(result.sums(), [2.0, 0.0]);
     }
 
     fn bgzf_block(data: &[u8]) -> Vec<u8> {
@@ -3723,12 +4162,12 @@ mod tests {
             assert_same_native_result(&expected, &actual, &path.display().to_string());
             assert_eq!(
                 expected
-                    .sum_scores
+                    .sums()
                     .iter()
                     .map(|value| value.to_bits())
                     .collect::<Vec<_>>(),
                 actual
-                    .sum_scores
+                    .sums()
                     .iter()
                     .map(|value| value.to_bits())
                     .collect::<Vec<_>>(),
@@ -3845,12 +4284,12 @@ mod tests {
         )
     }
 
-    type Visits = Option<Vec<Option<(u64, Option<u64>)>>>;
+    type Visits = Option<Vec<Option<(Dose, Option<Dose>)>>>;
 
     type DosageVisitor<'a> =
         dyn FnMut(usize, Option<DecodedAltDosage>) -> Result<(), Box<dyn Error + Send + Sync>> + 'a;
 
-    /// Every person a dosage route visits, as bits, or `None` if the route fails.
+    /// Every person a dosage route visits, as exact doses, or `None` if the route fails.
     fn bcf_dosage_visits(
         route: impl FnOnce(&mut DosageVisitor<'_>) -> Result<(), Box<dyn Error + Send + Sync>>,
     ) -> Visits {
@@ -3859,7 +4298,7 @@ mod tests {
                          decoded: Option<DecodedAltDosage>|
          -> Result<(), Box<dyn Error + Send + Sync>> {
             assert_eq!(out_idx, visits.len());
-            visits.push(decoded.map(|d| (d.alt_dosage.to_bits(), d.ref_dosage.map(f64::to_bits))));
+            visits.push(decoded.map(|d| (d.alt_dosage, d.ref_dosage)));
             Ok(())
         };
         let result = route(&mut visit);
@@ -4096,15 +4535,11 @@ mod tests {
                 for_each_bcf_dosage_best(record, &header, alt_index, alt_count, kept, visit)
             })
             .unwrap_or_else(|| panic!("record {index}: the typed route fails"));
-            let decoded: Vec<Option<(u64, Option<u64>)>> = codes
+            let decoded: Vec<Option<(Dose, Option<Dose>)>> = codes
                 .iter()
                 .map(|&code| {
-                    (code != MISSING_CALL).then(|| {
-                        (
-                            f64::from(code & 0x0f).to_bits(),
-                            Some(f64::from(code >> 4).to_bits()),
-                        )
-                    })
+                    (code != MISSING_CALL)
+                        .then(|| (Dose::copies(code & 0x0f), Some(Dose::copies(code >> 4))))
                 })
                 .collect();
             assert_eq!(decoded, visits, "record {index}, kept {kept:?}, ALT {alt_index}");
@@ -4156,7 +4591,16 @@ mod tests {
             (
                 "FORMAT=<ID=DS,Number=1,Type=String",
                 vec![(1, 1, 2, gt.clone()), (2, 7, 3, b"0.5".to_vec())],
-                Some(vec![Some((0.5f64.to_bits(), Some(1.5f64.to_bits())))]),
+                Some(vec![Some((
+                    Dose {
+                        digits: 5,
+                        places: 1,
+                    },
+                    Some(Dose {
+                        digits: 15,
+                        places: 1,
+                    }),
+                ))]),
             ),
         ] {
             let (header, records) = read_raw_bcf(
@@ -4193,8 +4637,8 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            bits(&expected.sum_scores),
-            bits(&actual.sum_scores),
+            bits(&expected.sums()),
+            bits(&actual.sums()),
             "{context}"
         );
     }
@@ -4379,7 +4823,8 @@ mod tests {
         let mut builder = ScoreRulesBuilder::default();
         builder.push_application(ScoreApplication {
             score_index: 0,
-            weight: 1.0,
+            digits: 1,
+            exponent: 0,
         });
         builder.push_row((22, 100), "G", "A", 0);
         let rules_by_key = builder.finish();

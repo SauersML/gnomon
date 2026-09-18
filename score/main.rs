@@ -1116,9 +1116,7 @@ fn finalize_and_write_native_output(
         &result.person_iids,
         &result.score_names,
         &result.score_variant_counts,
-        &F64Sums {
-            sums: &result.sum_scores,
-        },
+        &NativeCells { result },
         &result.missing_counts,
         score_regions,
         emit_components,
@@ -1816,11 +1814,32 @@ impl ScoreValues for ExactCells<'_> {
     }
 }
 
-/// f64 sums averaged in f64, as the native VCF scorer produces them.
+/// The native VCF scorer's exact cells, each rounded once.
+struct NativeCells<'a> {
+    result: &'a NativeVcfScoreResult,
+}
+
+impl ScoreValues for NativeCells<'_> {
+    fn cells(&self) -> usize {
+        self.result.missing_counts.len()
+    }
+
+    fn sum(&self, cell: usize) -> f64 {
+        self.result.sum(cell)
+    }
+
+    fn average(&self, cell: usize, variants_used: u32) -> f64 {
+        self.result.average(cell, variants_used)
+    }
+}
+
+/// f64 sums averaged in f64: the finished values the output tests write.
+#[cfg(test)]
 struct F64Sums<'a> {
     sums: &'a [f64],
 }
 
+#[cfg(test)]
 impl ScoreValues for F64Sums<'_> {
     fn cells(&self) -> usize {
         self.sums.len()

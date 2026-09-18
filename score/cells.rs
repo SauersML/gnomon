@@ -685,7 +685,7 @@ impl ExactPlan {
 }
 
 /// Base-10^9 digits, least significant first, without trailing zero limbs.
-fn limbs_of(mut value: u128) -> Vec<u32> {
+pub(crate) fn limbs_of(mut value: u128) -> Vec<u32> {
     let mut limbs = Vec::new();
     while value > 0 {
         limbs.push((value % BILLION) as u32);
@@ -694,7 +694,7 @@ fn limbs_of(mut value: u128) -> Vec<u32> {
     limbs
 }
 
-fn shift_decimal(limbs: &mut Vec<u32>, digits: u32) {
+pub(crate) fn shift_decimal(limbs: &mut Vec<u32>, digits: u32) {
     if limbs.is_empty() {
         return;
     }
@@ -711,7 +711,7 @@ fn shift_decimal(limbs: &mut Vec<u32>, digits: u32) {
     limbs.splice(0..0, std::iter::repeat_n(0, (digits / 9) as usize));
 }
 
-fn add_limbs(sum: &mut Vec<u32>, value: &[u32]) {
+pub(crate) fn add_limbs(sum: &mut Vec<u32>, value: &[u32]) {
     if sum.len() < value.len() {
         sum.resize(value.len(), 0);
     }
@@ -732,14 +732,14 @@ fn trim(limbs: &mut Vec<u32>) {
     }
 }
 
-fn compare_limbs(a: &[u32], b: &[u32]) -> Ordering {
+pub(crate) fn compare_limbs(a: &[u32], b: &[u32]) -> Ordering {
     a.len()
         .cmp(&b.len())
         .then_with(|| a.iter().rev().cmp(b.iter().rev()))
 }
 
 /// `a - b` for `a >= b`.
-fn subtract_limbs(a: &[u32], b: &[u32]) -> Vec<u32> {
+pub(crate) fn subtract_limbs(a: &[u32], b: &[u32]) -> Vec<u32> {
     let mut out = Vec::with_capacity(a.len());
     let mut borrow = 0i64;
     for (i, &limb) in a.iter().enumerate() {
@@ -757,7 +757,7 @@ fn subtract_limbs(a: &[u32], b: &[u32]) -> Vec<u32> {
 /// `Σ value × 10^-places` over `values`, divided by `denominator` (below 2^96), correctly
 /// rounded: the quotient's decimal expansion to [`ROUNDING_DIGITS`] fraction digits, a sticky
 /// digit when more follow, parsed by `str::parse`, which rounds a decimal of any length correctly.
-fn round_long(values: &[(i128, i32)], denominator: u128) -> f64 {
+pub(crate) fn round_long(values: &[(i128, i32)], denominator: u128) -> f64 {
     let top = values.iter().map(|&(_, places)| places).max().unwrap_or(0);
     let (mut positive, mut negative) = (Vec::new(), Vec::new());
     for &(value, places) in values {
@@ -771,6 +771,11 @@ fn round_long(values: &[(i128, i32)], denominator: u128) -> f64 {
         Ordering::Less => (true, subtract_limbs(&negative, &positive)),
         _ => (false, subtract_limbs(&positive, &negative)),
     };
+    round_decimal(negative_result, &magnitude, top, denominator)
+}
+
+/// `±magnitude × 10^-top / denominator` (below 2^96), correctly rounded, as [`round_long`] rounds.
+pub(crate) fn round_decimal(negative_result: bool, magnitude: &[u32], top: i32, denominator: u128) -> f64 {
     if magnitude.is_empty() {
         return 0.0;
     }

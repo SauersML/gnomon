@@ -699,8 +699,8 @@ mod tests {
         );
     }
 
-    /// Every person a dosage route visits, as bits.
-    type Visits = Vec<Option<(u64, Option<u64>)>>;
+    /// Every person a dosage route visits, as exact doses.
+    type Visits = Vec<Option<(Dose, Option<Dose>)>>;
 
     /// The hard-call decoder visits every kept person as the dosage route does,
     /// or fails with its error: phased, unphased, haploid, polyploid, missing and
@@ -750,7 +750,7 @@ mod tests {
             let fast = vcf_gt_calls(&samples, alt_index, 3, kept, &mut codes);
             let mut visits: Visits = Vec::new();
             let text = for_each_vcf_dosage_best(&samples, alt_index, 3, kept, |_, dosage| {
-                visits.push(dosage.map(|d| (d.alt_dosage.to_bits(), d.ref_dosage.map(f64::to_bits))));
+                visits.push(dosage.map(|d| (d.alt_dosage, d.ref_dosage)));
                 Ok(())
             });
             match fast {
@@ -760,10 +760,7 @@ mod tests {
                         .iter()
                         .map(|&code| {
                             (code != MISSING_CALL).then(|| {
-                                (
-                                    f64::from(code & 0x0f).to_bits(),
-                                    Some(f64::from(code >> 4).to_bits()),
-                                )
+                                (Dose::copies(code & 0x0f), Some(Dose::copies(code >> 4)))
                             })
                         })
                         .collect();
@@ -816,7 +813,7 @@ mod tests {
             assert!(fast, "{samples:?} decodes as hard calls");
             let mut visits: Visits = Vec::new();
             for_each_vcf_dosage_best(&samples, alt_index, 3, kept, |_, dosage| {
-                visits.push(dosage.map(|d| (d.alt_dosage.to_bits(), d.ref_dosage.map(f64::to_bits))));
+                visits.push(dosage.map(|d| (d.alt_dosage, d.ref_dosage)));
                 Ok(())
             })
             .unwrap_or_else(|err| panic!("{samples:?}: {err}"));
@@ -824,10 +821,7 @@ mod tests {
                 .iter()
                 .map(|&code| {
                     (code != MISSING_CALL).then(|| {
-                        (
-                            f64::from(code & 0x0f).to_bits(),
-                            Some(f64::from(code >> 4).to_bits()),
-                        )
+                        (Dose::copies(code & 0x0f), Some(Dose::copies(code >> 4)))
                     })
                 })
                 .collect();
@@ -866,20 +860,18 @@ mod tests {
             let alt_index = 1 + draws.below(alt_count);
             let ref_effect_error = || asks_for_ref(alt_index).then(|| String::from("REF-effect rule"));
 
-            let mut fast_dosages = Vec::new();
+            let mut fast_dosages = Doses::default();
             let fast = vcf_gt_ds_dosages(&samples, alt_index, alt_count, kept, &ref_effect_error, &mut fast_dosages);
-            let mut visits: Vec<[u64; 2]> = Vec::new();
+            let mut visits: Vec<[Dose; 2]> = Vec::new();
             let text = for_each_vcf_dosage_best(&samples, alt_index, alt_count, kept, |_, dosage| {
                 let pair = dosage_pair(dosage, &ref_effect_error)?;
-                visits.push(pair.map(f64::to_bits));
+                visits.push(pair);
                 Ok(())
             });
             match fast {
                 Ok(true) => {
                     text.unwrap_or_else(|err| panic!("{samples:?}: {err}"));
-                    let fast_bits: Vec<[u64; 2]> =
-                        fast_dosages.iter().map(|pair| pair.map(f64::to_bits)).collect();
-                    assert_eq!(fast_bits, visits, "{samples:?} kept {kept:?}");
+                    assert_eq!(fast_dosages.pairs(), visits, "{samples:?} kept {kept:?}");
                     decoded += 1;
                 }
                 Ok(false) => other_layouts += 1,
@@ -1043,7 +1035,7 @@ mod tests {
         }
     }
 
-    /// A plain decimal the fast path reads has the bits `str::parse` gives it.
+    /// A plain decimal the fast path reads is the number `str::parse` reads.
     #[test]
     fn plain_decimals_read_as_str_parse_reads_them() {
         let mut draws = Draws(0xdec1);
@@ -1056,7 +1048,8 @@ mod tests {
             if draws.below(3) > 0 {
                 text.insert(draws.below(text.len() + 1), '.');
             }
-            if let Some(value) = plain_decimal(text.as_bytes()) {
+            if let Some(dose) = plain_decimal(text.as_bytes()) {
+                let value: f64 = format!("{}e-{}", dose.digits, dose.places).parse().unwrap();
                 assert_eq!(
                     Some(value.to_bits()),
                     text.parse::<f64>().ok().map(f64::to_bits),
@@ -1158,8 +1151,8 @@ mod tests {
                                 values.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
                             };
                             assert_eq!(
-                                bits(&expected.sum_scores),
-                                bits(&actual.sum_scores),
+                                bits(&expected.sums()),
+                                bits(&actual.sums()),
                                 "{context}"
                             );
                         }

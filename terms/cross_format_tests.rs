@@ -902,8 +902,8 @@ fn assert_same_scores(stage: &Path, vcf: &str) {
             );
             let bits = |sums: &[f64]| sums.iter().map(|sum| sum.to_bits()).collect::<Vec<_>>();
             assert_eq!(
-                bits(&from_bcf.sum_scores),
-                bits(&from_vcf.sum_scores),
+                bits(&from_bcf.sums()),
+                bits(&from_vcf.sums()),
                 "{}: score sums",
                 stage.display()
             );

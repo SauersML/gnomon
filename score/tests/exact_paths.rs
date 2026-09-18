@@ -3,7 +3,9 @@
 //! codes are scored through the dense and sparse kernels, the bounded accumulator, small-keep
 //! direct scoring and split filesets. Every path must leave bit-identical cells and counts, and
 //! every sum and average must be the correctly rounded exact rational, which this file derives
-//! from the written weights with its own integer arithmetic.
+//! from the written weights with its own integer arithmetic. The same holds for VCF and BCF
+//! input scored natively, from GT calls, DS dosages and GP probabilities, and a GT panel prints
+//! the same numbers through the VCF, BCF and PLINK paths.
 
 use std::error::Error;
 use std::fs;
@@ -12,6 +14,7 @@ use std::sync::Arc;
 
 use gnomon::pipeline::{Dispatch, PipelineContext, run};
 use gnomon::prepare::prepare_for_computation;
+use gnomon::score::native_vcf::{NativeVcfScoreResult, score_vcf_streaming};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -359,6 +362,377 @@ fn every_dispatch_path_gives_the_correctly_rounded_exact_scores() -> TestResult 
                                 "average: {label} person {person} score {score}"
                             );
                         }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What a native scenario writes for each person on each site.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Field {
+    /// GT calls, phased and unphased, with missing calls.
+    Gt,
+    /// GT and DS; where DS is missing the call scores.
+    GtDs,
+    /// GP alone.
+    Gp,
+}
+
+/// `digits × 10^-places` with exactly `places` fraction digits, trailing zeros kept.
+fn decimal_text(digits: i64, places: u32) -> String {
+    let power = 10i64.pow(places);
+    if places == 0 {
+        format!("{digits}")
+    } else {
+        format!("{}.{:0width$}", digits / power, digits % power, width = places as usize)
+    }
+}
+
+/// A random decimal in `[0, whole]` with up to five places: its text and its value in millionths.
+fn random_decimal(rng: &mut Rng, whole: i64) -> (String, i128) {
+    let places = rng.below(6) as u32;
+    let digits = rng.below((whole * 10i64.pow(places) + 1) as usize) as i64;
+    (decimal_text(digits, places), i128::from(digits) * 10i128.pow(6 - places))
+}
+
+/// Biallelic sites written as VCF samples, with every person's dosage of each allele.
+struct NativePanel {
+    /// The sites as `.bim` rows, A1 the ALT allele and A2 the REF allele, and the score lines.
+    panel: Panel,
+    field: Field,
+    /// Per site, each person's sample column.
+    samples: Vec<Vec<String>>,
+    /// Per site, each person's ALT and REF dosages in millionths, `None` where missing.
+    doses: Vec<Vec<Option<(i128, i128)>>>,
+}
+
+impl NativePanel {
+    fn random(rng: &mut Rng, people: usize, scores: usize, field: Field) -> Self {
+        let (mut rows, mut lines, mut loci) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut samples, mut doses) = (Vec::new(), Vec::new());
+        for chrom in 1..=2u8 {
+            for j in 0..24u32 {
+                let pos = 1000 + 10 * j;
+                let (reference, alternate) = PAIRS[rng.below(PAIRS.len())];
+                let (mut texts, mut site_doses, mut calls) = (Vec::new(), Vec::new(), Vec::new());
+                for _ in 0..people {
+                    let (gt, copies): (&str, Option<i128>) = match rng.below(6) {
+                        0 => ("0/0", Some(0)),
+                        1 => ("0|1", Some(1)),
+                        2 => ("1|0", Some(1)),
+                        3 => ("0/1", Some(1)),
+                        4 => ("1/1", Some(2)),
+                        _ => ("./.", None),
+                    };
+                    let call = copies.map(|alt| (alt * 1_000_000, (2 - alt) * 1_000_000));
+                    let (text, dose) = match field {
+                        Field::Gt => (gt.to_string(), call),
+                        Field::GtDs => match rng.below(16) {
+                            0..=3 => (format!("{gt}:."), call),
+                            // 2 - 2.000001 = -1e-6 is inside the DS tolerance, so REF clamps to zero.
+                            4 => (format!("{gt}:2.000001"), Some((2_000_001, 0))),
+                            _ => {
+                                let (ds, alt) = random_decimal(rng, 2);
+                                (format!("{gt}:{ds}"), Some((alt, 2_000_000 - alt)))
+                            }
+                        },
+                        Field::Gp => match rng.below(6) {
+                            0 => (".".to_string(), None),
+                            _ => {
+                                let [(p0, q0), (p1, q1), (p2, q2)] = std::array::from_fn(|_| random_decimal(rng, 1));
+                                (format!("{p0},{p1},{p2}"), Some((q1 + 2 * q2, 2 * q0 + q1)))
+                            }
+                        },
+                    };
+                    calls.push(match copies {
+                        Some(2) => 0b00,
+                        Some(1) => 0b10,
+                        Some(_) => 0b11,
+                        None => 0b01,
+                    });
+                    texts.push(text);
+                    site_doses.push(dose);
+                }
+                rows.push(Row {
+                    chrom,
+                    pos,
+                    a1: alternate,
+                    a2: reference,
+                    calls,
+                });
+                loci.push((chrom, pos, Locus::Simple));
+                samples.push(texts);
+                doses.push(site_doses);
+                for _ in 0..1 + usize::from(rng.below(4) == 0) {
+                    let (effect, other) = if rng.below(2) == 0 {
+                        (alternate, reference)
+                    } else {
+                        (reference, alternate)
+                    };
+                    let weights = (0..scores)
+                        .map(|_| {
+                            (rng.below(3) != 0).then(|| match rng.below(10) {
+                                0 => 0,
+                                1 => (rng.below(9) as i64 + 1) * 1_000_000,
+                                _ => rng.below(4_000_001) as i64 - 2_000_000,
+                            })
+                        })
+                        .collect();
+                    lines.push(Line {
+                        chrom,
+                        pos,
+                        effect,
+                        other,
+                        weights,
+                    });
+                }
+            }
+        }
+        Self {
+            panel: Panel {
+                people,
+                scores,
+                rows,
+                lines,
+                loci,
+            },
+            field,
+            samples,
+            doses,
+        }
+    }
+
+    /// Writes the sites as VCF text, and the same records as BCF through noodles.
+    fn write_vcf_and_bcf(&self, dir: &Path) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+        use noodles_vcf::variant::io::Write as _;
+
+        let format = match self.field {
+            Field::Gt => "GT",
+            Field::GtDs => "GT:DS",
+            Field::Gp => "GP",
+        };
+        let mut text = String::from(
+            "##fileformat=VCFv4.2\n##contig=<ID=1>\n##contig=<ID=2>\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             ##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"ALT dosage\">\n\
+             ##FORMAT=<ID=GP,Number=G,Type=Float,Description=\"Genotype probabilities\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT",
+        );
+        for person in 0..self.panel.people {
+            text.push_str(&format!("\tI{person}"));
+        }
+        text.push('\n');
+        for (row, site) in self.panel.rows.iter().zip(&self.samples) {
+            text.push_str(&format!("{}\t{}\t.\t{}\t{}\t.\tPASS\t.\t{format}", row.chrom, row.pos, row.a2, row.a1));
+            for sample in site {
+                text.push('\t');
+                text.push_str(sample);
+            }
+            text.push('\n');
+        }
+        let (vcf, bcf) = (dir.join("cohort.vcf"), dir.join("cohort.bcf"));
+        fs::write(&vcf, text)?;
+        let mut reader = noodles_vcf::io::Reader::new(std::io::BufReader::new(fs::File::open(&vcf)?));
+        let header = reader.read_header()?;
+        let mut writer = noodles_bcf::io::Writer::new(fs::File::create(&bcf)?);
+        writer.write_header(&header)?;
+        let mut record = noodles_vcf::variant::RecordBuf::default();
+        while reader.read_record_buf(&header, &mut record)? != 0 {
+            writer.write_variant_record(&header, &record)?;
+        }
+        writer.try_finish()?;
+        Ok((vcf, bcf))
+    }
+
+    /// Per person and score: the exact sum in units of 10^-12, the score's variant count and the
+    /// person's missing count.
+    fn oracle(&self) -> (Vec<i128>, Vec<u32>, Vec<u32>) {
+        let (people, scores) = (self.panel.people, self.panel.scores);
+        let (mut sums, mut missing) = (vec![0i128; people * scores], vec![0u32; people * scores]);
+        let mut counts = vec![0u32; scores];
+        for (site, row) in self.panel.rows.iter().enumerate() {
+            let lines: Vec<&Line> =
+                self.panel.lines.iter().filter(|l| l.chrom == row.chrom && l.pos == row.pos).collect();
+            for score in 0..scores {
+                let scored: Vec<&Line> = lines.iter().copied().filter(|l| l.weights[score].is_some()).collect();
+                if scored.is_empty() {
+                    continue;
+                }
+                counts[score] += 1;
+                for person in 0..people {
+                    let cell = person * scores + score;
+                    let Some((alt, reference)) = self.doses[site][person] else {
+                        missing[cell] += 1;
+                        continue;
+                    };
+                    for line in &scored {
+                        let dose = if line.effect == row.a1 { alt } else { reference };
+                        sums[cell] += i128::from(line.weights[score].unwrap()) * dose;
+                    }
+                }
+            }
+        }
+        (sums, counts, missing)
+    }
+}
+
+/// Scores `input` natively against one score file, with every sample kept.
+fn score_natively(input: &Path, score: &Path) -> Result<NativeVcfScoreResult, Box<dyn Error>> {
+    score_vcf_streaming(input, &[score.to_path_buf()], None, None).map_err(|error| error as Box<dyn Error>)
+}
+
+/// The cell of `name` for `person`, and the score's variant count.
+fn native_cell(result: &NativeVcfScoreResult, name: &str, person: usize) -> (usize, u32) {
+    let column = result.score_names.iter().position(|n| n == name).expect("score column");
+    (person * result.score_names.len() + column, result.score_variant_counts[column])
+}
+
+#[test]
+fn native_vcf_and_bcf_give_the_correctly_rounded_exact_scores() -> TestResult {
+    const SCALE: u128 = 1_000_000_000_000;
+    let dir = tempfile::tempdir()?;
+    let mut rng = Rng(0x2354_c0de_5eed_0001);
+    for (seed, (people, scores)) in [(5usize, 1usize), (37, 3), (64, 17), (257, 70)].into_iter().enumerate() {
+        for field in [Field::Gt, Field::GtDs, Field::Gp] {
+            let native = NativePanel::random(&mut rng, people, scores, field);
+            let scenario = dir.path().join(format!("native{seed}-{field:?}"));
+            fs::create_dir_all(&scenario)?;
+            let score_path = scenario.join("weights.tsv");
+            native.panel.write_scores(&score_path)?;
+            let (vcf, bcf) = native.write_vcf_and_bcf(&scenario)?;
+            let (sums, counts, missing) = native.oracle();
+            let results = [
+                ("vcf", score_natively(&vcf, &score_path)?),
+                ("bcf", score_natively(&bcf, &score_path)?),
+            ];
+            for (format, result) in &results {
+                let label = format!("people {people} scores {scores} {field:?} {format}");
+                assert_eq!(result.person_iids.len(), people, "{label}");
+                for score in 0..scores {
+                    for person in 0..people {
+                        let (cell, count) = native_cell(result, &format!("S{score:02}"), person);
+                        let want = person * scores + score;
+                        assert_eq!(count, counts[score], "{label}");
+                        assert_eq!(result.missing_counts[cell], missing[want], "{label} person {person}");
+                        assert_eq!(
+                            result.sum(cell).to_bits(),
+                            rounded_quotient(sums[want], SCALE).to_bits(),
+                            "sum: {label} person {person} score {score}"
+                        );
+                        let used = count - missing[want];
+                        let want_average = if used == 0 {
+                            0.0
+                        } else {
+                            rounded_quotient(sums[want], SCALE * u128::from(used))
+                        };
+                        assert_eq!(
+                            result.average(cell, used).to_bits(),
+                            want_average.to_bits(),
+                            "average: {label} person {person} score {score}"
+                        );
+                    }
+                }
+            }
+            if field != Field::Gt {
+                continue;
+            }
+            // The same calls as a PLINK fileset print the same numbers.
+            let prefixes = native.panel.write_filesets(&scenario, false)?;
+            let prep = Arc::new(prepare_for_computation(&prefixes, &[score_path.clone()], None, None)?);
+            let (cells, plink_missing) = run(&PipelineContext::new(Arc::clone(&prep)))?;
+            let exact = prep.exact();
+            let stride = exact.stride();
+            let vcf_result = &results[0].1;
+            for (column, name) in prep.score_names.iter().enumerate() {
+                for person in 0..people {
+                    let label = format!("people {people} scores {scores} plink {name} person {person}");
+                    let lanes = &cells[person * stride..(person + 1) * stride];
+                    let (cell, count) = native_cell(vcf_result, name, person);
+                    assert_eq!(prep.score_variant_counts[column], count, "{label}");
+                    let used = count - plink_missing[person * scores + column];
+                    assert_eq!(exact.sum(column, lanes).to_bits(), vcf_result.sum(cell).to_bits(), "{label}");
+                    assert_eq!(
+                        exact.average(column, lanes, used).to_bits(),
+                        vcf_result.average(cell, used).to_bits(),
+                        "{label}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn native_lanes_flush_exactly_at_their_bound() -> TestResult {
+    // A weight of 2^52 on two copies bounds a term at 2^53, so a score's lanes take
+    // k = floor((2^63 - 1) / 2^53) = 1023 alleles between flushes. The person with two copies
+    // everywhere fills a lane to k × 2^53 = 2^63 - 2^53, where one more term would leave i64.
+    const WEIGHT: i128 = 1 << 52;
+    let dir = tempfile::tempdir()?;
+    for ds in [false, true] {
+        for names in [&["UP"][..], &["UP", "DOWN"][..]] {
+            for sites in [1023usize, 1024, 2046, 2047] {
+                let scenario = dir.path().join(format!("lanes-{ds}-{}-{sites}", names.len()));
+                fs::create_dir_all(&scenario)?;
+                let mut vcf = String::from(
+                    "##fileformat=VCFv4.2\n##contig=<ID=1>\n\
+                     ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+                     ##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"ALT dosage\">\n\
+                     #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tI0\tI1\tI2\n",
+                );
+                let mut weights = format!("variant_id\teffect_allele\tother_allele\t{}\n", names.join("\t"));
+                let (mut sums, mut missing) = ([0i128; 3], [0u32; 3]);
+                for site in 0..sites {
+                    let pos = 1000 + 10 * site;
+                    let calls = [Some(2i128), (site % 3 != 2).then_some(1), Some(0)];
+                    vcf.push_str(&format!("1\t{pos}\t.\tA\tG\t.\tPASS\t.\t{}", if ds { "GT:DS" } else { "GT" }));
+                    for copies in calls {
+                        vcf.push('\t');
+                        vcf.push_str(match copies {
+                            Some(2) => "1/1",
+                            Some(1) => "0/1",
+                            Some(_) => "0/0",
+                            None => "./.",
+                        });
+                        if ds {
+                            vcf.push_str(&copies.map_or(":.".to_string(), |copies| format!(":{copies}")));
+                        }
+                    }
+                    vcf.push('\n');
+                    weights.push_str(&format!("1:{pos}\tG\tA\t{WEIGHT}"));
+                    if names.len() == 2 {
+                        weights.push_str(&format!("\t-{WEIGHT}"));
+                    }
+                    weights.push('\n');
+                    for (person, copies) in calls.into_iter().enumerate() {
+                        match copies {
+                            Some(copies) => sums[person] += WEIGHT * copies,
+                            None => missing[person] += 1,
+                        }
+                    }
+                }
+                let (vcf_path, score_path) = (scenario.join("cohort.vcf"), scenario.join("weights.tsv"));
+                fs::write(&vcf_path, vcf)?;
+                fs::write(&score_path, weights)?;
+                let result = score_natively(&vcf_path, &score_path)?;
+                for person in 0..3 {
+                    for (score, name) in names.iter().enumerate() {
+                        let label = format!("ds {ds} scores {} sites {sites} person {person} {name}", names.len());
+                        let sum = if score == 0 { sums[person] } else { -sums[person] };
+                        let (cell, count) = native_cell(&result, name, person);
+                        assert_eq!(count, sites as u32, "{label}");
+                        assert_eq!(result.missing_counts[cell], missing[person], "{label}");
+                        assert_eq!(result.sum(cell).to_bits(), rounded_quotient(sum, 1).to_bits(), "{label}");
+                        let used = count - missing[person];
+                        assert_eq!(
+                            result.average(cell, used).to_bits(),
+                            rounded_quotient(sum, u128::from(used)).to_bits(),
+                            "{label}"
+                        );
                     }
                 }
             }
