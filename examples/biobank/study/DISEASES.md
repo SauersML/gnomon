@@ -6,6 +6,8 @@ directory. Changes after the lock need the lead's approval (SPEC section 2).
 ## Rules applied
 - **Phenotype.** A qualifying record is a `condition_occurrence` whose concept descends from the root in
   `concept_ancestor`, the root included.
+  - A disease can list `excluded_branches`. Records whose concept descends from one (the branch included) are
+    not qualifying records. Only CKD uses this.
   - A confirmed case has at least 2 distinct qualifying dates. The event date is the second one.
   - People with a single record are kept.
   - An exclusion is met when a person has at least 2 distinct dates for the exclusion root. When it counts depends
@@ -44,9 +46,12 @@ counts.
 | asthma | 195967001 Asthma | PGS001782 | Asthma (GBMI PRS-CS-auto) | yes | **no** | 884,043 / GRCh37 | | | 84,840 | 50,794 |
 | copd | 13645005 COPD | PGS001783 | COPD (GBMI PRS-CS-auto) | yes | yes | 884,139 / GRCh37 | | | 40,820 | 24,439 |
 | major_depressive_disorder | 370143000 Major depressive disorder | PGS004885 | MDD (MegaPRS auto) | no | yes | 801,544 / GRCh37 | | bipolar 13746004 | 111,380 | 66,683 |
-| chronic_kidney_disease | 709044004 Chronic kidney disease | PGS002237 | CKD stage ≥3 (GPS, eGFR-based) | partly | yes | 471,316 / GRCh37 | | | 50,740 | 30,378 |
+| chronic_kidney_disease | 709044004 Chronic kidney disease | PGS002237 | CKD stage ≥3 (GPS, eGFR-based) | partly | yes | 471,316 / GRCh37 | | stage 1-2 branches (records not qualifying) | 50,740* | 30,378* |
 | gout | 90560007 Gout | PGS001789 | Gout (GBMI leave-UKB-out) | yes | **no** | 910,151 / GRCh37 | | | 18,320 | 10,968 |
 | primary_open_angle_glaucoma | 77075001 Primary open angle glaucoma | PGS001797 | POAG (GBMI PRS-CS-auto) | yes | **no** | 885,417 / GRCh37 | | | 8,040 | 4,814 |
+
+\* The CKD counts include people whose only CKD records are stage 1 or 2. With those branches excluded, the
+browser count is between 35,420 and 50,740.
 
 Eight of the 12 scores are cached. PGS003725, PGS001782, PGS001789 and PGS001797 need scoring from the Catalog's
 GRCh38 harmonized files.
@@ -57,23 +62,24 @@ GRCh38 harmonized files.
 |---|---|---|---|---|
 | PGS004236 | MVP SBP, DBP and HTN GWAS (Giri 2019, multi-ancestry) + Pan-UKB | 3 C+T PRSs, unweighted sum | C+T parameters chosen in multi-ethnic TOPMed (Catalog: BioMe, n = 10,314) | 0 hits in PMC9213527 |
 | PGS002308 | DIAGRAM EUR, BBJ EAS, MEDIA AA | none | none (PRS-CSx auto + meta) | 0 hits in PMC9241245 |
-| PGS005168 | Roselli 2025 multi-ancestry AF meta-analysis, HUNT and UKB left out | none | none (PRS-CS, one weight set) | 0 hits in PMC12094172. AoU appears only as Catalog evaluation rows |
-| PGS003725 | CAD + 10 risk-factor GWAS, 5 ancestries (CARDIoGRAMplusC4D, MVP, BBJ, FinnGen, G&H, GBMI, GLGC, GIANT, DIAMANTE, ...) | ancestry- and trait-specific LDpred2 PGSs | integration weights fitted in UKB EUR (n = 116,649) | 2 hits in PMC10353935, both Discussion or reference only |
+| PGS005168 | Roselli 2025 multi-ancestry AF meta-analysis, HUNT and UKB left out | none | none (PRS-CS, one weight set) | 0 hits in PMC12094172. AoU appears in the Catalog only in evaluation: 5 of 55 performance records, all from a later external paper (Haydarlou 2026, PGP000788) |
+| PGS003725 | CAD + 10 risk-factor GWAS, 5 ancestries (CARDIoGRAMplusC4D, MVP, BBJ, FinnGen, G&H, GBMI, GLGC, GIANT, DIAMANTE, ...) | ancestry- and trait-specific LDpred2 PGSs | integration weights fitted in UKB EUR (n = 116,649) | 2 hits in PMC10353935, both Discussion or reference only. |
 | PGS000004 | BCAC EUR GWAS | none | stepwise selection in a BCAC EUR validation set (n = 10,444) | 0 hits in PMC6323553 |
 | PGS003766 | Wang 2023 multi-ancestry meta-analysis (PRACTICAL/ELLIPSE, UKB, FinnGen, eMERGE, BioVU, BioMe, MVP, ...) | none | none (fine-mapped variants with meta-analysis betas) | 0 hits in PMC10841479 |
 | PGS001782, PGS001783, PGS001789, PGS001797 | GBMI multi-ancestry meta-analyses (no AoU member) | none | none (PRS-CS-auto) | 0 hits in PMC9903818 |
 | PGS004885 | Wray 2018 PGC MDD (EUR) | none | none (MegaPRS auto, 1000G reference) | 0 hits in PMC11169548 |
 | PGS002237 | Wuttke 2019 trans-ethnic eGFR GWAS | polygenic part only; the paper's APOL1 term is not in the Catalog file | best of 19 P+T scores chosen in 70% of UKB EUR | 0 hits in PMC9329233 |
 
-**CKD and APOL1.** PGS002237 has no APOL1 G1/G2 term, and those risk genotypes are common almost only in
-African-ancestry people. So CKD slope and calibration in African-ancestry strata partly reflect that missing term,
-not transport of the polygenic score. CKD heterogeneity across ancestry must not be read as attenuation with
-genetic distance.
+**CKD and APOL1.** APOL1 G1/G2 is not in this score. It lowers African-ancestry discrimination; its effect on the z
+slope is ≤ ~2% for coded CKD, and its mean effect is absorbed by the PC surface, so slope and calibration
+heterogeneity remain interpretable. Optional AoU-only sensitivity analysis: add an APOL1 high-risk indicator (two
+G1/G2 risk alleles) to the marginal index q, if G1 and G2 are typed.
 
 **Cross-enrollment caveat.** Several development sets are US programs whose members can also be AoU participants,
 so individual overlap with the AoU test set cannot be excluded from public cohort names. The programs are MVP,
 BioVU, BioMe, MGB, eMERGE and the BCAC US cohorts. This is not AoU involvement in development, and it is recorded
-per score.
+per score. POAG names its six US GBMI cohorts: MGB, BioVU, BioMe, UCLA, CCPM and MGI.
+For CKD, overlap is unverified for the CKDGen trans-ethnic eGFR discovery cohorts.
 
 ## Root changes from the SPEC candidates
 - **Hypertension: 59621000 instead of 38341003.** 38341003 also pulls in obstetric (8,440) and maternal (7,920)
@@ -84,6 +90,11 @@ per score.
 - **CAD: 53741008 kept.** Every descendant is coronary atherosclerotic disease. It is not a "heart disease" root.
 
 ## Exclusions
+- **chronic_kidney_disease excludes the stage 1 (431855005) and stage 2 (431856006) branches.** They are listed in
+  `excluded_branches`, because PGS002237 is a stage ≥3 case score.
+  - Records under these branches (the branch concepts included) are not qualifying CKD records.
+  - This removes records, not people: someone with only stage 1-2 codes has zero qualifying CKD records.
+  - Browser: 3,020 participants have at least 1 stage-1 record and 12,300 at least 1 stage-2 record.
 - **type_2_diabetes excludes T1D (46635009).** T1D is often miscoded as T2D, and it is a different disease with
   different (HLA) genetics.
   - Known bias: the rule also removes insulin-treated T2D patients whose charts carry T1D (E10-type) codes on 2 or

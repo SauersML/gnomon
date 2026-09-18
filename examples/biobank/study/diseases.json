@@ -2,7 +2,7 @@
   "locked": "2026-09-18",
   "locked_by": "study-diseases",
   "spec_section": "SPEC section 2 (amended 20:45Z): case = at least 2 distinct qualifying dates, event date = the second; single-record people kept",
-  "phenotype_rule": "Qualifying record = a condition_occurrence whose condition_concept_id descends from snomed_code in concept_ancestor (root included). Sex restriction is applied on sex at birth. An exclusion is met when a person has at least 2 distinct qualifying dates for the exclusion root. When it counts depends on the model (SPEC section 2, audit C3). Survival: it counts only if met with records dated on or before the landmark; if it is met later, follow-up is censored at the date it is met (the second distinct exclusion-root date), not removed. Binary: it counts if met by the CDR cutoff.",
+  "phenotype_rule": "Qualifying record = a condition_occurrence whose condition_concept_id descends from snomed_code in concept_ancestor (root included), unless it also descends from one of the disease's excluded_branches (branch included); such records are not qualifying records. Sex restriction is applied on sex at birth. An exclusion is met when a person has at least 2 distinct qualifying dates for the exclusion root. When it counts depends on the model (SPEC section 2, audit C3). Survival: it counts only if met with records dated on or before the landmark; if it is met later, follow-up is censored at the date it is met (the second distinct exclusion-root date), not removed. Binary: it counts if met by the CDR cutoff.",
   "selection_rule": "Disease and score chosen from AoU Data Browser counts and published provenance only; no AUC or other result from any earlier AoU run was used (audit S8).",
   "aou_audit_rule": "A score is ineligible if All of Us participants contributed to its discovery GWAS, to any component score, or to its tuning or weight fitting (PGS004787-style). AoU used only as a later evaluation sample is allowed. Checked in the PGS Catalog record (samples_variants, samples_training cohorts) and in the full text of the development paper.",
   "cross_enrollment_caveat": "Several discovery or tuning sets include US health-system biobanks or programs whose institutions or members can also be AoU participants (for example BioVU at Vanderbilt, Mass General Brigham Biobank, the Million Veteran Program). Individual overlap with AoU test participants cannot be ruled out from public cohort names. This is not AoU involvement in development, and it is recorded per score.",
@@ -115,11 +115,11 @@
       "multi_ancestry": true,
       "cached": true,
       "audit": {
-        "aou_involvement": "none in development; AoU appears only as an evaluation sample set in the Catalog performance records",
+        "aou_involvement": "none in development. AoU appears in the Catalog only in evaluation: 5 of 55 performance records (PPM030616, PPM030619, PPM030622, PPM030625, PPM030628) from a later external evaluation, Haydarlou 2026 (PGP000788, doi 10.1038/s41467-026-72708-x)",
         "discovery": "Roselli 2025 multi-ancestry AF GWAS meta-analysis of more than 180,000 cases (European 700,518, East Asian 148,865, African American 11,138, Hispanic 9,439, South Asian 631), with HUNT and UK Biobank left out so they could be test sets.",
         "components": "none",
         "tuning": "none: PRS-CS with the 1000 Genomes European LD reference and one weight set, tested in HUNT (2,474 incident cases) and UK Biobank (10,416 incident cases).",
-        "aou_check": "Full text PMC12094172: 0 mentions of All of Us. Catalog samples_variants cohorts: no AllofUs. The Catalog's AoU performance rows are evaluation only.",
+        "aou_check": "Full text PMC12094172: 0 mentions of All of Us. Catalog samples_variants cohorts: no AllofUs. The Catalog's 5 AoU performance rows all come from the later Haydarlou 2026 evaluation paper, not the Roselli development paper (PGP000712).",
         "cross_enrollment": "BioMe and Vanderbilt are among the discovery cohorts.",
         "sources": [
           "https://www.pgscatalog.org/score/PGS005168/",
@@ -363,9 +363,25 @@
       "snomed_code": "709044004",
       "concept_name": "Chronic kidney disease",
       "omop_concept_id": 46271022,
-      "root_note": "Descendants are CKD stages 1-5, CKD due to hypertension or diabetes, and chronic renal failure. Acute kidney injury is not a descendant. Stage 1-2 codes (about 15,000) are broader than the score's stage-3-or-worse training trait.",
+      "root_note": "Descendants are CKD stages 1-5, CKD due to hypertension or diabetes, and chronic renal failure. Acute kidney injury is not a descendant. The stage 1 and stage 2 branches are excluded_branches: records under them are not qualifying records, because the score's case definition is stage 3 or worse.",
       "sex": null,
       "exclusions": [],
+      "excluded_branches": [
+        {
+          "snomed_code": "431855005",
+          "concept_name": "Chronic kidney disease stage 1",
+          "omop_concept_id": 443614,
+          "browser_any_record": 3020,
+          "reason": "PGS002237 is a stage ≥3 case score"
+        },
+        {
+          "snomed_code": "431856006",
+          "concept_name": "Chronic kidney disease stage 2",
+          "omop_concept_id": 443601,
+          "browser_any_record": 12300,
+          "reason": "PGS002237 is a stage ≥3 case score"
+        }
+      ],
       "pgs": "PGS002237",
       "pgs_name": "GPS_CKD",
       "pgs_trait": "Chronic kidney disease (stage 3 or greater)",
@@ -373,7 +389,10 @@
       "genome_build": "GRCh37",
       "multi_ancestry": true,
       "multi_ancestry_note": "Discovery is the trans-ethnic eGFR GWAS and validation covered 15 cohorts of diverse ancestry, but tuning used European UK Biobank. The published GPS adds APOL1 recessive risk genotypes, and the Catalog scoring file contains only the genome-wide polygenic part (no APOL1 term). We score exactly the Catalog file.",
-      "interpretation_note": "APOL1 G1/G2 risk genotypes are common almost only in African-ancestry people and are missing from this score. So CKD slope and calibration in African-ancestry strata partly reflect that missing term, not transport of the polygenic score. CKD heterogeneity across ancestry must not be read as attenuation with genetic distance.",
+      "interpretation_note": "APOL1 G1/G2 is not in this score. It lowers African-ancestry discrimination; its effect on the z slope is ≤ ~2% for coded CKD, and its mean effect is absorbed by the PC surface, so slope and calibration heterogeneity remain interpretable.",
+      "sensitivity_analyses": [
+        "Optional, AoU only: add an APOL1 high-risk indicator (two G1/G2 risk alleles) to the marginal index q, if G1 and G2 are typed in the AoU genotype data."
+      ],
       "cached": true,
       "audit": {
         "aou_involvement": "none found",
@@ -381,7 +400,7 @@
         "components": "The polygenic eGFR score only. The paper's APOL1 genotype term is not part of the Catalog file.",
         "tuning": "19 candidate P+T scores (1000 Genomes all-population LD reference). The best was chosen in an optimization set of 70% of European UK Biobank participants (Catalog: n = 279,819; R2 = 0.2, P = 0.03).",
         "aou_check": "Full text PMC9329233: 0 mentions of All of Us. The Catalog lists UKB as the only development cohort.",
-        "cross_enrollment": "none identified",
+        "cross_enrollment": "unverified for the CKDGen trans-ethnic eGFR discovery cohorts",
         "sources": [
           "https://www.pgscatalog.org/score/PGS002237/",
           "https://doi.org/10.1038/s41591-022-01869-1",
@@ -392,7 +411,8 @@
         "browser_any_record": 50740,
         "browser_female": 25080,
         "browser_male": 25000,
-        "array_projection_upper": 30378
+        "array_projection_upper": 30378,
+        "excluded_branches_note": "These counts include people whose only CKD records are stage 1 or 2 (3,020 and 12,300 participants have at least 1 such record). The count with the stage 1-2 branches excluded is between 35,420 and 50,740 in the browser, so the array projection overstates CKD cases."
       }
     },
     {
@@ -452,7 +472,7 @@
         "components": "none",
         "tuning": "none: PRS-CS-auto (phi auto, 1000 Genomes European LD reference).",
         "aou_check": "Full text PMC9903818: 0 mentions of All of Us. Catalog cohorts: no AllofUs. The AoU-trained glaucoma scores (PGS004765/PGS004766, PRSmix) are excluded.",
-        "cross_enrollment": "US health-system biobanks, as for asthma.",
+        "cross_enrollment": "GBMI discovery cohorts whose participants can also be AoU participants: MGB, BioVU, BioMe, UCLA, CCPM and MGI.",
         "sources": [
           "https://www.pgscatalog.org/score/PGS001797/",
           "https://doi.org/10.1016/j.xgen.2022.100241",
