@@ -28,6 +28,22 @@ from aou_checkpoint import StudyCheckpoint
 from aou_evaluation import audit_groups, loss_summary
 
 
+def digest_names(code, metrics):
+    """The token names the results digest's embedded script writes for `metrics`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        (directory / "metrics.json").write_text(json.dumps(metrics))
+        previous = Path.cwd()
+        try:
+            os.chdir(directory)
+            with patch.object(sys, "argv", ["digest", str(directory / "metrics.json")]), \
+                 patch.dict(sys.modules, {"aou_identity": SimpleNamespace(task_account=lambda: None)}):
+                exec(compile(code, "aou_results_digest.wdl", "exec"), {})
+        finally:
+            os.chdir(previous)
+        return {path.name for path in directory.glob("digest__*.txt")}
+
+
 class SurvivalContractTests(unittest.TestCase):
     def test_external_reference_rejects_wrong_score_projection_and_corruption(self):
         import hashlib
@@ -695,18 +711,7 @@ class SurvivalContractTests(unittest.TestCase):
                          "censoring_survival_upper": None},
                         {"ancestry": "SAS", "reason": "horizon_support", "censoring_survival": .031,
                          "censoring_survival_upper": .042}]}]}}}}
-        with tempfile.TemporaryDirectory() as tmp:
-            directory = Path(tmp)
-            (directory / "metrics.json").write_text(json.dumps(metrics))
-            previous = Path.cwd()
-            try:
-                os.chdir(directory)
-                with patch.object(sys, "argv", ["digest", str(directory / "metrics.json")]), \
-                     patch.dict(sys.modules, {"aou_identity": SimpleNamespace(task_account=lambda: None)}):
-                    exec(compile(code, "aou_results_digest.wdl", "exec"), {})
-            finally:
-                os.chdir(previous)
-            names = {path.name for path in directory.glob("digest__*.txt")}
+        names = digest_names(code, metrics)
         stage = "digest__hypertension__final__pc_varying_ctn__"
         self.assertEqual(names, {stage + "censoring_refused__h3__mid__training_rows.txt",
                                  stage + "censoring_refused__h3__sas__horizon_support.txt",
@@ -722,6 +727,38 @@ class SurvivalContractTests(unittest.TestCase):
                                  stage + "overall__h5__n__4000.txt",
                                  stage + "overall__h5__brier__0.1.txt",
                                  "digest__hypertension__status__completed.txt"})
+
+    def test_digest_withholds_counts_that_subtraction_would_disclose(self):
+        wdl = Path(__file__).with_name("aou_results_digest.wdl").read_text()
+        code = textwrap.dedent(wdl.split("<<'PY'\n", 1)[1].split("    PY\n", 1)[0])
+
+        def cell(group, n, events=None):
+            row = {"group": group, "horizon": 3., "status": "ok", "n": n, "ipcw_weight_n_eff": n / 2,
+                   "brier": .1}
+            return row if events is None else dict(row, observed_disease_events=events)
+        metrics = {"hypertension": {"status": "completed", "models": {"m": {"metrics": [
+            cell("overall", 4000, 300),
+            # MID's 12 participants would be 4,000 - 1,000 - 2,988.
+            cell("ancestry:AFR", 1000, 80), cell("ancestry:EUR", 2988, 220),
+            {"group": "ancestry:MID", "horizon": 3., "status": "insufficient_support"},
+            # Every member shown and adding up to the overall cell: nothing to recover.
+            cell("sex:0", 2100, 140), cell("sex:1", 1900, 160),
+            # Shown members that leave 15 participants in no shown cell.
+            cell("age:18-40", 985, 60), cell("age:40-60", 3000, 240)]}},
+            "incremental": [cell("overall", 4000), cell("sex:0", 2100), cell("sex:1", 1900)]}}
+        names = digest_names(code, metrics)
+        stage = "digest__hypertension__final__m__"
+        for group in ("ancestry_afr", "ancestry_eur", "age_18_40", "age_40_60"):
+            self.assertIn(stage + group + "__h3__counts_withheld.txt", names)
+            self.assertIn(stage + group + "__h3__brier__0.1.txt", names)
+            self.assertEqual([name for name in names if name.startswith(stage + group + "__h3__")
+                              and any(key in name for key in ("__n__", "observed_disease_events", "n_eff"))], [])
+        self.assertIn(stage + "ancestry_mid__h3__insufficient_support.txt", names)
+        self.assertLessEqual({stage + "overall__h3__n__4000.txt", stage + "overall__h3__observed_disease_events__300.txt",
+                              stage + "sex_0__h3__n__2100.txt", stage + "sex_1__h3__observed_disease_events__160.txt",
+                              stage + "sex_1__h3__ipcw_weight_n_eff__950.txt",
+                              "digest__hypertension__final__incremental__sex_1__h3__n__1900.txt"}, names)
+        self.assertFalse(any("sex_" in name and "counts_withheld" in name for name in names))
 
     def test_cached_score_uses_identified_column_and_rejects_duplicate_sources(self):
         with tempfile.TemporaryDirectory() as tmp:

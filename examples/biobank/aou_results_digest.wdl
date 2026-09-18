@@ -3,7 +3,8 @@ version 1.0
 # Reduce a completed pilot's aggregate metrics file to fixed-form result
 # tokens inside the workspace. Every emitted token is an aggregate over at
 # least the configured minimum number of participants; small counts,
-# identifiers and free text never leave.
+# identifiers and free text never leave, and no withheld count can be
+# recovered by subtracting the shown ones.
 workflow aou_results_digest {
   input {
     File metrics
@@ -57,7 +58,48 @@ task digest {
     def emit(parts):
         Path("digest__" + "__".join(parts) + ".txt").write_text("\n")
 
+    # Counts that add over disjoint groups, or nearly so (Kish's effective size of a
+    # group's weights). Withheld from one member of a partition of the overall cell,
+    # they would follow from the overall cell's minus the other members'.
+    COUNTS = ("n", "observed_disease_events", "ipcw_weight_n_eff")
+
+    def family(group):
+        group = str(group)
+        return "pc_neighborhood" if group == "pc_outside_training_support" else group.split(":", 1)[0]
+
+    def shown(row):
+        return row.get("status") == "ok" and int(row.get("n", 0)) >= MINIMUM_COUNT
+
+    def partitions_withheld(rows):
+        """The (horizon, family) partitions whose members keep their counts inside: a
+        member is withheld, or the shown counts do not add up to the overall cell's,
+        which leaves a remainder cell that subtraction would disclose."""
+        overall, members = {}, {}
+        for row in rows:
+            if row.get("status") == "pooled_censoring":
+                continue
+            horizon = float(row["horizon"])
+            if row["group"] == "overall":
+                overall[horizon] = row
+            else:
+                members.setdefault((horizon, family(row["group"])), []).append(row)
+        withheld = set()
+        for (horizon, name), group_rows in members.items():
+            whole = overall.get(horizon)
+            if whole is None or not shown(whole) or not all(shown(row) for row in group_rows):
+                withheld.add((horizon, name))
+                continue
+            for key in ("n", "observed_disease_events"):
+                values = [row.get(key) for row in group_rows]
+                if key not in whole and all(value is None for value in values):
+                    continue
+                if (key not in whole or any(value is None or int(value) < MINIMUM_COUNT for value in values)
+                        or sum(int(value) for value in values) != int(whole[key])):
+                    withheld.add((horizon, name))
+        return withheld
+
     def metric_rows(rows, stage):
+        withheld = partitions_withheld(rows)
         for row in rows:
             base = [stage, slug(row["group"]), "h" + token(float(row["horizon"]))]
             if row.get("status") == "pooled_censoring":
@@ -84,8 +126,11 @@ task digest {
             if row.get("status") != "ok" or int(row.get("n", 0)) < MINIMUM_COUNT:
                 emit(base + ["insufficient_support"])
                 continue
+            counts_withheld = (float(row["horizon"]), family(row["group"])) in withheld
+            if counts_withheld:
+                emit(base + ["counts_withheld"])
             for key in ALLOWED:
-                if key not in row:
+                if key not in row or (counts_withheld and key in COUNTS):
                     continue
                 if key == "observed_disease_events" and int(row[key]) < MINIMUM_COUNT:
                     continue
