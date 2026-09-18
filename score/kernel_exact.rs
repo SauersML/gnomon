@@ -261,21 +261,24 @@ fn group_keys(source: [&[u8]; VARIANTS_PER_TABLE], people: People, keys: &mut [u
     }
 }
 
-/// Writes every person's key of the group whose rows are `source` at `slot` of their
-/// `width`-byte key row, through `column_keys`, the group's keys in person order.
+/// Writes every person's key of the group whose rows are `source` at `slot` of their `W`-byte key
+/// row, through `column_keys`, the group's keys in person order. The rows are `W`-byte arrays, so
+/// no store is bounds-checked: as a function of its own with a runtime width, every one of them was
+/// (rare N 50,000 K 16: +8% instructions).
 #[inline(never)]
-fn write_keys(
+fn write_keys<const W: usize>(
     source: [&[u8]; VARIANTS_PER_TABLE],
     people: People,
     column_keys: &mut [u8],
     person_keys: &mut [u8],
     slot: usize,
-    width: usize,
 ) {
     let count = people.len();
     group_keys(source, people, column_keys);
-    for (p, &key) in column_keys[..count].iter().enumerate() {
-        person_keys[p * width + slot] = key;
+    assert!(slot < W);
+    let rows = &mut person_keys.as_chunks_mut::<W>().0[..count];
+    for (row, &key) in rows.iter_mut().zip(&column_keys[..count]) {
+        row[slot] = key;
     }
 }
 
@@ -347,7 +350,7 @@ pub(crate) fn apply_table_rows(
                 // them into a row a person first took a scattered byte store per person and group.
                 group_keys(source, people, &mut scratch.column_keys[g * key_width..(g + 1) * key_width]);
             } else {
-                write_keys(source, people, &mut scratch.column_keys, &mut scratch.person_keys, g, GROUPS_PER_BATCH);
+                write_keys::<GROUPS_PER_BATCH>(source, people, &mut scratch.column_keys, &mut scratch.person_keys, g);
             }
         }
         let tables = &scratch.tables[..batch.len() * 256 * stride];
@@ -366,12 +369,22 @@ pub(crate) fn apply_table_rows(
         .find(|&width| count * width <= UNTABLED_KEY_BYTES)
         .unwrap_or(GROUPS_PER_BATCH);
     grow(&mut scratch.person_keys, count * width);
-    for pass in scratch.untabled.chunks(width) {
+    let (untabled, zero_row) = (&scratch.untabled, &scratch.zero_row);
+    let (column_keys, person_keys) = (&mut scratch.column_keys, &mut scratch.person_keys);
+    for pass in untabled.chunks(width) {
         for (slot, &group) in pass.iter().enumerate() {
-            let source = group_rows(data, row_bytes, rows, &scratch.zero_row, group);
-            write_keys(source, people, &mut scratch.column_keys, &mut scratch.person_keys, slot, width);
+            let source = group_rows(data, row_bytes, rows, zero_row, group);
+            match width {
+                UNTABLED_PER_PASS => write_keys::<UNTABLED_PER_PASS>(source, people, column_keys, person_keys, slot),
+                32 => write_keys::<32>(source, people, column_keys, person_keys, slot),
+                _ => write_keys::<GROUPS_PER_BATCH>(source, people, column_keys, person_keys, slot),
+            }
         }
-        apply_rows(terms, &scratch.person_keys, width, pass, stride, cells);
+        match width {
+            UNTABLED_PER_PASS => apply_rows::<UNTABLED_PER_PASS>(terms, person_keys, pass, stride, cells),
+            32 => apply_rows::<32>(terms, person_keys, pass, stride, cells),
+            _ => apply_rows::<GROUPS_PER_BATCH>(terms, person_keys, pass, stride, cells),
+        }
     }
 }
 
@@ -386,9 +399,8 @@ fn apply_tables(tables: &[i64], keys: &[u8], in_batch: usize, stride: usize, cel
         }
     }
     let in_batch_groups = (1u32 << in_batch) - 1;
-    for (p, cell) in cells.chunks_exact_mut(stride).enumerate() {
-        let row = &keys[p * GROUPS_PER_BATCH..(p + 1) * GROUPS_PER_BATCH];
-        let nonzero = Simd::<u8, GROUPS_PER_BATCH>::from_slice(row)
+    for (cell, row) in cells.chunks_exact_mut(stride).zip(keys.as_chunks::<GROUPS_PER_BATCH>().0) {
+        let nonzero = Simd::<u8, GROUPS_PER_BATCH>::from_array(*row)
             .simd_ne(Simd::splat(0))
             .to_bitmask() as u32;
         let mut active = (nonzero | !zero_first) & in_batch_groups;
@@ -403,13 +415,12 @@ fn apply_tables(tables: &[i64], keys: &[u8], in_batch: usize, stride: usize, cel
 
 /// Adds untabled groups to every person, all of `groups` in one pass over the cells: a key `k` adds
 /// the rows of its calls that are not 00, the entry `k` of the group's table summed directly. An
-/// untabled group's code-00 terms are zero, so a key of 0 adds nothing. `keys` holds `width` bytes a
-/// person, a multiple of sixteen.
+/// untabled group's code-00 terms are zero, so a key of 0 adds nothing. `keys` holds `W` bytes a
+/// person, a multiple of sixteen, as `W`-byte arrays.
 #[inline(never)]
-fn apply_rows(terms: &[i64], keys: &[u8], width: usize, groups: &[usize], stride: usize, cells: &mut [i64]) {
+fn apply_rows<const W: usize>(terms: &[i64], keys: &[u8], groups: &[usize], stride: usize, cells: &mut [i64]) {
     let in_pass = u64::MAX >> (UNTABLED_PER_PASS - groups.len());
-    for (p, cell) in cells.chunks_exact_mut(stride).enumerate() {
-        let row = &keys[p * width..(p + 1) * width];
+    for (cell, row) in cells.chunks_exact_mut(stride).zip(keys.as_chunks::<W>().0) {
         let mut active = 0u64;
         for (i, chunk) in row.as_chunks::<GROUPS_PER_BATCH>().0.iter().enumerate() {
             let nonzero = Simd::<u8, GROUPS_PER_BATCH>::from_array(*chunk)
