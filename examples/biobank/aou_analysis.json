@@ -3,10 +3,10 @@
   "top_n_diseases": 20,
   "disease_limit": 1,
   "num_pcs": 6,
-  "baseline_centers": 32,
-  "slope_centers": 16,
-  "time_num_internal_knots": 4,
-  "max_rows_per_disease": 20000,
+  "baseline_centers": 8,
+  "slope_centers": 8,
+  "time_num_internal_knots": 6,
+  "max_rows_per_disease": 25000,
   "train_fraction": 0.8,
   "seed": 20260910,
   "lookback_days": 365,
@@ -24,16 +24,16 @@
   "min_report_count": 20,
   "landmark_days": 180,
   "fit_no_score_comparator": true,
-  "survival_time_anchor": 0.0,
+  "survival_time_anchor": null,
   "fit_budget": {
     "gamfit_version": "0.1.268",
-    "engine_sha256": null,
-    "solver_threads": 64,
-    "training_rows": 12000,
-    "wall_seconds": 2400,
+    "engine_sha256": "52ed895617b933987c70c5638042f1406be0e09003028561caa0fbf1ad76217a",
+    "solver_threads": 16,
+    "training_rows": 8000,
+    "wall_seconds": 695.2,
     "exponent": 1,
-    "budget_seconds": 4500,
-    "source": "AoU run 7a96b3b7 (2026-09-12), development stage without preemption: slowest of two concurrent fits (death, 48 of 64 threads) 40 min, from a gamfit 0.1.268 wheel built in Cargo's dev profile whose engine digest was not recorded, so no runtime engine matches it; exponent 1 is the linear lower bound, not a measurement"
+    "budget_seconds": 2189,
+    "source": "MSI amdsmall (AMD EPYC 7702 Rome, 16 cores, one thread per core), 2026-09-18: release-pypi gamfit of gam 18b1a6e353 through aou_survival fit workers and bounded_fits, four concurrent fits at equal thread shares, declared_empirical, synthetic partition shaped like the pilot's; slowest fit, median of three rounds: 349.2 s at 4,000 and 695.2 s at 8,000 training rows (exponent 0.99, recorded as the linear bound 1). budget_seconds = floor(4,500 / 1.5 / 1.37): 1.37 is the stage with 16 threads on 8 of those cores over 16 cores (median 1.365 of three paired rounds), the bound for 16 vCPUs that are 8 cores' hyperthreads; 1.5 is a declared timeout safety margin, an operating policy"
   },
   "score_law": "declared_empirical"
 }

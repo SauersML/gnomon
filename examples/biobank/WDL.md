@@ -63,8 +63,8 @@ PC-varying marginal-slope predictor. The score and model are prespecified;
 there is no challenger search. After development acceptance, the outcome model
 is fitted on outer training and evaluated on the locked test set.
 
-The baseline has age, sex and a joint six-PC Duchon surface (32 centers).
-The score surface has 16 centers and a time-constant signed slope. No frailty,
+The baseline has age, sex and a joint six-PC Duchon surface (8 centers).
+The score surface has 8 centers and a time-constant signed slope. No frailty,
 ensemble, manifold or post-hoc calibration stack is enabled. The baseline and
 score-effect surfaces are separately penalized and jointly fitted.
 
@@ -370,7 +370,7 @@ wheels require. The runtime image digest, installed versions, gamfit build
 information, source/input hashes, and query IDs are recorded in provenance.
 
 The default run contains one selected disease, at most `max_rows_per_disease`
-outcome-blind sampled rows each, four CPUs, 16 GiB RAM, and 50 GiB disk.
+outcome-blind sampled rows each, 16 vCPUs, 32 GiB RAM, and 50 GiB disk.
 The cap must fit the measured fit budget. `fit_budget` records one measured
 stage (gamfit version, solver threads, training rows, the slowest concurrent
 fit's wall seconds, and where it was measured), a cost exponent and the stage
@@ -390,10 +390,11 @@ Development and final evaluation require four cause-specific fits per endpoint
 and no AoU CTN fits. Under the Gaussian declaration one reference CTN is
 trained externally per endpoint with an explicit two-interior-knot CTN
 response basis.
-The outcome fits use the configured time basis and run
-sequentially with a checkpoint after each completed unit. Each fit has a
-180-second wall cap, each query a 120-second cap and a billed-byte ceiling;
-the command has a 30-minute cap and zero automatic retries. Temporary storage
+The outcome fits use the configured time basis. A stage's four fits run side
+by side under one `fit_timeout_seconds` bound and publish a checkpoint about
+every 30 seconds and after the stage completes. Each query has a 120-second cap
+and a billed-byte ceiling; the command has a 150-minute cap and zero automatic
+retries after a failure. Temporary storage
 and solver caches use the attached task disk. A child timeout terminates its
 process group. Insufficient training events fail before fitting. The primary-score
 smoke run records unsupported censoring-adjusted evaluation separately and emits
@@ -405,9 +406,38 @@ a completion receipt. Population event frequencies
 are never replaced with a balanced case/control sample.
 
 The hypertension pilot's original 5,000-row cap produced insufficient development
-death events for the prespecified competing-death model. The 20,000-row cap uses
-the same outcome-blind hash order and seed; it does not balance events or relax
-the minimum event count. Resource and wall limits are unchanged.
+death events for the prespecified competing-death model. Later caps use the same
+outcome-blind hash order and seed; they do not balance events or relax the
+minimum event count.
+
+The 25,000-row cap and `fit_budget` come from one measurement. The release-pypi
+gamfit build of gam 18b1a6e353 ran the declared-law stage (four concurrent fits,
+equal thread shares, 16 solver threads) on 16 EPYC 7702 (Rome) cores with one
+thread per core, on a synthetic partition shaped like the pilot's. Medians of
+three rounds: 349.2 s at 4,000 training rows and 695.2 s at 8,000 (exponent 0.99,
+recorded as the linear bound 1). With 16 threads on 8 of those cores the stage
+took 1.365 times as long (median of three paired rounds, used as 1.37), the bound
+for a VM whose 16 vCPUs are 8 cores' hyperthreads. The cap bounds eligible cohort
+rows; the final stage trains on `train_fraction` 0.8 of them and development on
+0.75 of that. The worst case counts every cohort row as a training row.
+
+| Step | Final stage | Development stage |
+| --- | --- | --- |
+| (1) Training rows at the 25,000-row cap | 20,000 (worst 25,000) | 15,000 (worst 18,750) |
+| (2) Validator scaling, 695.2 s × rows / 8,000, 16 MSI cores | 1,738 s (worst 2,173 s) | 1,304 s (worst 1,629 s) |
+| (3) × 1.37 for the 16-vCPU AoU VM | 2,381 s (worst 2,976 s) | 1,786 s (worst 2,232 s) |
+| (4) Against the 4,500 s fit timeout | 1.89× (worst 1.51×) | |
+
+Both stages plus about 10 minutes of setup, scoring and queries take about 79 of
+the command's 150 minutes (worst 97). `budget_seconds` = floor(4,500 / 1.5 / 1.37)
+= 2,189. The 1.5 is a declared timeout safety margin: an operating policy for
+extrapolating past the measured sizes and from a synthetic to a real partition,
+not an accuracy constant. The validator then allows 8,000 × 2,189 / 695.2 / 0.8 =
+31,487 cohort rows. The task runs 16 vCPUs at `RAYON_NUM_THREADS=16` with 32 GiB
+(the largest fit worker peaked at 298 MiB at 8,000 training rows; scoring and
+cohort preparation ran in a 16 GiB task), and every fit of a stage gets an equal
+share of the threads: the death fits' former three quarters left the 2-thread
+disease fits unfinished at 900 s where equal shares finished the stage in 500 s.
 
 Run static and synthetic contract validation on MSI using the existing warm
 Python dependencies; no participant data needs to leave AoU. Run every test

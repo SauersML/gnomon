@@ -1101,19 +1101,16 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, pgs):
                 pending.append((variant, cause, fit_dir, command))
     if pending:
         # Every fit runs side by side, so the wall time is the slowest fit
-        # rather than the sum. Death has far fewer events and needs many
-        # more outer cycles, so the death fits share three quarters of the
-        # solver threads and the disease fits the rest.
+        # rather than the sum, and every fit gets an equal share of the solver
+        # threads. With a release engine the disease fits are as slow as the
+        # death fits: giving death three quarters of 16 threads left the
+        # 2-thread disease fits unfinished at 900 s where equal shares finished
+        # the stage in 500 s (gnomon#2338, 6,000 training rows).
         for variant, cause, _, _ in pending:
             print(f"Fitting {slug}: {variant} cause {cause}", flush=True)
             if variant == "pc_varying":
                 publish_status(args.checkpoint_uri, "fitting_disease" if cause == 1 else "fitting_death")
-        total = solver_threads()
-        deaths = sum(1 for _, cause, _, _ in pending if cause == 2)
-        diseases = len(pending) - deaths
-        budget = {2: max(1, (total - total // 4) // max(1, deaths)), 1: max(1, (total // 4) // max(1, diseases))}
-        threads = [budget[cause] if deaths and diseases else max(1, total // len(pending))
-                   for _, cause, _, _ in pending]
+        threads = [max(1, solver_threads() // len(pending))] * len(pending)
         checkpointed_fits([(command, fit_dir / "fit.log") for _, _, fit_dir, command in pending],
                           config["fit_timeout_seconds"], checkpoint, threads=threads)
         for _, _, fit_dir, _ in pending:
