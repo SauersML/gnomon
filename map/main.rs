@@ -3649,8 +3649,8 @@ mod tests {
 mod ld_marker_budget_tests {
     use super::{LD_DEFAULT_MARKER_BUDGET, MapCommand, MapDriverError, effective_marker_budget, run};
     use crate::adapt_plink2::GenomeBuild;
-    use crate::map::fit::LdWindow;
-    use crate::map::io::{SelectionPlan, fit_artifact_path};
+    use crate::map::fit::{LdWindow, VariantBlockSource};
+    use crate::map::io::{GenotypeDataset, SelectionPlan, fit_artifact_path};
     use crate::map::variant_filter::{VariantFilter, VariantKey};
     use std::fmt::Write as _;
     use std::fs;
@@ -3906,6 +3906,51 @@ mod ld_marker_budget_tests {
         let model = ld_fit(dir.path().join("ld_p.pgen"), Some(build), None, None, 1_000, dir.path())
             .expect("a PGEN fileset with --ld must fit");
         assert!(model.is_file(), "no model at {}", model.display());
+    }
+
+    /// A PGEN projects bit for bit like the BED it was converted from: its decoded rows
+    /// are compacted for the packed hard-call kernels a BED's mapping reaches, instead of
+    /// being decoded to f64 for the dense path (gnomon#2375).
+    #[test]
+    fn a_pgen_projects_bit_for_bit_like_the_bed_it_was_converted_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/testdata");
+        for name in [
+            "ld.bed",
+            "ld.bim",
+            "ld.fam",
+            "ld_p.pgen",
+            "ld_p.pvar",
+            "ld_p.psam",
+        ] {
+            fs::copy(fixtures.join(name), dir.path().join(name)).unwrap();
+        }
+        let build = GenomeBuild::parse("38").expect("build");
+        let bed = dir.path().join("ld.bed");
+        let pgen = dir.path().join("ld_p.pgen");
+
+        let dataset = GenotypeDataset::open(&pgen, Some(build)).expect("open the PGEN");
+        let mut source = dataset.block_source().expect("PGEN block source");
+        assert!(
+            source.hard_call_packed().is_some(),
+            "a PGEN's rows reach the packed hard-call kernels"
+        );
+
+        plain_fit(bed.clone(), None).expect("fit on the BED");
+        fs::copy(
+            dir.path().join("ld.hwe.json"),
+            dir.path().join("ld_p.hwe.json"),
+        )
+        .unwrap();
+        let project = |genotypes: &Path, name: &str| {
+            let scores = dir.path().join(name);
+            super::run_project_with_output(genotypes, Some(build), None, None, &scores)
+                .expect("project");
+            fs::read(scores).unwrap()
+        };
+        let from_bed = project(&bed, "bed.projection_scores.bin");
+        let from_pgen = project(&pgen, "pgen.projection_scores.bin");
+        assert_eq!(from_pgen, from_bed);
     }
 
     #[test]
