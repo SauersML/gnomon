@@ -557,6 +557,10 @@ fn project_leaf_lanes<const LANES: usize>(
     }
 }
 
+/// The scatter kernel to run on x86_64, where `fused` picks AVX2 and FMA. No
+/// other target has a fused scatter, so they call [`scatter_leaf`] directly and
+/// never take the flag.
+#[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
 fn scatter_leaf_lanes<const LANES: usize>(
     fused: bool,
@@ -570,7 +574,6 @@ fn scatter_leaf_lanes<const LANES: usize>(
     tables: &[Lanes],
     lanes: &mut [Lanes],
 ) {
-    #[cfg(target_arch = "x86_64")]
     if fused {
         // SAFETY: `fused` comes from `fused_multiply_add`, which saw AVX2 and
         // FMA on this CPU.
@@ -947,10 +950,26 @@ impl<'a> Product<'a> {
                     }
                     for &(first_lane, lanes_here) in &self.groups {
                         let columns = 4 * first_lane..width.min(4 * (first_lane + lanes_here));
+                        #[cfg(target_arch = "x86_64")]
                         by_lanes!(
                             lanes_here,
                             scatter_leaf_lanes(
                                 self.fused,
+                                chunk.rb_mut(),
+                                columns,
+                                first_lane,
+                                lanes_total,
+                                chunk_groups,
+                                &high[..chunk_groups * count],
+                                &low[..chunk_groups * count],
+                                tables,
+                                lanes,
+                            )
+                        );
+                        #[cfg(not(target_arch = "x86_64"))]
+                        by_lanes!(
+                            lanes_here,
+                            scatter_leaf(
                                 chunk.rb_mut(),
                                 columns,
                                 first_lane,
