@@ -93,7 +93,9 @@ Usage
     simulate.py generate --out DIR --n 20000 --seed 1 [--scenario realistic] [--reference reference_pcs.parquet]
     simulate.py publish --root /scratch.global/sauer354/aou-study/sim/v1 --reference ... --git-sha SHA
 The scenarios are ``realistic`` (a), ``null_slope`` (b, constant slope), and ``gaussian_pgs`` (c, a Gaussian
-score law in every ancestry). Each writes one table directory per censoring rule. ``--world-seed`` fixes the data-
+score law in every ancestry). The ``true_*`` worlds make each competitor the true model (see SCENARIOS), and
+``holdout`` is the claim run's scenario, never to be used for selection. Each writes one table directory per
+censoring rule. ``--world-seed`` fixes the data-
 generating process (sites, disease parameters, ancestry shifts), and ``--seed`` draws a fresh sample from it, so
 replicate seeds are samples of one world. ``publish`` uses one seed per size for every scenario, so the scenarios
 are paired: the same people, scores and uniforms, differing only in the scenario's knobs.
@@ -407,7 +409,7 @@ def load_diseases(path: str | Path) -> list[DiseaseSpec]:
 
 
 REALISTIC = dict(link=("ao", 0.5), pgs_shape=True, slope="distance", eta="full", law="ancestry", coding="ehr",
-                 death=True, exit=True, alpha="saturating", scale="one")
+                 death=True, exit=True, alpha="saturating", scale="one", site_scale=1.0)
 # Competitor-true worlds (audit S3): the named competitor's family holds the truth exactly, so ours must tie. No
 # unobserved heterogeneity (eta = sex + linear PC1-6), one affine law of z in every ancestry (still skewed and
 # heavy tailed), no rule-out codes and a second code on the day after onset.
@@ -431,6 +433,9 @@ SCENARIOS = {
     "true_standard_survival": dict(_SURV, slope="constant"),
     "true_zpc_survival": dict(_SURV, slope="linear_pc"),
     "true_calpred_survival": dict(_SURV, link=("probit",), slope="constant", scale="calpred", alpha="log"),
+    # The claim run's scenario, never used for selection (SPEC section 8, S4): a heavier-tailed link, a slope that also
+    # weakens with age at consent, and larger site effects. Draw it only at claim time, with a fresh world seed.
+    "holdout": dict(REALISTIC, link=("ao", 2.0), slope="distance_age", site_scale=1.5),
 }
 PUBLISHED = ("realistic", "null_slope", "gaussian_pgs")
 CENSORING = ("independent", "lastcontact")
@@ -760,9 +765,11 @@ def person_disease_terms(world: World, dp: DiseaseParams, people: dict) -> dict:
     sd = world.link.sd
     scale = np.exp(-pcz @ dp.pc_scale) if cfg["scale"] == "calpred" else np.ones(n)
     base_slope = spec.beta * sd
-    if cfg["slope"] == "distance":
+    if cfg["slope"] in ("distance", "distance_age"):
         r = dp.r_min + (1.0 - dp.r_min) / (1.0 + (people["dist"] / dp.d50) ** 4)
         beta = base_slope * r * np.exp(spec.zeta * (people["male"] - 0.4))
+        if cfg["slope"] == "distance_age":
+            beta = beta * np.exp(-0.12 * (people["a_base"] - 55.0) / 10.0)
     elif cfg["slope"] == "constant":
         beta = np.full(n, base_slope)
     elif cfg["slope"] == "linear_pc":
@@ -773,7 +780,8 @@ def person_disease_terms(world: World, dp: DiseaseParams, people: dict) -> dict:
     site = people["site"]
     if cfg["eta"] == "full":
         anc = sum(spec.anc.get(c, 0.0) * w[:, i] for i, c in enumerate(COMPONENTS))
-        site_eff = np.where(people["ehr"], dp.site_effect[site] + world.sites.common_effect.to_numpy()[site], 0.0)
+        site_eff = cfg["site_scale"] * np.where(people["ehr"], dp.site_effect[site]
+                                                + world.sites.common_effect.to_numpy()[site], 0.0)
         reg = pd.Series(people["region"]).map(dp.region_effect).fillna(0.0).to_numpy()
         eta = sd * (spec.male * people["male"] + anc + spec.ses * people["ses_z"] + reg + site_eff
                     + 0.05 * np.tanh(pcz[:, 3]))

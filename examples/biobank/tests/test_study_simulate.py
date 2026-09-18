@@ -73,7 +73,7 @@ def resample(world, s, seed):
     rate = world.sites.exit_rate.to_numpy()[p["site"]]
     known = (p["x_exit"] - birth) / sim.DAYS
     x_exit = np.where(known < a_b, known, a_b + rng.exponential(1.0, n) / rate)   # a pre-consent exit is known
-    cut = (sim.day(sim.CDR_CUTOFF) + 1 - birth) / sim.DAYS
+    cut = (sim.day(sim.CDR_CUTOFF) + 1 - birth) / sim.DAYS - _lag(world)
     out = {}
     for rec in s["diseases"]:
         dp = rec["dp"]
@@ -145,6 +145,7 @@ def monte_carlo(world, s, truths, latent, horizons_used=(1, 3, 5)):
     p = s["people"]
     birth = p["birth"]
     a_l = (p["baseline"] + sim.LANDMARK_DAYS + 1 - birth) / sim.DAYS
+    lag = _lag(world)
     blocks = {f"cif_{h}y": [] for h in horizons_used}
     blocks.update(entry=[], p_ever=[], p_ever_noexit=[])
     hs = list(s["horizons"])
@@ -164,7 +165,7 @@ def monte_carlo(world, s, truths, latent, horizons_used=(1, 3, 5)):
         idx = np.flatnonzero(entry)
         for h in horizons_used:
             i = hs.index(h)
-            end = a_l[idx] + np.floor(sim.DAYS * h) / sim.DAYS
+            end = a_l[idx] + np.floor(sim.DAYS * h) / sim.DAYS - lag
             obs = (lat["t2"][idx] < end) & (lat["t2"][idx] < lat["t_m"][idx])
             pred = t["cif"][idx, i]
             st = _strata(s, slug, idx)
@@ -185,11 +186,16 @@ def monte_carlo(world, s, truths, latent, horizons_used=(1, 3, 5)):
     return result
 
 
-def own_latent(s):
+def _lag(world):
+    """Instant coding puts the event date one day after onset (the distinct-date rule); the truth applies it."""
+    return 1.0 / sim.DAYS if sim.SCENARIOS[world.scenario]["coding"] == "instant" else 0.0
+
+
+def own_latent(s, lag=0.0):
     """The generator's own latent outcomes, in the resample() layout."""
     p = s["people"]
     birth = p["birth"]
-    cut = (sim.day(sim.CDR_CUTOFF) + 1 - birth) / sim.DAYS
+    cut = (sim.day(sim.CDR_CUTOFF) + 1 - birth) / sim.DAYS - lag
     out = {}
     for rec in s["diseases"]:
         if rec["dp"].spec.pgs is None:
@@ -252,14 +258,14 @@ def derivatives(world, s, m=2000, h=1e-4):
     return worst
 
 
-def run_all(n, seed, plants=True):
+def run_all(n, seed, plants=True, scenario="realistic"):
     t0 = time.time()
-    world, s = world_and_sample(n, seed)
+    world, s = world_and_sample(n, seed, scenario)
     gen_seconds = time.time() - t0
     truths = truths_of(world, s)
-    report = {"n": n, "seed": seed, "generate_seconds": round(gen_seconds, 1),
+    report = {"n": n, "seed": seed, "scenario": scenario, "generate_seconds": round(gen_seconds, 1),
               "reference": world.ref_source}
-    own = own_latent(s)
+    own = own_latent(s, _lag(world))
     indep = resample(world, s, seed)
     report["own_draws"] = monte_carlo(world, s, truths, own)
     report["independent_draws"] = monte_carlo(world, s, truths, indep)
@@ -337,6 +343,17 @@ def test_truth_matches_monte_carlo():
     world, s = world_and_sample(N_TEST, 7)
     truths = truths_of(world, s)
     for name, latent in (("own", own_latent(s)), ("independent", resample(world, s, 7))):
+        res = monte_carlo(world, s, truths, latent)
+        bad = {k: v for k, v in res.items() if not v["passed"]}
+        assert not bad, (name, bad)
+
+
+def test_competitor_true_survival_world_matches_monte_carlo():
+    """The calpred survival world exercises what the realistic world does not: a probit link, log-age alpha, a
+    PC-dependent index scale and instant coding (event the day after onset), with death and exit on."""
+    world, s = world_and_sample(60000, 9, "true_calpred_survival")
+    truths = truths_of(world, s)
+    for name, latent in (("own", own_latent(s, _lag(world))), ("independent", resample(world, s, 9))):
         res = monte_carlo(world, s, truths, latent)
         bad = {k: v for k, v in res.items() if not v["passed"]}
         assert not bad, (name, bad)
@@ -479,8 +496,9 @@ def main():
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--json")
     ap.add_argument("--no-plants", action="store_true")
+    ap.add_argument("--scenario", default="realistic", choices=sorted(sim.SCENARIOS))
     a = ap.parse_args()
-    report = run_all(a.n, a.seed, plants=not a.no_plants)
+    report = run_all(a.n, a.seed, plants=not a.no_plants, scenario=a.scenario)
     text = json.dumps(report, indent=1, default=str)
     print(text)
     if a.json:
