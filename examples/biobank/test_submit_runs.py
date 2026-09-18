@@ -240,6 +240,25 @@ def test_command_timeout_ends_the_cli_and_everything_it_started(tmp_path):
                 pass
 
 
+def test_run_listing_outlives_the_workspace_list_latency():
+    # The workspace's run list took 61-64 s; under a 60 s bound the reuse check
+    # before the run step failed, after the workflow had been created.
+    bounds = {}
+    process = MagicMock(returncode=0, pid=1)
+
+    def communicate(timeout):
+        bounds[tuple(command[:4])] = timeout
+        return "[]", ""
+    process.communicate.side_effect = communicate
+    wb = workbench()
+    with patch.object(submit_aou.subprocess, "Popen", return_value=process):
+        for command in (["wb", "workflow", "job", "list"], ["wb", "workflow", "job", "run"],
+                        ["wb", "workflow", "describe", "--workflow=x"]):
+            wb.command(command)
+    assert bounds == {("wb", "workflow", "job", "list"): 180, ("wb", "workflow", "job", "run"): 180,
+                      ("wb", "workflow", "describe", "--workflow=x"): 60}
+
+
 def test_newest_cached_score_per_pgs_from_one_listing():
     cache = "artifacts/aou-training/sscore_cache"
     objects = [{"name": f"{cache}/old/PGS000014.sscore", "updated": "2026-09-10T01:00:00.000Z"},

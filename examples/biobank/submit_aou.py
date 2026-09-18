@@ -69,8 +69,11 @@ class Workbench:
         # Workbench acknowledges a submission after creating its engine run;
         # killing that handshake early can leave a real job without its receipt,
         # which is why run_workflow confirms a failed step by listing.
+        # The workspace's run list took 61-64 s on 2026-09-18, and a 60 s bound on it
+        # stopped a submission between creating its workflow and starting its run.
         if timeout is None:
-            timeout = 180 if command[:4] == ["wb", "workflow", "job", "run"] else 60
+            timeout = 180 if command[:4] in (["wb", "workflow", "job", "run"],
+                                             ["wb", "workflow", "job", "list"]) else 60
         # In its own session, a timeout ends the CLI and everything it started,
         # so no orphan can finish a submission after the caller gave up on it.
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
