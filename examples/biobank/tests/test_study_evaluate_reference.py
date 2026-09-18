@@ -418,3 +418,34 @@ def test_ipcw_estimator_gate_and_se_calibration_under_site_dependent_censoring()
         assert 0.8 < ratio < 1.25, metric
         planted = (spread[f"{metric}_se"] / 2).mean() / spread[metric].std(ddof=1)
         assert not 0.8 < planted < 1.25
+
+
+def test_binary_oe_interval_and_brier_standard_errors_cover_the_truth():
+    """No package computes these intervals, so their reference is the known truth: over replicate cells of
+    calibrated predictions, the O/E interval covers 1 and the Brier and paired-Brier intervals cover their
+    population values at about 95%. A planted half-width SE must break the coverage."""
+    rng = np.random.default_rng(41)
+    reps, n = 400, 3000
+    covered = {"oe": 0, "brier": 0, "d_brier": 0, "oe_half": 0}
+    # Population Brier values of the two predictors, from one large draw of the same law.
+    big = rng.normal(size=2_000_000)
+    p_big = 1 / (1 + np.exp(-(-1.5 + big)))
+    q_big = 1 / (1 + np.exp(-(-1.5 + 0.6 * big)))
+    brier_true = float(np.mean(p_big * (1 - p_big)))
+    d_true = float(np.mean(p_big * (1 - p_big) - (p_big * (1 - q_big) ** 2 + (1 - p_big) * q_big ** 2)))
+    for _ in range(reps):
+        x = rng.normal(size=n)
+        p = 1 / (1 + np.exp(-(-1.5 + x)))
+        q = 1 / (1 + np.exp(-(-1.5 + 0.6 * x)))
+        y = (rng.random(n) < p).astype(int)
+        row = ev.binary_cell(y, np.vstack([p, q]), ["ours", "standard"], "pooled", "overall", 21)[0]
+        covered["oe"] += row["oe_lo"] <= 1 <= row["oe_hi"]
+        half = (row["oe_hi"] - row["oe_lo"]) / 4
+        covered["oe_half"] += row["oe"] - half <= 1 <= row["oe"] + half
+        covered["brier"] += abs(row["brier"] - brier_true) <= ev.Z95 * row["brier_se"]
+        covered["d_brier"] += abs(row["d_brier_standard"] - d_true) <= ev.Z95 * row["d_brier_standard_se"]
+    rates = {k: v / reps for k, v in covered.items()}
+    print(f"coverage over {reps} cells: {rates}")
+    for name in ("oe", "brier", "d_brier"):
+        assert 0.92 <= rates[name] <= 0.985, name
+    assert rates["oe_half"] < 0.85

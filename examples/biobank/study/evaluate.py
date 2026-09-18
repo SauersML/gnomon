@@ -175,23 +175,37 @@ def loess(x, y, at, weights=None, span=LOESS_SPAN):
     over the q-th nearest distance, times the prior weights."""
     x, y = np.asarray(x, float), np.asarray(y, float)
     w = np.ones(len(x)) if weights is None else np.asarray(weights, float)
-    q = int(math.floor(len(x) * span))
+    order = np.argsort(x, kind="mergesort")
+    x, y, w = x[order], y[order], w[order]
+    n, q = len(x), int(math.floor(len(x) * min(span, 1.0)))
     if q < 3:
         raise MetricRefusal("ici", "loess needs at least three neighbours")
+    at = np.asarray(at, float)
+    # The q nearest points form a window [lo, lo + q) of the sorted x: bisect for the first lo from which
+    # moving the window right no longer brings a nearer point in.
+    low = np.clip(np.searchsorted(x, at) - q, 0, n - q)
+    high = np.clip(np.searchsorted(x, at), 0, n - q)
+    while np.any(low < high):
+        mid = (low + high) // 2
+        right = x[np.minimum(mid + q, n - 1)]
+        move = (mid + q < n) & (at - x[mid] > right - at)
+        low, high = np.where(move, mid + 1, low), np.where(move, high, mid)
+    radius = np.maximum(at - x[low], x[low + q - 1] - at) * max(span, 1.0)
+    if (radius <= 0).any():
+        raise MetricRefusal("ici", "loess neighbourhood has zero width")
     fitted = np.empty(len(at))
-    for k, x0 in enumerate(np.asarray(at, float)):
-        distance = np.abs(x - x0)
-        radius = np.partition(distance, q - 1)[q - 1]
-        if span > 1:
-            radius *= span
-        if radius <= 0:
-            raise MetricRefusal("ici", "loess neighbourhood has zero width")
-        near = distance < radius
-        u = (x[near] - x0) / radius
-        local = w[near] * (1 - (distance[near] / radius) ** 3) ** 3
-        design = np.column_stack([np.ones(near.sum()), u, u * u]) * np.sqrt(local)[:, None]
-        coef = np.linalg.lstsq(design, y[near] * np.sqrt(local), rcond=None)[0]
-        fitted[k] = coef[0]
+    for k, (x0, r, lo) in enumerate(zip(at, radius, low)):
+        # The weighted local quadratic in u = (x - x0) / r over the window (points at distance r weigh 0).
+        u = (x[lo:lo + q] - x0) / r
+        u2 = u * u
+        local = w[lo:lo + q] * np.clip(1 - np.abs(u) * u2, 0, None) ** 3
+        lu, lu2, yy = local * u, local * u2, y[lo:lo + q]
+        s0, s1, s2, s3, s4 = local.sum(), lu.sum(), lu2.sum(), lu2 @ u, lu2 @ u2
+        gram = np.array([[s0, s1, s2], [s1, s2, s3], [s2, s3, s4]])
+        try:
+            fitted[k] = np.linalg.solve(gram, np.array([local @ yy, lu @ yy, lu2 @ yy]))[0]
+        except np.linalg.LinAlgError as error:
+            raise MetricRefusal("ici", "singular local quadratic") from error
     return fitted
 
 
