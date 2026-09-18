@@ -9,7 +9,7 @@
 //! about content.
 use super::FilesetPaths;
 use super::blocks::BlockPartition;
-use crate::score::cells::{ExactPlan, ExactTables};
+use crate::score::cells::{ExactPlan, ExactTables, SavedWide};
 use crate::score::types::{
     BimRowIndex, GenomicRegion, GroupedComplexRule, PipelineKind, PreparationResult,
     ScoreColumnIndex, ScoreInfo,
@@ -24,14 +24,15 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-/// Plan format 5 stores the exact plan, whose integers stand in for the parsed f64 weights: a
-/// header holding the key and one BLAKE3 digest per section, then little-endian arrays padded
-/// to multiples of 8 bytes.
-const MAGIC: [u8; 8] = *b"GNPLAN05";
+/// Plan format 6 stores the exact plan, whose integers stand in for the parsed f64 weights, and a
+/// weight past i64 at its band's scale as its f64, flagged in its slot (format 5 stored its
+/// integer's entry and limbs beside the slot, 24 bytes more): a header holding the key and one
+/// BLAKE3 digest per section, then little-endian arrays padded to multiples of 8 bytes.
+const MAGIC: [u8; 8] = *b"GNPLAN06";
 /// Inputs are hashed in leaves of this many bytes, so a key depends only on the
 /// bytes, never on thread count, read sizes or available memory.
 const LEAF_BYTES: u64 = 4 << 20;
-const SECTIONS: usize = 22;
+const SECTIONS: usize = 21;
 const HEADER_BYTES: usize = MAGIC.len() + 32 + SECTIONS * (8 + 32) + 32;
 /// A temporary plan file younger than this may belong to a writer still running.
 const STALE_TEMPORARY_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -386,7 +387,7 @@ fn write_plan(path: &Path, key: &[u8; 32], sections: &Sections<'_>) -> io::Resul
     header.extend_from_slice(&MAGIC);
     header.extend_from_slice(key);
     for (column, digest) in stored.iter().zip(&digests) {
-        header.extend_from_slice(&(column.bytes().len() as u64).to_le_bytes());
+        header.extend_from_slice(&(column.len() as u64).to_le_bytes());
         header.extend_from_slice(digest);
     }
     let digest = blake3::hash(&header);
@@ -394,9 +395,8 @@ fn write_plan(path: &Path, key: &[u8; 32], sections: &Sections<'_>) -> io::Resul
     crate::output::write_atomically(path, |writer| {
         writer.write_all(&header)?;
         for column in &stored {
-            let bytes = column.bytes();
-            writer.write_all(bytes)?;
-            writer.write_all(&[0u8; 8][..padding(bytes.len() as u64)])?;
+            column.emit(&mut |bytes| writer.write_all(bytes))?;
+            writer.write_all(&[0u8; 8][..padding(column.len() as u64)])?;
         }
         Ok(())
     })
@@ -498,24 +498,76 @@ enum Column<'a> {
     U8(&'a [u8]),
     U32(&'a [u32]),
     U64(&'a [u64]),
-    I64(&'a [i64]),
     F64(&'a [f64]),
+    /// An array stored with some of its slots replaced, `(index, value)` in index order: the
+    /// exact plan's slots and flags, with its saved wide weights written over them as they are
+    /// written out, so that saving borrows the plan rather than copying it.
+    PatchedI64(&'a [i64], &'a [(usize, i64)]),
+    PatchedU8(&'a [u8], &'a [(usize, u8)]),
 }
 
+/// Elements a patched column copies at a time, to write its patches over them.
+const PATCH_CHUNK: usize = 1 << 16;
+
 impl Column<'_> {
-    fn bytes(&self) -> &[u8] {
+    /// The stored bytes.
+    fn len(&self) -> usize {
         match *self {
-            Column::U8(values) => values,
-            Column::U32(values) => as_bytes(values),
-            Column::U64(values) => as_bytes(values),
-            Column::I64(values) => as_bytes(values),
-            Column::F64(values) => as_bytes(values),
+            Column::U8(values) | Column::PatchedU8(values, _) => values.len(),
+            Column::U32(values) => std::mem::size_of_val(values),
+            Column::U64(values) => std::mem::size_of_val(values),
+            Column::PatchedI64(values, _) => std::mem::size_of_val(values),
+            Column::F64(values) => std::mem::size_of_val(values),
+        }
+    }
+
+    /// Hands the stored bytes to `each` in order, an unpatched array in one call.
+    fn emit<E>(&self, each: &mut impl FnMut(&[u8]) -> Result<(), E>) -> Result<(), E> {
+        match *self {
+            Column::U8(values) => each(values),
+            Column::U32(values) => each(as_bytes(values)),
+            Column::U64(values) => each(as_bytes(values)),
+            Column::F64(values) => each(as_bytes(values)),
+            Column::PatchedI64(values, patches) => emit_patched(values, patches, each),
+            Column::PatchedU8(values, patches) => emit_patched(values, patches, each),
         }
     }
 
     fn digest(&self) -> [u8; 32] {
-        *blake3::hash(self.bytes()).as_bytes()
+        let mut hasher = blake3::Hasher::new();
+        let Ok(()) = self.emit(&mut |bytes| -> Result<(), std::convert::Infallible> {
+            hasher.update(bytes);
+            Ok(())
+        });
+        *hasher.finalize().as_bytes()
     }
+}
+
+/// `values` with `patches` written over them, handed to `each` a chunk at a time; a chunk no
+/// patch falls in is handed over as it is.
+fn emit_patched<T: Plain, E>(
+    values: &[T],
+    patches: &[(usize, T)],
+    each: &mut impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut rest = patches;
+    let mut buffer = Vec::new();
+    for (chunk, part) in values.chunks(PATCH_CHUNK).enumerate() {
+        let start = chunk * PATCH_CHUNK;
+        let within = rest.partition_point(|&(at, _)| at < start + part.len());
+        if within == 0 {
+            each(as_bytes(part))?;
+            continue;
+        }
+        buffer.clear();
+        buffer.extend_from_slice(part);
+        for &(at, value) in &rest[..within] {
+            buffer[at - start] = value;
+        }
+        rest = &rest[within..];
+        each(as_bytes(&buffer))?;
+    }
+    Ok(())
 }
 
 /// A plan's arrays in file order. A loaded plan owns them; saving borrows the large
@@ -527,9 +579,12 @@ struct Sections<'a> {
     /// `[total_variants, score_count]`.
     scalars: Cow<'a, [u64]>,
     starts: Cow<'a, [u64]>,
-    /// The exact plan's entries: weights at their bands' scales, flags and bands.
+    /// The exact plan's entries: weights at their bands' scales, flags and bands. A saved plan's
+    /// wide weights are written over the first two as they are stored; a read plan's arrays
+    /// hold them already.
     exact_weights: Cow<'a, [i64]>,
     exact_flags: Cow<'a, [u8]>,
+    saved_wide: SavedWide,
     entry_band: Cow<'a, [u8]>,
     columns: Cow<'a, [u32]>,
     offsets: Cow<'a, [u64]>,
@@ -544,11 +599,10 @@ struct Sections<'a> {
     rule_application_ends: Cow<'a, [u64]>,
     application_weights: Cow<'a, [f64]>,
     application_columns: Cow<'a, [u64]>,
-    /// The exact plan's scores and wide weights, as [`ExactTables`] holds them.
+    /// The exact plan's scores, as [`ExactTables`] holds them.
     multiples: Cow<'a, [u64]>,
     band_ends: Cow<'a, [u64]>,
     bands: Cow<'a, [u64]>,
-    wide: Cow<'a, [u64]>,
 }
 
 impl Sections<'_> {
@@ -556,8 +610,8 @@ impl Sections<'_> {
         [
             Column::U64(&self.scalars),
             Column::U64(&self.starts),
-            Column::I64(&self.exact_weights),
-            Column::U8(&self.exact_flags),
+            Column::PatchedI64(&self.exact_weights, &self.saved_wide.slots),
+            Column::PatchedU8(&self.exact_flags, &self.saved_wide.flags),
             Column::U8(&self.entry_band),
             Column::U32(&self.columns),
             Column::U64(&self.offsets),
@@ -575,14 +629,13 @@ impl Sections<'_> {
             Column::U64(&self.multiples),
             Column::U64(&self.band_ends),
             Column::U64(&self.bands),
-            Column::U64(&self.wide),
         ]
     }
 
     fn file_len(&self) -> u64 {
         self.stored()
             .iter()
-            .map(|column| column.bytes().len() as u64)
+            .map(|column| column.len() as u64)
             .map(|len| len + padding(len) as u64)
             .fold(HEADER_BYTES as u64, u64::saturating_add)
     }
@@ -598,6 +651,7 @@ impl Sections<'_> {
             starts: Cow::Owned(reader.read()?),
             exact_weights: Cow::Owned(reader.read()?),
             exact_flags: Cow::Owned(reader.read()?),
+            saved_wide: SavedWide::default(),
             entry_band: Cow::Owned(reader.read()?),
             columns: Cow::Owned(reader.read()?),
             offsets: Cow::Owned(reader.read()?),
@@ -615,7 +669,6 @@ impl Sections<'_> {
             multiples: Cow::Owned(reader.read()?),
             band_ends: Cow::Owned(reader.read()?),
             bands: Cow::Owned(reader.read()?),
-            wide: Cow::Owned(reader.read()?),
         })
     }
 }
@@ -664,7 +717,6 @@ impl<'a> Sections<'a> {
             multiples,
             band_ends,
             bands,
-            wide,
         } = prep.exact().tables();
         Sections {
             scalars: Cow::Owned(vec![
@@ -674,6 +726,7 @@ impl<'a> Sections<'a> {
             starts: Cow::Owned(starts),
             exact_weights: Cow::Borrowed(exact_weights),
             exact_flags: Cow::Borrowed(exact_flags),
+            saved_wide: prep.exact().saved_wide(prep.sparse_score_columns()),
             entry_band: Cow::Borrowed(entry_band),
             columns: Cow::Borrowed(prep.sparse_score_columns()),
             offsets: Cow::Borrowed(prep.sparse_row_offsets()),
@@ -691,7 +744,6 @@ impl<'a> Sections<'a> {
             multiples: Cow::Owned(multiples),
             band_ends: Cow::Owned(band_ends),
             bands: Cow::Owned(bands),
-            wide: Cow::Owned(wide),
         }
     }
 
@@ -768,11 +820,17 @@ impl<'a> Sections<'a> {
             multiples: self.multiples.into_owned(),
             band_ends: self.band_ends.into_owned(),
             bands: self.bands.into_owned(),
-            wide: self.wide.into_owned(),
         };
+        let (mut exact_weights, mut exact_flags) = (self.exact_weights.into_owned(), self.exact_flags.into_owned());
+        for &(entry, slot) in &self.saved_wide.slots {
+            *exact_weights.get_mut(entry).ok_or_else(|| invalid("Invalid variant plan wide weight"))? = slot;
+        }
+        for &(entry, flag) in &self.saved_wide.flags {
+            *exact_flags.get_mut(entry).ok_or_else(|| invalid("Invalid variant plan wide weight"))? = flag;
+        }
         let exact = ExactPlan::from_parts(
-            self.exact_weights.into_owned(),
-            self.exact_flags.into_owned(),
+            exact_weights,
+            exact_flags,
             self.entry_band.into_owned(),
             tables,
             &self.columns,
@@ -1136,6 +1194,36 @@ mod tests {
     }
 
     #[test]
+    fn weights_past_i64_are_saved_as_their_f64s_and_load_back_bit_for_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (files, scores) = fixture(dir.path());
+        std::fs::write(&files[0].bim, "1 a 0 100 A G\n1 c 0 200 C T\n").unwrap();
+        std::fs::write(&files[0].bed, [0x6c, 0x1b, 0x01, 2, 2]).unwrap();
+        // At the 12 places 1e-12 needs, 123456789012.345 is past i64.
+        std::fs::write(
+            &scores[0],
+            "variant_id\teffect_allele\tother_allele\tS\n\
+             1:100\tG\tA\t123456789012.345\n\
+             1:200\tT\tC\t1e-12\n",
+        )
+        .unwrap();
+        let prep = compile(dir.path(), &scores);
+        let saved = prep.exact().saved_wide(prep.sparse_score_columns());
+        assert_eq!(saved.slots.len(), 1);
+        let (entry, slot) = saved.slots[0];
+        assert_eq!(slot as u64, 123456789012.345f64.to_bits());
+        let cache = cache_in(dir.path(), &files, &scores);
+        cache.save(&prep).unwrap();
+        // The file holds the f64 in the entry's slot and the mark in its flags, and nothing beside.
+        let stored = read_plan(&cache.path, &cache.key).unwrap().unwrap();
+        assert_eq!(stored.exact_weights[entry], slot);
+        assert_eq!(stored.exact_flags[entry], saved.flags[0].1);
+        assert_eq!(stored.exact_weights.len(), prep.sparse_score_columns().len());
+        let plan = cache.load().unwrap().unwrap();
+        assert_eq!(exact_of(&plan), prep.exact());
+    }
+
+    #[test]
     fn stored_arrays_keep_signed_zero_nan_payloads_and_subnormals() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("plan");
@@ -1256,7 +1344,7 @@ mod tests {
         };
         // This plan under the previous format's magic, in a header that checks.
         let mut previous = saved.clone();
-        previous[..MAGIC.len()].copy_from_slice(b"GNPLAN04");
+        previous[..MAGIC.len()].copy_from_slice(b"GNPLAN05");
         reseal(&mut previous);
         let truncated = saved[..HEADER_BYTES + (saved.len() - HEADER_BYTES) / 2].to_vec();
         // The first section's digest with one byte flipped, in a header that checks.
@@ -1338,7 +1426,13 @@ mod tests {
         assert!(valid().into_plan().is_ok());
         let broken = [
             Sections {
-                exact_flags: Cow::Borrowed(&[4]),
+                exact_flags: Cow::Borrowed(&[8]),
+                ..valid()
+            },
+            // 0.5 saved as a weight past i64, though at one place it is 5.
+            Sections {
+                exact_weights: Cow::Owned(vec![0.5f64.to_bits() as i64]),
+                exact_flags: Cow::Borrowed(&[6]),
                 ..valid()
             },
             Sections {
@@ -1347,10 +1441,6 @@ mod tests {
             },
             Sections {
                 exact_weights: Cow::Borrowed(&[i64::MIN]),
-                ..valid()
-            },
-            Sections {
-                wide: Cow::Borrowed(&[0, 5, 0]),
                 ..valid()
             },
             Sections {

@@ -22,6 +22,9 @@ use std::fmt;
 pub(crate) const LANE_WIDTH: usize = 4;
 const FLIPPED: u8 = 1;
 const COUNTED: u8 = 2;
+/// Marks, in a saved plan's flags only, an entry whose weight is past i64 at its band's scale: its
+/// slot holds the weight's f64 bits, and loading rebuilds the integer from them.
+const SAVED_WIDE: u8 = 4;
 /// Marks an entry whose weight does not fit i64; its weight is in `ExactPlan::wide`.
 const WIDE: i64 = i64::MIN;
 /// Entries a parallel pass over a plan takes per task.
@@ -95,7 +98,7 @@ pub struct ExactPlan {
     one_lane_per_score: bool,
 }
 
-/// An exact plan's per-score arithmetic and wide weights, as the words a saved plan stores.
+/// An exact plan's per-score arithmetic, as the words a saved plan stores.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ExactTables {
     /// Each score's multiple.
@@ -104,8 +107,16 @@ pub struct ExactTables {
     pub band_ends: Vec<u64>,
     /// [`BAND_WORDS`] words per band, in score order.
     pub bands: Vec<u64>,
-    /// The entry, low word and high word of each weight past i64, in entry order.
-    pub wide: Vec<u64>,
+}
+
+/// What a saved plan writes over [`ExactPlan::entry_arrays`] at its weights past i64, in entry
+/// order: each one's slot holds its weight's f64 bits and its flags gain [`SAVED_WIDE`]. The f64
+/// takes a slot's 8 bytes where the integer took 24 more beside it (#2354: 44.6% of a 27-file PGS
+/// Catalog plan's entries were past i64, and their integers made the plan 1.19× the parsed one).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SavedWide {
+    pub slots: Vec<(usize, i64)>,
+    pub flags: Vec<(usize, u8)>,
 }
 
 /// An i128 as its low and high words.
@@ -733,12 +744,34 @@ impl ExactPlan {
     }
 
     /// Each entry's weight at its band's scale ([`WIDE`] when past i64), its flags, and its band
-    /// (empty when every score has one): the per-entry arrays a saved plan stores.
+    /// (empty when every score has one): the per-entry arrays a saved plan stores, with
+    /// [`Self::saved_wide`] written over them.
     pub fn entry_arrays(&self) -> (&[i64], &[u8], &[u8]) {
         (&self.weights, &self.flags, &self.entry_band)
     }
 
-    /// The plan's per-score arithmetic and wide weights as the words a saved plan stores.
+    /// The saved form of the weights past i64, over the score columns of the plan's entries. A
+    /// wide integer is its weight's shortest decimal at its band's scale, so the decimal read
+    /// back as an f64 is the weight the join parsed.
+    pub fn saved_wide(&self, columns: &[u32]) -> SavedWide {
+        let mut entries: Vec<usize> = self.wide.keys().copied().collect();
+        entries.sort_unstable();
+        let slots = entries
+            .par_iter()
+            .map(|&entry| {
+                let column = columns[entry] as usize;
+                let (score, band) = (&self.scores[column], self.band_of(entry, column));
+                let (digits, exponent) =
+                    folded(self.wide[&entry] / i128::from(score.multiple), -score.bands[band].places);
+                let weight: f64 = format!("{digits}e{exponent}").parse().expect("a decimal reads as an f64");
+                (entry, weight.to_bits() as i64)
+            })
+            .collect();
+        let flags = entries.iter().map(|&entry| (entry, self.flags[entry] | SAVED_WIDE)).collect();
+        SavedWide { slots, flags }
+    }
+
+    /// The plan's per-score arithmetic as the words a saved plan stores.
     pub fn tables(&self) -> ExactTables {
         let mut tables = ExactTables::default();
         for score in &self.scores {
@@ -755,21 +788,15 @@ impl ExactPlan {
             }
             tables.band_ends.push((tables.bands.len() / BAND_WORDS) as u64);
         }
-        let mut wide: Vec<(usize, i128)> = self.wide.iter().map(|(&entry, &value)| (entry, value)).collect();
-        wide.sort_unstable_by_key(|&(entry, _)| entry);
-        for (entry, value) in wide {
-            let [low, high] = words(value);
-            tables.wide.extend([entry as u64, low, high]);
-        }
         tables
     }
 
-    /// The plan whose [`Self::entry_arrays`] and [`Self::tables`] these are, over the score
-    /// columns of its entries. Refuses arrays that no plan has: a saved plan this build cannot
-    /// read is compiled again.
+    /// The plan whose [`Self::entry_arrays`], with [`Self::saved_wide`] written over them, and
+    /// [`Self::tables`] these are, over the score columns of its entries. Refuses arrays that no
+    /// plan has: a saved plan this build cannot read is compiled again.
     pub fn from_parts(
-        weights: Vec<i64>,
-        flags: Vec<u8>,
+        mut weights: Vec<i64>,
+        mut flags: Vec<u8>,
         entry_band: Vec<u8>,
         tables: ExactTables,
         columns: &[u32],
@@ -780,14 +807,12 @@ impl ExactPlan {
             multiples,
             band_ends,
             bands,
-            wide: wide_words,
         } = tables;
         if weights.len() != entries
             || flags.len() != entries
             || !(entry_band.is_empty() || entry_band.len() == entries)
             || band_ends.len() != multiples.len()
             || bands.len() % BAND_WORDS != 0
-            || wide_words.len() % 3 != 0
         {
             return Err(invalid("its arrays disagree on their lengths"));
         }
@@ -823,15 +848,36 @@ impl ExactPlan {
         if start * BAND_WORDS != bands.len() {
             return Err(invalid("bands no score holds"));
         }
-        let mut wide = AHashMap::with_capacity(wide_words.len() / 3);
-        let mut next = 0usize;
-        for word in wide_words.chunks_exact(3) {
-            let entry = usize::try_from(word[0])
-                .ok()
-                .filter(|&entry| entry >= next && entry < entries && weights[entry] == WIDE)
-                .ok_or_else(|| invalid("a wide weight's entry"))?;
-            wide.insert(entry, joined([word[1], word[2]]));
-            next = entry + 1;
+        // A weight past i64 comes back from its f64 as the plan compiled it: its shortest decimal
+        // at its band's scale. One that i64 holds was never saved this way.
+        let rebuilt = (0..entries)
+            .into_par_iter()
+            .with_min_len(PLAN_CHUNK)
+            .filter(|&i| flags[i] & SAVED_WIDE != 0)
+            .map(|i| -> Result<(usize, i128), PlanError> {
+                let weight = f64::from_bits(weights[i] as u64);
+                let (multiple, specs) = scores.get(columns[i] as usize).ok_or_else(|| invalid("a wide weight's score"))?;
+                let band = match (specs.len(), entry_band.get(i)) {
+                    (1, _) => 0,
+                    (_, Some(&band)) => usize::from(band),
+                    (_, None) => return Err(invalid("a wide weight's band")),
+                };
+                let &(places, _, _) = specs.get(band).ok_or_else(|| invalid("a wide weight's band"))?;
+                if !weight.is_finite() {
+                    return Err(invalid("a wide weight"));
+                }
+                let (digits, exponent) = shortest_decimal(weight);
+                scale_digits(digits, exponent, places, *multiple)
+                    .filter(|&value| i64::try_from(value).ok().is_none_or(|narrow| narrow == WIDE))
+                    .map(|value| (i, value))
+                    .ok_or_else(|| invalid("a wide weight"))
+            })
+            .collect::<Result<Vec<(usize, i128)>, PlanError>>()?;
+        let mut wide = AHashMap::with_capacity(rebuilt.len());
+        for (i, value) in rebuilt {
+            weights[i] = WIDE;
+            flags[i] &= !SAVED_WIDE;
+            wide.insert(i, value);
         }
         let plan = Self::assemble(weights, wide, flags, entry_band, scores);
         let misplaced = (0..entries).into_par_iter().with_min_len(PLAN_CHUNK).any(|i| {
@@ -1389,6 +1435,7 @@ mod tests {
     #[test]
     fn stored_arrays_rebuild_the_plan_bit_for_bit() {
         let wide: Vec<f64> = (0..50).map(|i| 1e10 + (i as f64) * 1e-6).collect();
+        let flipped = -1.2345678901234567e40;
         let plans = [
             (vec![-0.7, 0.25], vec![1.4, 0.0], vec![0, 1], vec![0, 1, 2], Vec::new(), 2),
             (vec![0.25, 1e-40, 3.0, -2.5], vec![0.0; 4], vec![0; 4], rows(4), Vec::new(), 1),
@@ -1396,16 +1443,62 @@ mod tests {
             (vec![3e37, 5e37], vec![0.0; 2], vec![0; 2], rows(2), Vec::new(), 1),
             (wide, vec![0.0; 50], vec![0; 50], rows(50), Vec::new(), 1),
             (vec![0.5, 3.0], vec![0.0; 2], vec![0; 2], rows(2), vec![averaged_rule(0.1)], 1),
+            // One scale of 12 places in two limbs, where 123456789012.345 is past i64.
+            (vec![123456789012.345, 1e-12], vec![0.0; 2], vec![0; 2], rows(2), Vec::new(), 1),
+            // Banded, with the flipped 1.2345678901234567e40 past i64 at its band's places, -19.
+            (
+                vec![flipped, 1.2345678901234567e35, 1e-30],
+                vec![-2.0 * flipped, 0.0, 0.0],
+                vec![0; 3],
+                rows(3),
+                Vec::new(),
+                1,
+            ),
         ];
+        let (mut unbanded_wide, mut banded_wide) = (false, false);
         for (index, (weights, corrections, columns, offsets, rules, scores)) in plans.into_iter().enumerate() {
             let plan = ExactPlan::new(weights, &corrections, &columns, &offsets, &rules, &names(scores))
                 .expect("plan");
-            let (weights, flags, entry_band) = plan.entry_arrays();
-            let rebuilt =
-                ExactPlan::from_parts(weights.to_vec(), flags.to_vec(), entry_band.to_vec(), plan.tables(), &columns)
-                    .expect("stored plan");
+            let saved = stored(&plan, &columns);
+            let rebuilt = ExactPlan::from_parts(saved.0, saved.1, saved.2, plan.tables(), &columns).expect("stored plan");
             assert_eq!(rebuilt, plan, "plan {index}");
+            if !plan.wide.is_empty() {
+                let banded = plan.scores[0].bands.len() > 1;
+                (unbanded_wide, banded_wide) = (unbanded_wide || !banded, banded_wide || banded);
+            }
         }
+        assert!(unbanded_wide && banded_wide, "an unbanded and a banded plan hold weights past i64");
+    }
+
+    /// A plan's entry arrays as a saved plan stores them, [`ExactPlan::saved_wide`] written over them.
+    fn stored(plan: &ExactPlan, columns: &[u32]) -> (Vec<i64>, Vec<u8>, Vec<u8>) {
+        let (weights, flags, entry_band) = plan.entry_arrays();
+        let (mut weights, mut flags) = (weights.to_vec(), flags.to_vec());
+        let saved = plan.saved_wide(columns);
+        for &(entry, slot) in &saved.slots {
+            weights[entry] = slot;
+        }
+        for &(entry, flag) in &saved.flags {
+            flags[entry] = flag;
+        }
+        assert!(!weights.contains(&WIDE), "a saved slot holds no marker");
+        (weights, flags, entry_band.to_vec())
+    }
+
+    #[test]
+    fn saved_wide_weights_are_the_parsed_f64s_and_narrow_ones_are_refused() {
+        let weights = vec![123456789012.345, 1e-12];
+        let columns = vec![0u32; 2];
+        let plan = ExactPlan::new(weights.clone(), &[0.0; 2], &columns, &rows(2), &[], &names(1)).expect("plan");
+        assert_eq!(plan.wide.len(), 1, "123456789012.345 is past i64 at 12 places");
+        let saved = plan.saved_wide(&columns);
+        assert_eq!(saved.slots, vec![(0, weights[0].to_bits() as i64)]);
+        assert_eq!(saved.flags, vec![(0, plan.flags[0] | SAVED_WIDE)]);
+        // The narrow entry marked as saved wide: its f64's integer fits i64, so no plan saved it so.
+        let (mut stored_weights, mut flags, entry_band) = stored(&plan, &columns);
+        stored_weights[1] = weights[1].to_bits() as i64;
+        flags[1] |= SAVED_WIDE;
+        assert!(ExactPlan::from_parts(stored_weights, flags, entry_band, plan.tables(), &columns).is_err());
     }
 
     #[test]
