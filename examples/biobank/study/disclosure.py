@@ -16,6 +16,7 @@ models every count as an unknown with the linear relations that hold between the
 - a count that does not depend on the horizon is one unknown for all horizons;
 - a leave-one-group-out fit's cells are the pooled cells crossed with its held-out group;
 - a nested model's persons are a subset of the enclosing model's in the same cell;
+- an exclusion flow's steps are a decreasing chain, each step removing a non-negative count;
 - a proportion printed to four significant digits pins its numerator when only one integer rounds to it.
 Exact rational Gauss-Jordan elimination then finds every count, residual and increment the released numbers
 determine, and every group of unknown counts whose sum they determine. Each one in 1..LIMIT is a finding. A
@@ -29,6 +30,9 @@ from fractions import Fraction
 import math
 
 LIMIT = 20
+COUNT_SPEC = {"type": "count"}
+# The group-sum search adds up to this many relations, and refuses a digest whose search grows past the limit.
+GROUP_DEPTH, GROUP_SEARCH_LIMIT = 4, 2_000_000
 
 # Census divisions inside their regions, as slugged labels. "unknown" maps to itself.
 CENSUS = {"division": ("region", {
@@ -136,12 +140,14 @@ class _System:
 
 
 def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invariant=("n",),
-          nested_models=(), hierarchy=CENSUS, limit=LIMIT):
+          nested_models=(), chain=None, hierarchy=CENSUS, limit=LIMIT):
     """Findings: every released or derivable participant count in 1..limit, as dicts.
 
     rows       digest.parse output: KEYS (disease, model, variant, fit, stratum, horizon) plus metrics.
     registry   metric -> {"type": "count"} | {"type": "proportion", "of": count, "per": metric} |
-               {"type": "score"}; an unregistered numeric metric is an error (default deny). A count may
+               {"type": "score"}, or the bare word "count", "proportion" or "score" (evaluate.METRICS); a
+               proportion without "of" may appear only beside all of its cell's counts. An unregistered
+               numeric metric is an error (default deny). A count may
                carry "population": "train" (training rows); the default is the evaluation rows.
     axes       stratum axes (slugged), e.g. ancestry, region, division, ehr_site, sex, age_band, risk.
                A "risk" stratum is a per-variant predicted-risk bin.
@@ -149,8 +155,11 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
     cumulative model -> {count: "increasing" | "decreasing"} across horizons.
     nested_models  [(inner, outer)]: the inner model's persons are a subset of the outer model's, per cell,
                for the counts in horizon_invariant.
+    chain      a compiled pattern whose first group orders a row's exclusion-flow steps (e.g.
+               step_(\\d+)_\\w+): each matching metric is a count, and consecutive steps differ by a count.
     """
     parts, cumulative = parts or {}, cumulative or {}
+    registry = {metric: {"type": spec} if isinstance(spec, str) else spec for metric, spec in registry.items()}
     system, findings = _System(), []
     axes = set(axes)
     parent_axis = {child: parent for child, (parent, _) in hierarchy.items()}
@@ -173,6 +182,9 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
 
     cells = set()  # (disease, model, metric, horizon, conditions, population) that exist
     proportions = []
+    # A proportion without a declared numerator ("proportion" alone, as evaluate.METRICS writes it) times its
+    # cell's counts gives a count, so it may appear only in a cell whose counts are all released.
+    shown, released, vocabulary = [], defaultdict(set), defaultdict(set)
     for row in rows:
         disease, model, variant, fit = row["disease"], row["model"], row["variant"], row["fit"]
         horizon = _horizon(row["horizon"])
@@ -193,16 +205,24 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
         conditions = canonical(conditions)
         if conditions is None:
             continue
+        steps = []
         for metric, value in row.items():
             if metric in ("disease", "model", "variant", "fit", "stratum", "horizon") or isinstance(value, str):
                 continue
-            spec = registry.get(metric)
+            step = chain.fullmatch(metric) if chain is not None else None
+            if step is not None:
+                steps.append((int(step.group(1)), metric))
+            spec = COUNT_SPEC if step is not None else registry.get(metric)
             if spec is None:
                 raise ValueError(f"metric {metric!r} is not registered")
             if spec["type"] == "score":
                 continue
             if spec["type"] == "proportion":
-                proportions.append((disease, model, horizon, conditions, spec, value, logo, row))
+                if "of" in spec:
+                    proportions.append((disease, model, horizon, conditions, spec, value, logo, row))
+                else:
+                    shown.append((disease, model, horizon, conditions,
+                                  f"{disease}/{model}/{variant}/{fit}/{row['stratum']}/{row['horizon']}/{metric}"))
                 continue
             if spec["type"] != "count":
                 raise ValueError(f"metric {metric!r} has unknown type {spec['type']!r}")
@@ -222,10 +242,20 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
             system.fix(key(disease, model, metric, horizon, cell_conditions, population), int(value), label)
             cells.add((disease, model, metric, horizon if metric not in horizon_invariant else None,
                        cell_conditions, population))
+            if population == "evaluation":
+                released[(disease, model, cell_conditions)].add(
+                    (metric, None if metric in horizon_invariant else horizon))
+                vocabulary[model].add(metric)
+        steps.sort()
+        for (_, before), (_, after) in zip(steps, steps[1:]):
+            system.equate([(key(disease, model, before, horizon, conditions, "evaluation"), 1),
+                           (key(disease, model, after, horizon, conditions, "evaluation"), -1),
+                           (("removed", disease, model, before, after, conditions), -1)],
+                          f"{disease}/{model}: {before} to {after} removes a count")
 
     # LOGO train complements: a group's cell plus its complement is the pooled cell.
-    for disease, model, metric, horizon, conditions, population in list(cells):
-        for axis, value in conditions:
+    for disease, model, metric, horizon, conditions, population in sorted(cells, key=_order):
+        for axis, value in sorted(conditions, key=repr):
             if isinstance(value, str) and value.startswith("not_"):
                 rest = conditions - {(axis, value)}
                 group = rest | {(axis, value[len("not_"):])}
@@ -237,7 +267,7 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
 
     # Every cell's marginal cells exist, released or not, so each axis family lists every category it has:
     # a division implies its region's cell, a LOGO cross cell both of its marginals.
-    frontier = list(cells)
+    frontier = sorted(cells, key=_order)
     while frontier:
         disease, model, metric, horizon, conditions, population = frontier.pop()
         for axis, value in conditions:
@@ -252,8 +282,8 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
 
     # Partitions: every cell's categories along one axis, within the rest of its conditions.
     families = defaultdict(set)
-    for disease, model, metric, horizon, conditions, population in cells:
-        for axis, value in conditions:
+    for disease, model, metric, horizon, conditions, population in sorted(cells, key=_order):
+        for axis, value in sorted(conditions, key=repr):
             if isinstance(value, str) and value.startswith("not_"):
                 continue
             if axis in parent_axis:
@@ -273,12 +303,12 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
     # Declared parts, cumulative growth across horizons, nesting between models.
     horizons = defaultdict(set)
     conditions_seen = defaultdict(set)
-    for disease, model, metric, horizon, conditions, population in cells:
+    for disease, model, metric, horizon, conditions, population in sorted(cells, key=_order):
         horizons[(disease, model)].add(horizon)
         conditions_seen[(disease, model, population)].add(conditions)
-    for (disease, model, population), seen in conditions_seen.items():
+    for (disease, model, population), seen in sorted(conditions_seen.items(), key=_order):
         hs = sorted(h for h in horizons[(disease, model)] if h is not None)
-        for conditions in seen:
+        for conditions in sorted(seen, key=_order):
             for whole, pieces in parts.get(model, []):
                 for h in hs or [None]:
                     system.equate([(key(disease, model, whole, h, conditions, population), -1)]
@@ -292,7 +322,7 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
                                    (key(disease, model, metric, large, conditions, population), -1)],
                                   f"{disease}/{model}/{metric} between horizons {a:g} and {b:g}")
     for inner, outer in nested_models:
-        for disease, model, metric, horizon, conditions, population in list(cells):
+        for disease, model, metric, horizon, conditions, population in sorted(cells, key=_order):
             if model == inner and metric in horizon_invariant:
                 extra = ("nesting", disease, inner, outer, metric, conditions, population)
                 system.equate([(key(disease, inner, metric, None, conditions, population), 1), (extra, 1),
@@ -338,9 +368,12 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
     for v, (source_value, source) in system.known.items():
         if source.endswith("from its proportion") and 1 <= source_value <= limit:
             findings.append({"kind": "proportion", "what": source, "value": int(source_value)})
-    # Groups of unknowns with a determined sum: a reduced row, or an original relation after substitution.
+    # Groups of unknowns with a determined sum. Which reduced rows hold such a group depends on the pivot order,
+    # so the search runs over the original relations instead: each after substituting the determined values, and
+    # every signed sum of up to GROUP_DEPTH of them chained through an unknown that cancels (a suppressed cell
+    # between its own family and its parent's family, say).
     seen = set()
-    rows_to_check = [(row, const) for row, const in pivots.values() if len(row) > 1]
+    reduced = []
     for terms, _ in system.equations:
         free, constant = {}, Fraction(0)
         for u, c in terms.items():
@@ -348,20 +381,74 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
                 constant -= c * determined[u]
             else:
                 free[u] = c
-        rows_to_check.append((free, constant))
-    for free, constant in rows_to_check:
+        if free:
+            reduced.append((free, constant))
+    where = defaultdict(list)
+    for i, (free, _) in enumerate(reduced):
+        for u in free:
+            where[u].append(i)
+
+    def consider(free, constant):
         coefficients = set(free.values())
         if len(free) < 2 or len(coefficients) != 1:
-            continue
-        c = coefficients.pop()
-        total = constant / c
+            return
+        total = constant / coefficients.pop()
         group = frozenset(free)
         if group in seen or total.denominator != 1 or not 1 <= total <= limit:
-            continue
+            return
         seen.add(group)
         findings.append({"kind": "group_sum", "what": " + ".join(sorted(_describe(labels[u]) for u in group)),
                          "value": int(total)})
+
+    for row, const in pivots.values():
+        consider(row, const)
+    frontier = [((i, 1),) for i in range(len(reduced))]
+    visited = {frozenset(combo) for combo in frontier}
+    for depth in range(1, GROUP_DEPTH + 1):
+        grown = []
+        for combo in frontier:
+            free, constant = defaultdict(Fraction), Fraction(0)
+            for i, sign in combo:
+                for u, c in reduced[i][0].items():
+                    free[u] += sign * c
+                constant += sign * reduced[i][1]
+            free = {u: c for u, c in free.items() if c}
+            consider(free, constant)
+            if depth == GROUP_DEPTH:
+                continue
+            members = {i for i, _ in combo}
+            for u, c in free.items():
+                for j in where[u]:
+                    if j in members:
+                        continue
+                    sign = -1 if reduced[j][0][u] == c else 1 if reduced[j][0][u] == -c else 0
+                    if not sign:
+                        continue
+                    extended = combo + ((j, sign),)
+                    # A combination and its negation are the same relation.
+                    canonical_key = min(frozenset(extended), frozenset((k, -s) for k, s in extended), key=sorted)
+                    if canonical_key not in visited:
+                        visited.add(canonical_key)
+                        grown.append(extended)
+            if len(visited) > GROUP_SEARCH_LIMIT:
+                raise ValueError("the group-sum search outgrew its bound; audit this digest in smaller parts")
+        frontier = grown
+    for disease, model, horizon, conditions, label in shown:
+        needed = {(m, None if m in horizon_invariant else horizon) for m in vocabulary[model]}
+        missing = sorted(m for m, _ in needed - released[(disease, model, conditions)])
+        if missing:
+            findings.append({"kind": "proportion_beside_withheld", "value": 0,
+                             "what": f"{label} beside withheld {', '.join(missing)}"})
     return findings
+
+
+def _order(item):
+    """A canonical sort key: sets by their sorted members, so no iteration order depends on string hashing."""
+    if isinstance(item, (set, frozenset)):
+        return "{" + ",".join(sorted(_order(x) for x in item)) + "}"
+    if isinstance(item, tuple):
+        return "(" + ",".join(_order(x) for x in item) + ")"
+    return repr(item)
 
 
 def _describe(name):

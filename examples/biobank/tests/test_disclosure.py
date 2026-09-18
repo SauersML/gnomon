@@ -1,5 +1,6 @@
 """The differencing auditor: each planted disclosure must fire, and a safe digest must pass."""
 from pathlib import Path
+import re
 import sys
 
 import pytest
@@ -10,11 +11,12 @@ from study import disclosure  # noqa: E402
 
 COUNT, TRAIN = {"type": "count"}, {"type": "count", "population": "train"}
 REGISTRY = {"n": COUNT, "cases": COUNT, "controls": COUNT, "events": COUNT, "noncases": COUNT,
-            "censored": COUNT, "n_train": TRAIN, "auc": {"type": "score"},
+            "censored": COUNT, "n_train": TRAIN, "single_record_count": COUNT, "auc": {"type": "score"},
             "prevalence": {"type": "proportion", "of": "cases", "per": "n"}}
 AXES = ["ancestry", "region", "division", "sex", "age_band", "ehr_site", "risk"]
 PARTS = {"binary": [("n", ["cases", "controls"])], "survival": [("n", ["events", "noncases", "censored"])]}
 CUMULATIVE = {"survival": {"events": "increasing", "censored": "increasing", "noncases": "decreasing"}}
+STEP = re.compile(r"step_(\d+)_\w+")
 
 
 def row(stratum="overall", fit="pooled", model="binary", horizon="all", variant="ours", **metrics):
@@ -75,12 +77,15 @@ def test_a_division_is_recovered_inside_its_region():
     assert 12 in values(run(rows), "derived")
 
 
-def test_a_small_group_sum_across_region_and_division_fires():
+def group_sum_rows():
     # South is suppressed; the unlisted regions plus South's unlisted divisions total 10.
-    rows = [row(n=1000), row("region_northeast", n=300), row("region_midwest", n=300), row("region_west", n=300),
+    return [row(n=1000), row("region_northeast", n=300), row("region_midwest", n=300), row("region_west", n=300),
             suppressed("region_south"), row("division_south_atlantic", n=50),
             row("division_east_south_central", n=40)]
-    assert 10 in values(run(rows), "group_sum")
+
+
+def test_a_small_group_sum_across_region_and_division_fires():
+    assert 10 in values(run(group_sum_rows()), "group_sum")
 
 
 def test_a_group_sum_of_twenty_one_or_more_is_safe():
@@ -143,3 +148,49 @@ def test_numbers_that_make_a_count_negative_are_refused():
 def test_an_unregistered_metric_is_refused():
     with pytest.raises(ValueError, match="not registered"):
         run([row(n=100, noncase_rate=0.5)])
+
+
+def test_a_small_removal_between_flow_steps_fires():
+    rows = [row(model="flow_disease", step_00_rows=1000, step_01_pgs_present=988, step_02_sex_female=700)]
+    assert values(run(rows, chain=STEP), "derived") == [12]
+
+
+def test_a_merged_flow_chain_is_safe():
+    rows = [row(model="flow_disease", step_00_rows=1000, step_02_sex_female=700, single_record_count=150)]
+    assert run(rows, chain=STEP) == []
+
+
+EVALUATE_REGISTRY = {"n": "count", "cases": "count", "obs_risk": "proportion", "auc": "score"}
+
+
+def test_a_cell_proportion_beside_a_withheld_count_fires():
+    rows = [row(n=1000, cases=300, obs_risk=0.3), row("sex_0", n=600, obs_risk=0.2833)]
+    found = disclosure.audit(rows, EVALUATE_REGISTRY, axes=AXES, parts=PARTS)
+    assert [f["kind"] for f in found] == ["proportion_beside_withheld"]
+
+
+def test_a_logo_proportion_is_checked_against_its_pooled_cell():
+    rows = [row(n=1000, cases=300), row("ancestry_afr", n=400), row(fit="logo_ancestry_afr", obs_risk=0.25)]
+    found = disclosure.audit(rows, EVALUATE_REGISTRY, axes=AXES, parts=PARTS)
+    assert [f["kind"] for f in found] == ["proportion_beside_withheld"]
+
+
+def test_cell_proportions_beside_their_released_counts_are_safe():
+    rows = [row(n=1000, cases=300, obs_risk=0.3), row("sex_0", n=600, cases=170, obs_risk=0.2833),
+            row("sex_1", n=400, cases=130, obs_risk=0.325)]
+    assert disclosure.audit(rows, EVALUATE_REGISTRY, axes=AXES, parts=PARTS) == []
+
+
+def test_findings_do_not_depend_on_string_hashing():
+    # Set iteration order follows PYTHONHASHSEED; a finding that appears under one seed and not another is a
+    # disclosure the gate misses at random.
+    import json
+    import os
+    import subprocess
+    code = ("import json, sys; sys.path.insert(0, %r); import test_disclosure as t; "
+            "print(json.dumps(sorted([f['kind'], f['value']] for f in t.run(t.group_sum_rows()))))"
+            % str(Path(__file__).resolve().parent))
+    outputs = {subprocess.run([sys.executable, "-c", code], env={**os.environ, "PYTHONHASHSEED": str(seed)},
+                              capture_output=True, text=True, check=True).stdout for seed in range(8)}
+    assert len(outputs) == 1
+    assert ["group_sum", 10] in json.loads(outputs.pop())
