@@ -396,7 +396,7 @@ mod tests {
         }
         let spool_bytes_per_variant = compact.len() as u64;
         let names: Vec<String> = (0..num_scores).map(|i| format!("S{i}")).collect();
-        let exact = crate::score::cells::ExactPlan::new(&[], &[], &[], &[0], &rules, &names)
+        let exact = crate::score::cells::ExactPlan::new(Vec::new(), &[], &[], &[0], &rules, &names)
             .expect("exact plan");
         PreparationResult::new(
             exact,

@@ -365,7 +365,7 @@ mod tests {
             offsets.push(columns.len() as u64);
         }
         let names: Vec<String> = (0..scores).map(|s| format!("S{s}")).collect();
-        let exact = ExactPlan::new(&weights, &corrections, &columns, &offsets, &[], &names)
+        let exact = ExactPlan::new(weights, &corrections, &columns, &offsets, &[], &names)
             .expect("exact plan");
         let row_bytes = people.div_ceil(4);
         let data: Vec<u8> = (0..rows * row_bytes).map(|_| rng.next() as u8).collect();

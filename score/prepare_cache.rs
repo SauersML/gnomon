@@ -9,6 +9,7 @@
 //! about content.
 use super::FilesetPaths;
 use super::blocks::BlockPartition;
+use crate::score::cells::{ExactPlan, ExactTables};
 use crate::score::types::{
     BimRowIndex, GenomicRegion, GroupedComplexRule, PipelineKind, PreparationResult,
     ScoreColumnIndex, ScoreInfo,
@@ -23,23 +24,33 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-/// Plan format 3 retains f64 weights: a header holding the key and one BLAKE3
-/// digest per section, then little-endian arrays padded to multiples of 8 bytes.
-const MAGIC: [u8; 8] = *b"GNPLAN04";
+/// Plan format 5 stores the exact plan, whose integers stand in for the parsed f64 weights: a
+/// header holding the key and one BLAKE3 digest per section, then little-endian arrays padded
+/// to multiples of 8 bytes.
+const MAGIC: [u8; 8] = *b"GNPLAN05";
 /// Inputs are hashed in leaves of this many bytes, so a key depends only on the
 /// bytes, never on thread count, read sizes or available memory.
 const LEAF_BYTES: u64 = 4 << 20;
-const SECTIONS: usize = 18;
+const SECTIONS: usize = 22;
 const HEADER_BYTES: usize = MAGIC.len() + 32 + SECTIONS * (8 + 32) + 32;
 /// A temporary plan file younger than this may belong to a writer still running.
 const STALE_TEMPORARY_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// A plan's weights: as the join parsed them, or as the exact plan a saved plan stores.
+pub(super) enum PlanWeights {
+    /// Each entry's parsed weight and flip correction, and each score's flipped-allele baseline.
+    Parsed {
+        weights: Vec<f64>,
+        corrections: Vec<f64>,
+        baseline: Vec<f64>,
+    },
+    Exact(ExactPlan),
+}
+
 pub(super) struct VariantPlan {
-    pub weights: Vec<f64>,
-    pub corrections: Vec<f64>,
+    pub weights: PlanWeights,
     pub columns: Vec<u32>,
     pub offsets: Vec<u64>,
-    pub baseline: Vec<f64>,
     pub required: Vec<BimRowIndex>,
     pub complex: Vec<GroupedComplexRule>,
     pub names: Vec<String>,
@@ -120,12 +131,42 @@ fn plan_directory() -> Option<PathBuf> {
     }
 }
 
+/// Every source whose code decides what a saved plan holds, so that changing one invalidates
+/// plans even when the build timestamp does not change: the join and its row and score parsing,
+/// the block expansion, the text sources the join reads, the plan types and this format, the exact
+/// plan's places, multiples, bands, flags and entry bands, and the shortest round-trip decimals
+/// they scale, which the pinned `ryu` and toolchain decide.
+const SOURCES: [&[u8]; 11] = [
+    include_bytes!("prepare.rs"),
+    include_bytes!("prepare_parse.rs"),
+    include_bytes!("prepare_scores.rs"),
+    include_bytes!("prepare_blocks.rs"),
+    include_bytes!("prepare_cache.rs"),
+    include_bytes!("types.rs"),
+    include_bytes!("cells.rs"),
+    include_bytes!("exact.rs"),
+    include_bytes!("../shared/files.rs"),
+    include_bytes!("../Cargo.lock"),
+    include_bytes!("../rust-toolchain.toml"),
+];
+
 /// The digest naming a plan compiled from these inputs by this build.
 fn content_key(
     filesets: &[FilesetPaths],
     scores: &[PathBuf],
     regions: Option<&HashMap<String, GenomicRegion>>,
     blocks: Option<&BlockPartition>,
+) -> io::Result<[u8; 32]> {
+    content_key_from(filesets, scores, regions, blocks, &SOURCES)
+}
+
+/// [`content_key`] of a build whose plan-deciding sources are `sources`.
+fn content_key_from(
+    filesets: &[FilesetPaths],
+    scores: &[PathBuf],
+    regions: Option<&HashMap<String, GenomicRegion>>,
+    blocks: Option<&BlockPartition>,
+    sources: &[&[u8]],
 ) -> io::Result<[u8; 32]> {
     let inputs: Vec<&Path> = filesets
         .iter()
@@ -141,12 +182,7 @@ fn content_key(
     }
     // Compiler changes invalidate plans automatically, including changes
     // to chromosome parsing and shared representation invariants.
-    for source in [
-        &include_bytes!("prepare.rs")[..],
-        include_bytes!("prepare_cache.rs"),
-        include_bytes!("prepare_blocks.rs"),
-        include_bytes!("types.rs"),
-    ] {
+    for source in sources {
         hash.update(blake3::hash(source).as_bytes());
     }
     for count in [filesets.len(), scores.len()] {
@@ -440,6 +476,7 @@ unsafe trait Plain: Copy + Default {}
 unsafe impl Plain for u8 {}
 unsafe impl Plain for u32 {}
 unsafe impl Plain for u64 {}
+unsafe impl Plain for i64 {}
 unsafe impl Plain for f64 {}
 
 fn as_bytes<T: Plain>(values: &[T]) -> &[u8] {
@@ -461,6 +498,7 @@ enum Column<'a> {
     U8(&'a [u8]),
     U32(&'a [u32]),
     U64(&'a [u64]),
+    I64(&'a [i64]),
     F64(&'a [f64]),
 }
 
@@ -470,6 +508,7 @@ impl Column<'_> {
             Column::U8(values) => values,
             Column::U32(values) => as_bytes(values),
             Column::U64(values) => as_bytes(values),
+            Column::I64(values) => as_bytes(values),
             Column::F64(values) => as_bytes(values),
         }
     }
@@ -488,11 +527,12 @@ struct Sections<'a> {
     /// `[total_variants, score_count]`.
     scalars: Cow<'a, [u64]>,
     starts: Cow<'a, [u64]>,
-    weights: Cow<'a, [f64]>,
-    corrections: Cow<'a, [f64]>,
+    /// The exact plan's entries: weights at their bands' scales, flags and bands.
+    exact_weights: Cow<'a, [i64]>,
+    exact_flags: Cow<'a, [u8]>,
+    entry_band: Cow<'a, [u8]>,
     columns: Cow<'a, [u32]>,
     offsets: Cow<'a, [u64]>,
-    baseline: Cow<'a, [f64]>,
     required: Cow<'a, [u64]>,
     flags: Cow<'a, [u8]>,
     counts: Cow<'a, [u32]>,
@@ -504,6 +544,11 @@ struct Sections<'a> {
     rule_application_ends: Cow<'a, [u64]>,
     application_weights: Cow<'a, [f64]>,
     application_columns: Cow<'a, [u64]>,
+    /// The exact plan's scores and wide weights, as [`ExactTables`] holds them.
+    multiples: Cow<'a, [u64]>,
+    band_ends: Cow<'a, [u64]>,
+    bands: Cow<'a, [u64]>,
+    wide: Cow<'a, [u64]>,
 }
 
 impl Sections<'_> {
@@ -511,11 +556,11 @@ impl Sections<'_> {
         [
             Column::U64(&self.scalars),
             Column::U64(&self.starts),
-            Column::F64(&self.weights),
-            Column::F64(&self.corrections),
+            Column::I64(&self.exact_weights),
+            Column::U8(&self.exact_flags),
+            Column::U8(&self.entry_band),
             Column::U32(&self.columns),
             Column::U64(&self.offsets),
-            Column::F64(&self.baseline),
             Column::U64(&self.required),
             Column::U8(&self.flags),
             Column::U32(&self.counts),
@@ -527,6 +572,10 @@ impl Sections<'_> {
             Column::U64(&self.rule_application_ends),
             Column::F64(&self.application_weights),
             Column::U64(&self.application_columns),
+            Column::U64(&self.multiples),
+            Column::U64(&self.band_ends),
+            Column::U64(&self.bands),
+            Column::U64(&self.wide),
         ]
     }
 
@@ -547,11 +596,11 @@ impl Sections<'_> {
         Ok(Sections {
             scalars: Cow::Owned(reader.read()?),
             starts: Cow::Owned(reader.read()?),
-            weights: Cow::Owned(reader.read()?),
-            corrections: Cow::Owned(reader.read()?),
+            exact_weights: Cow::Owned(reader.read()?),
+            exact_flags: Cow::Owned(reader.read()?),
+            entry_band: Cow::Owned(reader.read()?),
             columns: Cow::Owned(reader.read()?),
             offsets: Cow::Owned(reader.read()?),
-            baseline: Cow::Owned(reader.read()?),
             required: Cow::Owned(reader.read()?),
             flags: Cow::Owned(reader.read()?),
             counts: Cow::Owned(reader.read()?),
@@ -563,6 +612,10 @@ impl Sections<'_> {
             rule_application_ends: Cow::Owned(reader.read()?),
             application_weights: Cow::Owned(reader.read()?),
             application_columns: Cow::Owned(reader.read()?),
+            multiples: Cow::Owned(reader.read()?),
+            band_ends: Cow::Owned(reader.read()?),
+            bands: Cow::Owned(reader.read()?),
+            wide: Cow::Owned(reader.read()?),
         })
     }
 }
@@ -604,18 +657,26 @@ impl<'a> Sections<'a> {
             }
             rule_application_ends.push(application_weights.len() as u64);
         }
+        // The exact plan is what a loaded plan scores with, so it is stored in place of the
+        // parsed weights it was built from.
+        let (exact_weights, exact_flags, entry_band) = prep.exact().entry_arrays();
+        let ExactTables {
+            multiples,
+            band_ends,
+            bands,
+            wide,
+        } = prep.exact().tables();
         Sections {
             scalars: Cow::Owned(vec![
                 prep.total_variants_in_bim,
                 prep.score_names.len() as u64,
             ]),
             starts: Cow::Owned(starts),
-            // The exact plan holds the weights; each entry's f64 is the parsed weight itself.
-            weights: Cow::Owned(prep.sparse_weights()),
-            corrections: Cow::Owned(prep.sparse_missing_corrections()),
+            exact_weights: Cow::Borrowed(exact_weights),
+            exact_flags: Cow::Borrowed(exact_flags),
+            entry_band: Cow::Borrowed(entry_band),
             columns: Cow::Borrowed(prep.sparse_score_columns()),
             offsets: Cow::Borrowed(prep.sparse_row_offsets()),
-            baseline: Cow::Owned(prep.baseline_missing_sum_by_score()),
             required: Cow::Owned(prep.required_bim_indices.iter().map(|r| r.0).collect()),
             flags: Cow::Borrowed(prep.required_is_complex()),
             counts: Cow::Borrowed(&prep.score_variant_counts),
@@ -627,6 +688,10 @@ impl<'a> Sections<'a> {
             rule_application_ends: Cow::Owned(rule_application_ends),
             application_weights: Cow::Owned(application_weights),
             application_columns: Cow::Owned(application_columns),
+            multiples: Cow::Owned(multiples),
+            band_ends: Cow::Owned(band_ends),
+            bands: Cow::Owned(bands),
+            wide: Cow::Owned(wide),
         }
     }
 
@@ -696,12 +761,27 @@ impl<'a> Sections<'a> {
             return Err(invalid("Trailing variant plan strings"));
         }
 
+        if self.multiples.len() != score_count {
+            return Err(invalid("Invalid variant plan exact score tables"));
+        }
+        let tables = ExactTables {
+            multiples: self.multiples.into_owned(),
+            band_ends: self.band_ends.into_owned(),
+            bands: self.bands.into_owned(),
+            wide: self.wide.into_owned(),
+        };
+        let exact = ExactPlan::from_parts(
+            self.exact_weights.into_owned(),
+            self.exact_flags.into_owned(),
+            self.entry_band.into_owned(),
+            tables,
+            &self.columns,
+        )
+        .map_err(|error| invalid(&error.to_string()))?;
         let plan = VariantPlan {
-            weights: self.weights.into_owned(),
-            corrections: self.corrections.into_owned(),
+            weights: PlanWeights::Exact(exact),
             columns: self.columns.into_owned(),
             offsets: self.offsets.into_owned(),
-            baseline: self.baseline.into_owned(),
             required: self
                 .required
                 .into_owned()
@@ -811,14 +891,11 @@ impl VariantPlan {
         let scores = self.names.len();
         if scores == 0
             || rows == 0
-            || self.weights.len() != self.corrections.len()
-            || self.weights.len() != self.columns.len()
             || self.offsets.len() != rows + 1
             || self.flags.len() != rows
             || self.counts.len() != scores
-            || self.baseline.len() != scores
             || self.offsets.first() != Some(&0)
-            || self.offsets.last() != Some(&(self.weights.len() as u64))
+            || self.offsets.last() != Some(&(self.columns.len() as u64))
             || self.offsets.par_windows(2).any(|w| w[0] > w[1])
             || self.columns.par_iter().any(|&c| c as usize >= scores)
             || self.required.par_windows(2).any(|w| w[0].0 >= w[1].0)
@@ -917,6 +994,13 @@ mod tests {
 
     fn bits(values: &[f64]) -> Vec<u64> {
         values.iter().map(|v| v.to_bits()).collect()
+    }
+
+    fn exact_of(plan: &VariantPlan) -> &ExactPlan {
+        match &plan.weights {
+            PlanWeights::Exact(exact) => exact,
+            PlanWeights::Parsed { .. } => panic!("a loaded plan holds its exact plan"),
+        }
     }
 
     #[test]
@@ -1019,23 +1103,11 @@ mod tests {
         assert!(cache.load().unwrap().is_none());
         cache.save(&prep).unwrap();
         let plan = cache.load().unwrap().unwrap();
-        assert_eq!(bits(&plan.weights), bits(&prep.sparse_weights()));
-        assert_eq!(
-            bits(&plan.corrections),
-            bits(&prep.sparse_missing_corrections())
-        );
+        // Score S spans forty decimal orders, so it is banded; the loaded exact plan is the
+        // compiled one, integer for integer.
+        assert_eq!(exact_of(&plan), prep.exact());
         assert_eq!(plan.columns, prep.sparse_score_columns());
         assert_eq!(plan.offsets, prep.sparse_row_offsets());
-        assert_eq!(
-            plan.baseline
-                .iter()
-                .map(|v| v.to_bits())
-                .collect::<Vec<_>>(),
-            prep.baseline_missing_sum_by_score()
-                .iter()
-                .map(|v| v.to_bits())
-                .collect::<Vec<_>>()
-        );
         assert_eq!(plan.required, prep.required_bim_indices);
         assert_eq!(plan.flags, prep.required_is_complex());
         assert_eq!(plan.counts, prep.score_variant_counts);
@@ -1077,23 +1149,19 @@ mod tests {
             0xffef_ffff_ffff_ffff,
         ]
         .map(f64::from_bits);
-        let doubles = [0u64, 1 << 63, 1, 0x7ff8_0000_0000_1234].map(f64::from_bits);
+        let integers = [0, -1, 1, i64::MIN, i64::MAX, -(1 << 62)];
         let sections = Sections {
-            weights: Cow::Borrowed(&floats),
-            baseline: Cow::Borrowed(&doubles),
+            application_weights: Cow::Borrowed(&floats),
+            exact_weights: Cow::Borrowed(&integers),
+            exact_flags: Cow::Borrowed(&[3, 0, 1]),
             string_bytes: Cow::Borrowed(b"abc"),
             ..Sections::default()
         };
         write_plan(&path, &key, &sections).unwrap();
         let read = read_plan(&path, &key).unwrap().unwrap();
-        assert_eq!(bits(&read.weights), bits(&floats));
-        assert_eq!(
-            read.baseline
-                .iter()
-                .map(|v| v.to_bits())
-                .collect::<Vec<_>>(),
-            doubles.map(f64::to_bits)
-        );
+        assert_eq!(bits(&read.application_weights), bits(&floats));
+        assert_eq!(&read.exact_weights[..], integers);
+        assert_eq!(&read.exact_flags[..], [3, 0, 1]);
         assert_eq!(&read.string_bytes[..], b"abc");
         assert_eq!(std::fs::metadata(&path).unwrap().len(), sections.file_len());
     }
@@ -1152,6 +1220,81 @@ mod tests {
     }
 
     #[test]
+    fn every_plan_deciding_source_is_in_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (files, scores) = fixture(dir.path());
+        let original = content_key(&files, &scores, None, None).unwrap();
+        for index in 0..SOURCES.len() {
+            let mut sources = SOURCES;
+            let edited = [SOURCES[index], &b" "[..]].concat();
+            sources[index] = &edited;
+            let key = content_key_from(&files, &scores, None, None, &sources).unwrap();
+            assert_ne!(key, original, "source {index}");
+        }
+    }
+
+    #[test]
+    fn stale_plans_are_compiled_again_and_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (files, scores) = complex_fixture(dir.path());
+        // Inputs no other test compiles, so no other test writes this plan.
+        let text = std::fs::read_to_string(&scores[0]).unwrap();
+        std::fs::write(&scores[0], text.replace("0.25", "0.375")).unwrap();
+        let Some(cache) = PlanCache::discover(&files, &scores, None, None).unwrap() else {
+            return;
+        };
+        let prepare = || {
+            super::super::prepare_for_computation(&[dir.path().join("panel")], &scores, None, None)
+                .unwrap()
+        };
+        let fresh = prepare();
+        let saved = std::fs::read(&cache.path).unwrap();
+        let reseal = |bytes: &mut [u8]| {
+            let body = HEADER_BYTES - 32;
+            let digest = blake3::hash(&bytes[..body]);
+            bytes[body..HEADER_BYTES].copy_from_slice(digest.as_bytes());
+        };
+        // This plan under the previous format's magic, in a header that checks.
+        let mut previous = saved.clone();
+        previous[..MAGIC.len()].copy_from_slice(b"GNPLAN04");
+        reseal(&mut previous);
+        let truncated = saved[..HEADER_BYTES + (saved.len() - HEADER_BYTES) / 2].to_vec();
+        // The first section's digest with one byte flipped, in a header that checks.
+        let mut flipped = saved.clone();
+        flipped[MAGIC.len() + 32 + 8] ^= 1;
+        reseal(&mut flipped);
+        // What a build with one plan-deciding source changed saves: under its own key, which
+        // this build never looks up, and so here only as a file at this key's path.
+        let mut sources = SOURCES;
+        let edited = [SOURCES[6], &b"\n"[..]].concat();
+        sources[6] = &edited;
+        let other_key = content_key_from(&files, &scores, None, None, &sources).unwrap();
+        assert_ne!(other_key, cache.key);
+        let other_build = PlanCache {
+            path: dir.path().join("other-build").join(hex::encode(other_key)),
+            key: other_key,
+        };
+        other_build.save(&fresh).unwrap();
+        let changed_source = std::fs::read(&other_build.path).unwrap();
+        for (bytes, why) in [
+            (previous, "previous format"),
+            (truncated, "truncated section"),
+            (flipped, "flipped digest"),
+            (changed_source, "changed source"),
+        ] {
+            std::fs::write(&cache.path, &bytes).unwrap();
+            assert!(cache.load().is_err(), "{why}: refused");
+            let again = prepare();
+            assert_eq!(again.exact(), fresh.exact(), "{why}: compiled again");
+            assert_eq!(
+                std::fs::read(&cache.path).unwrap(),
+                saved,
+                "{why}: the compiled plan replaces the stale one"
+            );
+        }
+    }
+
+    #[test]
     fn headers_describing_another_length_are_refused_before_allocating() {
         let key = [3u8; 32];
         let empty = Sections::default();
@@ -1177,20 +1320,66 @@ mod tests {
         let valid = || Sections {
             scalars: Cow::Borrowed(&scalars),
             starts: Cow::Borrowed(&[0]),
-            weights: Cow::Borrowed(&[0.5]),
-            corrections: Cow::Borrowed(&[0.0]),
+            // 0.5 at one decimal place, counted as its row's first entry of its score.
+            exact_weights: Cow::Borrowed(&[5]),
+            exact_flags: Cow::Borrowed(&[2]),
             columns: Cow::Borrowed(&[0]),
             offsets: Cow::Borrowed(&[0, 1]),
-            baseline: Cow::Borrowed(&[0.0]),
             required: Cow::Borrowed(&[0]),
             flags: Cow::Borrowed(&[0]),
             counts: Cow::Borrowed(&[1]),
             string_ends: Cow::Borrowed(&[1]),
             string_bytes: Cow::Borrowed(b"S"),
+            multiples: Cow::Borrowed(&[1]),
+            band_ends: Cow::Borrowed(&[1]),
+            bands: Cow::Borrowed(&[1, 1, 0, 0, 0]),
             ..Sections::default()
         };
         assert!(valid().into_plan().is_ok());
         let broken = [
+            Sections {
+                exact_flags: Cow::Borrowed(&[4]),
+                ..valid()
+            },
+            Sections {
+                exact_weights: Cow::Borrowed(&[5, 5]),
+                ..valid()
+            },
+            Sections {
+                exact_weights: Cow::Borrowed(&[i64::MIN]),
+                ..valid()
+            },
+            Sections {
+                wide: Cow::Borrowed(&[0, 5, 0]),
+                ..valid()
+            },
+            Sections {
+                multiples: Cow::Borrowed(&[]),
+                band_ends: Cow::Borrowed(&[]),
+                ..valid()
+            },
+            Sections {
+                multiples: Cow::Borrowed(&[0]),
+                ..valid()
+            },
+            Sections {
+                band_ends: Cow::Borrowed(&[2]),
+                ..valid()
+            },
+            Sections {
+                bands: Cow::Borrowed(&[1, 3, 0, 0, 0]),
+                ..valid()
+            },
+            Sections {
+                bands: Cow::Borrowed(&[1, 2, 0, 0, 0]),
+                ..valid()
+            },
+            Sections {
+                band_ends: Cow::Borrowed(&[2]),
+                bands: Cow::Borrowed(&[1, 1, 0, 0, 0, 1, 1, 0, 0, 0]),
+                entry_band: Cow::Borrowed(&[0]),
+                ..valid()
+            },
             Sections {
                 string_ends: Cow::Borrowed(&[2]),
                 ..valid()
@@ -1230,7 +1419,6 @@ mod tests {
         let (files, scores) = complex_fixture(dir.path());
         let prep = compile(dir.path(), &scores);
         let cache = cache_in(dir.path(), &files, &scores);
-        let expected = bits(&prep.sparse_weights());
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(|| {
@@ -1243,7 +1431,7 @@ mod tests {
                 scope.spawn(|| {
                     for _ in 0..100 {
                         if let Some(plan) = cache.load().unwrap() {
-                            assert_eq!(bits(&plan.weights), expected);
+                            assert_eq!(exact_of(&plan), prep.exact());
                         }
                     }
                 });

@@ -34,23 +34,26 @@ const NEVER_READ: u8 = u8::MAX - 1;
 /// midpoints have at most 767 significant decimal digits, so the parse decides correctly.
 const ROUNDING_DIGITS: usize = 800;
 const BILLION: u128 = 1_000_000_000;
+/// Words a saved plan stores per band: its places, its lanes (one or two), its limbs' split bits
+/// (zero for one lane), and its baseline's low and high words.
+const BAND_WORDS: usize = 5;
 
 /// Where a term goes in one person's lanes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
     lane: usize,
     split: Option<Split>,
 }
 
 /// One scale of a score: terms at `10^places × multiple`, and the lanes that hold them.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Band {
     places: i32,
     target: Target,
     baseline: i128,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ScoreArithmetic {
     multiple: u64,
     /// In ascending `places`; a term with `p` decimal places belongs to the first band with
@@ -78,7 +81,7 @@ impl fmt::Display for PlanError {
 }
 
 /// The exact form of a plan's CSR entries and every score's arithmetic.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ExactPlan {
     /// Each entry's weight at its band's scale, or [`WIDE`].
     weights: Vec<i64>,
@@ -90,6 +93,29 @@ pub struct ExactPlan {
     stride: usize,
     /// Whether every score is one band in one lane without limbs, so score `s` is lane `s`.
     one_lane_per_score: bool,
+}
+
+/// An exact plan's per-score arithmetic and wide weights, as the words a saved plan stores.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ExactTables {
+    /// Each score's multiple.
+    pub multiples: Vec<u64>,
+    /// Where each score's bands end, counted in bands.
+    pub band_ends: Vec<u64>,
+    /// [`BAND_WORDS`] words per band, in score order.
+    pub bands: Vec<u64>,
+    /// The entry, low word and high word of each weight past i64, in entry order.
+    pub wide: Vec<u64>,
+}
+
+/// An i128 as its low and high words.
+fn words(value: i128) -> [u64; 2] {
+    [value as u64, (value >> 64) as u64]
+}
+
+/// The i128 whose low and high words these are.
+fn joined([low, high]: [u64; 2]) -> i128 {
+    (i128::from(high as i64) << 64) | i128::from(low)
 }
 
 fn lcm(a: u64, b: u64) -> Option<u64> {
@@ -116,6 +142,31 @@ fn scale_digits(digits: i64, exponent: i32, places: i32, multiple: u64) -> Optio
     i128::from(digits)
         .checked_mul(10i128.checked_pow(shift)?)?
         .checked_mul(i128::from(multiple))
+}
+
+/// `digits × 10^exponent` with the digits' trailing zeros folded into the exponent, as
+/// [`shortest_decimal`] writes a weight: zero is `(0, 0)`.
+fn folded(mut digits: i128, mut exponent: i32) -> (i128, i32) {
+    if digits == 0 {
+        return (0, 0);
+    }
+    while digits % 10 == 0 {
+        digits /= 10;
+        exponent += 1;
+    }
+    (digits, exponent)
+}
+
+/// A weights buffer as integer slots, each holding its weight's bits. A vector's own iterator
+/// mapped to a type of the same size and alignment collects into the same allocation.
+fn into_integer_slots(weights: Vec<f64>) -> Vec<i64> {
+    weights.into_iter().map(|weight| weight.to_bits() as i64).collect()
+}
+
+/// The weight whose bits an integer slot still holds.
+#[inline(always)]
+fn weight_in(slot: i64) -> f64 {
+    f64::from_bits(slot as u64)
 }
 
 /// The lanes a set of terms needs: one when their magnitudes sum below 2^63, two carry-free
@@ -160,7 +211,7 @@ impl ExactPlan {
     /// correction), their complex rules and score names. Refuses only a score whose weights no
     /// banding holds, naming it.
     pub fn new(
-        weights: &[f64],
+        weights: Vec<f64>,
         corrections: &[f64],
         columns: &[u32],
         offsets: &[u64],
@@ -252,7 +303,10 @@ impl ExactPlan {
         // An entry read at the places its score held then keeps that integer and those places, and
         // the weight pass below takes the integer as it is where they are the score's final places:
         // scaling a weight to its score's places a second time was a fifth of a wide panel's run.
-        let mut int_weights = vec![0i64; entries];
+        // The integers take the weights' own buffer: a slot holds its weight's bits until the
+        // places pass or the weight pass writes the entry's integer over them, so a wide panel
+        // does not fault in a second array of its size.
+        let mut int_weights = into_integer_slots(weights);
         let mut read_places = vec![UNREAD; entries];
         let mut places = int_weights
             .par_chunks_mut(PLAN_CHUNK)
@@ -263,13 +317,12 @@ impl ExactPlan {
                 |(mut places, mut hint), (chunk, (slots, reads))| {
                     let start = chunk * PLAN_CHUNK;
                     let mut one = |at: usize, places: &mut [i32], slots: &mut [i64], reads: &mut [u8]| {
-                        let (i, column) = (start + at, columns[start + at] as usize);
+                        let (weight, column) = (weight_in(slots[at]), columns[start + at] as usize);
                         // A weight the score's places already hold leaves them as they are.
-                        match scaled_at_places(weights[i], places[column]) {
+                        match scaled_at_places(weight, places[column]) {
                             Some(scaled) => (slots[at], reads[at]) = (scaled, places[column] as u8),
                             None => {
-                                places[column] =
-                                    places[column].max(-shortest_decimal_hinted(weights[i], &mut hint).1);
+                                places[column] = places[column].max(-shortest_decimal_hinted(weight, &mut hint).1);
                             }
                         }
                     };
@@ -285,7 +338,12 @@ impl ExactPlan {
                             columns[i + 3] as usize,
                         ];
                         let held = [places[column[0]], places[column[1]], places[column[2]], places[column[3]]];
-                        let values = [weights[i], weights[i + 1], weights[i + 2], weights[i + 3]];
+                        let values = [
+                            weight_in(slots[at]),
+                            weight_in(slots[at + 1]),
+                            weight_in(slots[at + 2]),
+                            weight_in(slots[at + 3]),
+                        ];
                         match scaled_at_places_x4(values, held) {
                             Some(scaled) => {
                                 slots[at..at + 4].copy_from_slice(&scaled);
@@ -366,16 +424,17 @@ impl ExactPlan {
                 _ => NEVER_READ,
             })
             .collect();
-        let (mut bound, mut largest, wide_entries) = int_weights
+        let (mut bound, mut largest, wide_entries, unscaled) = int_weights
             .par_chunks_mut(PLAN_CHUNK)
             .zip(read_places.par_chunks(PLAN_CHUNK))
             .enumerate()
             .fold(
                 || {
-                    let parts = (vec![Some(0u128); num_scores], vec![0u128; num_scores], Vec::new(), 0usize);
+                    let parts =
+                        (vec![Some(0u128); num_scores], vec![0u128; num_scores], Vec::new(), Vec::new(), 0usize);
                     (parts, vec![0u128; num_scores], vec![0u64; num_scores])
                 },
-                |((mut bound, mut largest, mut wide, mut hint), mut reused, mut reused_largest),
+                |((mut bound, mut largest, mut wide, mut unscaled, mut hint), mut reused, mut reused_largest),
                  (chunk, (slots, reads))| {
                     for ((i, slot), &read) in (chunk * PLAN_CHUNK..).zip(slots.iter_mut()).zip(reads) {
                         let column = columns[i] as usize;
@@ -385,14 +444,36 @@ impl ExactPlan {
                             reused_largest[column] = reused_largest[column].max(magnitude);
                             continue;
                         }
-                        let exact = match scaled_at_places(weights[i], places[column]) {
-                            // A multiple of one leaves the integer as it is, without the i128
-                            // multiplication's libcall.
-                            Some(scaled) if multiples[column] == 1 => Some(i128::from(scaled)),
-                            Some(scaled) => i128::from(scaled).checked_mul(i128::from(multiples[column])),
-                            None => {
-                                let (digits, exponent) = shortest_decimal_hinted(weights[i], &mut hint);
-                                scale_digits(digits, exponent, places[column], multiples[column])
+                        // An entry the places pass scaled holds its shortest form at the places it
+                        // read, which are at most its score's final places; any other entry still
+                        // holds its weight's bits. A multiple of one leaves an integer as it is,
+                        // without the i128 multiplication's libcall.
+                        let (exact, decimal) = if read == UNREAD {
+                            let weight = weight_in(*slot);
+                            match scaled_at_places(weight, places[column]) {
+                                Some(scaled) if multiples[column] == 1 => (Some(i128::from(scaled)), None),
+                                Some(scaled) => {
+                                    (i128::from(scaled).checked_mul(i128::from(multiples[column])), None)
+                                }
+                                None => {
+                                    let (digits, exponent) = shortest_decimal_hinted(weight, &mut hint);
+                                    let exact = scale_digits(digits, exponent, places[column], multiples[column]);
+                                    (exact, Some((digits, exponent)))
+                                }
+                            }
+                        } else {
+                            let shift = (places[column] - i32::from(read)) as u32;
+                            match 10i64.checked_pow(shift).and_then(|power| slot.checked_mul(power)) {
+                                Some(scaled) if multiples[column] == 1 => (Some(i128::from(scaled)), None),
+                                _ => {
+                                    // A zero scales as its shortest form (0, 0) does, at the same
+                                    // places or not at all.
+                                    let (digits, exponent) = folded(i128::from(*slot), -i32::from(read));
+                                    // A divisor of the slot's integer, so i64 holds it.
+                                    let digits = digits as i64;
+                                    let exact = scale_digits(digits, exponent, places[column], multiples[column]);
+                                    (exact, Some((digits, exponent)))
+                                }
                             }
                         };
                         *slot = exact
@@ -401,22 +482,25 @@ impl ExactPlan {
                             .unwrap_or(WIDE);
                         if let (WIDE, Some(value)) = (*slot, exact) {
                             wide.push((i, value));
+                        } else if let (None, Some(decimal)) = (exact, decimal) {
+                            unscaled.push((i, decimal));
                         }
                         add_term(&mut bound, &mut largest, column, exact);
                     }
-                    ((bound, largest, wide, hint), reused, reused_largest)
+                    ((bound, largest, wide, unscaled, hint), reused, reused_largest)
                 },
             )
-            .map(|((mut bound, mut largest, wide, _), reused, reused_largest)| {
+            .map(|((mut bound, mut largest, wide, unscaled, _), reused, reused_largest)| {
                 for column in 0..num_scores {
                     bound[column] = bound[column].and_then(|b| b.checked_add(reused[column]));
                     largest[column] = largest[column].max(u128::from(reused_largest[column]));
                 }
-                (bound, largest, wide)
+                (bound, largest, wide, unscaled)
             })
             .reduce(
-                || (vec![Some(0u128); num_scores], vec![0u128; num_scores], Vec::new()),
-                |(mut bound, mut largest, mut wide), (other_bound, other_largest, other_wide)| {
+                || (vec![Some(0u128); num_scores], vec![0u128; num_scores], Vec::new(), Vec::new()),
+                |(mut bound, mut largest, mut wide, mut unscaled),
+                 (other_bound, other_largest, other_wide, other_unscaled)| {
                     for (b, o) in bound.iter_mut().zip(other_bound) {
                         *b = b.zip(o).and_then(|(b, o)| b.checked_add(o));
                     }
@@ -424,7 +508,8 @@ impl ExactPlan {
                         *l = (*l).max(o);
                     }
                     wide.extend(other_wide);
-                    (bound, largest, wide)
+                    unscaled.extend(other_unscaled);
+                    (bound, largest, wide, unscaled)
                 },
             );
         let mut wide = AHashMap::new();
@@ -449,9 +534,29 @@ impl ExactPlan {
             .collect();
         let mut entry_band = Vec::new();
         if banded.iter().any(|&b| b) {
+            // A banded score's entries in shortest form, from what the weight pass left: an integer
+            // at the score's single scale over its multiple, or the form an entry kept when that
+            // scale could not hold it.
+            let unscaled: AHashMap<usize, (i64, i32)> = unscaled.into_iter().collect();
+            let decimals = (0..entries)
+                .filter(|&i| banded[columns[i] as usize])
+                .map(|i| -> Result<(usize, (i64, i32)), PlanError> {
+                    let column = columns[i] as usize;
+                    if let Some(&decimal) = unscaled.get(&i) {
+                        return Ok((i, decimal));
+                    }
+                    let value = match int_weights[i] {
+                        WIDE => wide.get(&i).copied().ok_or_else(|| {
+                            PlanError::Invariant(format!("Plan entry {i} lost its weight."))
+                        })?,
+                        narrow => i128::from(narrow),
+                    };
+                    let (digits, exponent) = folded(value / i128::from(multiples[column]), -places[column]);
+                    Ok((i, (i64::try_from(digits).map_err(|_| refusal(column))?, exponent)))
+                })
+                .collect::<Result<Vec<(usize, (i64, i32))>, PlanError>>()?;
             let mut groups: Vec<AHashMap<i32, PlacesGroup>> = vec![AHashMap::new(); num_scores];
-            let mut gather = |column: usize, value: f64| {
-                let (digits, exponent) = shortest_decimal(value);
+            let mut gather = |column: usize, (digits, exponent): (i64, i32)| {
                 let magnitude = 2 * u128::from(digits.unsigned_abs());
                 let group = groups[column].entry(-exponent).or_insert(PlacesGroup {
                     places: -exponent,
@@ -461,14 +566,12 @@ impl ExactPlan {
                 group.sum = group.sum.saturating_add(magnitude);
                 group.largest = group.largest.max(magnitude);
             };
-            for i in 0..entries {
-                if banded[columns[i] as usize] {
-                    gather(columns[i] as usize, weights[i]);
-                }
+            for &(i, decimal) in &decimals {
+                gather(columns[i] as usize, decimal);
             }
             for &(column, weight) in &applications {
                 if banded[column] {
-                    gather(column, weight);
+                    gather(column, shortest_decimal(weight));
                 }
             }
             for column in (0..num_scores).filter(|&column| banded[column]) {
@@ -494,12 +597,8 @@ impl ExactPlan {
                 }
             }
             entry_band = vec![0u8; entries];
-            for i in 0..entries {
+            for (i, (digits, exponent)) in decimals {
                 let column = columns[i] as usize;
-                if !banded[column] {
-                    continue;
-                }
-                let (digits, exponent) = shortest_decimal(weights[i]);
                 let band = specs[column]
                     .iter()
                     .position(|&(band_places, _)| band_places >= -exponent)
@@ -518,55 +617,12 @@ impl ExactPlan {
             }
         }
 
-        let mut scores = Vec::with_capacity(num_scores);
-        let mut lane = 0usize;
-        for column in 0..num_scores {
-            let bands: Vec<Band> = specs[column]
-                .iter()
-                .map(|&(band_places, split)| {
-                    let band = Band {
-                        places: band_places,
-                        target: Target { lane, split },
-                        baseline: 0,
-                    };
-                    lane += if split.is_some() { 2 } else { 1 };
-                    band
-                })
-                .collect();
-            // One band rounds by one division at its own places. A banded score's single band holds
-            // weights no scale at the score's places could, so its places can be below them.
-            let fixed = match bands.as_slice() {
-                [band] => u32::try_from(band.places)
-                    .ok()
-                    .and_then(|places| 5u128.checked_pow(places))
-                    .and_then(|power| power.checked_mul(u128::from(multiples[column])))
-                    .filter(|scale| scale.checked_mul(u128::from(u32::MAX)).is_some())
-                    .map(|scale| FixedPoint {
-                        exp: -band.places,
-                        scale,
-                    }),
-                _ => None,
-            };
-            scores.push(ScoreArithmetic {
-                multiple: multiples[column],
-                bands,
-                fixed,
-            });
-        }
-        // Lanes go to scores in column order, so when every score is one band in one lane, score `s`
-        // is lane `s`, and every weight fits i64 because its score's magnitudes sum below 2^63.
-        let one_lane_per_score = scores
-            .iter()
-            .all(|score| matches!(score.bands.as_slice(), [band] if band.target.split.is_none()));
-        let mut plan = Self {
-            weights: int_weights,
-            wide,
-            flags,
-            entry_band,
-            scores,
-            stride: lane.div_ceil(LANE_WIDTH).max(1) * LANE_WIDTH,
-            one_lane_per_score,
-        };
+        let scores = specs.into_iter().zip(multiples).map(|(specs, multiple)| {
+            let bands: Vec<(i32, Option<Split>, i128)> =
+                specs.into_iter().map(|(places, split)| (places, split, 0)).collect();
+            (multiple, bands)
+        });
+        let mut plan = Self::assemble(int_weights, wide, flags, entry_band, scores);
         // The flipped-allele baseline of every band: two doses of each flipped entry's effect, in
         // parallel parts. A band's term magnitudes sum below 2^126, so no part's sum overflows.
         let mut band_starts = vec![0usize; num_scores + 1];
@@ -610,6 +666,189 @@ impl ExactPlan {
             {
                 band.baseline = sum.ok_or_else(|| refusal(column))?;
             }
+        }
+        Ok(plan)
+    }
+
+    /// The plan of these entries whose scores take, in column order, a multiple and bands of
+    /// `(places, split, baseline)` in ascending places. Lanes go to the bands in that order.
+    fn assemble(
+        weights: Vec<i64>,
+        wide: AHashMap<usize, i128>,
+        flags: Vec<u8>,
+        entry_band: Vec<u8>,
+        scores: impl IntoIterator<Item = (u64, Vec<(i32, Option<Split>, i128)>)>,
+    ) -> Self {
+        let mut lane = 0usize;
+        let scores: Vec<ScoreArithmetic> = scores
+            .into_iter()
+            .map(|(multiple, specs)| {
+                let bands: Vec<Band> = specs
+                    .into_iter()
+                    .map(|(places, split, baseline)| {
+                        let band = Band {
+                            places,
+                            target: Target { lane, split },
+                            baseline,
+                        };
+                        lane += if split.is_some() { 2 } else { 1 };
+                        band
+                    })
+                    .collect();
+                // One band rounds by one division at its own places, which a banded score's
+                // single band need not share with the scale that could not hold it.
+                let fixed = match bands.as_slice() {
+                    [band] => u32::try_from(band.places)
+                        .ok()
+                        .and_then(|places| 5u128.checked_pow(places))
+                        .and_then(|power| power.checked_mul(u128::from(multiple)))
+                        .filter(|scale| scale.checked_mul(u128::from(u32::MAX)).is_some())
+                        .map(|scale| FixedPoint {
+                            exp: -band.places,
+                            scale,
+                        }),
+                    _ => None,
+                };
+                ScoreArithmetic {
+                    multiple,
+                    bands,
+                    fixed,
+                }
+            })
+            .collect();
+        // Lanes go to scores in column order, so when every score is one band in one lane, score `s`
+        // is lane `s`, and every weight fits i64 because its score's magnitudes sum below 2^63.
+        let one_lane_per_score = scores
+            .iter()
+            .all(|score| matches!(score.bands.as_slice(), [band] if band.target.split.is_none()));
+        Self {
+            weights,
+            wide,
+            flags,
+            entry_band,
+            scores,
+            stride: lane.div_ceil(LANE_WIDTH).max(1) * LANE_WIDTH,
+            one_lane_per_score,
+        }
+    }
+
+    /// Each entry's weight at its band's scale ([`WIDE`] when past i64), its flags, and its band
+    /// (empty when every score has one): the per-entry arrays a saved plan stores.
+    pub fn entry_arrays(&self) -> (&[i64], &[u8], &[u8]) {
+        (&self.weights, &self.flags, &self.entry_band)
+    }
+
+    /// The plan's per-score arithmetic and wide weights as the words a saved plan stores.
+    pub fn tables(&self) -> ExactTables {
+        let mut tables = ExactTables::default();
+        for score in &self.scores {
+            tables.multiples.push(score.multiple);
+            for band in &score.bands {
+                let (lanes, bits) = band
+                    .target
+                    .split
+                    .map_or((1, 0), |split| (2, u64::from(split.bits)));
+                let [low, high] = words(band.baseline);
+                tables
+                    .bands
+                    .extend([i64::from(band.places) as u64, lanes, bits, low, high]);
+            }
+            tables.band_ends.push((tables.bands.len() / BAND_WORDS) as u64);
+        }
+        let mut wide: Vec<(usize, i128)> = self.wide.iter().map(|(&entry, &value)| (entry, value)).collect();
+        wide.sort_unstable_by_key(|&(entry, _)| entry);
+        for (entry, value) in wide {
+            let [low, high] = words(value);
+            tables.wide.extend([entry as u64, low, high]);
+        }
+        tables
+    }
+
+    /// The plan whose [`Self::entry_arrays`] and [`Self::tables`] these are, over the score
+    /// columns of its entries. Refuses arrays that no plan has: a saved plan this build cannot
+    /// read is compiled again.
+    pub fn from_parts(
+        weights: Vec<i64>,
+        flags: Vec<u8>,
+        entry_band: Vec<u8>,
+        tables: ExactTables,
+        columns: &[u32],
+    ) -> Result<Self, PlanError> {
+        let invalid = |what: &str| PlanError::Invariant(format!("Saved exact plan: {what}."));
+        let entries = columns.len();
+        let ExactTables {
+            multiples,
+            band_ends,
+            bands,
+            wide: wide_words,
+        } = tables;
+        if weights.len() != entries
+            || flags.len() != entries
+            || !(entry_band.is_empty() || entry_band.len() == entries)
+            || band_ends.len() != multiples.len()
+            || bands.len() % BAND_WORDS != 0
+            || wide_words.len() % 3 != 0
+        {
+            return Err(invalid("its arrays disagree on their lengths"));
+        }
+        let mut scores = Vec::with_capacity(multiples.len());
+        let mut start = 0usize;
+        for (&multiple, &end) in multiples.iter().zip(&band_ends) {
+            let end = usize::try_from(end)
+                .ok()
+                .filter(|&end| end > start && end - start <= usize::from(u8::MAX))
+                .filter(|&end| end.checked_mul(BAND_WORDS).is_some_and(|stored| stored <= bands.len()))
+                .ok_or_else(|| invalid("a score's bands"))?;
+            if multiple == 0 {
+                return Err(invalid("a score's multiple"));
+            }
+            let specs = bands[start * BAND_WORDS..end * BAND_WORDS]
+                .chunks_exact(BAND_WORDS)
+                .map(|band| -> Result<(i32, Option<Split>, i128), PlanError> {
+                    let places = i32::try_from(band[0] as i64).map_err(|_| invalid("a band's places"))?;
+                    let split = match (band[1], band[2]) {
+                        (1, 0) => None,
+                        (2, bits @ 1..=62) => Some(Split { bits: bits as u32 }),
+                        _ => return Err(invalid("a band's lanes")),
+                    };
+                    Ok((places, split, joined([band[3], band[4]])))
+                })
+                .collect::<Result<Vec<_>, PlanError>>()?;
+            if specs.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+                return Err(invalid("a score's band places"));
+            }
+            scores.push((multiple, specs));
+            start = end;
+        }
+        if start * BAND_WORDS != bands.len() {
+            return Err(invalid("bands no score holds"));
+        }
+        let mut wide = AHashMap::with_capacity(wide_words.len() / 3);
+        let mut next = 0usize;
+        for word in wide_words.chunks_exact(3) {
+            let entry = usize::try_from(word[0])
+                .ok()
+                .filter(|&entry| entry >= next && entry < entries && weights[entry] == WIDE)
+                .ok_or_else(|| invalid("a wide weight's entry"))?;
+            wide.insert(entry, joined([word[1], word[2]]));
+            next = entry + 1;
+        }
+        let plan = Self::assemble(weights, wide, flags, entry_band, scores);
+        let misplaced = (0..entries).into_par_iter().with_min_len(PLAN_CHUNK).any(|i| {
+            let Some(score) = plan.scores.get(columns[i] as usize) else {
+                return true;
+            };
+            let band = match (score.bands.len(), plan.entry_band.get(i)) {
+                (1, _) => 0,
+                (_, Some(&band)) => usize::from(band),
+                (_, None) => return true,
+            };
+            band >= score.bands.len()
+                || plan.flags[i] & !(FLIPPED | COUNTED) != 0
+                || (plan.weights[i] == WIDE && !plan.wide.contains_key(&i))
+        });
+        if misplaced || (plan.one_lane_per_score && !plan.wide.is_empty()) {
+            return Err(invalid("an entry its scores cannot hold"));
         }
         Ok(plan)
     }
@@ -972,7 +1211,7 @@ mod tests {
         let corrections = [0.0, 0.25, 0.0, 0.0];
         let columns = [0, 0, 1, 1];
         let offsets = [0, 3, 4];
-        let plan = ExactPlan::new(&weights, &corrections, &columns, &offsets, &[], &names(2))
+        let plan = ExactPlan::new(weights.to_vec(), &corrections, &columns, &offsets, &[], &names(2))
             .expect("plan");
         assert_eq!(plan.stride(), LANE_WIDTH);
         assert!(plan.counts_missing(0) && !plan.counts_missing(1));
@@ -999,7 +1238,7 @@ mod tests {
 
     #[test]
     fn a_missing_call_cancels_the_flipped_baseline() {
-        let plan = ExactPlan::new(&[-0.7], &[1.4], &[0], &[0, 1], &[], &names(1)).expect("plan");
+        let plan = ExactPlan::new(vec![-0.7], &[1.4], &[0], &[0, 1], &[], &names(1)).expect("plan");
         let expect = [1.4, 0.0, 0.7, 0.0];
         for (code, want) in expect.into_iter().enumerate() {
             assert_eq!(plan.sum(0, &one_person(&plan, &[code])), want, "code {code}");
@@ -1021,7 +1260,7 @@ mod tests {
                 score_column_index: ScoreColumnIndex(0),
             }],
         };
-        let plan = ExactPlan::new(&[], &[], &[], &[0], &[rule], &names(1)).expect("plan");
+        let plan = ExactPlan::new(Vec::new(), &[], &[], &[0], &[rule], &names(1)).expect("plan");
         let mut lanes = vec![0i64; plan.stride()];
         plan.add(plan.complex_target(0, 0.1), plan.complex_term(0, 0.1, 4, 3), &mut lanes);
         assert_eq!(plan.sum(0, &lanes), 0.4 / 3.0);
@@ -1034,7 +1273,7 @@ mod tests {
         let count = 2_000;
         let weights: Vec<f64> = (0..count).map(|i| 1e10 + (i as f64) * 1e-6).collect();
         let columns = vec![0u32; count];
-        let plan = ExactPlan::new(&weights, &vec![0.0; count], &columns, &rows(count), &[], &names(1))
+        let plan = ExactPlan::new(weights.clone(), &vec![0.0; count], &columns, &rows(count), &[], &names(1))
             .expect("plan");
         assert_eq!(plan.scores[0].bands.len(), 1);
         assert!(plan.scores[0].bands[0].target.split.is_some());
@@ -1054,7 +1293,7 @@ mod tests {
             for count in [fits, fits + 1] {
                 let weights = vec![weight as f64; count];
                 let plan =
-                    ExactPlan::new(&weights, &vec![0.0; count], &vec![0u32; count], &rows(count), &[], &names(1))
+                    ExactPlan::new(weights.clone(), &vec![0.0; count], &vec![0u32; count], &rows(count), &[], &names(1))
                         .expect("plan");
                 let band = &plan.scores[0].bands[0];
                 assert_eq!(plan.scores[0].bands.len(), 1);
@@ -1070,7 +1309,7 @@ mod tests {
     fn scores_spanning_many_decimal_orders_are_banded_and_round_exactly() {
         // The plan-cache fixture's panel: 0.25, 1e-40, 3 and -2.5 in one score.
         let weights = [0.25, 1e-40, 3.0, -2.5];
-        let plan = ExactPlan::new(&weights, &[0.0; 4], &[0; 4], &rows(4), &[], &names(1)).expect("plan");
+        let plan = ExactPlan::new(weights.to_vec(), &[0.0; 4], &[0; 4], &rows(4), &[], &names(1)).expect("plan");
         assert!(plan.scores[0].bands.len() > 1);
         for (entry, &weight) in weights.iter().enumerate() {
             assert_eq!(plan.entry_weight_f64(entry, 0).to_bits(), weight.to_bits());
@@ -1080,13 +1319,13 @@ mod tests {
         let want: f64 = "0.7500000000000000000000000000000000000001".parse().unwrap();
         assert_eq!(plan.sum(0, &lanes).to_bits(), want.to_bits());
         let weights = [0.75, 1e-40, -3.0, 2.25];
-        let plan = ExactPlan::new(&weights, &[0.0; 4], &[0; 4], &rows(4), &[], &names(1)).expect("plan");
+        let plan = ExactPlan::new(weights.to_vec(), &[0.0; 4], &[0; 4], &rows(4), &[], &names(1)).expect("plan");
         let lanes = one_person(&plan, &[2, 2, 2, 2]);
         assert_eq!(plan.sum(0, &lanes).to_bits(), 1e-40f64.to_bits());
         assert_eq!(plan.average(0, &lanes, 4).to_bits(), 2.5e-41f64.to_bits());
         // Extremes of the double range round-trip.
         let weights = [1e300, 1e-300, 5e-324, -1.7976931348623157e308];
-        let plan = ExactPlan::new(&weights, &[0.0; 4], &[0; 4], &rows(4), &[], &names(1)).expect("plan");
+        let plan = ExactPlan::new(weights.to_vec(), &[0.0; 4], &[0; 4], &rows(4), &[], &names(1)).expect("plan");
         for (entry, &weight) in weights.iter().enumerate() {
             assert_eq!(plan.entry_weight_f64(entry, 0).to_bits(), weight.to_bits());
         }
@@ -1108,11 +1347,72 @@ mod tests {
         assert_eq!(round_long(&[(5, 1), (-5, 1)], 1), 0.0);
     }
 
+    fn averaged_rule(weight: f64) -> GroupedComplexRule {
+        GroupedComplexRule {
+            locus_chr_pos: ("1".to_string(), 100),
+            possible_contexts: (0..3)
+                .map(|row| (BimRowIndex(row), "A".to_string(), "G".to_string()))
+                .collect(),
+            score_applications: vec![ScoreInfo {
+                effect_allele: "G".to_string(),
+                other_allele: "A".to_string(),
+                weight,
+                score_column_index: ScoreColumnIndex(0),
+            }],
+        }
+    }
+
+    #[test]
+    fn integer_slots_take_the_weights_own_buffer() {
+        let weights = vec![0.5, -3.0, 1e-300];
+        let (pointer, capacity) = (weights.as_ptr() as usize, weights.capacity());
+        let slots = into_integer_slots(weights);
+        assert_eq!((slots.as_ptr() as usize, slots.capacity()), (pointer, capacity));
+        assert_eq!(weight_in(slots[1]).to_bits(), (-3.0f64).to_bits());
+    }
+
+    #[test]
+    fn weights_read_before_their_score_gains_places_scale_to_its_final_places() {
+        // 3, -7 and 2 are read at the one place 0.5 gave the score, and 0.125 then takes it to
+        // three; with the averaged rule the score's multiple is 6 as well.
+        let weights = [0.5, 3.0, -7.0, 0.125, 2.0];
+        for rules in [Vec::new(), vec![averaged_rule(0.1)]] {
+            let plan = ExactPlan::new(weights.to_vec(), &[0.0; 5], &[0; 5], &rows(5), &rules, &names(1))
+                .expect("plan");
+            for (entry, &weight) in weights.iter().enumerate() {
+                assert_eq!(plan.entry_weight_f64(entry, 0).to_bits(), weight.to_bits());
+            }
+            assert_eq!(plan.sum(0, &one_person(&plan, &[2; 5])), -1.375);
+        }
+    }
+
+    #[test]
+    fn stored_arrays_rebuild_the_plan_bit_for_bit() {
+        let wide: Vec<f64> = (0..50).map(|i| 1e10 + (i as f64) * 1e-6).collect();
+        let plans = [
+            (vec![-0.7, 0.25], vec![1.4, 0.0], vec![0, 1], vec![0, 1, 2], Vec::new(), 2),
+            (vec![0.25, 1e-40, 3.0, -2.5], vec![0.0; 4], vec![0; 4], rows(4), Vec::new(), 1),
+            (vec![1e300, 1e-300, 5e-324, -1.7976931348623157e308], vec![0.0; 4], vec![0; 4], rows(4), Vec::new(), 1),
+            (vec![3e37, 5e37], vec![0.0; 2], vec![0; 2], rows(2), Vec::new(), 1),
+            (wide, vec![0.0; 50], vec![0; 50], rows(50), Vec::new(), 1),
+            (vec![0.5, 3.0], vec![0.0; 2], vec![0; 2], rows(2), vec![averaged_rule(0.1)], 1),
+        ];
+        for (index, (weights, corrections, columns, offsets, rules, scores)) in plans.into_iter().enumerate() {
+            let plan = ExactPlan::new(weights, &corrections, &columns, &offsets, &rules, &names(scores))
+                .expect("plan");
+            let (weights, flags, entry_band) = plan.entry_arrays();
+            let rebuilt =
+                ExactPlan::from_parts(weights.to_vec(), flags.to_vec(), entry_band.to_vec(), plan.tables(), &columns)
+                    .expect("stored plan");
+            assert_eq!(rebuilt, plan, "plan {index}");
+        }
+    }
+
     #[test]
     fn a_banded_score_of_one_band_rounds_at_the_band_places() {
         // At no decimal places the terms' doubled magnitudes sum past 2^126, while one band at -37
         // places, where the weights are 3 and 5, holds them in one lane.
-        let plan = ExactPlan::new(&[3e37, 5e37], &[0.0; 2], &[0; 2], &rows(2), &[], &names(1)).expect("plan");
+        let plan = ExactPlan::new(vec![3e37, 5e37], &[0.0; 2], &[0; 2], &rows(2), &[], &names(1)).expect("plan");
         assert_eq!(plan.scores[0].bands.len(), 1);
         assert_eq!(plan.scores[0].bands[0].places, -37);
         assert_eq!(plan.sum(0, &one_person(&plan, &[2, 2])), 8e37);
@@ -1123,7 +1423,7 @@ mod tests {
         }
         // A flipped weight's baseline rounds at the band's places too: two doses of 3e37 at code 00,
         // one at code 10.
-        let plan = ExactPlan::new(&[-3e37, 5e37], &[6e37, 0.0], &[0; 2], &rows(2), &[], &names(1)).expect("plan");
+        let plan = ExactPlan::new(vec![-3e37, 5e37], &[6e37, 0.0], &[0; 2], &rows(2), &[], &names(1)).expect("plan");
         assert_eq!(plan.baseline_f64(0), 6e37);
         assert_eq!(plan.sum(0, &one_person(&plan, &[0, 2])), 1.1e38);
         assert_eq!(plan.sum(0, &one_person(&plan, &[2, 3])), 1.3e38);
@@ -1131,6 +1431,6 @@ mod tests {
 
     #[test]
     fn merged_corrections_are_refused() {
-        assert!(ExactPlan::new(&[0.5], &[0.3], &[0], &[0, 1], &[], &names(1)).is_err());
+        assert!(ExactPlan::new(vec![0.5], &[0.3], &[0], &[0, 1], &[], &names(1)).is_err());
     }
 }

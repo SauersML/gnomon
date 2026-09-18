@@ -1638,7 +1638,7 @@ mod tests {
     fn memory_test_prep(people: usize, scores: usize) -> PreparationResult {
         let names: Vec<String> = (0..scores).map(|i| format!("S{i}")).collect();
         PreparationResult::new(
-            crate::score::cells::ExactPlan::new(&[], &[], &[], &[0], &[], &names)
+            crate::score::cells::ExactPlan::new(Vec::new(), &[], &[], &[0], &[], &names)
                 .expect("empty plan"),
             vec![],
             vec![0],
@@ -1916,9 +1916,10 @@ mod tests {
         let columns: Vec<u32> = (0..rows).flat_map(|_| [0u32, 1]).collect();
         let offsets: Vec<u64> = (0..=rows as u64).map(|row| 2 * row).collect();
         let names: Vec<String> = (0..scores).map(|s| format!("S{s}")).collect();
+        let corrections = vec![0.0; weights.len()];
         let exact = crate::score::cells::ExactPlan::new(
-            &weights,
-            &vec![0.0; weights.len()],
+            weights,
+            &corrections,
             &columns,
             &offsets,
             &[],

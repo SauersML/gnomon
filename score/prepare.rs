@@ -1603,11 +1603,13 @@ fn prepare_for_computation_with_retry(
         *sum += error;
     }
     let mut plan = cache::VariantPlan {
-        weights: sparse_weights,
-        corrections: sparse_missing_corrections,
+        weights: cache::PlanWeights::Parsed {
+            weights: sparse_weights,
+            corrections: sparse_missing_corrections,
+            baseline: baseline_missing_sum_by_score,
+        },
         columns: sparse_score_columns,
         offsets: sparse_row_offsets,
-        baseline: baseline_missing_sum_by_score,
         required: required_bim_indices,
         complex: final_complex_rules,
         names: score_names,
@@ -1661,18 +1663,26 @@ fn assemble_preparation(
     }
     let num_people_to_score = final_person_iids.len();
     let num_reconciled_variants = plan.required.len();
-    let exact = ExactPlan::new(
-        &plan.weights,
-        &plan.corrections,
-        &plan.columns,
-        &plan.offsets,
-        &plan.complex,
-        &plan.names,
-    )
-    .map_err(|error| match error {
-        PlanError::Invariant(message) => PrepError::Invariant(message),
-        PlanError::Unrepresentable(message) => PrepError::Parse(message),
-    })?;
+    // A saved plan holds its exact plan; a compiled one's weights become theirs in place.
+    let exact = match plan.weights {
+        cache::PlanWeights::Exact(exact) => exact,
+        cache::PlanWeights::Parsed {
+            weights,
+            corrections,
+            ..
+        } => ExactPlan::new(
+            weights,
+            &corrections,
+            &plan.columns,
+            &plan.offsets,
+            &plan.complex,
+            &plan.names,
+        )
+        .map_err(|error| match error {
+            PlanError::Invariant(message) => PrepError::Invariant(message),
+            PlanError::Unrepresentable(message) => PrepError::Parse(message),
+        })?,
+    };
     let bytes_per_variant = (total_people_in_fam as u64).div_ceil(4);
     let bytes_per_variant_usize = bytes_per_variant as usize;
     let (spool_compact_byte_index, spool_dense_map) =

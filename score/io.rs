@@ -182,7 +182,7 @@ mod pool_tests {
         let names = vec!["S0".to_string()];
         let offsets: Vec<u64> = (0..=rows as u64).collect();
         let exact = crate::score::cells::ExactPlan::new(
-            &vec![1.0; rows],
+            vec![1.0; rows],
             &vec![0.0; rows],
             &vec![0; rows],
             &offsets,

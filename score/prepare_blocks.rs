@@ -11,7 +11,7 @@
 // uses for the unsplit score, so the partials of a score are a partition of its
 // total. Nothing downstream of the plan knows blocks exist.
 
-use super::cache::VariantPlan;
+use super::cache::{PlanWeights, VariantPlan};
 use super::{PrepError, VariantKey, accumulate_baseline};
 use crate::score::types::{GroupedComplexRule, ScoreInfo, parse_chromosome_label};
 use std::io::{self, Write};
@@ -367,12 +367,22 @@ pub(super) fn expand_plan(
             row_keys.len()
         )));
     }
+    let PlanWeights::Parsed {
+        weights: parsed_weights,
+        corrections: parsed_corrections,
+        baseline: parsed_baseline,
+    } = &plan.weights
+    else {
+        return Err(PrepError::Invariant(
+            "Block expansion takes the join's parsed weights, not a saved plan's.".into(),
+        ));
+    };
     let base_scores = plan.names.len();
-    if plan.counts.len() != base_scores || plan.baseline.len() != base_scores {
+    if plan.counts.len() != base_scores || parsed_baseline.len() != base_scores {
         return Err(PrepError::Invariant(format!(
             "Block expansion: {base_scores} score names, {} counts, {} baselines.",
             plan.counts.len(),
-            plan.baseline.len()
+            parsed_baseline.len()
         )));
     }
     let per_score = partition.columns_per_score();
@@ -410,7 +420,7 @@ pub(super) fn expand_plan(
     let mut errors = vec![0.0f64; columns];
     let mut counts = vec![0u32; columns];
     for score in 0..base_scores {
-        baseline[score * per_score] = plan.baseline[score];
+        baseline[score * per_score] = parsed_baseline[score];
         counts[score * per_score] = plan.counts[score];
     }
     offsets.push(0);
@@ -426,7 +436,7 @@ pub(super) fn expand_plan(
             }
             let total = score * per_score;
             let partial = total + 1 + block;
-            let (weight, correction) = (plan.weights[entry], plan.corrections[entry]);
+            let (weight, correction) = (parsed_weights[entry], parsed_corrections[entry]);
             expanded_columns.push(total as u32);
             weights.push(weight);
             corrections.push(correction);
@@ -480,11 +490,13 @@ pub(super) fn expand_plan(
         });
     }
     Ok(VariantPlan {
-        weights,
-        corrections,
+        weights: PlanWeights::Parsed {
+            weights,
+            corrections,
+            baseline,
+        },
         columns: expanded_columns,
         offsets,
-        baseline,
         required: plan.required,
         complex,
         names: partition.column_names(&plan.names),
@@ -627,11 +639,13 @@ mod tests {
         // Three rows: row 0 has entries for scores 0 and 1, row 1 is a complex
         // row without entries, row 2 has one entry for score 1.
         VariantPlan {
-            weights: vec![0.5, -1.0, 2.0],
-            corrections: vec![0.0, 2.0, 0.25],
+            weights: PlanWeights::Parsed {
+                weights: vec![0.5, -1.0, 2.0],
+                corrections: vec![0.0, 2.0, 0.25],
+                baseline: vec![0.0, 2.25],
+            },
             columns: vec![0, 1, 1],
             offsets: vec![0, 2, 2, 3],
-            baseline: vec![0.0, 2.25],
             required: vec![BimRowIndex(0), BimRowIndex(1), BimRowIndex(2)],
             complex: vec![GroupedComplexRule {
                 locus_chr_pos: ("1".to_string(), 150),
@@ -659,15 +673,20 @@ mod tests {
         assert_eq!(expanded.names.len(), 8);
         assert_eq!(expanded.offsets, [0, 4, 4, 6]);
         assert_eq!(expanded.columns, [0, 2, 4, 6, 4, 5]);
-        assert_eq!(expanded.weights, [0.5, 0.5, -1.0, -1.0, 2.0, 2.0]);
-        assert_eq!(expanded.corrections, [0.0, 0.0, 2.0, 2.0, 0.25, 0.25]);
+        let PlanWeights::Parsed {
+            weights,
+            corrections,
+            baseline,
+        } = &expanded.weights
+        else {
+            panic!("an expanded plan keeps the parsed weights");
+        };
+        assert_eq!(weights, &[0.5, 0.5, -1.0, -1.0, 2.0, 2.0]);
+        assert_eq!(corrections, &[0.0, 0.0, 2.0, 2.0, 0.25, 0.25]);
         // Unsplit columns keep the join's values; blocks count what they hold,
         // complex applications included.
         assert_eq!(expanded.counts, [2, 0, 1, 1, 2, 1, 1, 0]);
-        assert_eq!(
-            expanded.baseline,
-            [0.0, 0.0, 0.0, 0.0, 2.25, 0.25, 2.0, 0.0]
-        );
+        assert_eq!(baseline, &[0.0, 0.0, 0.0, 0.0, 2.25, 0.25, 2.0, 0.0]);
         assert_eq!(expanded.required, plan().required);
         assert_eq!(expanded.flags, plan().flags);
         let rule = &expanded.complex[0];
