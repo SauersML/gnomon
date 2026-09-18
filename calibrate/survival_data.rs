@@ -51,8 +51,7 @@ pub struct SurvivalTrainingBundle {
 /// Owned arrays backing `SurvivalPredictionInputs` alongside the raw covariates.
 #[derive(Debug)]
 pub struct SurvivalPredictionData {
-    /// Each row's identifier: the `sample_id` column exactly as written, or the row
-    /// number from 1 when the file has none.
+    /// Each row's identifier, from the required `sample_id` column exactly as written.
     pub sample_ids: Vec<String>,
     pub age_entry: Array1<f64>,
     pub age_exit: Array1<f64>,
@@ -416,14 +415,15 @@ fn read_survival_arrays(
     })
 }
 
-/// The rows' identifiers: the `sample_id` column (any case) exactly as written, or row
-/// numbers from 1 when the file has none.
+/// The rows' identifiers: the required `sample_id` column (any case) exactly as
+/// written. Predictions are joined back to samples by it, and a row number is not an
+/// identity.
 fn extract_sample_ids(
     df: &DataFrame,
     name_map: &HashMap<String, String>,
 ) -> Result<Vec<String>, SurvivalDataError> {
     let Some(actual) = name_map.get("sample_id") else {
-        return Ok((1..=df.height()).map(|row| row.to_string()).collect());
+        return Err(SurvivalDataError::ColumnNotFound("sample_id".to_string()));
     };
     let column = df.column(actual)?.cast(&DataType::String)?;
     if column.null_count() > 0 {
@@ -571,6 +571,7 @@ mod tests {
 
     fn sample_dataframe() -> DataFrame {
         DataFrame::new(vec![
+            Series::new("sample_id".into(), vec!["a", "b", "c"]).into(),
             Series::new("age_entry".into(), vec![50.0, 60.0, 70.0]).into(),
             Series::new("age_exit".into(), vec![55.0, 65.0, 75.0]).into(),
             Series::new("event_target".into(), vec![1i32, 0, 0]).into(),
@@ -673,6 +674,7 @@ mod tests {
 
         let ids = ["000123", "sample-A", "9007199254740993"];
         let mut df = sample_dataframe();
+        df.drop_in_place("sample_id").expect("drop the lower-case identifiers");
         df.with_column(Series::new("Sample_ID".into(), ids.to_vec())).expect("add identifiers");
         let file = write_tsv(&df);
         let data = load_survival_prediction_data(file.path().to_str().expect("path"), 2)
@@ -703,9 +705,12 @@ mod tests {
         assert!(header.contains("\tnet_risk_entry\tnet_risk_exit\t"), "{header}");
         assert!(!header.contains("cumulative_incidence"), "{header}");
 
-        let unnamed = write_tsv(&sample_dataframe());
-        let data = load_survival_prediction_data(unnamed.path().to_str().expect("path"), 2)
-            .expect("load prediction data without identifiers");
-        assert_eq!(data.sample_ids, ["1", "2", "3"]);
+        let mut unnamed = sample_dataframe();
+        unnamed.drop_in_place("sample_id").expect("drop the identifiers");
+        let unnamed = write_tsv(&unnamed);
+        assert!(matches!(
+            load_survival_prediction_data(unnamed.path().to_str().expect("path"), 2),
+            Err(SurvivalDataError::ColumnNotFound(column)) if column == "sample_id"
+        ));
     }
 }

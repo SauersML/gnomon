@@ -48,8 +48,7 @@ pub struct PredictionData {
     /// The Principal Components matrix (`PC`), from 'PC1', 'PC2', ... columns.
     /// Shape: [n_samples, num_pcs].
     pub pcs: Array2<f64>,
-    /// Optional sample identifiers. If an input column `sample_id` exists, it is used;
-    /// otherwise sequential IDs (1-based) are generated as strings.
+    /// Each row's identifier, from the required `sample_id` column exactly as written.
     pub sample_ids: Vec<String>,
 }
 
@@ -113,7 +112,7 @@ pub fn load_training_data(path: &str, num_pcs: usize) -> Result<TrainingData, Da
     })
 }
 
-/// The link a training phenotype is fitted with: binary (the Bernoulli
+/// The link a training phenotype is fitted with: binary (the probit Bernoulli
 /// marginal-slope fit) exactly when every value is 0 or 1 and both occur,
 /// continuous (the Gaussian location-scale fit) otherwise. A phenotype with
 /// exactly two distinct values other than 0 and 1 is refused rather than fitted
@@ -130,7 +129,7 @@ pub fn detect_link_function(phenotype: ArrayView1<f64>) -> Result<LinkFunction, 
     }
     distinct.sort_by(f64::total_cmp);
     match distinct[..] {
-        [low, high] if low == 0.0 && high == 1.0 => Ok(LinkFunction::Logit),
+        [low, high] if low == 0.0 && high == 1.0 => Ok(LinkFunction::Probit),
         [low, high] => Err(DataError::TwoValuedPhenotypeNotZeroOne { low, high }),
         _ => Ok(LinkFunction::Identity),
     }
@@ -200,11 +199,12 @@ mod internal {
         Ok(arr)
     }
 
-    /// Preserve supplied identifiers exactly; generate row numbers only if absent.
+    /// The rows' identifiers exactly as written. A prediction table must name its
+    /// rows: predictions are joined back to samples by this column, and a row number
+    /// is not an identity.
     pub(super) fn extract_sample_ids(df: &DataFrame) -> Result<Vec<String>, DataError> {
-        let has_col = df.get_column_names().iter().any(|c| c == &"sample_id");
-        if !has_col {
-            return Ok((1..=df.height()).map(|i| i.to_string()).collect());
+        if !df.get_column_names().iter().any(|c| c == &"sample_id") {
+            return Err(DataError::ColumnNotFound("sample_id".to_string()));
         }
         let s = df.column("sample_id")?;
         if s.null_count() > 0 {
@@ -496,8 +496,8 @@ mod tests {
     #[test]
     fn test_load_prediction_data_success() {
         // Create test data that includes required columns including weights
-        let header = "score\tsex\tPC1\tweights";
-        let data_row = "1.5\t1\t0.1\t1.0"; // Added dummy weight
+        let header = "sample_id\tscore\tsex\tPC1\tweights";
+        let data_row = "S\t1.5\t1\t0.1\t1.0"; // Added dummy weight
         let content = generate_csv_content(header, data_row, 30);
         let file = create_test_csv(&content).unwrap();
         let data = load_prediction_data(file.path().to_str().unwrap(), 1).unwrap();
@@ -534,11 +534,17 @@ mod tests {
     }
 
     #[test]
-    fn prediction_without_ids_uses_row_numbers_and_ignores_training_columns() {
+    fn prediction_without_ids_is_refused_and_training_columns_are_ignored() {
         let file =
             create_test_csv("score\tsex\tweights\tphenotype\n1.5\t1\tunused\tunused").unwrap();
-        let data = load_prediction_data(file.path().to_str().unwrap(), 0).unwrap();
-        assert_eq!(data.sample_ids, vec!["1"]);
+        assert!(matches!(
+            load_prediction_data(file.path().to_str().unwrap(), 0),
+            Err(DataError::ColumnNotFound(column)) if column == "sample_id"
+        ));
+        let named = create_test_csv("sample_id\tscore\tsex\tweights\tphenotype\nA\t1.5\t1\tunused\tunused")
+            .unwrap();
+        let data = load_prediction_data(named.path().to_str().unwrap(), 0).unwrap();
+        assert_eq!(data.sample_ids, vec!["A"]);
         assert_eq!(data.pcs.shape(), &[1, 0]);
     }
 
@@ -644,7 +650,7 @@ mod tests {
         use ndarray::array;
         assert!(matches!(
             detect_link_function(array![0.0, 1.0, 1.0, 0.0].view()),
-            Ok(LinkFunction::Logit)
+            Ok(LinkFunction::Probit)
         ));
         // A continuous trait in [0, 2) truncates to {0, 1} as integers; it stays continuous.
         assert!(matches!(

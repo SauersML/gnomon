@@ -22,7 +22,7 @@ use gnomon::map::LdWindow;
 use gnomon::map::main as map_cli;
 use gnomon::terms::{infer_sex_to_tsv, infer_sex_to_tsv_at};
 use infer_sex::GenomeBuild as SexGenomeBuild;
-use ndarray::{Array1, ArrayView1};
+use ndarray::ArrayView1;
 use std::env;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -383,7 +383,7 @@ struct TrainArgs {
 
 #[derive(Args)]
 struct InferArgs {
-    /// Path to test TSV file with score,PC1,PC2,... columns (no phenotype needed). A
+    /// Path to test TSV file with sample_id,score,PC1,PC2,... columns (no phenotype needed). A
     /// survival model writes net risk (net_risk_entry, net_risk_exit): the competing
     /// event is treated as independent censoring, so it is not cumulative incidence
     test_data: String,
@@ -1011,13 +1011,12 @@ fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
 
             println!("Generating predictions with diagnostics...");
             let p = model.predict_detailed(data.p.view(), data.sex.view(), data.pcs.view())?;
-            let signed_dist = p.signed_dist.unwrap_or_else(|| Array1::zeros(p.eta.len()));
 
             let output_path = "predictions.tsv";
             write_predictions(
                 &mut std::fs::File::create(output_path)?,
                 &data.sample_ids,
-                &signed_dist,
+                p.signed_dist.as_ref(),
                 &p.eta,
                 &p.mean,
                 p.se_eta.as_ref(),

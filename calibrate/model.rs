@@ -104,7 +104,7 @@ pub struct ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            model_family: ModelFamily::Gam(LinkFunction::Logit),
+            model_family: ModelFamily::Gam(LinkFunction::Probit),
             pgs_basis_config: SmoothConfig { num_centers: 8 },
             pc_configs: Vec::new(),
             pgs_range: (0.0, 0.0),

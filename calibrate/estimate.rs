@@ -351,7 +351,7 @@ fn train_model_on_pool(
     let context = context_formula(&pc_bases);
     let mut fit_config = base_fit_config(config);
     let formula = match link {
-        LinkFunction::Probit | LinkFunction::Logit => {
+        LinkFunction::Probit => {
             fit_config.family = Some("bernoulli-marginal-slope".to_string());
             fit_config.z_column = Some(SCORE_COLUMN.to_string());
             fit_config.latent_measure = Some(config.latent_law.latent_measure().to_string());
@@ -360,7 +360,7 @@ fn train_model_on_pool(
         }
         other => {
             return Err(EstimationError::Domain(format!(
-                "{other:?} link not yet wired in calibrate; supported: Identity (Gaussian location-scale GAMLSS fit), Probit/Logit (Bernoulli marginal-slope)"
+                "calibrate fits a binary phenotype with the probit marginal-slope model (Probit) and a continuous one with the Gaussian location-scale model (Identity); it does not fit {other:?}"
             )));
         }
     };
@@ -704,7 +704,7 @@ mod tests {
             weights: Array1::ones(n),
         };
         let config = ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Logit),
+            model_family: ModelFamily::Gam(LinkFunction::Probit),
             pgs_basis_config: SmoothConfig { num_centers: 4 },
             ..Default::default()
         };

@@ -43,8 +43,9 @@ as a covariate, because the score is their latent coordinate.
 
 ### Binary path — Bernoulli marginal-slope
 
-For `phenotype ∈ {0,1}`. Even if `LinkFunction::Logit` is detected, the base
-link is probit. With `z` the score, the model is
+For `phenotype ∈ {0,1}` (every value exactly 0 or 1), recorded as
+`LinkFunction::Probit`: the base link is probit, and a configuration naming another
+binary link is refused. With `z` the score, the model is
 
 ```
 P(Y=1 | x, z) = Φ(η(x, z)),   η(x, z) = α(x) + b(x)·z + b(x)·δ_h(z) + δ_w(α(x) + b(x)·z)

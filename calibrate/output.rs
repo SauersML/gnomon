@@ -41,7 +41,7 @@ fn write_row(out: &mut impl Write, fields: &[&dyn Display]) -> io::Result<()> {
 pub fn write_predictions(
     out: &mut impl Write,
     sample_ids: &[String],
-    signed_distance: &Array1<f64>,
+    signed_distance: Option<&Array1<f64>>,
     eta: &Array1<f64>,
     mean: &Array1<f64>,
     se_eta: Option<&Array1<f64>>,
@@ -56,6 +56,8 @@ pub fn write_predictions(
     writeln!(out, "{header}")?;
     for index in 0..eta.len() {
         let na = || "NA".to_string();
+        // calibrate computes no hull distance yet; the column says so rather than 0.
+        let distance = signed_distance.map_or_else(na, |distance| distance[index].to_string());
         let (se, lower, upper) = match se_eta {
             None => (na(), na(), na()),
             Some(se_eta) => {
@@ -65,8 +67,8 @@ pub fn write_predictions(
                 if binary {
                     (
                         se.to_string(),
-                        normal_cdf(low).clamp(0.0, 1.0).to_string(),
-                        normal_cdf(high).clamp(0.0, 1.0).to_string(),
+                        normal_cdf(low).to_string(),
+                        normal_cdf(high).to_string(),
                     )
                 } else {
                     (se.to_string(), low.to_string(), high.to_string())
@@ -79,7 +81,7 @@ pub fn write_predictions(
                 out,
                 &[
                     sample_id,
-                    &signed_distance[index],
+                    &distance,
                     &eta[index],
                     &se,
                     &mean[index],
@@ -90,7 +92,7 @@ pub fn write_predictions(
         } else {
             write_row(
                 out,
-                &[sample_id, &signed_distance[index], &mean[index], &se, &lower, &upper],
+                &[sample_id, &distance, &mean[index], &se, &lower, &upper],
             )?;
         }
     }
@@ -143,11 +145,11 @@ mod tests {
         write_predictions(
             &mut table,
             &["a".to_string(), "b".to_string()],
-            &array![0.0, 0.0],
+            None,
             &eta,
             &mean,
             Some(&se),
-            LinkFunction::Logit,
+            LinkFunction::Probit,
         )
         .expect("write the table");
         let table = String::from_utf8(table).expect("utf-8");
@@ -157,6 +159,7 @@ mod tests {
         assert!(!BINARY_PREDICTION_HEADER.contains("log_odds"));
         for (index, line) in lines.enumerate() {
             let fields: Vec<&str> = line.split('\t').collect();
+            assert_eq!(fields[1], "NA", "calibrate computes no hull distance");
             let field = |column: usize| fields[column].parse::<f64>().expect("a number");
             assert_eq!(field(2), eta[index]);
             assert_eq!(field(4), mean[index]);

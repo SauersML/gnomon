@@ -82,5 +82,6 @@ under independent censoring by the competing event, not cumulative incidence) an
 `conditional_risk`.
 
 Required arguments:
-- `test_data`: path to a TSV file with score and PC columns.
+- `test_data`: path to a TSV file with `sample_id`, score and PC columns; a table
+  without `sample_id` is refused, since predictions are joined back to samples by it.
 - `--model <path>`: path to the trained calibration model JSON bundle.
