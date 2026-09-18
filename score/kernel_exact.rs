@@ -3,6 +3,11 @@
 // A cell is one person's i64 lanes of the exact plan (see `score::cells`), `stride` lanes wide.
 // Every term enters a cell as an integer and lanes add with wrapping arithmetic, so tables,
 // walks, batch sizes, thread counts and the order of rows cannot change a single bit.
+//
+// Each loop over people or table entries is a function of its own (`#[inline(never)]`), called once
+// a group or a batch, so its code depends on nothing around it. Inlined, the same loops took from 2%
+// to twice the instructions as code elsewhere in the crate changed an inliner decision: a caller's
+// size, a third call site (#2362), an unrelated scratch buffer.
 
 use crate::score::cells::LANE_WIDTH;
 use std::simd::{Simd, cmp::SimdPartialEq, num::SimdUint};
@@ -56,6 +61,7 @@ fn add_into(dst: &mut [i64], a: &[i64], b: &[i64]) {
 
 /// Entry `key` of a group's table = Σ over its four rows of `terms[row][code of row in key]`, all
 /// lanes at once. Prefix expansion shares partial sums: 4 + 12 + 48 + 192 lane rows.
+#[inline(never)]
 fn build_table(terms: &[i64], group: usize, stride: usize, table: &mut [i64]) {
     let row = |v: usize, code: usize| {
         let at = ((group * VARIANTS_PER_TABLE + v) * 4 + code) * stride;
@@ -86,7 +92,7 @@ fn build_table(terms: &[i64], group: usize, stride: usize, table: &mut [i64]) {
 
 /// Table keys for 32 people per step: the butterfly transpose of four row words on eight u32
 /// lanes. `rows[k]` are whole 8-byte chunks of the same byte range; `keys.len() == 4 * rows[k].len()`.
-#[inline]
+#[inline(never)]
 fn transpose_keys(rows: [&[u8]; VARIANTS_PER_TABLE], keys: &mut [u8]) {
     let lane = |chunk: &[u8; 8]| Simd::<u8, 8>::from_array(*chunk).cast::<u32>();
     let (out, _) = keys.as_chunks_mut::<32>();
@@ -99,6 +105,9 @@ fn transpose_keys(rows: [&[u8]; VARIANTS_PER_TABLE], keys: &mut [u8]) {
         rows[3].as_chunks::<8>().0,
     ];
     let steps = rows.iter().fold(out.len(), |steps, row| steps.min(row.len()));
+    // Every view cut to `steps`, so the loop's indices need no bounds checks.
+    let out = &mut out[..steps];
+    let rows = [&rows[0][..steps], &rows[1][..steps], &rows[2][..steps], &rows[3][..steps]];
     for step in 0..steps {
         let [c0, c1, c2, c3] = [&rows[0][step], &rows[1][step], &rows[2][step], &rows[3][step]];
         let mut word = lane(c0) | (lane(c1) << 8) | (lane(c2) << 16) | (lane(c3) << 24);
@@ -127,6 +136,7 @@ fn transpose_calls(bytes: [u8; 4]) -> [u8; 4] {
 /// person. Either way a carrier (a person with some call not 00) adds one term row; the table pays
 /// its 256 entries up front, and direct adds pay one more row for each further call of a carrier.
 /// A group whose code-00 terms are not zero adds to people without calls, so only a table holds it.
+#[inline(never)]
 fn prefers_table(terms: &[i64], group: usize, stride: usize, rows: [&[u8]; VARIANTS_PER_TABLE]) -> bool {
     let code_zero_adds = (0..VARIANTS_PER_TABLE).any(|v| {
         let at = (group * VARIANTS_PER_TABLE + v) * 4 * stride;
@@ -135,30 +145,46 @@ fn prefers_table(terms: &[i64], group: usize, stride: usize, rows: [&[u8]; VARIA
     if code_zero_adds {
         return true;
     }
-    let (mut calls, mut carriers) = (0u64, 0u64);
-    let mut count = |masks: [u64; VARIANTS_PER_TABLE]| {
-        calls += masks.iter().map(|mask| u64::from(mask.count_ones())).sum::<u64>();
-        carriers += u64::from((masks[0] | masks[1] | masks[2] | masks[3]).count_ones());
+    // Calls past each carrier's first, summed over the rows' words: a word's calls are never fewer
+    // than its carriers, so the sum only grows, and a group has the table's answer as soon as it
+    // reaches 256. A dense group reaches it within a few words.
+    let surplus = |masks: [u64; VARIANTS_PER_TABLE]| {
+        let calls: u32 = masks.iter().map(|mask| mask.count_ones()).sum();
+        u64::from(calls - (masks[0] | masks[1] | masks[2] | masks[3]).count_ones())
     };
     let whole = rows[0].len() / 8 * 8;
+    // Each row's whole words, cut to the same count so the loop's indices need no bounds checks.
+    let n = whole / 8;
     let words = [
-        rows[0].as_chunks::<8>().0,
-        rows[1].as_chunks::<8>().0,
-        rows[2].as_chunks::<8>().0,
-        rows[3].as_chunks::<8>().0,
+        &rows[0].as_chunks::<8>().0[..n],
+        &rows[1].as_chunks::<8>().0[..n],
+        &rows[2].as_chunks::<8>().0[..n],
+        &rows[3].as_chunks::<8>().0[..n],
     ];
     let calls_in = |word: &[u8; 8]| {
         let x = u64::from_le_bytes(*word);
         (x | (x >> 1)) & M55
     };
-    for w in 0..whole / 8 {
-        count([calls_in(&words[0][w]), calls_in(&words[1][w]), calls_in(&words[2][w]), calls_in(&words[3][w])]);
+    // Checked once every sixteen words, so a rare group, which scans every word, pays one compare a
+    // block rather than one a word.
+    let mut beyond = 0u64;
+    for block in (0..n).step_by(16) {
+        for w in block..(block + 16).min(n) {
+            let masks =
+                [calls_in(&words[0][w]), calls_in(&words[1][w]), calls_in(&words[2][w]), calls_in(&words[3][w])];
+            beyond += surplus(masks);
+        }
+        if beyond >= 256 {
+            return true;
+        }
     }
     let calls_at = |row: &[u8], byte: usize| u64::from((row[byte] | (row[byte] >> 1)) & 0x55);
     for byte in whole..rows[0].len() {
-        count([calls_at(rows[0], byte), calls_at(rows[1], byte), calls_at(rows[2], byte), calls_at(rows[3], byte)]);
+        let masks =
+            [calls_at(rows[0], byte), calls_at(rows[1], byte), calls_at(rows[2], byte), calls_at(rows[3], byte)];
+        beyond += surplus(masks);
     }
-    calls - carriers >= 256
+    beyond >= 256
 }
 
 /// Reusable per-thread scratch for [`apply_table_rows`].
@@ -193,12 +219,20 @@ fn group_rows<'a>(
     [row(0), row(1), row(2), row(3)]
 }
 
-/// `buffer` at least `len` long, grown with zeros and never shrunk.
+/// `buffer` at least `len` long, grown with zeros and never shrunk. The growth is a cold call of
+/// its own: whether `Vec::resize` was inlined into the kernel followed how many callers the kernel
+/// had, and a third call site (#2362) moved N 20,000 task-clock by 2.5-3.7%.
 #[inline(always)]
-fn grow<T: Copy + Default>(buffer: &mut Vec<T>, len: usize) {
+pub(crate) fn grow<T: Copy + Default>(buffer: &mut Vec<T>, len: usize) {
     if buffer.len() < len {
-        buffer.resize(len, T::default());
+        grow_cold(buffer, len);
     }
+}
+
+#[cold]
+#[inline(never)]
+fn grow_cold<T: Copy + Default>(buffer: &mut Vec<T>, len: usize) {
+    buffer.resize(len, T::default());
 }
 
 /// Writes the keys of the group whose rows are `source` into `keys` in person order, person `p`'s
@@ -229,7 +263,7 @@ fn group_keys(source: [&[u8]; VARIANTS_PER_TABLE], people: People, keys: &mut [u
 
 /// Writes every person's key of the group whose rows are `source` at `slot` of their
 /// `width`-byte key row, through `column_keys`, the group's keys in person order.
-#[inline(always)]
+#[inline(never)]
 fn write_keys(
     source: [&[u8]; VARIANTS_PER_TABLE],
     people: People,
@@ -343,6 +377,7 @@ pub(crate) fn apply_table_rows(
 
 /// Adds a batch's tables to every person: only the groups whose entry adds something, a key other
 /// than 0 or a group whose key-0 entry is not zero. On rare rows most keys are 0.
+#[inline(never)]
 fn apply_tables(tables: &[i64], keys: &[u8], in_batch: usize, stride: usize, cells: &mut [i64]) {
     let mut zero_first = 0u32;
     for g in 0..in_batch {
@@ -370,6 +405,7 @@ fn apply_tables(tables: &[i64], keys: &[u8], in_batch: usize, stride: usize, cel
 /// the rows of its calls that are not 00, the entry `k` of the group's table summed directly. An
 /// untabled group's code-00 terms are zero, so a key of 0 adds nothing. `keys` holds `width` bytes a
 /// person, a multiple of sixteen.
+#[inline(never)]
 fn apply_rows(terms: &[i64], keys: &[u8], width: usize, groups: &[usize], stride: usize, cells: &mut [i64]) {
     let in_pass = u64::MAX >> (UNTABLED_PER_PASS - groups.len());
     for (p, cell) in cells.chunks_exact_mut(stride).enumerate() {
@@ -402,7 +438,7 @@ macro_rules! apply_stripe {
     ($name:ident, $lanes:literal) => {
         /// Each person's lanes accumulated in registers over the batch's groups. `keys` holds
         /// each group's keys in person order, `key_width` apart.
-        #[inline(always)]
+        #[inline(never)]
         fn $name(tables: &[i64], keys: &[u8], key_width: usize, in_batch: usize, cells: &mut [i64]) {
             let people = cells.len() / $lanes;
             assert!(people <= key_width && keys.len() >= in_batch * key_width);

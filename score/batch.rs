@@ -13,11 +13,12 @@
 
 use crate::score::cells::ExactPlan;
 use crate::score::kernel_exact::{
-    People, TableScratch, apply_table_rows, for_each_call, for_each_missing,
+    People, TableScratch, apply_table_rows, for_each_call, for_each_missing, grow,
 };
 use crate::score::types::{
     OriginalPersonIndex, PersonSubset, PreparationResult, ReconciledVariantIndex, VariantCsrView,
 };
+use std::collections::TryReserveError;
 use std::error::Error;
 
 /// Where each scored person's call sits in a packed row.
@@ -110,14 +111,17 @@ pub fn run_dense_batch(
     if data.len() < rows.len() * row_bytes {
         return Err(Box::from("Dense batch holds fewer bytes than its rows need."));
     }
-    // Term rows for PLINK codes [00, 01, 10, 11], padded to whole four-variant groups.
+    // Term rows for PLINK codes [00, 01, 10, 11], padded to whole four-variant groups. The buffer
+    // grows on a cold path and is zeroed in place, so no resize sits in the batch's code.
     let terms_len = rows.len().div_ceil(4) * 4 * 4 * stride;
-    scratch.terms.clear();
-    scratch.terms.try_reserve_exact(terms_len)?;
-    scratch.terms.resize(terms_len, 0);
+    if scratch.terms.len() < terms_len {
+        grow_terms(&mut scratch.terms, terms_len)?;
+    }
+    let terms = &mut scratch.terms[..terms_len];
+    terms.fill(0);
     for (r, &index) in rows.iter().enumerate() {
         let view = prep.variant_csr_view(index);
-        add_code_rows(exact, &view, stride, &mut scratch.terms[r * 4 * stride..(r + 1) * 4 * stride]);
+        add_code_rows(exact, &view, stride, &mut terms[r * 4 * stride..(r + 1) * 4 * stride]);
         for_each_missing(
             &data[r * row_bytes..(r + 1) * row_bytes],
             layout.people(),
@@ -134,12 +138,22 @@ pub fn run_dense_batch(
         data,
         row_bytes,
         rows.len(),
-        &scratch.terms,
+        terms,
         stride,
         layout.people(),
         &mut scratch.tables,
         cells,
     );
+    Ok(())
+}
+
+/// Grows the batch's term rows to `len`, off the batch's own code: a refused allocation is the
+/// batch's error rather than an abort.
+#[cold]
+#[inline(never)]
+fn grow_terms(terms: &mut Vec<i64>, len: usize) -> Result<(), TryReserveError> {
+    terms.try_reserve_exact(len - terms.len())?;
+    terms.resize(len, 0);
     Ok(())
 }
 
@@ -189,15 +203,19 @@ impl VariantTerms {
         let exact = prep.exact();
         let stride = exact.stride();
         self.stride = stride;
-        self.table.clear();
-        self.table.resize(4 * stride, 0);
-        self.missing.clear();
-        self.missing.resize(prep.score_names.len(), 0);
+        // Both grow once, on a cold path, and are zeroed in place for every variant.
+        let scores = prep.score_names.len();
+        grow(&mut self.table, 4 * stride);
+        grow(&mut self.missing, scores);
+        let table = &mut self.table[..4 * stride];
+        table.fill(0);
+        let missing = &mut self.missing[..scores];
+        missing.fill(0);
         let view = prep.variant_csr_view(index);
-        add_code_rows(exact, &view, stride, &mut self.table);
+        add_code_rows(exact, &view, stride, table);
         for contribution in view.iter() {
             if exact.counts_missing(contribution.entry) {
-                self.missing[contribution.score_column.0] += 1;
+                missing[contribution.score_column.0] += 1;
             }
         }
     }
@@ -440,6 +458,9 @@ mod tests {
     #[test]
     fn dense_and_sparse_paths_give_the_correctly_rounded_exact_sums() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        // One dense scratch and one variant scratch for every panel: they only grow, so later, smaller
+        // panels run over stale terms, tables and keys from earlier ones, which must not reach a cell.
+        let (mut scratch, mut terms) = (DenseScratch::default(), VariantTerms::default());
         for (people, scores, rows, keep, wide) in [
             (5, 1, 3, false, false),
             (64, 3, 7, false, false),
@@ -461,7 +482,6 @@ mod tests {
                 (0..rows as u32).map(ReconciledVariantIndex).collect();
 
             let (mut dense_cells, mut dense_counts) = (vec![0i64; n * stride], vec![0u32; n * scores]);
-            let mut scratch = DenseScratch::default();
             for chunk in (0..rows).step_by(8) {
                 let end = (chunk + 8).min(rows);
                 run_dense_batch(
@@ -476,7 +496,6 @@ mod tests {
                 .unwrap();
             }
             let (mut sparse_cells, mut sparse_counts) = (vec![0i64; n * stride], vec![0u32; n * scores]);
-            let mut terms = VariantTerms::default();
             for row in 0..rows {
                 run_variant_major_path(
                     &panel.data[row * row_bytes..(row + 1) * row_bytes],

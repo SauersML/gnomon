@@ -7,6 +7,12 @@
 //! cannot depend on the order, grouping, partition or thread count of the accumulation.
 //! Floating point appears once, when a finished sum is rounded to f64 for output.
 
+use std::simd::{
+    Simd, StdFloat,
+    cmp::{SimdPartialEq, SimdPartialOrd},
+    num::SimdFloat,
+};
+
 /// One score's fixed point: a cell holding `v` means `v * 2^exp / scale`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FixedPoint {
@@ -221,6 +227,22 @@ fn integer_at(value: f64, places: usize) -> Option<f64> {
 pub(crate) fn scaled_at_places(value: f64, places: i32) -> Option<i64> {
     let places = usize::try_from(places).ok().filter(|&places| places < POWERS_OF_TEN.len())?;
     integer_at(value, places).map(|scaled| scaled as i64)
+}
+
+/// [`scaled_at_places`] of four weights at once, when all four have an integer; `None` when any
+/// lacks one. Each lane takes the same rounded product and the same correctly rounded division as
+/// one weight does, so a lane's integer is the one [`scaled_at_places`] gives. Four divisions in
+/// one instruction overlap, where one weight at a time waits on each.
+#[inline(always)]
+pub(crate) fn scaled_at_places_x4(values: [f64; 4], places: [i32; 4]) -> Option<[i64; 4]> {
+    if places.iter().any(|&p| !(0..POWERS_OF_TEN.len() as i32).contains(&p)) {
+        return None;
+    }
+    let power = Simd::from_array(places.map(|p| POWERS_OF_TEN[p as usize]));
+    let value = Simd::from_array(values);
+    let scaled = (value * power).round();
+    let fits = scaled.abs().simd_lt(Simd::splat((1u64 << 50) as f64)) & (scaled / power).simd_eq(value);
+    fits.all().then(|| scaled.cast::<i64>().to_array())
 }
 
 /// [`shortest_decimal`], searching from `hint` decimal places, which becomes the places found.
@@ -494,5 +516,32 @@ mod tests {
                 assert_eq!(scaled_at_places(value, places).map(i128::from), want, "{value:e} at {places}");
             }
         }
+    }
+
+    #[test]
+    fn four_weights_at_once_scale_as_one_at_a_time() {
+        let mut rng = Rng(0x2354_5ca1_ed00_0004);
+        let mut every = 0usize;
+        for _ in 0..200_000u64 {
+            let draw = |rng: &mut Rng| -> (f64, i32) {
+                let value = match rng.next() % 5 {
+                    0 => (rng.next() % 4_000_001) as f64 / 1e6 - 2.0,
+                    1 => format!("{}e{}", rng.next() % 99_999 + 1, (rng.next() % 40) as i32 - 25)
+                        .parse()
+                        .unwrap(),
+                    2 => f64::from_bits(rng.next()),
+                    3 => -0.0,
+                    _ => ((rng.next() % 1_000_000) * 10u64.pow((rng.next() % 12) as u32)) as f64,
+                };
+                (value, [0i32, 1, 3, 6, 9, 15, 16, -1][(rng.next() % 8) as usize])
+            };
+            let quad: [(f64, i32); 4] = std::array::from_fn(|_| draw(&mut rng));
+            let one_at_a_time: Option<Vec<i64>> = quad.iter().map(|&(v, p)| scaled_at_places(v, p)).collect();
+            let at_once = scaled_at_places_x4(quad.map(|(v, _)| v), quad.map(|(_, p)| p));
+            assert_eq!(at_once.map(Vec::from), one_at_a_time, "{quad:?}");
+            every += usize::from(at_once.is_some());
+        }
+        // The draws reach both outcomes often.
+        assert!(every > 1_000 && every < 199_000, "{every} of 200,000 quads scaled");
     }
 }

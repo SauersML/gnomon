@@ -10,7 +10,7 @@
 //! arithmetic: a one-limb value is exact modulo 2^64 and known to fit, so it is exact.
 
 use crate::score::exact::{
-    FixedPoint, Split, scaled_at_places, shortest_decimal, shortest_decimal_hinted,
+    FixedPoint, Split, scaled_at_places, scaled_at_places_x4, shortest_decimal, shortest_decimal_hinted,
 };
 use crate::score::types::GroupedComplexRule;
 use ahash::AHashMap;
@@ -28,6 +28,8 @@ const WIDE: i64 = i64::MIN;
 const PLAN_CHUNK: usize = 1 << 14;
 /// Marks an entry the places pass did not scale; a scaled one's places are below `u8::MAX`.
 const UNREAD: u8 = u8::MAX;
+/// Marks a score whose entries the weight pass always scales, matching no read places.
+const NEVER_READ: u8 = u8::MAX - 1;
 /// Fraction digits the long-division rounding writes before its sticky digit. A double's
 /// midpoints have at most 767 significant decimal digits, so the parse decides correctly.
 const ROUNDING_DIGITS: usize = 800;
@@ -259,16 +261,46 @@ impl ExactPlan {
             .fold(
                 || (vec![0i32; num_scores], 0usize),
                 |(mut places, mut hint), (chunk, (slots, reads))| {
-                    for ((i, slot), read) in (chunk * PLAN_CHUNK..).zip(slots.iter_mut()).zip(reads.iter_mut()) {
-                        let column = columns[i] as usize;
+                    let start = chunk * PLAN_CHUNK;
+                    let mut one = |at: usize, places: &mut [i32], slots: &mut [i64], reads: &mut [u8]| {
+                        let (i, column) = (start + at, columns[start + at] as usize);
                         // A weight the score's places already hold leaves them as they are.
                         match scaled_at_places(weights[i], places[column]) {
-                            Some(scaled) => (*slot, *read) = (scaled, places[column] as u8),
+                            Some(scaled) => (slots[at], reads[at]) = (scaled, places[column] as u8),
                             None => {
                                 places[column] =
                                     places[column].max(-shortest_decimal_hinted(weights[i], &mut hint).1);
                             }
                         }
+                    };
+                    // Four weights at a time while all four have an integer at their scores'
+                    // places, which then stay as they are; otherwise each of the four in order.
+                    let quads = slots.len() / 4 * 4;
+                    for at in (0..quads).step_by(4) {
+                        let i = start + at;
+                        let column = [
+                            columns[i] as usize,
+                            columns[i + 1] as usize,
+                            columns[i + 2] as usize,
+                            columns[i + 3] as usize,
+                        ];
+                        let held = [places[column[0]], places[column[1]], places[column[2]], places[column[3]]];
+                        let values = [weights[i], weights[i + 1], weights[i + 2], weights[i + 3]];
+                        match scaled_at_places_x4(values, held) {
+                            Some(scaled) => {
+                                slots[at..at + 4].copy_from_slice(&scaled);
+                                let held = [held[0] as u8, held[1] as u8, held[2] as u8, held[3] as u8];
+                                reads[at..at + 4].copy_from_slice(&held);
+                            }
+                            None => {
+                                for k in 0..4 {
+                                    one(at + k, &mut places, slots, reads);
+                                }
+                            }
+                        }
+                    }
+                    for at in quads..slots.len() {
+                        one(at, &mut places, slots, reads);
                     }
                     (places, hint)
                 },
@@ -321,19 +353,36 @@ impl ExactPlan {
                 bound[column] = bound[column].zip(magnitude).and_then(|(b, m)| b.checked_add(m));
                 largest[column] = largest[column].max(magnitude.unwrap_or(0));
             };
+        // The places an entry read at its score's final places with a multiple of one holds: its
+        // integer is then the weight at the score's scale, as scaled_at_places there gives it, below
+        // 2^50 in magnitude. Such a term's doubled magnitude is below 2^51, and a part holds at most
+        // every entry, fewer than 2^64 (a usize count), so a part's plain u128 sum of them stays below
+        // 2^51 × 2^64 = 2^115 and cannot wrap. It joins the checked bound once, when the part is done:
+        // magnitudes are not negative, so a checked add of the sum overflows exactly when adding its
+        // terms one at a time would have.
+        let reuse: Vec<u8> = (0..num_scores)
+            .map(|column| match u8::try_from(places[column]) {
+                Ok(held) if held < UNREAD && multiples[column] == 1 => held,
+                _ => NEVER_READ,
+            })
+            .collect();
         let (mut bound, mut largest, wide_entries) = int_weights
             .par_chunks_mut(PLAN_CHUNK)
             .zip(read_places.par_chunks(PLAN_CHUNK))
             .enumerate()
             .fold(
-                || (vec![Some(0u128); num_scores], vec![0u128; num_scores], Vec::new(), 0usize),
-                |(mut bound, mut largest, mut wide, mut hint), (chunk, (slots, reads))| {
+                || {
+                    let parts = (vec![Some(0u128); num_scores], vec![0u128; num_scores], Vec::new(), 0usize);
+                    (parts, vec![0u128; num_scores], vec![0u64; num_scores])
+                },
+                |((mut bound, mut largest, mut wide, mut hint), mut reused, mut reused_largest),
+                 (chunk, (slots, reads))| {
                     for ((i, slot), &read) in (chunk * PLAN_CHUNK..).zip(slots.iter_mut()).zip(reads) {
                         let column = columns[i] as usize;
-                        // Read at the final places with a multiple of one, the integer is the weight at
-                        // its score's scale: scaled_at_places there gives the same integer, below 2^50.
-                        if read != UNREAD && i32::from(read) == places[column] && multiples[column] == 1 {
-                            add_term(&mut bound, &mut largest, column, Some(i128::from(*slot)));
+                        if read == reuse[column] {
+                            let magnitude = slot.unsigned_abs() << 1;
+                            reused[column] += u128::from(magnitude);
+                            reused_largest[column] = reused_largest[column].max(magnitude);
                             continue;
                         }
                         let exact = match scaled_at_places(weights[i], places[column]) {
@@ -355,10 +404,16 @@ impl ExactPlan {
                         }
                         add_term(&mut bound, &mut largest, column, exact);
                     }
-                    (bound, largest, wide, hint)
+                    ((bound, largest, wide, hint), reused, reused_largest)
                 },
             )
-            .map(|(bound, largest, wide, _)| (bound, largest, wide))
+            .map(|((mut bound, mut largest, wide, _), reused, reused_largest)| {
+                for column in 0..num_scores {
+                    bound[column] = bound[column].and_then(|b| b.checked_add(reused[column]));
+                    largest[column] = largest[column].max(u128::from(reused_largest[column]));
+                }
+                (bound, largest, wide)
+            })
             .reduce(
                 || (vec![Some(0u128); num_scores], vec![0u128; num_scores], Vec::new()),
                 |(mut bound, mut largest, mut wide), (other_bound, other_largest, other_wide)| {
@@ -957,6 +1012,29 @@ mod tests {
         let lanes = one_person(&plan, &vec![3; count]);
         let exact: i128 = (0..count).map(|entry| plan.entry_terms(entry)[3]).sum();
         assert_eq!(ExactPlan::band_value(&plan.scores[0].bands[0], &lanes), exact);
+    }
+
+    #[test]
+    fn reused_terms_bound_a_score_exactly_at_the_one_lane_limit() {
+        // Integer weights of the largest magnitude a reused term holds, 2^50 - 1 at places 0, and
+        // 2^47 - 1 over more entries than one pass part takes. 2^63 / (2 × weight) such terms fit
+        // one lane exactly (bound 2^63 - 2^13, and 2^63 - 2^16); one more needs two limbs. Either
+        // way every sum is the exact integer sum.
+        for (weight, fits) in [((1u64 << 50) - 1, 1usize << 12), ((1u64 << 47) - 1, 1 << 15)] {
+            assert!(fits > PLAN_CHUNK || weight == (1u64 << 50) - 1);
+            for count in [fits, fits + 1] {
+                let weights = vec![weight as f64; count];
+                let plan =
+                    ExactPlan::new(&weights, &vec![0.0; count], &vec![0u32; count], &rows(count), &[], &names(1))
+                        .expect("plan");
+                let band = &plan.scores[0].bands[0];
+                assert_eq!(plan.scores[0].bands.len(), 1);
+                assert_eq!(band.places, 0);
+                assert_eq!(band.target.split.is_some(), count > fits, "weight {weight} count {count}");
+                let lanes = one_person(&plan, &vec![3; count]);
+                assert_eq!(ExactPlan::band_value(band, &lanes), 2 * i128::from(weight) * count as i128);
+            }
+        }
     }
 
     #[test]
