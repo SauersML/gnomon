@@ -6,7 +6,6 @@
 use clap::ValueEnum;
 use clap::{Args, Parser};
 use clap::{CommandFactory, Subcommand};
-use gam::probability::normal_cdf;
 use gnomon::adapt_plink2::GenomeBuild;
 use gnomon::calibrate::data::{detect_link_function, load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::{train_model, train_survival_model};
@@ -15,7 +14,8 @@ use gnomon::calibrate::model::SurvivalModelConfig;
 use gnomon::calibrate::model::SurvivalPrediction;
 use gnomon::calibrate::model::SurvivalRiskType;
 use gnomon::calibrate::model::SurvivalTimeWiggleConfig;
-use gnomon::calibrate::model::{LatentLaw, LinkFunction, ModelConfig, ModelFamily, TrainedModel};
+use gnomon::calibrate::model::{LatentLaw, ModelConfig, ModelFamily, TrainedModel};
+use gnomon::calibrate::output::write_predictions;
 use gnomon::calibrate::survival_data::{
     SurvivalPredictionData, has_survival_columns, load_survival_prediction_data,
     load_survival_training_data,
@@ -1014,14 +1014,14 @@ fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
             let signed_dist = p.signed_dist.unwrap_or_else(|| Array1::zeros(p.eta.len()));
 
             let output_path = "predictions.tsv";
-            save_predictions_detailed(
+            write_predictions(
+                &mut std::fs::File::create(output_path)?,
                 &data.sample_ids,
                 &signed_dist,
                 &p.eta,
                 &p.mean,
                 p.se_eta.as_ref(),
                 *link_function,
-                output_path,
             )?;
             println!("Predictions saved to: {output_path}");
         }
@@ -1085,111 +1085,6 @@ fn write_tsv_row(
         write!(file, "\t{field}")?;
     }
     writeln!(file)?;
-    Ok(())
-}
-
-fn se_and_ci(
-    se_eta_opt: Option<&Array1<f64>>,
-    index: usize,
-    eta_value: f64,
-    link: LinkFunction,
-) -> (String, String, String) {
-    let Some(se_eta) = se_eta_opt else {
-        return ("NA".to_string(), "NA".to_string(), "NA".to_string());
-    };
-
-    let se = se_eta[index];
-    let lo_eta = eta_value - 1.959964 * se;
-    let hi_eta = eta_value + 1.959964 * se;
-    match link {
-        LinkFunction::Identity => (se.to_string(), lo_eta.to_string(), hi_eta.to_string()),
-        LinkFunction::Logit => {
-            let lo_p = 1.0 / (1.0 + (-lo_eta).exp());
-            let hi_p = 1.0 / (1.0 + (-hi_eta).exp());
-            (
-                se.to_string(),
-                lo_p.clamp(0.0, 1.0).to_string(),
-                hi_p.clamp(0.0, 1.0).to_string(),
-            )
-        }
-        LinkFunction::Probit => (
-            se.to_string(),
-            normal_cdf(lo_eta).clamp(0.0, 1.0).to_string(),
-            normal_cdf(hi_eta).clamp(0.0, 1.0).to_string(),
-        ),
-        LinkFunction::CLogLog => {
-            let lo_p = 1.0 - (-lo_eta.exp()).exp();
-            let hi_p = 1.0 - (-hi_eta.exp()).exp();
-            (
-                se.to_string(),
-                lo_p.clamp(0.0, 1.0).to_string(),
-                hi_p.clamp(0.0, 1.0).to_string(),
-            )
-        }
-        _ => ("NA".to_string(), "NA".to_string(), "NA".to_string()),
-    }
-}
-
-fn save_predictions_detailed(
-    sample_ids: &[String],
-    signed_distance: &Array1<f64>,
-    eta: &Array1<f64>,
-    mean: &Array1<f64>,
-    se_eta_opt: Option<&Array1<f64>>,
-    link: LinkFunction,
-    output_path: &str,
-) -> Result<(), std::io::Error> {
-    use std::io::Write;
-
-    let mut file = std::fs::File::create(output_path)?;
-    let is_binary = !matches!(link, LinkFunction::Identity);
-
-    if is_binary {
-        writeln!(
-            file,
-            "sample_id\thull_signed_distance\tlog_odds\tstandard_error_log_odds\tprediction\tprobability_lower_95\tprobability_upper_95"
-        )?;
-    } else {
-        writeln!(
-            file,
-            "sample_id\thull_signed_distance\tprediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95"
-        )?;
-    }
-
-    for index in 0..eta.len() {
-        let prediction = mean[index];
-        let (se_str, lo_str, hi_str) = se_and_ci(
-            se_eta_opt,
-            index,
-            if is_binary { eta[index] } else { prediction },
-            link,
-        );
-
-        if is_binary {
-            write_tsv_row(
-                &mut file,
-                &[
-                    &sample_ids[index] as &dyn std::fmt::Display,
-                    &signed_distance[index],
-                    &eta[index],
-                    &se_str,
-                ],
-                None,
-                &[&prediction, &lo_str, &hi_str],
-            )?;
-        } else {
-            write_tsv_row(
-                &mut file,
-                &[
-                    &sample_ids[index] as &dyn std::fmt::Display,
-                    &signed_distance[index],
-                ],
-                None,
-                &[&prediction, &se_str, &lo_str, &hi_str],
-            )?;
-        }
-    }
-
     Ok(())
 }
 

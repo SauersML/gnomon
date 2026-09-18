@@ -6,6 +6,7 @@ pub mod construction;
 pub mod data;
 pub mod estimate;
 pub mod model;
+pub mod output;
 mod runtime;
 pub mod survival;
 pub mod survival_data;
