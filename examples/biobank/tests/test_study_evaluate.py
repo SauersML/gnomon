@@ -159,34 +159,30 @@ def test_planted_missing_competing_branch_breaks_the_concordance_check():
 # --------------------------------------------------------------------------- #
 # Aalen-Johansen and censoring
 # --------------------------------------------------------------------------- #
-def test_aalen_johansen_without_censoring_is_the_empirical_incidence():
-    t, code, _, _ = survival_sample(2000, 6)
-    code = np.where(code == 0, 2, code)  # no censoring
-    horizon = 3.0
-    cif, se = ev.aalen_johansen(t, code, horizon)
-    empirical = np.mean((code == 1) & (t <= horizon))
-    assert abs(cif - empirical) < 1e-12
-    assert abs(se - np.sqrt(empirical * (1 - empirical) / len(t))) < 1e-12
+def aalen_johansen(t, code, horizon):
+    """The Aalen-Johansen incidence of cause 1 by its product-limit definition (every other exit competing)."""
+    times, k = np.unique(t, return_inverse=True)
+    d1 = np.bincount(k, weights=code == 1, minlength=len(times))
+    d = np.bincount(k, weights=code != 0, minlength=len(times))
+    at_risk = np.cumsum(np.bincount(k, minlength=len(times))[::-1])[::-1]
+    before = np.r_[1.0, np.cumprod(1 - d / at_risk)[:-1]]
+    return float(np.sum(np.where(times <= horizon, before * d1 / at_risk, 0.0)))
 
 
-def test_aalen_johansen_influence_matches_a_finite_difference_of_case_weights():
-    t, code, _, _ = survival_sample(60, 7, ties=True)
-    horizon = float(np.quantile(t, 0.8))
-
-    def weighted_cif(w):
-        times, k = np.unique(t, return_inverse=True)
-        d1 = np.bincount(k, weights=w * (code == 1), minlength=len(times))
-        d = np.bincount(k, weights=w * (code != 0), minlength=len(times))
-        at_risk = np.cumsum(np.bincount(k, weights=w, minlength=len(times))[::-1])[::-1]
-        before = np.r_[1.0, np.cumprod(1 - d / at_risk)[:-1]]
-        return float(np.sum(np.where(times <= horizon, before * d1 / at_risk, 0.0)))
-
-    eps = 1e-7
-    derivative = np.array([(weighted_cif(np.ones(60) + eps * np.eye(60)[l]) - weighted_cif(np.ones(60))) / eps
-                           for l in range(60)])
-    cif, se = ev.aalen_johansen(t, code, horizon)
-    assert abs(cif - weighted_cif(np.ones(60))) < 1e-12
-    assert abs(se - np.sqrt(np.sum(derivative ** 2))) < 1e-5 * se
+@pytest.mark.parametrize("ties", [False, True])
+def test_ipcw_observed_risk_with_a_km_g_is_the_aalen_johansen_incidence(ties):
+    # Events leave the censoring risk set first, so n S(u-) G(u-) = Y(u) even at tied times, and the IPCW mean
+    # of the outcome is the Aalen-Johansen incidence exactly.
+    t, code, _, _ = survival_sample(3000, 6, ties=ties)
+    code = np.where((code == 2) & (np.arange(len(code)) % 3 == 0), 3, code)
+    horizon = 2.5
+    frame = pd.DataFrame({"followup": t, "event_code": code})
+    w = ev.ipcw(frame, horizon, ev.Censoring(frame, horizon, "km"))
+    y = (code == 1) & (t <= horizon)
+    assert abs(np.mean(w * y) - aalen_johansen(t, code, horizon)) < 1e-12
+    # Planted: 1 - KM with every competing exit censored is not the competing-risk incidence.
+    times, km, _ = ev.reverse_km(t, np.where(code == 1, 0, 1))
+    assert abs(1 - float(ev.step_at(times, km, horizon)) - aalen_johansen(t, code, horizon)) > 1e-3
 
 
 def test_reverse_km_puts_events_before_censorings():

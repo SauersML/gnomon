@@ -14,7 +14,8 @@ Survival cells, at each horizon h on time since entry, with death (and an exclus
 makes it one) a competing event:
 - the IPCW AUC with controls including deaths (Blanche definition 2);
 - the IPCW Brier score, a death before h being a known non-case weighted 1/G(T-);
-- the Aalen-Johansen observed risk and O/E against the mean predicted CIF;
+- the observed risk, the IPCW incidence (the Aalen-Johansen estimator when G is the cell's reverse KM), and
+  O/E against the mean predicted CIF;
 - the IPCW calibration intercept, slope and integrated calibration index;
 - Wolbers' competing-risk concordance truncated at h, unweighted (Harrell) and IPCW (Uno);
 - paired AUC and Brier differences with influence-function standard errors.
@@ -392,38 +393,8 @@ def ipcw(frame, horizon, censoring):
 
 
 # --------------------------------------------------------------------------- #
-# Aalen-Johansen and Wolbers' concordance
+# Wolbers' concordance
 # --------------------------------------------------------------------------- #
-def aalen_johansen(time, code, horizon):
-    """The Aalen-Johansen cumulative incidence of cause 1 at a horizon, every other exit (death, 2, or an
-    exclusion-rule exit, 3) competing, and its infinitesimal-jackknife standard error (R:
-    survfit(Surv(time, factor(code)) ~ 1)$std.err).
-
-    With h1, h the cause-1 and all-cause hazards, Y the risk set, d the events and S the all-cause Kaplan-Meier,
-    F1(h) = sum_{u <= h} S(u-) h1(u). The derivative of F1(h) in row l's weight is
-    sum_{v <= min(T_l, h)} a(v) B(v) - [l ended by h] B(T_l) / (Y - d)(T_l) + [l a case by h] S(T_l-) / Y(T_l)
-    - sum_{u <= min(T_l, h)} S(u-) h1(u) / Y(u), with a = h / (Y - d) and B(v) = F1(h) - F1(v); the variance
-    is the sum of its squares."""
-    t, code = np.asarray(time, float), np.asarray(code, int)
-    times, k, counts = np.unique(t, return_inverse=True, return_counts=True)
-    d1 = np.bincount(k, weights=code == 1, minlength=len(times))
-    d = np.bincount(k, weights=code != 0, minlength=len(times))
-    at_risk = np.cumsum(counts[::-1])[::-1].astype(float)
-    within = times <= horizon
-    before = np.r_[1.0, np.cumprod(1 - d / at_risk)[:-1]]
-    increment = np.where(within, before * d1 / at_risk, 0.0)
-    cif = np.cumsum(increment)
-    total = float(cif[-1])
-    after = at_risk - d
-    a = np.divide(d / at_risk, after, out=np.zeros(len(times)), where=after > 0)
-    remaining = np.divide(total - cif, after, out=np.zeros(len(times)), where=after > 0)
-    influence = (np.cumsum(np.where(within, a * (total - cif), 0.0))[k]
-                 - np.cumsum(increment / at_risk)[k]
-                 - np.where((code != 0) & within[k], remaining[k], 0.0)
-                 + np.where((code == 1) & within[k], before[k] / at_risk[k], 0.0))
-    return total, float(np.sqrt(np.sum(influence ** 2)))
-
-
 def _earlier_below(rank, weight, group=None):
     """For each element, in the given order: the total weight of earlier elements of its group whose rank is
     smaller, and whose rank is equal. Ranks are integers from 0; O(n log n), one stable sort per bit."""
@@ -673,7 +644,11 @@ def survival_cell(t, code, w, censoring, P, variants, fit, stratum, horizon, min
     followed, g_upper = cell_support(t, code, horizon)
     if followed < minimum or g_upper < POSITIVITY_FLOOR or w.max() > 1 / POSITIVITY_FLOOR:
         return [dict(base, variant=v, status=UNSUPPORTED) for v in variants]
-    observed, observed_se = aalen_johansen(t, code, horizon)
+    # The observed risk is the IPCW mean of the outcome, with the same weights as every other metric. With the
+    # cell's own reverse Kaplan-Meier as G it is exactly the Aalen-Johansen incidence (n S(u-) G(u-) = Y(u));
+    # a marginal Aalen-Johansen per cell would be biased wherever censoring depends on a covariate.
+    observed = float(np.mean(w * y))
+    observed_se = float(np.std(w * y, ddof=1) / np.sqrt(n))
     shared = {"obs_risk": observed, "obs_risk_se": observed_se, "w_max": float(w.max()),
               "n_eff": float(w.sum() ** 2 / np.sum(w ** 2))}
     stacked = P if pooled is None else np.vstack([P, pooled])
