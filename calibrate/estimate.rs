@@ -24,6 +24,7 @@ use crate::calibrate::model::{
 use crate::calibrate::runtime::on_gam_pool;
 use crate::calibrate::survival_data::SurvivalTrainingBundle;
 
+use gam::FailureCategory;
 use gam::data::{ColumnKindTag, DataSchema, EncodedDataset, SchemaColumn};
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::gamlss::GaussianLocationScaleTermSpec;
@@ -32,9 +33,10 @@ use gam::inference::model_payload_builders::{
     LocationScaleInputs, LocationScaleResponse, LocationScaleWiggle, SavedModelSourceMetadata,
     assemble_location_scale_payload, fit_formula_to_payload,
 };
-use gam::model_types::BlockRole;
+use gam::model_types::{BlockRole, EstimationError as GamEstimationError};
 use gam::solver::fit_orchestration::{
-    FitConfig, FitRequest, FitResult, GaussianLocationScaleFitRequest, LinkWiggleConfig, fit_model,
+    FitConfig, FitFailure, FitRequest, FitResult, GaussianLocationScaleFitRequest, LinkWiggleConfig,
+    WorkflowError, fit_model,
 };
 use gam::terms::smooth::{SpatialLengthScaleOptimizationOptions, freeze_term_collection_from_design};
 use gam::types::{LinkFunction, WigglePenaltyConfig};
@@ -42,15 +44,108 @@ use gam::types::{LinkFunction, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 
 /// Errors surfaced by the training adapter.
+///
+/// A failed gam fit keeps gam's typed error whole, under the variant of its
+/// fixed category (gam#2937), so a caller branches on what stopped the fit
+/// without reading the text.
 #[derive(Debug)]
 pub enum EstimationError {
+    /// The outer search declined a certified optimum that an evaluated state
+    /// beats and certified nothing in its place (gam#2953). The error names the
+    /// checkpoint to resume from.
+    DominatedCertifiedPlateau(WorkflowError),
+    /// An outer smoothing search or an inner solve ended without its
+    /// convergence certificate.
+    Convergence(WorkflowError),
+    /// Outer startup validation refused every candidate seed.
+    StartupSeeds(WorkflowError),
+    /// gam's own consistency contract failed: an engine defect.
+    Invariant(WorkflowError),
+    /// gam refused the configuration, the data or the problem's size.
+    Input(WorkflowError),
+    /// A factorization, eigendecomposition, root solve or row quantity failed.
+    Numerical(WorkflowError),
+    /// A quadrature did not reach its tolerance.
+    Integration(WorkflowError),
+    /// The failure reached gam's boundary as prose, so gam knows no category.
+    Unclassified(WorkflowError),
+    /// A gam call outside a fit whose interface reports only text.
     Gam(String),
     Domain(String),
+}
+
+impl EstimationError {
+    /// The typed gam fit failure, when a fit is what failed.
+    pub fn fit_failure(&self) -> Option<&WorkflowError> {
+        match self {
+            Self::DominatedCertifiedPlateau(error)
+            | Self::Convergence(error)
+            | Self::StartupSeeds(error)
+            | Self::Invariant(error)
+            | Self::Input(error)
+            | Self::Numerical(error)
+            | Self::Integration(error)
+            | Self::Unclassified(error) => Some(error),
+            Self::Gam(_) | Self::Domain(_) => None,
+        }
+    }
+}
+
+/// Whether gam's error ends in a dominated certified plateau, seen through the
+/// layers that only carry it.
+fn ends_in_dominated_plateau(error: &WorkflowError) -> bool {
+    match error {
+        WorkflowError::Fit(failure) => matches!(
+            failure.estimation_error(),
+            Some(GamEstimationError::DominatedCertifiedPlateau { .. })
+        ),
+        WorkflowError::SpatialUnderresolved {
+            refit_failure: Some(refit_failure),
+            ..
+        } => ends_in_dominated_plateau(refit_failure),
+        _ => false,
+    }
+}
+
+impl From<WorkflowError> for EstimationError {
+    fn from(error: WorkflowError) -> Self {
+        if ends_in_dominated_plateau(&error) {
+            return Self::DominatedCertifiedPlateau(error);
+        }
+        match error.failure_category() {
+            FailureCategory::Convergence => Self::Convergence(error),
+            FailureCategory::StartupSeeds => Self::StartupSeeds(error),
+            FailureCategory::Invariant => Self::Invariant(error),
+            FailureCategory::Input => Self::Input(error),
+            FailureCategory::Numerical => Self::Numerical(error),
+            FailureCategory::Integration => Self::Integration(error),
+            FailureCategory::Unclassified => Self::Unclassified(error),
+        }
+    }
+}
+
+impl From<GamEstimationError> for EstimationError {
+    fn from(error: GamEstimationError) -> Self {
+        Self::from(WorkflowError::from(FitFailure::from(error)))
+    }
 }
 
 impl std::fmt::Display for EstimationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::DominatedCertifiedPlateau(error)
+            | Self::Convergence(error)
+            | Self::StartupSeeds(error)
+            | Self::Invariant(error)
+            | Self::Input(error)
+            | Self::Numerical(error)
+            | Self::Integration(error)
+            | Self::Unclassified(error) => write!(
+                f,
+                "gam error [{}, {}]: {error}",
+                error.failure_category(),
+                error.variant_name()
+            ),
             Self::Gam(s) => write!(f, "gam error: {s}"),
             Self::Domain(s) => write!(f, "domain error: {s}"),
         }
@@ -205,7 +300,6 @@ fn blockwise_options(config: &ModelConfig) -> BlockwiseFitOptions {
 fn base_fit_config(config: &ModelConfig) -> FitConfig {
     FitConfig {
         weight_column: Some(WEIGHT_COLUMN.to_string()),
-        outer_max_iter: config.reml_max_iterations,
         spatial_optimization: spatial_options(config),
         ..FitConfig::default()
     }
@@ -218,8 +312,8 @@ fn fit_payload(
     num_predictors: usize,
 ) -> Result<FittedModelPayload, EstimationError> {
     let fit_config = fit_config.resolve().map_err(EstimationError::Domain)?;
-    let mut payload = fit_formula_to_payload(formula, dataset, &fit_config)
-        .map_err(|error| EstimationError::Gam(error.to_string()))?;
+    let mut payload =
+        fit_formula_to_payload(formula, dataset, &fit_config).map_err(EstimationError::from)?;
     record_training_metadata(&mut payload, dataset, num_predictors);
     Ok(payload)
 }
@@ -315,7 +409,7 @@ fn train_gaussian_location_scale(
         kappa_options: spatial_options(config),
     };
     let result = match fit_model(FitRequest::GaussianLocationScale(request))
-        .map_err(|error| EstimationError::Gam(error.to_string()))?
+        .map_err(EstimationError::from)?
     {
         FitResult::GaussianLocationScale(result) => result,
         _ => {
@@ -338,11 +432,9 @@ fn train_gaussian_location_scale(
     };
     let block = result.fit;
     let resolved_termspec =
-        freeze_term_collection_from_design(&block.meanspec_resolved, &block.mean_design)
-            .map_err(|error| EstimationError::Gam(error.to_string()))?;
+        freeze_term_collection_from_design(&block.meanspec_resolved, &block.mean_design)?;
     let resolved_termspec_noise =
-        freeze_term_collection_from_design(&block.noisespec_resolved, &block.noise_design)
-            .map_err(|error| EstimationError::Gam(error.to_string()))?;
+        freeze_term_collection_from_design(&block.noisespec_resolved, &block.noise_design)?;
     let beta_noise = block
         .fit
         .block_by_role(BlockRole::Scale)
@@ -542,6 +634,22 @@ mod tests {
             log::set_logger(&LOGGER).expect("initialize engine test logger");
             log::set_max_level(log::LevelFilter::Warn);
         });
+    }
+
+    /// gam#2945's refusal, as a dominated certified plateau whose terminal certificate cannot certify a stationary
+    /// optimum because the criterion declares no outer curvature.
+    fn refused_for_missing_outer_curvature(error: &EstimationError) -> bool {
+        let EstimationError::DominatedCertifiedPlateau(WorkflowError::Fit(failure)) = error else {
+            return false;
+        };
+        let Some(GamEstimationError::DominatedCertifiedPlateau { terminal_refusal, .. }) =
+            failure.estimation_error()
+        else {
+            return false;
+        };
+        let refusal = terminal_refusal.to_string();
+        refusal.contains("did not certify a stationary optimum")
+            && refusal.contains("curvature_source=unavailable")
     }
 
     /// The saved latent law must be the law of the training scores as given.
@@ -759,6 +867,62 @@ mod tests {
     }
 
     #[test]
+    fn every_gam_failure_category_and_a_dominated_plateau_keep_their_own_variant() {
+        let raised = |category| {
+            EstimationError::from(WorkflowError::from(FitFailure::Raised {
+                category,
+                reason: "refused".to_string(),
+            }))
+        };
+        let cases: [(FailureCategory, fn(&EstimationError) -> bool); 7] = [
+            (FailureCategory::Convergence, |e| matches!(e, EstimationError::Convergence(_))),
+            (FailureCategory::StartupSeeds, |e| matches!(e, EstimationError::StartupSeeds(_))),
+            (FailureCategory::Invariant, |e| matches!(e, EstimationError::Invariant(_))),
+            (FailureCategory::Input, |e| matches!(e, EstimationError::Input(_))),
+            (FailureCategory::Numerical, |e| matches!(e, EstimationError::Numerical(_))),
+            (FailureCategory::Integration, |e| matches!(e, EstimationError::Integration(_))),
+            (FailureCategory::Unclassified, |e| matches!(e, EstimationError::Unclassified(_))),
+        ];
+        for (category, is_its_variant) in cases {
+            let error = raised(category);
+            assert!(is_its_variant(&error), "{category} mapped to {error:?}");
+            assert_eq!(
+                error.fit_failure().map(WorkflowError::failure_category),
+                Some(category)
+            );
+            assert!(error.to_string().starts_with(&format!("gam error [{category}, ")), "{error}");
+        }
+
+        // A plateau refusal is a convergence failure to gam; it keeps its own variant through the
+        // context an orchestration layer puts in front of it.
+        let plateau = GamEstimationError::DominatedCertifiedPlateau {
+            context: "marginal-slope".to_string(),
+            kind: gam_problem::DominanceRefusalKind::IncumbentUnescapableSaddle,
+            plateau_rho: vec![0.5],
+            plateau_value: 73.02427,
+            incumbent_rho: vec![-1.25],
+            incumbent_value: 72.50521,
+            incumbent_projected_grad_norm: Some(2.632e-1),
+            gap: 9.541e-3,
+            band: 1.088e-6,
+            continuation: "declined another certified optimum".to_string(),
+            terminal_refusal: Box::new(GamEstimationError::RemlOptimizationFailed(
+                "not stationary".to_string(),
+            )),
+        };
+        let error = EstimationError::from(WorkflowError::from(
+            FitFailure::from(plateau).context("marginal-slope fit failed"),
+        ));
+        assert!(matches!(error, EstimationError::DominatedCertifiedPlateau(_)), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .starts_with("gam error [convergence, EstimationError::DominatedCertifiedPlateau]: "),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn survival_public_train_save_load_predict_preserves_time_and_latent_score() {
         init_engine_test_logging();
         use crate::calibrate::model::SurvivalRiskType;
@@ -773,15 +937,14 @@ mod tests {
             Err(EstimationError::Domain(_))
         ));
         // gam refuses this fit by name: its outer search cannot certify a stationary optimum because the survival
-        // marginal-slope criterion declares no exact outer ψψ/ρψ curvature yet (gam#2945). Any other error fails the
-        // test; once gam certifies the fit, every check below runs.
+        // marginal-slope criterion declares no exact outer ψψ/ρψ curvature yet (gam#2945). Since gam#2954 stage 1 that
+        // refusal arrives as the terminal certificate of a dominated certified plateau: gam declines the certified
+        // optimum a railed checkpoint beats, and the checkpoint cannot certify without that curvature. Any other error
+        // fails the test; once gam certifies the fit, every check below runs.
         let model = match train_survival_model(&bundle, &config) {
             Ok(model) => model,
-            Err(EstimationError::Gam(message))
-                if message.contains("did not certify a stationary optimum")
-                    && message.contains("curvature_source=unavailable") =>
-            {
-                eprintln!("survival fit refused by name (gam#2945): {message}");
+            Err(error) if refused_for_missing_outer_curvature(&error) => {
+                eprintln!("survival fit refused by name (gam#2945): {error}");
                 return;
             }
             Err(error) => panic!("train survival model: {error}"),

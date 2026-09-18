@@ -52,7 +52,7 @@ name = "gnomon-calibrate"
 path = "cli/main.rs"
 
 [dependencies]
-gam = { version = "0.3.157", git = "https://github.com/SauersML/gam", rev = "d2f73efe1725c4466784b586a7a9d394098f1520" }
+gam = { version = "0.3.157", git = "https://github.com/SauersML/gam", rev = "5a2cbcaebba1a1c8dd0bb7ce849db04cbc604c3b" }
 ahash = "0.8.12"
 clap = { version = "4.5.48", features = ["derive"] }
 memmap2 = "0.9.8"
@@ -135,6 +135,8 @@ dead_code = "deny"
 unused_imports = "deny"
 
 [dev-dependencies]
+# Only to build a dominated-plateau refusal in calibrate's error-mapping test; same rev as gam.
+gam-problem = { version = "0.3.157", git = "https://github.com/SauersML/gam", rev = "5a2cbcaebba1a1c8dd0bb7ce849db04cbc604c3b" }
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.10.0"
 rand_distr = "0.6.0"
