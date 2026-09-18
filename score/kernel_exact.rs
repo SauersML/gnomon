@@ -239,23 +239,28 @@ fn grow_cold<T: Copy + Default>(buffer: &mut Vec<T>, len: usize) {
 /// at `keys[p]`. For a complete cohort `keys` takes a row's four keys a byte, past the last person.
 #[inline(always)]
 fn group_keys(source: [&[u8]; VARIANTS_PER_TABLE], people: People, keys: &mut [u8]) {
+    // The four rows cut to one length, so a byte inside one is inside all four.
+    let row_bytes = source[0].len();
+    let source = [&source[0][..row_bytes], &source[1][..row_bytes], &source[2][..row_bytes], &source[3][..row_bytes]];
     match people {
         People::All(_) => {
-            let row_bytes = source[0].len();
             let whole = row_bytes / 8 * 8;
             let keys = &mut keys[..row_bytes * 4];
             let rows = [&source[0][..whole], &source[1][..whole], &source[2][..whole], &source[3][..whole]];
             transpose_keys(rows, &mut keys[..whole * 4]);
+            let quads = &mut keys.as_chunks_mut::<4>().0[..row_bytes];
             for byte in whole..row_bytes {
                 let calls = [source[0][byte], source[1][byte], source[2][byte], source[3][byte]];
-                keys[byte * 4..byte * 4 + 4].copy_from_slice(&transpose_calls(calls));
+                quads[byte] = transpose_calls(calls);
             }
         }
         People::Gathered { bytes, shifts } => {
-            for (p, (&byte, &shift)) in bytes.iter().zip(shifts).enumerate() {
+            for ((key, &byte), &shift) in keys[..bytes.len()].iter_mut().zip(bytes).zip(shifts) {
                 let byte = byte as usize;
+                // One check a person for its four rows' bytes.
+                assert!(byte < row_bytes);
                 let code = |v: usize| ((source[v][byte] >> shift) & 3) << (2 * v);
-                keys[p] = code(0) | code(1) | code(2) | code(3);
+                *key = code(0) | code(1) | code(2) | code(3);
             }
         }
     }
@@ -420,6 +425,11 @@ fn apply_tables(tables: &[i64], keys: &[u8], in_batch: usize, stride: usize, cel
 #[inline(never)]
 fn apply_rows<const W: usize>(terms: &[i64], keys: &[u8], groups: &[usize], stride: usize, cells: &mut [i64]) {
     let in_pass = u64::MAX >> (UNTABLED_PER_PASS - groups.len());
+    // Each slot's first term row, in an array a pass's slot always indexes.
+    let mut first_rows = [0usize; UNTABLED_PER_PASS];
+    for (first, &group) in first_rows.iter_mut().zip(groups) {
+        *first = group * VARIANTS_PER_TABLE;
+    }
     for (cell, row) in cells.chunks_exact_mut(stride).zip(keys.as_chunks::<W>().0) {
         let mut active = 0u64;
         for (i, chunk) in row.as_chunks::<GROUPS_PER_BATCH>().0.iter().enumerate() {
@@ -430,10 +440,11 @@ fn apply_rows<const W: usize>(terms: &[i64], keys: &[u8], groups: &[usize], stri
         }
         active &= in_pass;
         while active != 0 {
-            let slot = active.trailing_zeros() as usize;
+            // A set bit of a nonzero word is below 64; the mask says so for the index.
+            let slot = active.trailing_zeros() as usize & (UNTABLED_PER_PASS - 1);
             active &= active - 1;
             let key = usize::from(row[slot]);
-            let first_row = groups[slot] * VARIANTS_PER_TABLE;
+            let first_row = first_rows[slot];
             for v in 0..VARIANTS_PER_TABLE {
                 let code = (key >> (2 * v)) & 3;
                 if code != 0 {
