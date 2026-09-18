@@ -533,16 +533,20 @@ impl ExactPlan {
                     band
                 })
                 .collect();
-            let fixed = (bands.len() == 1)
-                .then(|| u32::try_from(places[column]).ok())
-                .flatten()
-                .and_then(|places| 5u128.checked_pow(places))
-                .and_then(|power| power.checked_mul(u128::from(multiples[column])))
-                .filter(|scale| scale.checked_mul(u128::from(u32::MAX)).is_some())
-                .map(|scale| FixedPoint {
-                    exp: -places[column],
-                    scale,
-                });
+            // One band rounds by one division at its own places. A banded score's single band holds
+            // weights no scale at the score's places could, so its places can be below them.
+            let fixed = match bands.as_slice() {
+                [band] => u32::try_from(band.places)
+                    .ok()
+                    .and_then(|places| 5u128.checked_pow(places))
+                    .and_then(|power| power.checked_mul(u128::from(multiples[column])))
+                    .filter(|scale| scale.checked_mul(u128::from(u32::MAX)).is_some())
+                    .map(|scale| FixedPoint {
+                        exp: -band.places,
+                        scale,
+                    }),
+                _ => None,
+            };
             scores.push(ScoreArithmetic {
                 multiple: multiples[column],
                 bands,
@@ -1102,6 +1106,27 @@ mod tests {
             );
         }
         assert_eq!(round_long(&[(5, 1), (-5, 1)], 1), 0.0);
+    }
+
+    #[test]
+    fn a_banded_score_of_one_band_rounds_at_the_band_places() {
+        // At no decimal places the terms' doubled magnitudes sum past 2^126, while one band at -37
+        // places, where the weights are 3 and 5, holds them in one lane.
+        let plan = ExactPlan::new(&[3e37, 5e37], &[0.0; 2], &[0; 2], &rows(2), &[], &names(1)).expect("plan");
+        assert_eq!(plan.scores[0].bands.len(), 1);
+        assert_eq!(plan.scores[0].bands[0].places, -37);
+        assert_eq!(plan.sum(0, &one_person(&plan, &[2, 2])), 8e37);
+        assert_eq!(plan.sum(0, &one_person(&plan, &[3, 2])), 1.1e38);
+        assert_eq!(plan.average(0, &one_person(&plan, &[3, 2]), 2), 5.5e37);
+        for (entry, weight) in [3e37f64, 5e37].into_iter().enumerate() {
+            assert_eq!(plan.entry_weight_f64(entry, 0).to_bits(), weight.to_bits());
+        }
+        // A flipped weight's baseline rounds at the band's places too: two doses of 3e37 at code 00,
+        // one at code 10.
+        let plan = ExactPlan::new(&[-3e37, 5e37], &[6e37, 0.0], &[0; 2], &rows(2), &[], &names(1)).expect("plan");
+        assert_eq!(plan.baseline_f64(0), 6e37);
+        assert_eq!(plan.sum(0, &one_person(&plan, &[0, 2])), 1.1e38);
+        assert_eq!(plan.sum(0, &one_person(&plan, &[2, 3])), 1.3e38);
     }
 
     #[test]

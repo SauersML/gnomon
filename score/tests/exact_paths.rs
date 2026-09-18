@@ -10,11 +10,14 @@
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use gnomon::pipeline::{Dispatch, PipelineContext, run};
 use gnomon::prepare::prepare_for_computation;
 use gnomon::score::native_vcf::{NativeVcfScoreResult, score_vcf_streaming};
+
+use super::cli_outputs::{SCORE_BIN, assert_success};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -736,6 +739,78 @@ fn native_lanes_flush_exactly_at_their_bound() -> TestResult {
                     }
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// The person rows of an `.sscore`, split on tabs.
+fn sscore_rows(path: &Path) -> Result<Vec<Vec<String>>, Box<dyn Error>> {
+    Ok(fs::read_to_string(path)?
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| line.split('\t').map(str::to_string).collect())
+        .collect())
+}
+
+#[test]
+fn a_banded_score_of_one_band_prints_its_exact_scores() -> TestResult {
+    // Score B's weights, 3e37 and 5e37, have doubled magnitudes that sum past 2^126 at no decimal
+    // places, so B is banded; one band at -37 places holds both. Score N is an ordinary score.
+    let dir = tempfile::tempdir()?;
+    // Per variant, each person's PLINK code: 00 two A1, 01 missing, 10 one of each, 11 two A2.
+    let calls: [[u8; 4]; 2] = [[0, 2, 3, 1], [3, 2, 1, 0]];
+    let fam: String = (0..4).map(|person| format!("F I{person} 0 0 0 -9\n")).collect();
+    fs::write(dir.path().join("cohort.fam"), fam)?;
+    fs::write(dir.path().join("cohort.bim"), "1 v0 0 100 A G\n1 v1 0 200 C T\n")?;
+    let mut bed = vec![0x6c, 0x1b, 0x01];
+    for row in &calls {
+        bed.push(row.iter().enumerate().fold(0u8, |byte, (i, &call)| byte | (call << (2 * i))));
+    }
+    fs::write(dir.path().join("cohort.bed"), bed)?;
+    let score = dir.path().join("weights.tsv");
+    fs::write(
+        &score,
+        "variant_id\teffect_allele\tother_allele\tB\tN\n1:100\tG\tA\t3e37\t0.5\n1:200\tT\tC\t5e37\t-0.25\n",
+    )?;
+    // The effect allele is A2 on both variants. B's weights in units of 10^37, N's in hundredths.
+    let weights = [(3i128, 50i128), (5, -25)];
+    let dose = |call: u8| [Some(0i128), None, Some(1), Some(2)][usize::from(call)];
+    for (components, out) in [(true, "sums"), (false, "averages")] {
+        let mut command = Command::new(SCORE_BIN);
+        command
+            .current_dir(dir.path())
+            .env("GNOMON_CACHE_DIR", dir.path().join("cache"))
+            .arg("--out")
+            .arg(dir.path().join(out));
+        if components {
+            command.arg("--emit-components");
+        }
+        let output = command.arg(&score).arg(dir.path().join("cohort")).output()?;
+        assert_success(&output);
+        let rows = sscore_rows(&dir.path().join(format!("{out}.sscore")))?;
+        assert_eq!(rows.len(), 4, "{out}");
+        for (person, row) in rows.iter().enumerate() {
+            assert_eq!(row[0], format!("I{person}"));
+            let (mut b, mut n, mut used) = (0i128, 0i128, 0u32);
+            for (variant, &(b_weight, n_weight)) in weights.iter().enumerate() {
+                if let Some(copies) = dose(calls[variant][person]) {
+                    b += b_weight * copies;
+                    n += n_weight * copies;
+                    used += 1;
+                }
+            }
+            let (b_value, n_value): (f64, f64) = (row[1].parse()?, row[3].parse()?);
+            let (b_want, n_want) = if components {
+                (format!("{b}e37").parse::<f64>()?, format!("{n}e-2").parse::<f64>()?)
+            } else {
+                (
+                    rounded_quotient(b * 10i128.pow(37), u128::from(used)),
+                    rounded_quotient(n, 100 * u128::from(used)),
+                )
+            };
+            assert_eq!(b_value.to_bits(), b_want.to_bits(), "{out}: B, person {person}: {} for {b_want:e}", row[1]);
+            assert_eq!(n_value.to_bits(), n_want.to_bits(), "{out}: N, person {person}: {} for {n_want:e}", row[3]);
         }
     }
     Ok(())
