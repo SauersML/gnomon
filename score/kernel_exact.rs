@@ -90,10 +90,17 @@ fn build_table(terms: &[i64], group: usize, stride: usize, table: &mut [i64]) {
 fn transpose_keys(rows: [&[u8]; VARIANTS_PER_TABLE], keys: &mut [u8]) {
     let lane = |chunk: &[u8; 8]| Simd::<u8, 8>::from_array(*chunk).cast::<u32>();
     let (out, _) = keys.as_chunks_mut::<32>();
-    let rows = rows.map(|row| row.as_chunks::<8>().0);
+    // Four explicit lanes rather than array::map: an out-of-line map left a call in the loop in some
+    // builds, whatever the surrounding code.
+    let rows = [
+        rows[0].as_chunks::<8>().0,
+        rows[1].as_chunks::<8>().0,
+        rows[2].as_chunks::<8>().0,
+        rows[3].as_chunks::<8>().0,
+    ];
     let steps = rows.iter().fold(out.len(), |steps, row| steps.min(row.len()));
     for step in 0..steps {
-        let [c0, c1, c2, c3] = rows.map(|row| &row[step]);
+        let [c0, c1, c2, c3] = [&rows[0][step], &rows[1][step], &rows[2][step], &rows[3][step]];
         let mut word = lane(c0) | (lane(c1) << 8) | (lane(c2) << 16) | (lane(c3) << 24);
         let swap = (word ^ (word >> 6)) & Simd::splat(0x00cc_00cc);
         word ^= swap ^ (swap << 6);
@@ -134,14 +141,22 @@ fn prefers_table(terms: &[i64], group: usize, stride: usize, rows: [&[u8]; VARIA
         carriers += u64::from((masks[0] | masks[1] | masks[2] | masks[3]).count_ones());
     };
     let whole = rows[0].len() / 8 * 8;
-    for start in (0..whole).step_by(8) {
-        count(rows.map(|row| {
-            let x = u64::from_le_bytes(std::array::from_fn(|i| row[start + i]));
-            (x | (x >> 1)) & M55
-        }));
+    let words = [
+        rows[0].as_chunks::<8>().0,
+        rows[1].as_chunks::<8>().0,
+        rows[2].as_chunks::<8>().0,
+        rows[3].as_chunks::<8>().0,
+    ];
+    let calls_in = |word: &[u8; 8]| {
+        let x = u64::from_le_bytes(*word);
+        (x | (x >> 1)) & M55
+    };
+    for w in 0..whole / 8 {
+        count([calls_in(&words[0][w]), calls_in(&words[1][w]), calls_in(&words[2][w]), calls_in(&words[3][w])]);
     }
+    let calls_at = |row: &[u8], byte: usize| u64::from((row[byte] | (row[byte] >> 1)) & 0x55);
     for byte in whole..rows[0].len() {
-        count(rows.map(|row| u64::from((row[byte] | (row[byte] >> 1)) & 0x55)));
+        count([calls_at(rows[0], byte), calls_at(rows[1], byte), calls_at(rows[2], byte), calls_at(rows[3], byte)]);
     }
     calls - carriers >= 256
 }
@@ -171,10 +186,11 @@ fn group_rows<'a>(
     zero_row: &'a [u8],
     group: usize,
 ) -> [&'a [u8]; VARIANTS_PER_TABLE] {
-    std::array::from_fn(|v| {
+    let row = |v: usize| {
         let r = group * VARIANTS_PER_TABLE + v;
         if r < rows { &data[r * row_bytes..(r + 1) * row_bytes] } else { &zero_row[..row_bytes] }
-    })
+    };
+    [row(0), row(1), row(2), row(3)]
 }
 
 /// `buffer` at least `len` long, grown with zeros and never shrunk.
@@ -194,9 +210,11 @@ fn group_keys(source: [&[u8]; VARIANTS_PER_TABLE], people: People, keys: &mut [u
             let row_bytes = source[0].len();
             let whole = row_bytes / 8 * 8;
             let keys = &mut keys[..row_bytes * 4];
-            transpose_keys(source.map(|r| &r[..whole]), &mut keys[..whole * 4]);
+            let rows = [&source[0][..whole], &source[1][..whole], &source[2][..whole], &source[3][..whole]];
+            transpose_keys(rows, &mut keys[..whole * 4]);
             for byte in whole..row_bytes {
-                keys[byte * 4..byte * 4 + 4].copy_from_slice(&transpose_calls(source.map(|r| r[byte])));
+                let calls = [source[0][byte], source[1][byte], source[2][byte], source[3][byte]];
+                keys[byte * 4..byte * 4 + 4].copy_from_slice(&transpose_calls(calls));
             }
         }
         People::Gathered { bytes, shifts } => {
