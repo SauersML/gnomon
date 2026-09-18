@@ -175,7 +175,20 @@ pub(crate) struct Limits {
     pub in_flight_bytes: usize,
     pub min_workers: usize,
     pub max_workers: usize,
+    /// Each worker thread's stack, which bounds the memory the thread can hold on it.
+    pub stack_bytes: usize,
 }
+
+/// A remote worker's stack: std's default. A Cloud Storage fetch polls its request's future on
+/// the worker, TLS handshake and token refresh included, which cannot be measured on a cluster
+/// without a bucket to read, and a thread that outgrows its stack crashes the run; so the remote
+/// stack stays as it was and is charged in full.
+pub(crate) const REMOTE_WORKER_STACK_BYTES: usize = 2 << 20;
+
+/// A local read plan's worker stack. Its fetch is a positional read into a heap buffer, and on a
+/// 140,000-variant .bed the workers touched 8-16 KiB of their stacks, a sixteenth of this. A files
+/// test runs their deepest path, a read past a truncated file, on a stack of this size.
+pub(crate) const LOCAL_WORKER_STACK_BYTES: usize = 256 << 10;
 
 /// Sized for a cohort whose rows are ~100 KB: a full window of such rows
 /// keeps a 10-30 Gbps VM busy while request latency stays the bottleneck.
@@ -184,6 +197,7 @@ pub(crate) const LIMITS: Limits = Limits {
     in_flight_bytes: 128 * 1024 * 1024,
     min_workers: 8,
     max_workers: 256,
+    stack_bytes: REMOTE_WORKER_STACK_BYTES,
 };
 
 /// [`LIMITS`] within this machine's memory, as available when first asked.
@@ -215,6 +229,8 @@ struct State {
     ready: BTreeMap<usize, Result<Arc<Vec<u8>>, PipelineError>>,
     /// Bytes in flight or in `ready`.
     window_bytes: usize,
+    /// The most `window_bytes` has held.
+    peak_bytes: usize,
     started: bool,
     /// No further ranges may be dispatched: the reader is being dropped or a
     /// fetch failed. The failure itself is delivered through `ready`.
@@ -260,6 +276,7 @@ impl PlannedReader {
                     dispatch: 0,
                     ready: BTreeMap::new(),
                     window_bytes: 0,
+                    peak_bytes: 0,
                     started: false,
                     halted: false,
                 }),
@@ -289,6 +306,24 @@ impl PlannedReader {
 
     pub(crate) fn workers(&self) -> usize {
         Self::worker_count(&self.plan, &self.shared.limits)
+    }
+
+    /// The stacks of the threads this reader fetches on, each bounded by its stack size.
+    pub(crate) fn worker_stack_bytes(&self) -> usize {
+        self.workers()
+            .saturating_mul(self.shared.limits.stack_bytes)
+    }
+
+    /// The most bytes this reader holds at once: ranges in flight plus received and unread stay
+    /// within the window, except that a range is always dispatched into an empty one, and they
+    /// never exceed the plan's row ranges together (the header is read directly).
+    pub(crate) fn held_bytes_bound(&self) -> usize {
+        let rows = &self.plan.ranges[1..];
+        let largest = rows.iter().map(|&(_, length)| length).max().unwrap_or(0);
+        let total = rows
+            .iter()
+            .fold(0usize, |sum, &(_, length)| sum.saturating_add(length));
+        self.shared.limits.window_bytes.max(largest).min(total)
     }
 
     /// The range containing `offset`, as `(range start, bytes)`.
@@ -358,14 +393,30 @@ impl PlannedReader {
             let plan = Arc::clone(&self.plan);
             let fetch = Arc::clone(&self.fetch);
             let shared = Arc::clone(&self.shared);
-            workers.push(std::thread::spawn(move || worker(&plan, &fetch, &shared)));
+            workers.push(
+                std::thread::Builder::new()
+                    .stack_size(self.shared.limits.stack_bytes)
+                    .spawn(move || worker(&plan, &fetch, &shared))
+                    .expect("failed to spawn a read-plan worker"),
+            );
         }
     }
 }
 
 impl Drop for PlannedReader {
     fn drop(&mut self) {
-        self.shared.state.lock().unwrap().halted = true;
+        let peak = {
+            let mut state = self.shared.state.lock().unwrap();
+            state.halted = true;
+            state.peak_bytes
+        };
+        if peak > 0 {
+            eprintln!(
+                "> Read plan held at most {:.2} MiB in flight and unread, of a {:.2} MiB bound.",
+                peak as f64 / (1 << 20) as f64,
+                self.held_bytes_bound() as f64 / (1 << 20) as f64
+            );
+        }
         self.shared.changed.notify_all();
         for worker in self.workers.lock().unwrap().drain(..) {
             let _ = worker.join();
@@ -384,6 +435,7 @@ fn worker(plan: &BedReadPlan, fetch: &SegmentFetch, shared: &Shared) {
                 let length = plan.ranges[state.dispatch].1;
                 if state.window_bytes == 0 || state.window_bytes + length <= shared.limits.window_bytes {
                     state.window_bytes += length;
+                    state.peak_bytes = state.peak_bytes.max(state.window_bytes);
                     state.dispatch += 1;
                     break state.dispatch - 1;
                 }
@@ -768,6 +820,7 @@ mod tests {
             in_flight_bytes: 1 << 20,
             min_workers: 8,
             max_workers: 8,
+            stack_bytes: REMOTE_WORKER_STACK_BYTES,
         };
         let outstanding = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));

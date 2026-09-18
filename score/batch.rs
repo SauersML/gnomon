@@ -92,6 +92,24 @@ pub struct DenseScratch {
     tables: TableScratch,
 }
 
+impl DenseScratch {
+    /// The bytes this scratch holds on the heap.
+    pub fn heap_bytes(&self) -> usize {
+        self.terms.capacity() * std::mem::size_of::<i64>() + self.tables.heap_bytes()
+    }
+}
+
+/// The most bytes a [`DenseScratch`] grows to over batches of at most `rows` rows of `row_bytes`
+/// bytes, for `count` people at `stride` lanes: four code rows of terms a row, padded to whole
+/// four-variant groups, and the table kernel's scratch.
+pub fn dense_scratch_bound(rows: usize, row_bytes: usize, count: usize, stride: usize) -> usize {
+    (rows.div_ceil(4) * 4 * 4 * std::mem::size_of::<i64>())
+        .saturating_mul(stride)
+        .saturating_add(crate::score::kernel_exact::table_scratch_bytes(
+            rows, row_bytes, count, stride,
+        ))
+}
+
 /// Adds one batch of dense packed rows (each a complete `.bed` row) to every scored person's
 /// cells and missing counts. `cells` holds people × stride lanes and `counts` people × scores.
 pub fn run_dense_batch(

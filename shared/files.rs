@@ -235,6 +235,11 @@ pub struct BedSource {
     fetch: Option<SegmentFetch>,
     /// Every byte of a remote `.bed` that was read whole when opened.
     whole: Option<Arc<Vec<u8>>>,
+    /// The most bytes this source holds in memory to serve its reads: a read plan's window, or
+    /// a remote `.bed` read whole. A mapping or plain reads hold none.
+    read_buffer: usize,
+    /// The stacks of the threads a read plan fetches its ranges on.
+    read_stack: usize,
 }
 
 impl BedSource {
@@ -246,6 +251,8 @@ impl BedSource {
             file: None,
             fetch: None,
             whole: None,
+            read_buffer: 0,
+            read_stack: 0,
         }
     }
 
@@ -257,6 +264,8 @@ impl BedSource {
             mapped_reads: false,
             fetch: None,
             whole: None,
+            read_buffer: 0,
+            read_stack: 0,
         }
     }
 
@@ -282,6 +291,7 @@ impl BedSource {
     }
 
     fn with_reader(&self, reader: PlannedReader) -> Self {
+        let (read_buffer, read_stack) = (reader.held_bytes_bound(), reader.worker_stack_bytes());
         Self {
             byte_source: Arc::new(PlannedByteRangeSource {
                 reader,
@@ -292,7 +302,19 @@ impl BedSource {
             mapped_reads: false,
             fetch: self.fetch.clone(),
             whole: None,
+            read_buffer,
+            read_stack,
         }
+    }
+
+    /// The most bytes this source holds in memory to serve its reads.
+    pub fn read_buffer_bytes(&self) -> usize {
+        self.read_buffer
+    }
+
+    /// The stacks of the threads this source's read plan fetches on, 0 without one.
+    pub fn read_stack_bytes(&self) -> usize {
+        self.read_stack
     }
 
     pub fn byte_source(&self) -> Arc<dyn ByteRangeSource> {
@@ -461,6 +483,8 @@ fn remote_bed_source(
             file: None,
             mapped_reads: false,
             fetch: None,
+            read_buffer: bytes.len(),
+            read_stack: 0,
             whole: Some(bytes),
         });
     }
@@ -471,6 +495,8 @@ fn remote_bed_source(
         mapped_reads: false,
         fetch: Some(fetch),
         whole: None,
+        read_buffer: 0,
+        read_stack: 0,
     })
 }
 
@@ -624,6 +650,7 @@ fn open_planned_local_bed(
             in_flight_bytes: 4 * 1024 * 1024,
             min_workers: 1,
             max_workers: 2,
+            stack_bytes: crate::range_fetch::LOCAL_WORKER_STACK_BYTES,
         },
     );
     eprintln!(
@@ -632,6 +659,8 @@ fn open_planned_local_bed(
         reader.workers(),
         window_bytes / (1024 * 1024)
     );
+    source.read_buffer = reader.held_bytes_bound();
+    source.read_stack = reader.worker_stack_bytes();
     source.byte_source = Arc::new(PlannedLocalSource {
         len: source.len(),
         reader,
@@ -3141,6 +3170,7 @@ mod tests {
                 in_flight_bytes: 2 * 1024 * 1024,
                 min_workers: 1,
                 max_workers: 2,
+                stack_bytes: crate::range_fetch::LOCAL_WORKER_STACK_BYTES,
             },
         );
         let source = PlannedLocalSource { len, reader };
@@ -3196,6 +3226,19 @@ mod tests {
         .unwrap();
         assert!(mapped.mapped_rows().is_some());
         assert!(planned.mapped_rows().is_none());
+        // The planned reader holds at most its window, here more than its planned ranges together, so
+        // those bound it: at least the planned rows, at most the file's rows. The mapping holds no
+        // read buffer and fetches on no thread.
+        let held = planned.read_buffer_bytes();
+        assert!(
+            held >= rows.len() * row_bytes && held <= n_rows * row_bytes,
+            "{held}"
+        );
+        assert!(planned.read_stack_bytes() >= crate::range_fetch::LOCAL_WORKER_STACK_BYTES);
+        assert_eq!(
+            (mapped.read_buffer_bytes(), mapped.read_stack_bytes()),
+            (0, 0)
+        );
         for &row in &rows {
             let offset = 3 + row * row_bytes as u64;
             let (mut from_map, mut from_reads) = (vec![0; row_bytes], vec![0; row_bytes]);
@@ -3215,6 +3258,39 @@ mod tests {
                 .read_at_positional(bed.len() as u64, &mut [0])
                 .is_err()
         );
+    }
+
+    /// A local read plan's workers run on LOCAL_WORKER_STACK_BYTES. The deepest thing they do is
+    /// fail: a row past a file truncated after the plan opened takes the positional read's error
+    /// path on the worker, which must come back as an error, not a stack overflow.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_read_plan_fails_on_its_own_stack_without_overflowing() {
+        use super::*;
+        let row_bytes = 4096usize;
+        let n_rows = 64usize;
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        bed.extend((0..n_rows * row_bytes).map(|i| (i % 253) as u8));
+        let file = tempfile::Builder::new().suffix(".bed").tempfile().unwrap();
+        std::fs::write(file.path(), &bed).unwrap();
+        let rows: Vec<u64> = (0..n_rows as u64).collect();
+        let planned = open_planned_local_bed(
+            file.path(),
+            open_bed_source(file.path(), None).unwrap(),
+            &rows,
+            row_bytes as u64,
+            4 * BedReadPlan::MAX_RANGE,
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(file.path())
+            .unwrap()
+            .set_len(3)
+            .unwrap();
+        let mut row = vec![0; row_bytes];
+        let offset = 3 + (n_rows as u64 - 1) * row_bytes as u64;
+        assert!(planned.byte_source().read_at(offset, &mut row).is_err());
     }
     use super::*;
     use std::io::{BufRead, Write};
@@ -3271,6 +3347,11 @@ mod tests {
         ]);
         let source = open_bed_source_for_scoring(Path::new(&url), None, &[99], 100_000, 100, 0)
             .expect("planned remote BED source");
+        // One planned row of 100 KB, fetched on one thread, is all the plan can hold.
+        assert_eq!(
+            (source.read_buffer_bytes(), source.read_stack_bytes()),
+            (100_000, crate::range_fetch::REMOTE_WORKER_STACK_BYTES)
+        );
         let mut bytes = [0; 4];
         source.read_at(9_999_999, &mut bytes).expect("required row tail");
         assert_eq!(&bytes, b"aaaa");

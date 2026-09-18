@@ -203,6 +203,56 @@ const UNTABLED_PER_PASS: usize = 64;
 /// The most bytes of person keys an untabled pass takes before it adds fewer groups per pass.
 const UNTABLED_KEY_BYTES: usize = 1 << 24;
 
+impl TableScratch {
+    /// The bytes this scratch holds on the heap.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.tables.capacity() * std::mem::size_of::<i64>()
+            + self.column_keys.capacity()
+            + self.person_keys.capacity()
+            + self.zero_row.capacity()
+            + (self.tabled.capacity() + self.untabled.capacity()) * std::mem::size_of::<usize>()
+    }
+}
+
+/// The most bytes [`TableScratch`] grows to over calls of at most `rows` rows of `row_bytes`
+/// bytes for `count` people at `stride` lanes: the zero row, the keys in person order (a row's
+/// four keys a byte, sixteen groups' of them when striped), sixteen groups' tables once any group
+/// is tabled, the person keys of the widest untabled pass the key budget allows (at least a
+/// tabled batch's), and the two group lists at the capacity pushing gives them. A byte buffer is
+/// never below Vec's smallest capacity, eight.
+pub(crate) fn table_scratch_bytes(
+    rows: usize,
+    row_bytes: usize,
+    count: usize,
+    stride: usize,
+) -> usize {
+    let key_width = row_bytes.saturating_mul(4).max(count);
+    let striped = matches!(stride, 4 | 8);
+    let column_keys = if striped {
+        GROUPS_PER_BATCH.saturating_mul(key_width)
+    } else {
+        key_width
+    }
+    .max(8);
+    let tables = (GROUPS_PER_BATCH * 256 * std::mem::size_of::<i64>()).saturating_mul(stride);
+    let width = [UNTABLED_PER_PASS, 32, GROUPS_PER_BATCH]
+        .into_iter()
+        .find(|&width| count.saturating_mul(width) <= UNTABLED_KEY_BYTES)
+        .unwrap_or(GROUPS_PER_BATCH);
+    let person_keys = if striped {
+        0
+    } else {
+        count.saturating_mul(width).max(8)
+    };
+    let groups = rows.div_ceil(VARIANTS_PER_TABLE).next_power_of_two().max(4);
+    row_bytes
+        .max(8)
+        .saturating_add(column_keys)
+        .saturating_add(tables)
+        .saturating_add(person_keys)
+        .saturating_add(groups.saturating_mul(2 * std::mem::size_of::<usize>()))
+}
+
 /// The four packed rows of `group`, the rows past the end reading as zero calls.
 #[inline(always)]
 fn group_rows<'a>(
@@ -664,6 +714,76 @@ mod tests {
                     }
                 }
                 assert_eq!(cells, want, "people {people} rows {rows} stride {stride} gathered {gathered}");
+            }
+        }
+    }
+
+    /// A scratch never outgrows `table_scratch_bytes`, whatever mix of tabled and untabled groups
+    /// its calls take and whichever person layout: the memory plan charges each dense consumer
+    /// that bound.
+    #[test]
+    fn table_scratch_stays_within_its_bound() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for (people, rows, stride, sparse) in [
+            (1usize, 1usize, 4usize, 1u64),
+            (37, 5, 4, 1),
+            (64, 67, 8, 1),
+            (130, 13, 12, 1),
+            (600, 70, 12, 30),
+            (501, 131, 20, 3),
+            (1000, 67, 16, 40),
+            (40, 300, 12, 1),
+        ] {
+            let row_bytes = (people + 5).div_ceil(4);
+            let data: Vec<u8> = (0..rows * row_bytes)
+                .map(|at| {
+                    let every = if (at / row_bytes / 4) % 2 == 1 { sparse } else { 1 };
+                    (0..4).fold(0u8, |byte, slot| {
+                        let call = if rng.next() % every == 0 { rng.next() as u8 & 3 } else { 0 };
+                        byte | call << (2 * slot)
+                    })
+                })
+                .collect();
+            let mut terms = vec![0i64; rows.div_ceil(4) * 4 * 4 * stride];
+            for r in 0..rows {
+                for code in 1..4 {
+                    for lane in 0..stride {
+                        terms[(r * 4 + code) * stride + lane] = rng.next() as i64;
+                    }
+                }
+            }
+            let kept: Vec<usize> = (0..people)
+                .map(|p| (people - 1 - p) * 2 % (row_bytes * 4))
+                .collect();
+            let bytes: Vec<u32> = kept.iter().map(|&f| (f / 4) as u32).collect();
+            let shifts: Vec<u8> = kept.iter().map(|&f| (2 * (f % 4)) as u8).collect();
+            for gathered in [false, true] {
+                let layout = if gathered {
+                    People::Gathered {
+                        bytes: &bytes,
+                        shifts: &shifts,
+                    }
+                } else {
+                    People::All(people)
+                };
+                let mut cells = vec![0i64; people * stride];
+                let mut scratch = TableScratch::default();
+                apply_table_rows(
+                    &data,
+                    row_bytes,
+                    rows,
+                    &terms,
+                    stride,
+                    layout,
+                    &mut scratch,
+                    &mut cells,
+                );
+                let bound = table_scratch_bytes(rows, row_bytes, people, stride);
+                assert!(
+                    scratch.heap_bytes() <= bound,
+                    "people {people} rows {rows} stride {stride} gathered {gathered}: {} > {bound}",
+                    scratch.heap_bytes()
+                );
             }
         }
     }

@@ -1721,12 +1721,16 @@ mod tests {
                 };
                 let input = InputCharge {
                     mapped,
+                    read_buffers: 0,
                     prefetch: true,
                 };
                 let consumers = bounded_dense_consumers(&prep, budget, input).unwrap();
                 let private = result_bytes(&prep).unwrap()
-                    + dense_scratch_bytes(&prep, bounded_dense_batch_size(&prep, budget).unwrap())
-                        .unwrap()
+                    + consumer_scratch_bytes(
+                        &prep,
+                        bounded_dense_batch_size(&prep, budget).unwrap(),
+                    )
+                    .unwrap()
                     + thread_stack_bytes();
                 let charged = memory_floor_bytes(&prep, budget, input).unwrap() + held + mapped;
                 let at = format!("{mebibytes} MiB, {held} held, {mapped} mapped");
@@ -1772,6 +1776,7 @@ mod tests {
         let mapped = 16usize << 20;
         let input = InputCharge {
             mapped,
+            read_buffers: 0,
             prefetch: true,
         };
         let at = |max_ram_bytes| MemoryBudget {
@@ -1840,8 +1845,9 @@ mod tests {
         assert_eq!(held_beyond_plan(&prep, at(csr + 1)), 1);
     }
 
-    /// Only a source that may read through a planned prefetch window is charged one: before the
-    /// sources open, and while any of them serves no map.
+    /// The local prefetch budget is charged only while a source may still take it: before the
+    /// sources open, and while one serves neither a map nor a read plan. A source reading through
+    /// a plan is charged its reader's own window instead.
     #[test]
     fn the_prefetch_window_is_charged_only_while_a_source_may_take_one() {
         // 16,384 people pack into 4,096-byte rows; 4,096 needed rows take a local prefetch budget.
@@ -1855,11 +1861,23 @@ mod tests {
         assert!(window > 0);
         let mapped = InputCharge {
             mapped: 0,
+            read_buffers: 0,
             prefetch: false,
         };
         assert_eq!(
             memory_floor_bytes(&prep, budget, InputCharge::UNOPENED).unwrap(),
             memory_floor_bytes(&prep, budget, mapped).unwrap() + window
+        );
+        // A source reading through a plan is charged its reader's own window, here past the
+        // budget's 16 MiB cap, in place of the budget.
+        let planned = InputCharge {
+            mapped: 0,
+            read_buffers: 48 << 20,
+            prefetch: false,
+        };
+        assert_eq!(
+            memory_floor_bytes(&prep, budget, planned).unwrap(),
+            memory_floor_bytes(&prep, budget, mapped).unwrap() + (48 << 20)
         );
     }
 
@@ -2680,7 +2698,7 @@ fn bounded_plan(
     let floor = memory_floor_bytes(prep, budget, input)?;
     let resident = held_beyond_plan(prep, budget);
     let private = result_bytes(prep)?
-        .checked_add(dense_scratch_bytes(
+        .checked_add(consumer_scratch_bytes(
             prep,
             bounded_dense_batch_size(prep, budget)?,
         )?)
@@ -2857,6 +2875,30 @@ fn bounded_dense_batch_size(
     Ok((budget.max_ram_bytes() / 16 / row_bytes).clamp(1, DENSE_BATCH_SIZE))
 }
 
+/// The most bytes one dense consumer holds for batches of at most `variants` rows: the batch's
+/// rows concatenated, its work descriptors and indices, and the dense kernel's scratch as it
+/// grows ([`batch::dense_scratch_bound`]). The memory plan charges this; batch sizing keeps
+/// [`dense_scratch_bytes`].
+fn consumer_scratch_bytes(
+    prep: &PreparationResult,
+    variants: usize,
+) -> Result<usize, PipelineError> {
+    let row = usize::try_from(prep.bytes_per_variant)
+        .map_err(|_| PipelineError::Compute("PLINK row width overflow.".into()))?;
+    let per_row = row
+        .checked_add(
+            std::mem::size_of::<WorkItem>() + std::mem::size_of::<ReconciledVariantIndex>(),
+        )
+        .and_then(|per_row| per_row.checked_mul(variants))
+        .ok_or_else(|| PipelineError::Compute("Dense consumer scratch size overflow.".into()))?;
+    Ok(per_row.saturating_add(batch::dense_scratch_bound(
+        variants,
+        row,
+        prep.num_people_to_score,
+        prep.exact().stride(),
+    )))
+}
+
 fn dense_scratch_bytes(prep: &PreparationResult, variants: usize) -> Result<usize, PipelineError> {
     let row = usize::try_from(prep.bytes_per_variant).ok();
     // Packed calls, each variant's four term rows, its share of the four-variant tables (256
@@ -2889,26 +2931,37 @@ fn held_beyond_plan(prep: &PreparationResult, budget: MemoryBudget) -> usize {
         .saturating_sub(prep.csr_heap_bytes())
 }
 
-/// What a run's input sources add to its memory: the rows it reads through memory maps, and
-/// whether some source reads through a planned prefetch window instead, which a source that
-/// serves its rows from a map never allocates.
+/// What a run's input sources add to its memory: the rows it reads through memory maps, the
+/// read buffers its sources hold (each read plan's window and the stacks of the threads it
+/// fetches on, and each remote `.bed` read whole), and whether some other source that serves no
+/// map may still take the local prefetch budget.
 #[derive(Clone, Copy, Debug)]
 struct InputCharge {
     mapped: usize,
+    read_buffers: usize,
     prefetch: bool,
 }
 
 impl InputCharge {
-    /// Before the sources open: no mapped rows, and room for a prefetch window.
+    /// Before the sources open: no mapped rows, no read buffers yet, and room for a prefetch
+    /// window.
     const UNOPENED: Self = Self {
         mapped: 0,
+        read_buffers: 0,
         prefetch: true,
     };
 
     fn of(prep: &PreparationResult, sources: &[io::BedSource]) -> Self {
         Self {
             mapped: mapped_row_bytes(prep, sources),
-            prefetch: sources.iter().any(|source| source.mapped_rows().is_none()),
+            read_buffers: sources.iter().fold(0usize, |total, source| {
+                total
+                    .saturating_add(source.read_buffer_bytes())
+                    .saturating_add(source.read_stack_bytes())
+            }),
+            prefetch: sources
+                .iter()
+                .any(|source| source.mapped_rows().is_none() && source.read_buffer_bytes() == 0),
         }
     }
 }
@@ -2954,8 +3007,9 @@ fn ensure_memory_floor(
 }
 
 /// The least memory scoring needs: one output, the CSR at the bytes it holds, the I/O buffers,
-/// the local prefetch window when a source may read through one, one dense consumer's batch
-/// scratch and the stacks of the threads scoring starts.
+/// the read buffers the sources hold (a read plan's window, a remote `.bed` read whole), the
+/// local prefetch budget while some other source that serves no map may take it, one dense
+/// consumer's batch scratch and the stacks of the threads scoring starts.
 fn memory_floor_bytes(
     prep: &PreparationResult,
     budget: MemoryBudget,
@@ -2973,13 +3027,14 @@ fn memory_floor_bytes(
     let scratch = if direct {
         0
     } else {
-        dense_scratch_bytes(prep, bounded_dense_batch_size(prep, budget)?)?
+        consumer_scratch_bytes(prep, bounded_dense_batch_size(prep, budget)?)?
     };
     let prefetch = if input.prefetch {
         io::local_prefetch_budget(prep, budget)
     } else {
         0
-    };
+    }
+    .saturating_add(input.read_buffers);
     output
         .checked_add(prep.csr_heap_bytes())
         .and_then(|v| v.checked_add(row.checked_mul(buffers)?))
