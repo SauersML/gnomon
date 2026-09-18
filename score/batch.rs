@@ -11,11 +11,12 @@
 // not homozygous reference. It performs ZERO scientific logic or reconciliation, and
 // neither path can change a cell's value, only how fast it is reached.
 
+use crate::score::cells::ExactPlan;
 use crate::score::kernel_exact::{
     People, TableScratch, apply_table_rows, for_each_call, for_each_missing,
 };
 use crate::score::types::{
-    OriginalPersonIndex, PersonSubset, PreparationResult, ReconciledVariantIndex,
+    OriginalPersonIndex, PersonSubset, PreparationResult, ReconciledVariantIndex, VariantCsrView,
 };
 use std::error::Error;
 
@@ -116,14 +117,7 @@ pub fn run_dense_batch(
     scratch.terms.resize(terms_len, 0);
     for (r, &index) in rows.iter().enumerate() {
         let view = prep.variant_csr_view(index);
-        for contribution in view.iter() {
-            let target = exact.entry_target(contribution.entry, contribution.score_column.0);
-            let terms = exact.entry_terms(contribution.entry);
-            for (code, &term) in terms.iter().enumerate().skip(1) {
-                let at = (r * 4 + code) * stride;
-                exact.add(target, term, &mut scratch.terms[at..at + stride]);
-            }
-        }
+        add_code_rows(exact, &view, stride, &mut scratch.terms[r * 4 * stride..(r + 1) * 4 * stride]);
         for_each_missing(
             &data[r * row_bytes..(r + 1) * row_bytes],
             layout.people(),
@@ -149,6 +143,36 @@ pub fn run_dense_batch(
     Ok(())
 }
 
+/// Adds `view`'s entries to one variant's four code rows, `rows` holding 4 × stride lanes that start
+/// at zero: what calls 00, 01, 10 and 11 add. Code 00 adds nothing. When every score is one lane,
+/// score `s` is lane `s`, so an entry adds its weight to the 10 row and, flipped, twice it to the 01
+/// row, and the 11 row is twice the 10 row, as a wrapping sum of doubled weights is.
+fn add_code_rows(exact: &ExactPlan, view: &VariantCsrView<'_>, stride: usize, rows: &mut [i64]) {
+    let (missing_row, doses) = rows[stride..4 * stride].split_at_mut(stride);
+    let (one_dose, two_doses) = doses.split_at_mut(stride);
+    if exact.one_lane_per_score() {
+        for contribution in view.iter() {
+            let score = contribution.score_column.0;
+            let (weight, flipped) = exact.narrow_entry(contribution.entry);
+            one_dose[score] = one_dose[score].wrapping_add(weight);
+            if flipped {
+                missing_row[score] = missing_row[score].wrapping_add(weight.wrapping_mul(2));
+            }
+        }
+        for (two, &one) in two_doses.iter_mut().zip(one_dose.iter()) {
+            *two = one.wrapping_mul(2);
+        }
+    } else {
+        for contribution in view.iter() {
+            let target = exact.entry_target(contribution.entry, contribution.score_column.0);
+            let [_, missing, one, two] = exact.entry_terms(contribution.entry);
+            exact.add(target, missing, missing_row);
+            exact.add(target, one, one_dose);
+            exact.add(target, two, two_doses);
+        }
+    }
+}
+
 /// One variant's entries summed per call: for each code 00..11, what the call adds to every lane
 /// of a person's cell, and what a missing call adds to each score's missing count. The sums are
 /// a table of one variant, so they stay inside the plan's bounds as the dense tables do.
@@ -169,16 +193,11 @@ impl VariantTerms {
         self.table.resize(4 * stride, 0);
         self.missing.clear();
         self.missing.resize(prep.score_names.len(), 0);
-        for contribution in prep.variant_csr_view(index).iter() {
-            let score = contribution.score_column.0;
-            let target = exact.entry_target(contribution.entry, score);
-            let terms = exact.entry_terms(contribution.entry);
-            // Code 00 adds nothing, so its row stays zero.
-            for (code, lanes) in self.table.chunks_exact_mut(stride).enumerate().skip(1) {
-                exact.add(target, terms[code], lanes);
-            }
+        let view = prep.variant_csr_view(index);
+        add_code_rows(exact, &view, stride, &mut self.table);
+        for contribution in view.iter() {
             if exact.counts_missing(contribution.entry) {
-                self.missing[score] += 1;
+                self.missing[contribution.score_column.0] += 1;
             }
         }
     }
@@ -295,8 +314,10 @@ mod tests {
     }
 
     /// A random panel: six-decimal weights, some entries flipped, some score lines duplicated,
-    /// every PLINK code present, and optionally a kept subset in reversed order.
-    fn panel(rng: &mut Rng, people: usize, scores: usize, rows: usize, keep: bool) -> Panel {
+    /// every PLINK code present, and optionally a kept subset in reversed order. `wide` weights
+    /// are fifteen-digit decimals at three places, about 10^12, so a score of a few thousand
+    /// entries needs two limbs.
+    fn panel(rng: &mut Rng, people: usize, scores: usize, rows: usize, keep: bool, wide: bool) -> Panel {
         let (mut weights, mut corrections, mut columns, mut offsets) =
             (Vec::new(), Vec::new(), Vec::new(), vec![0u64]);
         let (mut weights6, mut corrections6) = (Vec::new(), Vec::new());
@@ -308,7 +329,12 @@ mod tests {
                 row.sort_unstable();
             }
             for column in row {
-                let micro = (rng.next() % 2_000_001) as i64 - 1_000_000;
+                let micro = if wide {
+                    let milli = 500_000_000_000_000 + (rng.next() % 500_000_000_000_000) as i64;
+                    if rng.next() % 2 == 0 { milli * 1000 } else { -milli * 1000 }
+                } else {
+                    (rng.next() % 2_000_001) as i64 - 1_000_000
+                };
                 let flipped = rng.next() % 3 == 0;
                 let weight6 = if flipped { -micro } else { micro };
                 weights6.push(weight6);
@@ -414,15 +440,18 @@ mod tests {
     #[test]
     fn dense_and_sparse_paths_give_the_correctly_rounded_exact_sums() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-        for (people, scores, rows, keep) in [
-            (5, 1, 3, false),
-            (64, 3, 7, false),
-            (100, 7, 9, true),
-            (33, 70, 5, false),
-            (257, 16, 256, true),
+        for (people, scores, rows, keep, wide) in [
+            (5, 1, 3, false, false),
+            (64, 3, 7, false, false),
+            (100, 7, 9, true, false),
+            (33, 70, 5, false, false),
+            (257, 16, 256, true, false),
+            // Two-limb scores: code rows go through the plan's targets, not one lane a score.
+            (40, 2, 12_000, false, true),
         ] {
-            let panel = panel(&mut rng, people, scores, rows, keep);
+            let panel = panel(&mut rng, people, scores, rows, keep, wide);
             let prep = &panel.prep;
+            assert_eq!(prep.exact().one_lane_per_score(), !wide);
             let (want_sums, want_counts) = oracle(&panel);
             let layout = PersonLayout::new(prep);
             let stride = prep.exact().stride();

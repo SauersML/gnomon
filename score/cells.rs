@@ -84,6 +84,8 @@ pub struct ExactPlan {
     entry_band: Vec<u8>,
     scores: Vec<ScoreArithmetic>,
     stride: usize,
+    /// Whether every score is one band in one lane without limbs, so score `s` is lane `s`.
+    one_lane_per_score: bool,
 }
 
 fn lcm(a: u64, b: u64) -> Option<u64> {
@@ -315,6 +317,9 @@ impl ExactPlan {
                     for (i, slot) in (chunk * PLAN_CHUNK..).zip(slots.iter_mut()) {
                         let column = columns[i] as usize;
                         let exact = match scaled_at_places(weights[i], places[column]) {
+                            // A multiple of one leaves the integer as it is, without the i128
+                            // multiplication's libcall.
+                            Some(scaled) if multiples[column] == 1 => Some(i128::from(scaled)),
                             Some(scaled) => i128::from(scaled).checked_mul(i128::from(multiples[column])),
                             None => {
                                 let (digits, exponent) = shortest_decimal_hinted(weights[i], &mut hint);
@@ -469,6 +474,11 @@ impl ExactPlan {
                 fixed,
             });
         }
+        // Lanes go to scores in column order, so when every score is one band in one lane, score `s`
+        // is lane `s`, and every weight fits i64 because its score's magnitudes sum below 2^63.
+        let one_lane_per_score = scores
+            .iter()
+            .all(|score| matches!(score.bands.as_slice(), [band] if band.target.split.is_none()));
         let mut plan = Self {
             weights: int_weights,
             wide,
@@ -476,6 +486,7 @@ impl ExactPlan {
             entry_band,
             scores,
             stride: lane.div_ceil(LANE_WIDTH).max(1) * LANE_WIDTH,
+            one_lane_per_score,
         };
         // The flipped-allele baseline of every band: two doses of each flipped entry's effect, in
         // parallel parts. A band's term magnitudes sum below 2^126, so no part's sum overflows.
@@ -528,6 +539,20 @@ impl ExactPlan {
     #[inline(always)]
     pub fn stride(&self) -> usize {
         self.stride
+    }
+
+    /// Whether every score is one band in one lane without limbs, so score `s` is lane `s` and
+    /// [`Self::narrow_entry`] gives every entry.
+    #[inline(always)]
+    pub fn one_lane_per_score(&self) -> bool {
+        self.one_lane_per_score
+    }
+
+    /// `entry`'s weight at its score's scale and whether it is flipped, for a plan with one lane per
+    /// score, where every weight fits i64.
+    #[inline(always)]
+    pub fn narrow_entry(&self, entry: usize) -> (i64, bool) {
+        (self.weights[entry], self.flags[entry] & FLIPPED != 0)
     }
 
     #[inline(always)]
