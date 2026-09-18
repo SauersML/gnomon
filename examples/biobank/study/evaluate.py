@@ -1,16 +1,17 @@
 """Held-out metrics for the study's single results table.
 
-One row per disease x model x method x axis x stratum x analysis x horizon; the columns are COLUMNS below and
-the layout is written up in the study's TABLE.md. Every metric here is checked against an independent
-reference implementation by tests/test_evaluate_reference.py (R survival/stats, pROC, riskRegression and
-timeROC where installed; lifelines, scikit-survival, scikit-learn and statsmodels), each with a planted error
-that must make it fail.
+One row per (disease, model, variant, fit, stratum, horizon), the digest's KEYS; the metrics a row can carry
+are the registry METRICS, and the layout is written up in the study's TABLE.md. Every metric here is checked
+against an independent reference implementation by tests/test_study_evaluate_reference.py (R survival/stats
+and pROC, timeROC and riskRegression where installed; lifelines, scikit-survival, scikit-learn and statsmodels),
+each with a planted error that must make it fail.
 
 Binary cells: AUC with its DeLong standard error, Brier, O/E, the calibration intercept (slope fixed at one) and
 slope, the integrated calibration index, and paired AUC and Brier differences against the covariates-only and
 standard competitors.
 
-Survival cells, at each horizon h on time since entry, with death a competing event:
+Survival cells, at each horizon h on time since entry, with death (and an exclusion-rule exit, when study-cohort
+makes it one) a competing event:
 - the IPCW AUC with controls including deaths (Blanche definition 2);
 - the IPCW Brier score, a death before h being a known non-case weighted 1/G(T-);
 - the Aalen-Johansen observed risk and O/E against the mean predicted CIF;
@@ -32,8 +33,11 @@ import pandas as pd
 
 Z95 = 1.959963984540054
 ONE_SIDED_95 = 1.6448536269514722
-# The AoU dissemination minimum: no released count, and no count derivable from released ones, in 1..19.
-MIN_CELL = 20
+# The AoU dissemination rule: no released count, and no count derivable from released ones, in 1..20. A cell
+# needs more than config["report"]["small_cell_max"] (default this) cases, non-cases and rows.
+SMALL_CELL_MAX = 20
+# A censoring-model category level with fewer rows is merged with the other small levels.
+CENSORING_LEVEL_MIN = 20
 # The prespecified support rule for a horizon in a cell: the one-sided 95% upper bound on the cell's own
 # reverse Kaplan-Meier G(h) at or above this floor, which caps its IPCW weights near 1/floor.
 POSITIVITY_FLOOR = 0.05
@@ -299,7 +303,7 @@ def cox_fit(time, event, X, ridge=1.0, iterations=50):
     return beta, times[events], np.cumsum(deaths[events] / (s0[events] * np.exp(shift)))
 
 
-def censoring_design(frame, covariates, minimum=MIN_CELL, categorical_levels=12):
+def censoring_design(frame, covariates, minimum=CENSORING_LEVEL_MIN, categorical_levels=12):
     """The censoring model's design: one-hot categories with the first level dropped, levels of fewer than
     `minimum` rows merged into one; for a numeric column with more than `categorical_levels` distinct values
     (entry age, not entry year) its standardised value and centred square."""
@@ -391,8 +395,9 @@ def ipcw(frame, horizon, censoring):
 # Aalen-Johansen and Wolbers' concordance
 # --------------------------------------------------------------------------- #
 def aalen_johansen(time, code, horizon):
-    """The Aalen-Johansen cumulative incidence of cause 1 at a horizon, death (cause 2) competing, and its
-    infinitesimal-jackknife standard error (R: survfit(Surv(time, factor(code)) ~ 1)$std.err).
+    """The Aalen-Johansen cumulative incidence of cause 1 at a horizon, every other exit (death, 2, or an
+    exclusion-rule exit, 3) competing, and its infinitesimal-jackknife standard error (R:
+    survfit(Surv(time, factor(code)) ~ 1)$std.err).
 
     With h1, h the cause-1 and all-cause hazards, Y the risk set, d the events and S the all-cause Kaplan-Meier,
     F1(h) = sum_{u <= h} S(u-) h1(u). The derivative of F1(h) in row l's weight is
@@ -455,8 +460,9 @@ CONCORDANCE_BLOCK = 10_000_000
 def wolbers_concordance(time, code, risks, horizon, censoring=None):
     """Wolbers' competing-risk concordance truncated at a horizon, on time since entry, for one risk per row or
     for several (variants x rows) at once. A case i (cause 1 at T_i <= h) is comparable with j when j outlives
-    it (T_j > T_i, or T_j = T_i and j is not a case) or when j died (cause 2) before T_i; the pair is
-    concordant when risk_i > risk_j, ties counting half. Without `censoring` every pair weighs one (Harrell).
+    it (T_j > T_i, or T_j = T_i and j is not a case) or when j left by a competing exit (code 2 or 3) before
+    T_i; the pair is concordant when risk_i > risk_j, ties counting half. Without `censoring` every pair weighs
+    one (Harrell).
     With a Censoring of the same rows every pair weighs the inverse probability that it is seen (Uno's weights,
     each row with its own censoring survival): 1/(G_i(T_i-) G_j(T_i-)) when j outlives i, and
     1/(G_i(T_i-) G_j(T_j-)) when j died first. The outliving pairs are then summed exactly, block by block."""
@@ -475,10 +481,10 @@ def wolbers_concordance(time, code, risks, horizon, censoring=None):
         if (g_left[case] <= 0).any():
             raise MetricRefusal("concordance", "zero censoring survival at a case time")
         inverse_left = np.divide(1.0, g_left, out=np.zeros(n), where=g_left > 0)
-    # j died before the case: ascending time, cases before deaths at a tied time (a death at the case's own
-    # time outlives it instead).
-    died_order = np.lexsort((code == 2, t))
-    mass = np.where(code == 2, inverse_left, 0.0)[died_order]
+    # j left by a competing exit before the case: ascending time, cases before competing exits at a tied time
+    # (one at the case's own time outlives it instead).
+    died_order = np.lexsort((code >= 2, t))
+    mass = np.where(code >= 2, inverse_left, 0.0)[died_order]
     died_total = np.empty(n)
     died_total[died_order] = np.cumsum(mass) - mass
     comparable = float(np.sum((inverse_left * died_total)[case]))
@@ -650,8 +656,9 @@ def cell_support(time, code, horizon):
 
 def survival_cell(t, code, w, censoring, P, variants, fit, stratum, horizon, minimum, references=REFERENCES,
                   pooled=None, truth=None):
-    """Rows for one survival cell at a horizon: t the follow-up from entry, code 0/1/2, w the IPCW weights and
-    `censoring` the evaluation's censoring model for these rows, P the (variants x rows) CIFs at the horizon.
+    """Rows for one survival cell at a horizon: t the follow-up from entry; code 0 censored, 1 disease, 2 death,
+    3 an exclusion-rule exit (2 and 3 compete); w the IPCW weights and `censoring` the evaluation's censoring
+    model for these rows; P the (variants x rows) CIFs at the horizon.
     truth (simulator only): (true CIF at h, uncensored follow-up, uncensored event code) per row.
 
     Reported only where the prespecified support rule holds: at least `minimum` cases, known non-cases and
@@ -747,8 +754,9 @@ def potential_followup(frame, config):
 def evaluate(kind, test, predictions, horizons, config, train=None, truth=None):
     """Every row of the single results table for one disease and model, from its outer-test rows.
 
-    kind: "binary" or "survival". test: the outer-test frame (binary: `y`; survival: `followup`, `event` 0/1/2
-    and `entry_age`; both: the axis and censoring columns, and admin_years). predictions: (variant, fit) ->
+    kind: "binary" or "survival". test: the outer-test frame (binary: `y`; survival: `followup`, `event` (0
+    censored, 1 disease, 2 death, 3 an exclusion-rule exit; 2 and 3 compete) and `entry_age`; both: the axis and
+    censoring columns, and admin_years). predictions: (variant, fit) ->
     risk per test row (binary) or rows x horizons CIF (survival), NaN outside the fit's rows; fit is "pooled"
     or "logo:<axis>:<group>". A LOGO row is the pooled cell of its held-out group, with stratum "overall".
     truth (simulator only): rows aligned with test carrying p_ever (binary) or cif_<h>y, uncensored_event and
@@ -759,7 +767,7 @@ def evaluate(kind, test, predictions, horizons, config, train=None, truth=None):
     config["evaluate"] may set "censoring" ("cox", "km" or "strata") and "censoring_covariates";
     config["report"]["small_cell_max"] is the largest count withheld."""
     settings = config.get("evaluate", {})
-    minimum = int(config.get("report", {}).get("small_cell_max", MIN_CELL - 1)) + 1
+    minimum = int(config.get("report", {}).get("small_cell_max", SMALL_CELL_MAX)) + 1
     fits = _fits(predictions)
     variants = [v for v in ("ours", "covariates", "standard", "z_pc", "calpred") if v in fits]
     variants += sorted(set(fits) - set(variants))
@@ -797,8 +805,8 @@ def evaluate(kind, test, predictions, horizons, config, train=None, truth=None):
             eligible = np.ones(len(sub), bool) if potential is None else potential >= horizon
             frame = sub.loc[eligible].rename(columns={"event": "event_code"}).reset_index(drop=True)
             t, code = frame.followup.to_numpy(float), frame.event_code.to_numpy(int)
-            if not ((t > 0).all() and np.isin(code, (0, 1, 2)).all()):
-                raise ValueError("follow-up must be positive and events 0, 1 or 2")
+            if not ((t > 0).all() and np.isin(code, (0, 1, 2, 3)).all()):
+                raise ValueError("follow-up must be positive and events 0, 1, 2 or 3")
             model = Censoring(frame, horizon, settings.get("censoring", "cox"),
                               tuple(c for c in settings.get("censoring_covariates", CENSORING_COVARIATES)
                                     if c in frame))

@@ -40,7 +40,7 @@ def brute_wolbers(t, code, risk, horizon, g=None):
             if j == i:
                 continue
             outlives = t[j] > t[i] or (t[j] == t[i] and code[j] != 1)
-            died_first = code[j] == 2 and t[j] < t[i]
+            died_first = code[j] >= 2 and t[j] < t[i]
             if not (outlives or died_first):
                 continue
             w = 1.0 if g is None else 1 / (gi * g(j, t[i] if outlives else t[j]))
@@ -350,6 +350,8 @@ def test_a_cell_with_twenty_cases_is_withheld_and_a_planted_minimum_releases_it(
     status = lambda rows: {r["status"] for r in rows if r["stratum"] == "ancestry_mid"}
     rows = ev.evaluate("binary", frame, predictions, [], {"report": {"small_cell_max": 20}})
     assert status(rows) == {ev.INSUFFICIENT}
+    # Without a report block the AoU rule (counts 1 to 20 withheld) still holds.
+    assert status(ev.evaluate("binary", frame, predictions, [], {})) == {ev.INSUFFICIENT}
     assert all(min(r["n"], r["cases"], r["n"] - r["cases"]) > 20 for r in rows if r["status"] == "ok")
     planted = ev.evaluate("binary", frame, predictions, [], {"report": {"small_cell_max": 4}})
     assert status(planted) == {"ok"}
@@ -387,6 +389,22 @@ def test_a_horizon_evaluates_only_rows_whose_administrative_follow_up_reaches_it
     for horizon in horizons:
         overall = [r for r in rows if r["stratum"] == "overall" and r["horizon"] == horizon][0]
         assert overall["n"] == int(np.sum(frame.admin_years - 180 / 365.25 >= horizon))
+
+
+def test_an_exclusion_exit_competes_exactly_like_a_death():
+    horizons = [1.0, 2.0]
+    frame, x = table_frame(6000, 22, "survival")
+    split = np.random.default_rng(23).random(len(frame)) < 0.5
+    three = frame.assign(event=np.where((frame.event == 2) & split, 3, frame.event))
+    assert (three.event == 3).sum() > 100
+    predictions = predictions_for(frame, x, "survival", horizons)
+    rows2 = ev.evaluate("survival", frame, predictions, horizons, {})
+    rows3 = ev.evaluate("survival", three, predictions, horizons, {})
+    assert len(rows2) == len(rows3)
+    for a, b in zip(rows2, rows3):
+        assert a.keys() == b.keys()
+        for key, value in a.items():
+            assert value == b[key] or (isinstance(value, float) and np.isnan(value) and np.isnan(b[key])), key
 
 
 def test_paired_differences_are_differences_of_the_rows_own_metrics():
