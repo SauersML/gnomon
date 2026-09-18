@@ -35,6 +35,8 @@ jobs:
           google-cloud-bigquery google-cloud-storage miniwdl pytest
       # Every test module and every WDL: a stale test outside test_aou_survival
       # once sent SIGKILL to every process its account owned on a shared node.
+      # examples/biobank/tests/ is not collected: the study's tests run on MSI
+      # only (SPEC section 1), against the simulator tables and the study venv.
       - name: Validate prospective workflow contracts
         working-directory: examples/biobank
         run: |

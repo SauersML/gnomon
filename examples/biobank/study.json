@@ -1,0 +1,54 @@
+{
+  "study": "aou-single-study-v1",
+  "diseases_file": "study/diseases.json",
+  "frozen_config_sha256": null,
+  "primary_censoring_rule": "ehr_end",
+  "variants": ["ours", "shipped", "covariates", "standard", "z_pc", "calpred"],
+  "data": {
+    "source": "bigquery",
+    "google_project": null,
+    "workspace_cdr": null,
+    "query_timeout_seconds": 1800,
+    "maximum_bytes_billed": 50000000000,
+    "genotype_prefix": "gs://vwb-aou-datasets-controlled/v8/microarray/plink/arrays"
+  },
+  "cohort": {
+    "seed": 918273645,
+    "num_pcs": 6,
+    "lookback_days": 365,
+    "landmark_days": 180,
+    "min_age": 18,
+    "test_fraction": 0.2,
+    "dev_folds": 5,
+    "max_prune_unmatched": 0,
+    "exclusion_competing_fraction": 0.01,
+    "horizon_candidates": [1, 2, 3, 4, 5],
+    "horizon_min_reach": 0.5
+  },
+  "logo": {
+    "axes": ["ancestry", "region", "ehr_site"],
+    "max_sites": 10,
+    "sites": 5,
+    "reuse_pooled": false,
+    "variants": ["ours", "covariates", "standard"]
+  },
+  "models": {
+    "binary": {},
+    "survival": {}
+  },
+  "compute": {
+    "total_threads": null,
+    "threads": {
+      "ours": {"binary": 4, "survival": 4},
+      "competitor": {"binary": 1, "survival": 1},
+      "predict": 2,
+      "evaluate": 1
+    },
+    "job_timeout_seconds": 900,
+    "scoring_timeout_seconds": 600,
+    "checkpoint_interval_seconds": 20
+  },
+  "report": {
+    "small_cell_max": 20
+  }
+}
