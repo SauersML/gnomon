@@ -14,36 +14,120 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BasisConfig {
-    pub num_knots: usize,
-    pub degree: usize,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SmoothConfig {
     pub num_centers: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrincipalComponentConfig {
-    pub name: String,
-    pub basis_config: SmoothConfig,
-    pub range: (f64, f64),
+/// The ancestry dependence of the context and of the score's slope: one joint
+/// Duchon smooth over `PC1..PCk` in each, never a smooth per component.
+///
+/// The kernel is gam's scale-free structural default (no length scale, affine
+/// null space, spectral power `s = (k − 1)/2`, the kernel `r³` in every
+/// dimension), which meets both of gam's conditions on a pure Duchon kernel,
+/// `2s < k` and `2(p + s) > k + 2` (`p = 2` for the affine null space), at
+/// every `k`. `power` overrides `s` and is held to the same conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PcSmoothConfig {
+    /// `k`, the number of leading principal components; 0 means none.
+    pub num_pcs: usize,
+    /// Centers of the joint smooth in the context (marginal) formula.
+    pub context_centers: usize,
+    /// Centers of the joint smooth in the slope formula.
+    pub slope_centers: usize,
+    /// An explicit Duchon spectral power, or `None` for gam's default.
+    pub power: Option<f64>,
+}
+
+impl PcSmoothConfig {
+    /// The joint smooth over `k` components with center counts derived from
+    /// `k`: `⌈3k/2⌉` in the context and `⌈5k/4⌉` in the slope, the 24 and 20
+    /// that the AoU study uses at `k = 16`, scaled linearly in `k`, and never
+    /// fewer than `k + 2`, one more than the `k + 1` columns of the affine null
+    /// space, which gam requires the centers to exceed.
+    pub fn for_pcs(num_pcs: usize) -> Self {
+        let floor = num_pcs + 2;
+        Self {
+            num_pcs,
+            context_centers: (3 * num_pcs).div_ceil(2).max(floor),
+            slope_centers: (5 * num_pcs).div_ceil(4).max(floor),
+            power: None,
+        }
+    }
+
+    /// Refuses, before any fit, a center count gam would refuse for `k`
+    /// components and an explicit power gam would refuse or override: the pure
+    /// Duchon kernel needs `2s < k` (conditional positive definiteness on the
+    /// null-space complement) and `2(p + s) > k + 2` with `p = 2` (existence at
+    /// the second-derivative operator of gam's default penalty; below it gam
+    /// raises the null space instead). gam's default `s = (k - 1)/2` meets both.
+    /// The center counts are explicit because gam's default count grows like
+    /// `n^0.4` in high dimension (about 1,970 at `n = 50,000`, `k = 16`;
+    /// gam#2993); `for_pcs` is an interim rule until the AoU study's center
+    /// sweep at `k = 16` replaces it, and until gam#2993 fixes the default.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.num_pcs == 0 {
+            return Ok(());
+        }
+        let null_space = self.num_pcs + 1;
+        for (formula, centers) in [
+            ("context", self.context_centers),
+            ("slope", self.slope_centers),
+        ] {
+            if centers <= null_space {
+                return Err(format!(
+                    "the joint PC smooth of the {formula} has {centers} centers for {} PCs; it needs \
+                     more than the {null_space} columns of its affine null space",
+                    self.num_pcs
+                ));
+            }
+        }
+        let Some(power) = self.power else {
+            return Ok(());
+        };
+        if !(power.is_finite() && power >= 0.0) {
+            return Err(format!(
+                "the joint PC smooth's power must be a finite non-negative number, not {power}"
+            ));
+        }
+        let dimension = self.num_pcs as f64;
+        if 2.0 * power >= dimension {
+            return Err(format!(
+                "the joint PC smooth's power {power} is not below half its dimension {}; the pure \
+                 Duchon kernel needs 2s < k. Omit the power to use gam's default s = (k - 1)/2",
+                self.num_pcs
+            ));
+        }
+        if 2.0 * (2.0 + power) <= dimension + 2.0 {
+            return Err(format!(
+                "the joint PC smooth's power {power} leaves 2(p + s) = {} at or below its dimension \
+                 plus the penalty's derivative order, {} (p = 2 for the affine null space); gam \
+                 would raise the null space. Omit the power to use gam's default s = (k - 1)/2",
+                2.0 * (2.0 + power),
+                self.num_pcs + 2
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// gam's `timewiggle()` on the survival baseline; every `None` keeps gam's default.
 pub struct SurvivalTimeWiggleConfig {
-    pub basis: BasisConfig,
-    pub penalty_order: usize,
-    pub double_penalty: bool,
+    pub num_knots: Option<usize>,
+    pub degree: Option<usize>,
+    pub penalty_order: Option<usize>,
+    pub double_penalty: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurvivalModelConfig {
-    pub baseline_basis: BasisConfig,
+    /// Internal knots and degree of the baseline's I-spline time basis; `None`
+    /// keeps gam's default.
+    pub baseline_knots: Option<usize>,
+    pub baseline_degree: Option<usize>,
     pub time_wiggle: Option<SurvivalTimeWiggleConfig>,
 }
 
@@ -90,12 +174,8 @@ impl LatentLaw {
 pub struct ModelConfig {
     pub model_family: ModelFamily,
     pub pgs_basis_config: SmoothConfig,
-    pub pc_configs: Vec<PrincipalComponentConfig>,
+    pub pcs: PcSmoothConfig,
     pub pgs_range: (f64, f64),
-    /// Overrides gam's outer iteration cap; `None` keeps gam's own.
-    pub reml_max_iterations: Option<usize>,
-    /// Overrides gam's outer convergence tolerance; `None` keeps gam's own.
-    pub reml_convergence_tolerance: Option<f64>,
     pub latent_law: LatentLaw,
     #[serde(default)]
     pub survival: Option<SurvivalModelConfig>,
@@ -106,10 +186,8 @@ impl Default for ModelConfig {
         Self {
             model_family: ModelFamily::Gam(LinkFunction::Probit),
             pgs_basis_config: SmoothConfig { num_centers: 8 },
-            pc_configs: Vec::new(),
+            pcs: PcSmoothConfig::for_pcs(0),
             pgs_range: (0.0, 0.0),
-            reml_max_iterations: None,
-            reml_convergence_tolerance: None,
             latent_law: LatentLaw::default(),
             survival: None,
         }
@@ -125,7 +203,10 @@ pub struct TrainedModel {
     pub saved: FittedModelPayload,
 }
 
-pub(super) const MODEL_BUNDLE_VERSION: u32 = 2;
+/// Version 3 smooths the PCs jointly. Version 2 fitted one smooth per PC; such a
+/// bundle is refused by name at load, never read.
+pub(super) const MODEL_BUNDLE_VERSION: u32 = 3;
+const PER_PC_BUNDLE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PredictDetailed {
@@ -278,6 +359,35 @@ fn predict_from_data_on_pool(
     data: &Array2<f64>,
     col_map: &HashMap<String, usize>,
 ) -> Result<gam::predict::PredictResult, ModelError> {
+    with_predictor(payload, data, col_map, |predictor, pred_input| {
+        predictor
+            .predict_plugin_response(pred_input)
+            .map_err(|e| ModelError::Predict(format!("predict_plugin_response failed: {e}")))
+    })
+}
+
+fn noise_scale_from_data(
+    payload: &FittedModelPayload,
+    data: &Array2<f64>,
+    col_map: &HashMap<String, usize>,
+) -> Result<Option<Array1<f64>>, ModelError> {
+    on_gam_pool(|| {
+        with_predictor(payload, data, col_map, |predictor, pred_input| {
+            predictor
+                .predict_noise_scale(pred_input)
+                .map_err(|e| ModelError::Predict(format!("predict_noise_scale failed: {e}")))
+        })
+    })
+    .map_err(ModelError::Predict)?
+}
+
+/// Runs `work` on the saved model's predictor and its prediction input for `data`.
+fn with_predictor<R>(
+    payload: &FittedModelPayload,
+    data: &Array2<f64>,
+    col_map: &HashMap<String, usize>,
+    work: impl FnOnce(&dyn gam::predict::PredictableModel, &gam::predict::PredictInput) -> Result<R, ModelError>,
+) -> Result<R, ModelError> {
     let model = FittedModel::from_payload(payload.clone());
     let n = data.nrows();
     let offset = Array1::<f64>::zeros(n);
@@ -295,9 +405,7 @@ fn predict_from_data_on_pool(
     let predictor = model
         .predictor()
         .ok_or_else(|| ModelError::Predict("saved model could not construct a predictor".into()))?;
-    predictor
-        .predict_plugin_response(&pred_input)
-        .map_err(|e| ModelError::Predict(format!("predict_plugin_response failed: {e}")))
+    work(predictor.as_ref(), &pred_input)
 }
 
 impl TrainedModel {
@@ -354,8 +462,27 @@ impl TrainedModel {
 
     pub fn load(path: &str) -> Result<Self, ModelError> {
         let reader = std::io::BufReader::new(std::fs::File::open(path)?);
-        let model: Self = serde_json::from_reader(reader)
+        let bundle: serde_json::Value = serde_json::from_reader(reader)
             .map_err(|error| ModelError::Serde(error.to_string()))?;
+        // The version is read before the rest, so a bundle of another version is
+        // refused by name rather than by whichever of its fields fails to parse.
+        let version = bundle.get("format_version").and_then(serde_json::Value::as_u64);
+        if version == Some(u64::from(PER_PC_BUNDLE_VERSION)) {
+            return Err(ModelError::Serde(format!(
+                "{path} is a version {PER_PC_BUNDLE_VERSION} calibration bundle, which fits one smooth per \
+                 principal component; gnomon no longer fits or predicts that model. Retrain it: \
+                 version {MODEL_BUNDLE_VERSION} smooths the PCs jointly."
+            )));
+        }
+        if version != Some(u64::from(MODEL_BUNDLE_VERSION)) {
+            return Err(ModelError::Serde(format!(
+                "{path} is calibration bundle version {}; this gnomon reads version \
+                 {MODEL_BUNDLE_VERSION}",
+                version.map_or_else(|| "(none)".to_string(), |version| version.to_string())
+            )));
+        }
+        let model: Self =
+            serde_json::from_value(bundle).map_err(|error| ModelError::Serde(error.to_string()))?;
         model.validate()?;
         Ok(model)
     }
@@ -376,6 +503,19 @@ impl TrainedModel {
             signed_dist: None,
             se_eta: None,
         })
+    }
+
+    /// The Gaussian location-scale model's predicted standard deviation σ(x) of
+    /// each row, in the response's units; `None` for a model with no per-row
+    /// distribution scale.
+    pub fn predict_standard_deviation(
+        &self,
+        p_new: ArrayView1<f64>,
+        sex_new: ArrayView1<f64>,
+        pcs_new: ArrayView2<f64>,
+    ) -> Result<Option<Array1<f64>>, ModelError> {
+        let (data, col_map) = build_predict_data(&self.saved, p_new, sex_new, pcs_new)?;
+        noise_scale_from_data(&self.saved, &data, &col_map)
     }
 
     pub fn predict_mean(
@@ -598,5 +738,22 @@ mod tests {
         ] {
             assert!(survival_risks_from_hazards(array![entry], array![exit]).is_err());
         }
+    }
+
+    #[test]
+    fn a_per_pc_bundle_is_refused_by_name() {
+        let directory = tempfile::tempdir().expect("model directory");
+        let path = directory.path().join("model.json");
+        std::fs::write(
+            &path,
+            r#"{"format_version": 2, "config": {"pc_configs": [{"name": "PC1"}], "reml_max_iterations": 10}, "saved": {}}"#,
+        )
+        .expect("write a version 2 bundle");
+        let error = match TrainedModel::load(path.to_str().expect("path")) {
+            Ok(_) => panic!("a version 2 bundle loaded"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("version 2 calibration bundle"), "{error}");
+        assert!(error.contains("one smooth per principal component"), "{error}");
     }
 }

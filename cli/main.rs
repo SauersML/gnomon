@@ -9,7 +9,7 @@ use clap::{CommandFactory, Subcommand};
 use gnomon::adapt_plink2::GenomeBuild;
 use gnomon::calibrate::data::{detect_link_function, load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::{train_model, train_survival_model};
-use gnomon::calibrate::model::{BasisConfig, SmoothConfig};
+use gnomon::calibrate::model::{PcSmoothConfig, SmoothConfig};
 use gnomon::calibrate::model::SurvivalModelConfig;
 use gnomon::calibrate::model::SurvivalRiskType;
 use gnomon::calibrate::model::SurvivalTimeWiggleConfig;
@@ -302,11 +302,10 @@ impl From<LatentLawCli> for LatentLaw {
     }
 }
 
-/// A removed inner-solver flag refuses any value instead of being ignored.
-fn removed_inner_solver_flag(_value: &str) -> Result<String, String> {
-    Err("this flag was removed: calibration now leaves the inner solver to gam, which runs to \
-         its own convergence certificates; bound the outer REML loop with \
-         --reml-max-iterations and --reml-convergence-tolerance"
+/// A removed iteration or tolerance flag refuses any value instead of being ignored.
+fn removed_solver_bound_flag(_value: &str) -> Result<String, String> {
+    Err("this flag was removed: gam derives every stop of the inner and outer solvers from its \
+         own convergence certificates, and calibrate sets no iteration cap or tolerance"
         .to_string())
 }
 
@@ -322,13 +321,9 @@ struct TrainArgs {
     #[arg(long, value_name = "N")]
     num_pcs: usize,
 
-    /// Number of farthest-point centers for the PGS Duchon smooth (at least 4)
+    /// Number of centers of the Gaussian model's score smooth (at least 4)
     #[arg(long, default_value = "10")]
     pgs_centers: usize,
-
-    /// Number of farthest-point centers for each PC Duchon smooth (at least 4)
-    #[arg(long, default_value = "5")]
-    pc_centers: usize,
 
     /// Law of the score the marginal-slope index is anchored on: the empirical
     /// law of the training scores, or a declaration that the score is already
@@ -336,47 +331,47 @@ struct TrainArgs {
     #[arg(long, value_enum, default_value_t = LatentLawCli::Empirical)]
     latent_law: LatentLawCli,
 
-    /// Removed; any value is refused with the flags that replace it
-    #[arg(long, hide = true, value_parser = removed_inner_solver_flag)]
+    /// Removed; any value is refused
+    #[arg(long, hide = true, value_parser = removed_solver_bound_flag)]
     max_iterations: Option<String>,
 
-    /// Removed; any value is refused with the flags that replace it
-    #[arg(long, hide = true, value_parser = removed_inner_solver_flag)]
+    /// Removed; any value is refused
+    #[arg(long, hide = true, value_parser = removed_solver_bound_flag)]
     convergence_tolerance: Option<String>,
 
-    /// Override gam's outer iteration cap for the smoothing and length-scale search (absent: gam's own)
-    #[arg(long, value_parser = parse_positive_usize)]
-    reml_max_iterations: Option<usize>,
+    /// Removed; any value is refused
+    #[arg(long, hide = true, value_parser = removed_solver_bound_flag)]
+    reml_max_iterations: Option<String>,
 
-    /// Override gam's outer convergence tolerance for the smoothing and length-scale search (absent: gam's own)
+    /// Removed; any value is refused
+    #[arg(long, hide = true, value_parser = removed_solver_bound_flag)]
+    reml_convergence_tolerance: Option<String>,
+
+    /// Number of internal knots for the survival baseline spline (gam's default when omitted)
     #[arg(long)]
-    reml_convergence_tolerance: Option<f64>,
+    survival_baseline_knots: Option<usize>,
 
-    /// Number of internal knots for the survival baseline spline
-    #[arg(long, default_value = "6")]
-    survival_baseline_knots: usize,
-
-    /// Degree for the survival baseline spline
-    #[arg(long, default_value = "3")]
-    survival_baseline_degree: usize,
+    /// Degree for the survival baseline spline (gam's default when omitted)
+    #[arg(long)]
+    survival_baseline_degree: Option<usize>,
 
     /// Add a smooth transformation of the survival baseline time coordinate
     #[arg(long)]
     survival_time_wiggle: bool,
 
-    /// Number of internal knots for the baseline time-wiggle spline
-    #[arg(long, default_value = "5")]
-    survival_time_wiggle_knots: usize,
+    /// Number of internal knots for the baseline time-wiggle spline (gam's default when omitted)
+    #[arg(long)]
+    survival_time_wiggle_knots: Option<usize>,
 
-    /// Degree for the baseline time-wiggle spline
-    #[arg(long, default_value = "3")]
-    survival_time_wiggle_degree: usize,
+    /// Degree for the baseline time-wiggle spline (gam's default when omitted)
+    #[arg(long)]
+    survival_time_wiggle_degree: Option<usize>,
 
-    /// Difference-penalty order for the baseline time-wiggle spline
-    #[arg(long, default_value = "2")]
-    survival_time_wiggle_penalty_order: usize,
+    /// Difference-penalty order for the baseline time-wiggle spline (gam's default when omitted)
+    #[arg(long)]
+    survival_time_wiggle_penalty_order: Option<usize>,
 
-    /// Penalize the nullspace of the baseline time-wiggle spline too
+    /// Penalize the nullspace of the baseline time-wiggle spline too (gam's default when omitted)
     #[arg(long)]
     survival_time_wiggle_double_penalty: bool,
 }
@@ -502,16 +497,6 @@ enum CalibrateCommands {
 /// On Windows we fall back to `process::exit` because the CUDA crash
 /// hasn't been reported there and Windows uses a different shutdown
 /// path entirely.
-/// An iteration cap of zero is not a cap: the solver would have to stop before
-/// it starts. Refuse it where every other argument is checked, at parse time.
-fn parse_positive_usize(text: &str) -> Result<usize, String> {
-    match text.trim().parse::<usize>() {
-        Ok(0) => Err("must be at least 1".to_string()),
-        Ok(value) => Ok(value),
-        Err(err) => Err(err.to_string()),
-    }
-}
-
 fn terminate_skipping_atexit(code: i32) -> ! {
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -898,22 +883,12 @@ fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
             let pgs_basis_config = SmoothConfig { num_centers: args.pgs_centers };
 
-            let pc_configs = (0..args.num_pcs)
-                .map(|i| gnomon::calibrate::model::PrincipalComponentConfig {
-                    name: format!("PC{}", i + 1),
-                    basis_config: SmoothConfig { num_centers: args.pc_centers },
-                    range: pc_ranges[i],
-                })
-                .collect();
-
             println!("Training model with REML estimation of smoothing parameters");
             let config = ModelConfig {
                 model_family: ModelFamily::Gam(link_function),
-                reml_convergence_tolerance: args.reml_convergence_tolerance,
-                reml_max_iterations: args.reml_max_iterations,
                 latent_law: args.latent_law.clone().into(),
                 pgs_basis_config,
-                pc_configs,
+                pcs: PcSmoothConfig::for_pcs(args.num_pcs),
                 pgs_range,
                 ..Default::default()
             };
@@ -946,12 +921,10 @@ fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::
 
     let time_wiggle = if args.survival_time_wiggle {
         Some(SurvivalTimeWiggleConfig {
-            basis: BasisConfig {
-                num_knots: args.survival_time_wiggle_knots,
-                degree: args.survival_time_wiggle_degree,
-            },
+            num_knots: args.survival_time_wiggle_knots,
+            degree: args.survival_time_wiggle_degree,
             penalty_order: args.survival_time_wiggle_penalty_order,
-            double_penalty: args.survival_time_wiggle_double_penalty,
+            double_penalty: args.survival_time_wiggle_double_penalty.then_some(true),
         })
     } else {
         None
@@ -959,16 +932,14 @@ fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::
 
     if let Some(settings) = &time_wiggle {
         println!(
-            "Enabling baseline time wiggle (knots={}, degree={}, penalty order={})",
-            settings.basis.num_knots, settings.basis.degree, settings.penalty_order
+            "Enabling baseline time wiggle (knots={:?}, degree={:?}, penalty order={:?}; None is gam's default)",
+            settings.num_knots, settings.degree, settings.penalty_order
         );
     }
 
     let survival_config = SurvivalModelConfig {
-        baseline_basis: BasisConfig {
-            num_knots: args.survival_baseline_knots,
-            degree: args.survival_baseline_degree,
-        },
+        baseline_knots: args.survival_baseline_knots,
+        baseline_degree: args.survival_baseline_degree,
         time_wiggle,
     };
 
@@ -976,15 +947,7 @@ fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::
         model_family: ModelFamily::Survival,
         pgs_basis_config: SmoothConfig { num_centers: args.pgs_centers },
         pgs_range: calculate_range(bundle.data.pgs.view()),
-        pc_configs: (0..bundle.data.pcs.ncols()).map(|index| {
-            gnomon::calibrate::model::PrincipalComponentConfig {
-                name: format!("PC{}", index + 1),
-                basis_config: SmoothConfig { num_centers: args.pc_centers },
-                range: calculate_range(bundle.data.pcs.column(index)),
-            }
-        }).collect(),
-        reml_convergence_tolerance: args.reml_convergence_tolerance,
-        reml_max_iterations: args.reml_max_iterations,
+        pcs: PcSmoothConfig::for_pcs(bundle.data.pcs.ncols()),
         latent_law: args.latent_law.clone().into(),
         survival: Some(survival_config),
     };
@@ -1000,7 +963,7 @@ fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading model from: {}", args.model);
 
     let model = TrainedModel::load(&args.model)?;
-    let num_pcs = model.config.pc_configs.len();
+    let num_pcs = model.config.pcs.num_pcs;
     println!("Model expects {num_pcs} PCs");
 
     match &model.config.model_family {

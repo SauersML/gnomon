@@ -106,7 +106,7 @@ not a requirement for correct CLI behavior.
 
 ```
 # Train a calibration model
-./target/release/gnomon train training_data.tsv --num-pcs 10
+./target/release/gnomon train training_data.tsv --num-pcs 6
 ```
 
 ```

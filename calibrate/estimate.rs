@@ -14,12 +14,11 @@
 
 use crate::calibrate::construction::{
     AGE_ENTRY_COLUMN, AGE_EXIT_COLUMN, EVENT_COLUMN, PHENOTYPE_COLUMN, SCORE_COLUMN,
-    WEIGHT_COLUMN, context_formula, duchon_smooth, marginal_termspec, slope_formula,
+    WEIGHT_COLUMN, context_formula, marginal_termspec, score_smooth, slope_formula,
 };
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::model::{
-    LatentLaw, MODEL_BUNDLE_VERSION, ModelConfig, ModelFamily, SmoothConfig, TrainedModel,
-    predictor_headers,
+    LatentLaw, MODEL_BUNDLE_VERSION, ModelConfig, ModelFamily, TrainedModel, predictor_headers,
 };
 use crate::calibrate::runtime::on_gam_pool;
 use crate::calibrate::survival_data::SurvivalTrainingBundle;
@@ -27,7 +26,7 @@ use crate::calibrate::survival_data::SurvivalTrainingBundle;
 use gam::FailureCategory;
 use gam::data::{ColumnKindTag, DataSchema, EncodedDataset, SchemaColumn};
 use gam::families::custom_family::BlockwiseFitOptions;
-use gam::families::gamlss::GaussianLocationScaleTermSpec;
+use gam::families::gamlss::{GaussianLocationScaleFitResult, GaussianLocationScaleTermSpec};
 use gam::inference::model::FittedModelPayload;
 use gam::inference::model_payload_builders::{
     LocationScaleInputs, LocationScaleResponse, LocationScaleWiggle, SavedModelSourceMetadata,
@@ -196,12 +195,12 @@ fn validate_training_data(data: &TrainingData) -> Result<(), EstimationError> {
 }
 
 fn validate_smooth_configs(config: &ModelConfig) -> Result<(), EstimationError> {
-    if config.pgs_basis_config.num_centers < 4
-        || config.pc_configs.iter().any(|pc| pc.basis_config.num_centers < 4)
-    {
-        return Err(EstimationError::Domain("Duchon smooths require at least 4 centers".into()));
+    if config.pgs_basis_config.num_centers < 4 {
+        return Err(EstimationError::Domain(
+            "the score's Duchon smooth requires at least 4 centers".into(),
+        ));
     }
-    Ok(())
+    config.pcs.validate().map_err(EstimationError::Domain)
 }
 
 /// Predictor columns in `predictor_headers` order: score | sex | PC1..PCk.
@@ -268,39 +267,11 @@ fn record_training_metadata(
     payload.set_training_feature_metadata(dataset.headers[..num_predictors].to_vec(), ranges);
 }
 
-/// gam's spatial length-scale search, with its own iteration cap and relative
-/// tolerance unless the configuration overrides them.
-fn spatial_options(config: &ModelConfig) -> SpatialLengthScaleOptimizationOptions {
-    let mut options = SpatialLengthScaleOptimizationOptions::default();
-    if let Some(max_iterations) = config.reml_max_iterations {
-        options.max_outer_iter = max_iterations;
-    }
-    if let Some(tolerance) = config.reml_convergence_tolerance {
-        options.rel_tol = tolerance;
-    }
-    options
-}
-
-/// gam's blockwise fit options with the coefficient covariance on, and gam's own
-/// outer iteration cap and tolerance unless the configuration overrides them.
-fn blockwise_options(config: &ModelConfig) -> BlockwiseFitOptions {
-    let mut options = BlockwiseFitOptions {
-        compute_covariance: true,
-        ..BlockwiseFitOptions::default()
-    };
-    if let Some(max_iterations) = config.reml_max_iterations {
-        options.outer_max_iter = max_iterations;
-    }
-    if let Some(tolerance) = config.reml_convergence_tolerance {
-        options.outer_tol = tolerance;
-    }
-    options
-}
-
-fn base_fit_config(config: &ModelConfig) -> FitConfig {
+/// The marginal-slope routes' formula configuration: gam's defaults with the
+/// weight column named. gam derives every solver stop from its own certificates.
+fn base_fit_config() -> FitConfig {
     FitConfig {
         weight_column: Some(WEIGHT_COLUMN.to_string()),
-        spatial_optimization: spatial_options(config),
         ..FitConfig::default()
     }
 }
@@ -339,24 +310,28 @@ fn train_model_on_pool(
         }
     };
     validate_training_data(data)?;
-    if config.pc_configs.len() != data.pcs.ncols() {
+    if config.pcs.num_pcs != data.pcs.ncols() {
         return Err(EstimationError::Domain(
             "PC configuration count must match the training matrix".into(),
         ));
     }
-    let pc_bases: Vec<_> = config.pc_configs.iter().map(|pc| pc.basis_config).collect();
     if matches!(link, LinkFunction::Identity) {
-        return train_gaussian_location_scale(data, config, &pc_bases);
+        return train_gaussian_location_scale(data, config);
     }
-    let context = context_formula(&pc_bases);
-    let mut fit_config = base_fit_config(config);
+    let context = context_formula(&config.pcs);
+    let mut fit_config = base_fit_config();
     let formula = match link {
         LinkFunction::Probit => {
             fit_config.family = Some("bernoulli-marginal-slope".to_string());
             fit_config.z_column = Some(SCORE_COLUMN.to_string());
             fit_config.latent_measure = Some(config.latent_law.latent_measure().to_string());
-            fit_config.slope_formula = Some(format!("{} + linkwiggle()", slope_formula(&pc_bases)));
-            format!("{PHENOTYPE_COLUMN} ~ {context} + link(type=probit) + linkwiggle()")
+            // The binary model carries the score warp and the link deviation
+            // (`linkwiggle()` in the slope and marginal formulas; calibrate/README.md,
+            // Binary path): without them the score enters only through `b(x)·z`. The
+            // base link is gam's marginal-slope default, probit.
+            fit_config.slope_formula =
+                Some(format!("{} + linkwiggle()", slope_formula(&config.pcs)));
+            format!("{PHENOTYPE_COLUMN} ~ {context} + linkwiggle()")
         }
         other => {
             return Err(EstimationError::Domain(format!(
@@ -387,12 +362,20 @@ fn train_model_on_pool(
 fn train_gaussian_location_scale(
     data: &TrainingData,
     config: &ModelConfig,
-    pc_bases: &[SmoothConfig],
 ) -> Result<TrainedModel, EstimationError> {
     let columns = predictor_columns(data.p.view(), data.sex.view(), data.pcs.view());
     let num_predictors = columns.len();
     let dataset = encoded_dataset(&columns);
-    let terms = marginal_termspec(&config.pgs_basis_config, pc_bases);
+    let result = fit_gaussian_location_scale(data, config, &dataset)?;
+    assemble_gaussian_location_scale(result, config, &dataset, num_predictors)
+}
+
+fn fit_gaussian_location_scale(
+    data: &TrainingData,
+    config: &ModelConfig,
+    dataset: &EncodedDataset,
+) -> Result<GaussianLocationScaleFitResult, EstimationError> {
+    let terms = marginal_termspec(&config.pgs_basis_config, &config.pcs);
     let n = data.y.len();
     let request = GaussianLocationScaleFitRequest {
         data: dataset.values.view(),
@@ -405,19 +388,24 @@ fn train_gaussian_location_scale(
             log_sigma_offset: Array1::zeros(n),
         },
         wiggle: Some(cubic_link_wiggle()),
-        options: blockwise_options(config),
-        kappa_options: spatial_options(config),
+        options: BlockwiseFitOptions::default(),
+        // No term has a length scale, so gam's kappa search has nothing to search.
+        kappa_options: SpatialLengthScaleOptimizationOptions::default(),
     };
-    let result = match fit_model(FitRequest::GaussianLocationScale(request))
-        .map_err(EstimationError::from)?
-    {
-        FitResult::GaussianLocationScale(result) => result,
-        _ => {
-            return Err(EstimationError::Gam(
-                "a Gaussian location-scale request returned a different fit".into(),
-            ));
-        }
-    };
+    match fit_model(FitRequest::GaussianLocationScale(request)).map_err(EstimationError::from)? {
+        FitResult::GaussianLocationScale(result) => Ok(result),
+        _ => Err(EstimationError::Gam(
+            "a Gaussian location-scale request returned a different fit".into(),
+        )),
+    }
+}
+
+fn assemble_gaussian_location_scale(
+    result: GaussianLocationScaleFitResult,
+    config: &ModelConfig,
+    dataset: &EncodedDataset,
+    num_predictors: usize,
+) -> Result<TrainedModel, EstimationError> {
     let wiggle = match (result.wiggle_knots, result.wiggle_degree, result.beta_link_wiggle) {
         (Some(knots), Some(degree), Some(beta_link_wiggle)) => LocationScaleWiggle {
             knots: knots.to_vec(),
@@ -441,8 +429,8 @@ fn train_gaussian_location_scale(
         .map(|scale| scale.beta.to_vec());
     let rhs = format!(
         "{} + {}",
-        duchon_smooth(SCORE_COLUMN, config.pgs_basis_config.num_centers),
-        context_formula(pc_bases)
+        score_smooth(&config.pgs_basis_config),
+        context_formula(&config.pcs)
     );
     let mut saved = assemble_location_scale_payload(
         LocationScaleInputs {
@@ -467,7 +455,7 @@ fn train_gaussian_location_scale(
         },
     )
     .map_err(EstimationError::Gam)?;
-    record_training_metadata(&mut saved, &dataset, num_predictors);
+    record_training_metadata(&mut saved, dataset, num_predictors);
     Ok(TrainedModel {
         format_version: MODEL_BUNDLE_VERSION,
         config: config.clone(),
@@ -475,7 +463,10 @@ fn train_gaussian_location_scale(
     })
 }
 
-/// gam's cubic triple-penalty link wiggle.
+/// gam's cubic triple-penalty link wiggle, its default for `linkwiggle()`. The
+/// direct location-scale request has no default and takes the configuration
+/// explicitly; the wiggle lets the Gaussian mean flex away from an additive form,
+/// as `linkwiggle()` does in the saved formula.
 fn cubic_link_wiggle() -> LinkWiggleConfig {
     let penalty = WigglePenaltyConfig::cubic_triple_operator_default();
     LinkWiggleConfig {
@@ -522,7 +513,7 @@ fn train_survival_model_on_pool(
         data.extra_static_covariates.view(),
     )
     .map_err(|error| EstimationError::Domain(error.to_string()))?;
-    if config.pc_configs.len() != data.pcs.ncols() {
+    if config.pcs.num_pcs != data.pcs.ncols() {
         return Err(EstimationError::Domain(
             "PC configuration count must match the training matrix".into(),
         ));
@@ -556,36 +547,40 @@ fn train_survival_model_on_pool(
             "survival exit ages must have a positive finite mean".into(),
         ));
     }
-    let pc_bases: Vec<_> = config.pc_configs.iter().map(|pc| pc.basis_config).collect();
-    let time_wiggle = survival_cfg
-        .time_wiggle
-        .as_ref()
-        .map_or_else(String::new, |settings| {
-            format!(
-                " + timewiggle(internal_knots={}, degree={}, penalty_order={}, double_penalty={})",
-                settings.basis.num_knots,
-                settings.basis.degree,
-                settings.penalty_order,
-                settings.double_penalty
-            )
-        });
+    let time_wiggle = survival_cfg.time_wiggle.as_ref().map_or_else(String::new, |settings| {
+        let options: Vec<String> = [
+            settings.num_knots.map(|knots| format!("internal_knots={knots}")),
+            settings.degree.map(|degree| format!("degree={degree}")),
+            settings.penalty_order.map(|order| format!("penalty_order={order}")),
+            settings.double_penalty.map(|double| format!("double_penalty={double}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        format!(" + timewiggle({})", options.join(", "))
+    });
     let formula = format!(
         "Surv({AGE_ENTRY_COLUMN}, {AGE_EXIT_COLUMN}, {EVENT_COLUMN}) ~ {}{time_wiggle}",
-        context_formula(&pc_bases)
+        context_formula(&config.pcs)
     );
-    let fit_config = FitConfig {
+    let mut fit_config = FitConfig {
         survival_likelihood: Some("marginal-slope".to_string()),
-        slope_formula: Some(slope_formula(&pc_bases)),
+        slope_formula: Some(slope_formula(&config.pcs)),
         z_column: Some(SCORE_COLUMN.to_string()),
         latent_measure: Some(config.latent_law.latent_measure().to_string()),
-        time_basis: "ispline".to_string(),
-        time_degree: survival_cfg.baseline_basis.degree,
-        time_num_internal_knots: survival_cfg.baseline_basis.num_knots,
         baseline_target: "weibull".to_string(),
         baseline_scale: Some(baseline_scale),
         baseline_shape: Some(1.0),
-        ..base_fit_config(config)
+        ..base_fit_config()
     };
+    // gam's I-spline time basis at its own degree and knot count unless the user
+    // names them.
+    if let Some(degree) = survival_cfg.baseline_degree {
+        fit_config.time_degree = degree;
+    }
+    if let Some(knots) = survival_cfg.baseline_knots {
+        fit_config.time_num_internal_knots = knots;
+    }
 
     // Outcomes, times and weights are separate formula roles, never predictors.
     let event_target = data.event_target.mapv(f64::from);
@@ -747,31 +742,70 @@ mod tests {
         assert!((one[0] - restored[41]).abs() < 1e-10);
     }
 
-    #[test]
-    fn gaussian_public_train_save_load_predict_preserves_schema_and_single_rows() {
-        init_engine_test_logging();
+    /// 48 rows with two PCs, so the joint PC smooth is fitted, saved and replayed.
+    fn gaussian_fixture() -> (TrainingData, ModelConfig) {
         let n = 48;
         let p = Array1::from_iter((0..n).map(|index| (index as f64 - 24.0) / 12.0));
         let sex = Array1::from_iter((0..n).map(|index| (index % 2) as f64));
+        let pcs = Array2::from_shape_fn((n, 2), |(index, pc)| {
+            ((index * (3 + 2 * pc)) as f64 * 0.37).sin()
+        });
         let y = Array1::from_iter((0..n).map(|index| {
-            2.0 + 0.7 * p[index] + 0.3 * sex[index] + 0.2 * (index as f64 * 1.7).sin()
+            2.0 + 0.7 * p[index] + 0.3 * sex[index] + 0.4 * pcs[[index, 0]] * pcs[[index, 1]]
+                + 0.2 * (index as f64 * 1.7).sin()
         }));
-        let data = TrainingData {
-            y,
-            p,
-            sex,
-            pcs: Array2::zeros((n, 0)),
-            weights: Array1::ones(n),
-        };
         let config = ModelConfig {
             model_family: ModelFamily::Gam(LinkFunction::Identity),
             pgs_basis_config: crate::calibrate::model::SmoothConfig { num_centers: 4 },
+            pcs: crate::calibrate::model::PcSmoothConfig::for_pcs(2),
             ..Default::default()
         };
+        (TrainingData { y, p, sex, pcs, weights: Array1::ones(n) }, config)
+    }
+
+    /// Through save, load and predict, the Gaussian location-scale model returns exactly the
+    /// σ its own fit fitted on the training rows: gam's block states are in the response's
+    /// units, σ = response_scale·floor + exp(η_log σ). The same check on the mean,
+    /// μ = η_μ + η_wiggle, waits for gam#3001: gam evaluates the link wiggle one way in the
+    /// fit's state and another in the predictor, which differ by up to 3 ulp.
+    #[test]
+    fn gaussian_predictions_replay_the_fits_own_fitted_scale() {
+        init_engine_test_logging();
+        let (data, config) = gaussian_fixture();
+        let columns = predictor_columns(data.p.view(), data.sex.view(), data.pcs.view());
+        let dataset = encoded_dataset(&columns);
+        let result = fit_gaussian_location_scale(&data, &config, &dataset).expect("fit");
+        let states = result.fit.fit.block_states.clone();
+        assert_eq!(states.len(), 3, "location, log scale and link wiggle blocks");
+        let floor = result.response_scale * gam::families::sigma_link::LOGB_SIGMA_FLOOR;
+        let fitted_sigma = states[1].eta.mapv(|eta| floor + eta.exp());
+        let model = assemble_gaussian_location_scale(result, &config, &dataset, columns.len())
+            .expect("assemble the model");
+        let directory = tempfile::tempdir().expect("model directory");
+        let path = directory.path().join("model.json");
+        model.save(path.to_str().expect("path")).expect("save model");
+        let loaded = TrainedModel::load(path.to_str().expect("path")).expect("load model");
+        let (p, sex, pcs) = (data.p.view(), data.sex.view(), data.pcs.view());
+        let sigma = loaded
+            .predict_standard_deviation(p, sex, pcs)
+            .expect("predict the scale")
+            .expect("a location-scale model has a scale");
+        let largest_gap = sigma
+            .iter()
+            .zip(fitted_sigma.iter())
+            .map(|(predicted, fitted)| (predicted - fitted).abs())
+            .fold(0.0f64, f64::max);
+        assert!(sigma == fitted_sigma, "predicted σ misses the fit's by up to {largest_gap}");
+    }
+
+    #[test]
+    fn gaussian_public_train_save_load_predict_preserves_schema_and_single_rows() {
+        init_engine_test_logging();
+        let (data, config) = gaussian_fixture();
         let model = train_model(&data, &config).expect("train Gaussian model");
         assert_eq!(
             model.saved.training_headers.as_ref().expect("headers"),
-            &["score", "sex"]
+            &["score", "sex", "PC1", "PC2"]
         );
         let predicted = model
             .predict(data.p.view(), data.sex.view(), data.pcs.view())
@@ -846,12 +880,13 @@ mod tests {
     fn survival_config(
         time_wiggle: Option<crate::calibrate::model::SurvivalTimeWiggleConfig>,
     ) -> ModelConfig {
-        use crate::calibrate::model::{BasisConfig, SurvivalModelConfig};
+        use crate::calibrate::model::SurvivalModelConfig;
         ModelConfig {
             model_family: ModelFamily::Survival,
             pgs_basis_config: SmoothConfig { num_centers: 4 },
             survival: Some(SurvivalModelConfig {
-                baseline_basis: BasisConfig { num_knots: 4, degree: 3 },
+                baseline_knots: Some(4),
+                baseline_degree: Some(3),
                 time_wiggle,
             }),
             ..Default::default()
@@ -860,11 +895,12 @@ mod tests {
 
     #[test]
     fn survival_time_wiggle_with_the_empirical_law_is_refused_before_fitting() {
-        use crate::calibrate::model::{BasisConfig, SurvivalTimeWiggleConfig};
+        use crate::calibrate::model::SurvivalTimeWiggleConfig;
         let wiggle = SurvivalTimeWiggleConfig {
-            basis: BasisConfig { num_knots: 4, degree: 3 },
-            penalty_order: 2,
-            double_penalty: true,
+            num_knots: Some(4),
+            degree: Some(3),
+            penalty_order: Some(2),
+            double_penalty: Some(true),
         };
         let error = train_survival_model(&survival_bundle(16), &survival_config(Some(wiggle)))
             .err()

@@ -47,11 +47,14 @@ Train a generalized additive model used for calibration and save its complete in
 
 Required arguments:
 - `training_data`: path to a TSV file with phenotype, score, and PC columns.
-- `--num-pcs <N>`: number of principal components to include.
+- `--num-pcs <N>`: number of leading principal components to include (6 in the
+  examples, which fit much faster than 16; any count works).
 
 Optional arguments:
-- `--pgs-centers`: farthest-point centers for the PGS Duchon smooth (at least 4).
-- `--pc-centers`: farthest-point centers for each PC Duchon smooth (at least 4).
+- `--pgs-centers`: centers of the Gaussian model's score smooth (at least 4).
+- The PCs enter as one joint Duchon smooth in the context and one in the slope,
+  with center counts derived from `--num-pcs` (9 and 8 at 6 PCs, 24 and 20 at
+  16); there is no per-PC setting.
 - `--latent-law empirical|standard-normal`: the law of the score that a
   marginal-slope model anchors on. `empirical` (the default) declares the
   weighted empirical law of the training scores; `standard-normal` declares a
@@ -61,16 +64,10 @@ Optional arguments:
   declared empirical law only on a rigid time baseline, so the combination is
   refused before fitting.
 
-Removed: `--max-iterations` and `--convergence-tolerance`. Training now leaves
-the inner solver to gam, which stops on its own convergence certificates;
-passing either flag is an error that names
-`--reml-max-iterations` / `--reml-convergence-tolerance` as the outer-loop bounds.
-- `--reml-max-iterations` / `--reml-convergence-tolerance`: optional overrides of the
-  outer smoothing-parameter and length-scale search. Absent, gnomon passes nothing and
-  gam's own defaults apply: 80 iterations at relative tolerance 1e-4 for the spatial
-  length-scale search, 60 at 1e-5 for the Gaussian location-scale fit, and 200 on the
-  marginal-slope formula route. An override can only loosen or tighten what gam
-  certifies; the defaults are the accurate choice.
+Removed: `--max-iterations`, `--convergence-tolerance`, `--reml-max-iterations` and
+`--reml-convergence-tolerance`. gam derives every stop of the inner and outer
+solvers from its own convergence certificates, and calibrate sets no iteration
+cap or tolerance; passing any of these flags is an error.
 
 ### `infer`
 Apply a previously trained calibration model to new samples and saves predictions

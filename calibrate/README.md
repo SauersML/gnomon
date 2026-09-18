@@ -26,20 +26,28 @@ The crate dispatches three model families from `estimate.rs`. They share one
 context skeleton over sex and the principal components:
 
 ```
-c(x) = β₀ + γ_sex·sex + Σ_j f_j(PC_j)
+c(x) = β₀ + γ_sex·sex + f(PC₁, …, PC_k)
 ```
 
-Each `f_j` is a 1-D Duchon smooth
-(`s(PC_j, type=duchon, centers=k, power=1, length_scale=1)`: the hybrid
-Duchon-Matérn kernel at a fixed unit length scale) and `γ_sex` is a penalized
-linear term. Tensor PC interactions are intentionally not built. The formula
+`f` is one joint Duchon smooth over the leading `k` principal components
+(`s(PC1, …, PCk, type=duchon, centers=m)`), never a smooth per component, and
+`γ_sex` is a penalized linear term. The kernel is gam's scale-free structural
+default: no length scale, an affine null space (`k + 1` columns) and spectral
+power `s = (k − 1)/2`, the kernel `r³` in every dimension, which satisfies
+Duchon's existence condition `2(p + s) > k` (`p = 2`) at every `k`. The formula
 text, and the equivalent term specifications of the Gaussian model, are
 assembled in [`construction.rs`](construction.rs).
 
-`SmoothConfig.num_centers` (CLI `--pgs-centers` / `--pc-centers`) sets the
-center counts, with at least four centers. `--pgs-centers` sizes the score
-smooth of the Gaussian model; the marginal-slope models do not smooth the score
-as a covariate, because the score is their latent coordinate.
+`PcSmoothConfig::for_pcs(k)` derives the joint smooth's center counts from
+`k`: `⌈3k/2⌉` in the context and `⌈5k/4⌉` in the slope (9 and 8 at `k = 6`,
+24 and 20 at `k = 16`), never fewer than `k + 2`, since gam needs more centers
+than the null space has columns. The smooth works for any `k`; the examples use
+6 PCs, which fit much faster than 16. A configuration with too few centers, or with an explicit
+power at which the kernel does not exist, is refused before any fit.
+`--pgs-centers` (at least four) sizes the score smooth of the Gaussian model;
+the marginal-slope models do not smooth the score as a covariate, because the
+score is their latent coordinate. A saved bundle from before the joint smooth
+(format version 2, one smooth per PC) is refused by name at load; retrain it.
 
 ### Binary path — Bernoulli marginal-slope
 
@@ -52,7 +60,7 @@ P(Y=1 | x, z) = Φ(η(x, z)),   η(x, z) = α(x) + b(x)·z + b(x)·δ_h(z) + δ_
 ```
 
 where `q(x)` is the marginal index over the context formula, `b(x)` the slope
-over `1 + Σ_j f_j(PC_j)`, `δ_h` the score-warp and `δ_w` the link-deviation
+over `1 + f(PC₁, …, PC_k)` (its own joint smooth), `δ_h` the score-warp and `δ_w` the link-deviation
 cubic blocks (`linkwiggle()` on the slope and marginal formulas), and `α(x)` is
 defined by the anchoring equation on the declared law `{(u_k, w_k)}` of the
 score:
@@ -87,7 +95,8 @@ y | x  ~  N( μ(x), σ(x)² )
 log σ(x)  = f_score^σ(score) + c^σ(x)
 ```
 
-`f_score` is a Duchon smooth of the score and `c` the context skeleton above;
+`f_score` is a Duchon smooth of the score (gam's default kernel, `--pgs-centers`
+centers) and `c` the context skeleton above;
 both channels share the same terms, and gam's cubic triple-penalty link wiggle
 lets the mean flex away from a strict additive form. gam's formula route
 refuses `linkwiggle()` for a non-binomial family, so the fit is a direct
@@ -97,12 +106,15 @@ records that scale and the link wiggle, so prediction reproduces both.
 
 ### Survival path — Survival marginal-slope
 
-The outcome is `Surv(age_entry, age_exit, event_target) ~ sex + Σ_j f_j(PC_j)`,
-the slope formula is `1 + Σ_j f_j(PC_j)`, and the score is the latent coordinate,
+The outcome is `Surv(age_entry, age_exit, event_target) ~ sex + f(PC₁, …, PC_k)`,
+the slope formula is `1 + f(PC₁, …, PC_k)`, and the score is the latent coordinate,
 declared exactly as on the binary path. The base link is probit.
 
-`SurvivalModelConfig.baseline_basis` (CLI `--survival-baseline-knots` /
-`--survival-baseline-degree`) controls the I-spline time basis. The baseline
+gam's I-spline time basis carries the baseline at gam's default degree and knot
+count unless `SurvivalModelConfig.baseline_knots` / `baseline_degree` (CLI
+`--survival-baseline-knots` / `--survival-baseline-degree`) name them; the
+`--survival-time-wiggle-*` options likewise fall back to gam's `timewiggle()`
+defaults. The baseline
 starts from unit-shape Weibull offsets at the mean exit age. gam chooses the time
 anchor: marginal-slope centres the time basis at the median exit age, because an
 earliest-entry anchor on delayed-entry ages inflates the unpenalized time column
@@ -135,11 +147,11 @@ for non-Gaussian (binary, survival). Both objectives include stabilization
 priors and null-space accounting. This is **empirical Bayes**: hyperparameters
 are estimated from the data via marginal likelihood, then coefficients are
 inferred conditional on those point estimates. gnomon passes no outer bounds of
-its own: the outer loop runs under gam's defaults (80 iterations at relative
-tolerance 1e-4 for the spatial length-scale search, 60 at 1e-5 for the Gaussian
-location-scale fit, 200 on the marginal-slope formula route), and the inner solver
-runs to gam's own certificates. `--reml-max-iterations` and
-`--reml-convergence-tolerance` are optional overrides of those outer defaults.
+its own: the outer loop runs under gam's defaults (60 iterations at 1e-5 for the
+Gaussian location-scale fit, gam's own certificates on the marginal-slope formula
+route), and the inner solver runs to gam's own certificates. No smooth carries a
+length scale, so no spatial length-scale search runs, and calibrate sets no
+iteration cap or tolerance anywhere.
 
 ## Optimization strategy
 
