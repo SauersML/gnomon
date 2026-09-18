@@ -26,6 +26,8 @@ const COUNTED: u8 = 2;
 const WIDE: i64 = i64::MIN;
 /// Entries a parallel pass over a plan takes per task.
 const PLAN_CHUNK: usize = 1 << 14;
+/// Marks an entry the places pass did not scale; a scaled one's places are below `u8::MAX`.
+const UNREAD: u8 = u8::MAX;
 /// Fraction digits the long-division rounding writes before its sticky digit. A double's
 /// midpoints have at most 767 significant decimal digits, so the parse decides correctly.
 const ROUNDING_DIGITS: usize = 800;
@@ -245,16 +247,28 @@ impl ExactPlan {
             }
             a
         };
-        let mut places = (0..entries)
-            .into_par_iter()
+        // An entry read at the places its score held then keeps that integer and those places, and
+        // the weight pass below takes the integer as it is where they are the score's final places:
+        // scaling a weight to its score's places a second time was a fifth of a wide panel's run.
+        let mut int_weights = vec![0i64; entries];
+        let mut read_places = vec![UNREAD; entries];
+        let mut places = int_weights
+            .par_chunks_mut(PLAN_CHUNK)
+            .zip(read_places.par_chunks_mut(PLAN_CHUNK))
+            .enumerate()
             .fold(
                 || (vec![0i32; num_scores], 0usize),
-                |(mut places, mut hint), i| {
-                    let column = columns[i] as usize;
-                    // A weight the score's places already hold leaves them as they are.
-                    if scaled_at_places(weights[i], places[column]).is_none() {
-                        places[column] =
-                            places[column].max(-shortest_decimal_hinted(weights[i], &mut hint).1);
+                |(mut places, mut hint), (chunk, (slots, reads))| {
+                    for ((i, slot), read) in (chunk * PLAN_CHUNK..).zip(slots.iter_mut()).zip(reads.iter_mut()) {
+                        let column = columns[i] as usize;
+                        // A weight the score's places already hold leaves them as they are.
+                        match scaled_at_places(weights[i], places[column]) {
+                            Some(scaled) => (*slot, *read) = (scaled, places[column] as u8),
+                            None => {
+                                places[column] =
+                                    places[column].max(-shortest_decimal_hinted(weights[i], &mut hint).1);
+                            }
+                        }
                     }
                     (places, hint)
                 },
@@ -307,15 +321,21 @@ impl ExactPlan {
                 bound[column] = bound[column].zip(magnitude).and_then(|(b, m)| b.checked_add(m));
                 largest[column] = largest[column].max(magnitude.unwrap_or(0));
             };
-        let mut int_weights = vec![0i64; entries];
         let (mut bound, mut largest, wide_entries) = int_weights
             .par_chunks_mut(PLAN_CHUNK)
+            .zip(read_places.par_chunks(PLAN_CHUNK))
             .enumerate()
             .fold(
                 || (vec![Some(0u128); num_scores], vec![0u128; num_scores], Vec::new(), 0usize),
-                |(mut bound, mut largest, mut wide, mut hint), (chunk, slots)| {
-                    for (i, slot) in (chunk * PLAN_CHUNK..).zip(slots.iter_mut()) {
+                |(mut bound, mut largest, mut wide, mut hint), (chunk, (slots, reads))| {
+                    for ((i, slot), &read) in (chunk * PLAN_CHUNK..).zip(slots.iter_mut()).zip(reads) {
                         let column = columns[i] as usize;
+                        // Read at the final places with a multiple of one, the integer is the weight at
+                        // its score's scale: scaled_at_places there gives the same integer, below 2^50.
+                        if read != UNREAD && i32::from(read) == places[column] && multiples[column] == 1 {
+                            add_term(&mut bound, &mut largest, column, Some(i128::from(*slot)));
+                            continue;
+                        }
                         let exact = match scaled_at_places(weights[i], places[column]) {
                             // A multiple of one leaves the integer as it is, without the i128
                             // multiplication's libcall.

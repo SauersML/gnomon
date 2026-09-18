@@ -173,12 +173,44 @@ fn group_rows<'a>(
 ) -> [&'a [u8]; VARIANTS_PER_TABLE] {
     std::array::from_fn(|v| {
         let r = group * VARIANTS_PER_TABLE + v;
-        if r < rows { &data[r * row_bytes..(r + 1) * row_bytes] } else { zero_row }
+        if r < rows { &data[r * row_bytes..(r + 1) * row_bytes] } else { &zero_row[..row_bytes] }
     })
 }
 
+/// `buffer` at least `len` long, grown with zeros and never shrunk.
+#[inline(always)]
+fn grow<T: Copy + Default>(buffer: &mut Vec<T>, len: usize) {
+    if buffer.len() < len {
+        buffer.resize(len, T::default());
+    }
+}
+
+/// Writes the keys of the group whose rows are `source` into `keys` in person order, person `p`'s
+/// at `keys[p]`. For a complete cohort `keys` takes a row's four keys a byte, past the last person.
+#[inline(always)]
+fn group_keys(source: [&[u8]; VARIANTS_PER_TABLE], people: People, keys: &mut [u8]) {
+    match people {
+        People::All(_) => {
+            let row_bytes = source[0].len();
+            let whole = row_bytes / 8 * 8;
+            let keys = &mut keys[..row_bytes * 4];
+            transpose_keys(source.map(|r| &r[..whole]), &mut keys[..whole * 4]);
+            for byte in whole..row_bytes {
+                keys[byte * 4..byte * 4 + 4].copy_from_slice(&transpose_calls(source.map(|r| r[byte])));
+            }
+        }
+        People::Gathered { bytes, shifts } => {
+            for (p, (&byte, &shift)) in bytes.iter().zip(shifts).enumerate() {
+                let byte = byte as usize;
+                let code = |v: usize| ((source[v][byte] >> shift) & 3) << (2 * v);
+                keys[p] = code(0) | code(1) | code(2) | code(3);
+            }
+        }
+    }
+}
+
 /// Writes every person's key of the group whose rows are `source` at `slot` of their
-/// `width`-byte key row. `column_keys` holds a row's four keys a byte.
+/// `width`-byte key row, through `column_keys`, the group's keys in person order.
 #[inline(always)]
 fn write_keys(
     source: [&[u8]; VARIANTS_PER_TABLE],
@@ -188,26 +220,10 @@ fn write_keys(
     slot: usize,
     width: usize,
 ) {
-    match people {
-        People::All(count) => {
-            let row_bytes = source[0].len();
-            let whole = row_bytes / 8 * 8;
-            let keys = &mut column_keys[..row_bytes * 4];
-            transpose_keys(source.map(|r| &r[..whole]), &mut keys[..whole * 4]);
-            for byte in whole..row_bytes {
-                keys[byte * 4..byte * 4 + 4].copy_from_slice(&transpose_calls(source.map(|r| r[byte])));
-            }
-            for (p, &key) in keys[..count].iter().enumerate() {
-                person_keys[p * width + slot] = key;
-            }
-        }
-        People::Gathered { bytes, shifts } => {
-            for (p, (&byte, &shift)) in bytes.iter().zip(shifts).enumerate() {
-                let byte = byte as usize;
-                let code = |v: usize| ((source[v][byte] >> shift) & 3) << (2 * v);
-                person_keys[p * width + slot] = code(0) | code(1) | code(2) | code(3);
-            }
-        }
+    let count = people.len();
+    group_keys(source, people, column_keys);
+    for (p, &key) in column_keys[..count].iter().enumerate() {
+        person_keys[p * width + slot] = key;
     }
 }
 
@@ -231,14 +247,20 @@ pub(crate) fn apply_table_rows(
     if count == 0 || rows == 0 {
         return;
     }
-    scratch.zero_row.resize(row_bytes, 0);
-    if let People::All(_) = people {
-        scratch.column_keys.resize(row_bytes * 4, 0);
-    }
+    // Scratch only grows: every slot a kernel reads is written first, and a buffer shrunk by one
+    // call and grown by the next would be zeroed again every call.
+    grow(&mut scratch.zero_row, row_bytes);
+    // A group's keys in person order: the transpose writes a whole row's four keys a byte.
+    let key_width = match people {
+        People::All(_) => row_bytes * 4,
+        People::Gathered { .. } => count,
+    };
+    grow(&mut scratch.column_keys, key_width);
     // A stride of one or two SIMD widths keeps each person's accumulator in registers, and reads
-    // every group through its table. Past that, a group whose table costs more than its rows is
-    // added from its rows, and every such group of the call in as few passes over the cells as the
-    // key budget allows: on rare rows a pass over every person's cell is most of the cost.
+    // every group through its table, from each group's keys in person order. Past that, a group
+    // whose table costs more than its rows is added from its rows, and every such group of the call
+    // in as few passes over the cells as the key budget allows: on rare rows a pass over every
+    // person's cell is most of the cost.
     let striped = matches!(stride, 4 | 8);
     scratch.tabled.clear();
     scratch.untabled.clear();
@@ -252,8 +274,12 @@ pub(crate) fn apply_table_rows(
     }
 
     if !scratch.tabled.is_empty() {
-        scratch.tables.resize(GROUPS_PER_BATCH * 256 * stride, 0);
-        scratch.person_keys.resize(count * GROUPS_PER_BATCH, 0);
+        grow(&mut scratch.tables, GROUPS_PER_BATCH * 256 * stride);
+        if striped {
+            grow(&mut scratch.column_keys, GROUPS_PER_BATCH * key_width);
+        } else {
+            grow(&mut scratch.person_keys, count * GROUPS_PER_BATCH);
+        }
     }
     for batch in scratch.tabled.chunks(GROUPS_PER_BATCH) {
         for (g, &group) in batch.iter().enumerate() {
@@ -264,12 +290,18 @@ pub(crate) fn apply_table_rows(
                 &mut scratch.tables[g * 256 * stride..(g + 1) * 256 * stride],
             );
             let source = group_rows(data, row_bytes, rows, &scratch.zero_row, group);
-            write_keys(source, people, &mut scratch.column_keys, &mut scratch.person_keys, g, GROUPS_PER_BATCH);
+            if striped {
+                // A striped person reads each group's key where the transpose left it: gathering
+                // them into a row a person first took a scattered byte store per person and group.
+                group_keys(source, people, &mut scratch.column_keys[g * key_width..(g + 1) * key_width]);
+            } else {
+                write_keys(source, people, &mut scratch.column_keys, &mut scratch.person_keys, g, GROUPS_PER_BATCH);
+            }
         }
         let tables = &scratch.tables[..batch.len() * 256 * stride];
         match stride {
-            4 => apply_stripe_4(tables, &scratch.person_keys, batch.len(), cells),
-            8 => apply_stripe_8(tables, &scratch.person_keys, batch.len(), cells),
+            4 => apply_stripe_4(tables, &scratch.column_keys, key_width, batch.len(), cells),
+            8 => apply_stripe_8(tables, &scratch.column_keys, key_width, batch.len(), cells),
             _ => apply_tables(tables, &scratch.person_keys, batch.len(), stride, cells),
         }
     }
@@ -281,7 +313,7 @@ pub(crate) fn apply_table_rows(
         .into_iter()
         .find(|&width| count * width <= UNTABLED_KEY_BYTES)
         .unwrap_or(GROUPS_PER_BATCH);
-    scratch.person_keys.resize(count * width, 0);
+    grow(&mut scratch.person_keys, count * width);
     for pass in scratch.untabled.chunks(width) {
         for (slot, &group) in pass.iter().enumerate() {
             let source = group_rows(data, row_bytes, rows, &scratch.zero_row, group);
@@ -350,16 +382,16 @@ fn apply_rows(terms: &[i64], keys: &[u8], width: usize, groups: &[usize], stride
 
 macro_rules! apply_stripe {
     ($name:ident, $lanes:literal) => {
-        /// Each person's lanes accumulated in registers over the batch's groups.
+        /// Each person's lanes accumulated in registers over the batch's groups. `keys` holds
+        /// each group's keys in person order, `key_width` apart.
         #[inline(always)]
-        fn $name(tables: &[i64], keys: &[u8], in_batch: usize, cells: &mut [i64]) {
+        fn $name(tables: &[i64], keys: &[u8], key_width: usize, in_batch: usize, cells: &mut [i64]) {
+            let people = cells.len() / $lanes;
+            assert!(people <= key_width && keys.len() >= in_batch * key_width);
             for (p, cell) in cells.chunks_exact_mut($lanes).enumerate() {
                 let mut acc = Simd::<i64, $lanes>::from_slice(cell);
-                for (g, &key) in keys[p * GROUPS_PER_BATCH..p * GROUPS_PER_BATCH + in_batch]
-                    .iter()
-                    .enumerate()
-                {
-                    let at = (g * 256 + key as usize) * $lanes;
+                for g in 0..in_batch {
+                    let at = (g * 256 + usize::from(keys[g * key_width + p])) * $lanes;
                     acc += Simd::<i64, $lanes>::from_slice(&tables[at..at + $lanes]);
                 }
                 acc.copy_to_slice(cell);
@@ -490,6 +522,7 @@ mod tests {
     #[test]
     fn tables_match_per_call_sums_for_every_stride_and_person_layout() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut shared = TableScratch::default();
         // (people, rows, stride, calls kept in one of how many in every other group of four rows):
         // dense groups of 600 or more people take tables, groups of 130 people and sparse groups
         // add rows directly, and alternating groups mix both within a batch.
@@ -538,6 +571,11 @@ mod tests {
                 let mut cells = vec![0i64; people * stride];
                 let mut scratch = TableScratch::default();
                 apply_table_rows(&data, row_bytes, rows, &terms, stride, layout, &mut scratch, &mut cells);
+                // Scratch only grows, so one kept across every case holds stale keys and tables
+                // from larger calls; the cells must not see them.
+                let mut reused = vec![0i64; people * stride];
+                apply_table_rows(&data, row_bytes, rows, &terms, stride, layout, &mut shared, &mut reused);
+                assert_eq!(reused, cells, "people {people} rows {rows} stride {stride} gathered {gathered}, reused scratch");
                 let mut want = vec![0i64; people * stride];
                 for p in 0..people {
                     let slot = if gathered { kept[p] } else { p };
@@ -557,6 +595,7 @@ mod tests {
     #[test]
     fn sparse_rows_skip_only_groups_that_add_nothing() {
         let mut rng = Rng(0x2354_0000_5a17_0001);
+        let mut shared = TableScratch::default();
         // (people, rows, stride, every how many rows code 00 adds terms; 0 for never)
         for (people, rows, stride, flipped_every) in
             [(45usize, 70usize, 16usize, 7usize), (33, 131, 32, 0), (100, 64, 12, 3), (7, 9, 16, 1), (70, 5, 24, 0)]
@@ -593,6 +632,11 @@ mod tests {
                 let mut cells = vec![0i64; people * stride];
                 let mut scratch = TableScratch::default();
                 apply_table_rows(&data, row_bytes, rows, &terms, stride, layout, &mut scratch, &mut cells);
+                // Scratch only grows, so one kept across every case holds stale keys and tables
+                // from larger calls; the cells must not see them.
+                let mut reused = vec![0i64; people * stride];
+                apply_table_rows(&data, row_bytes, rows, &terms, stride, layout, &mut shared, &mut reused);
+                assert_eq!(reused, cells, "people {people} rows {rows} stride {stride} gathered {gathered}, reused scratch");
                 let mut want = vec![0i64; people * stride];
                 for p in 0..people {
                     let slot = if gathered { kept[p] } else { p };
