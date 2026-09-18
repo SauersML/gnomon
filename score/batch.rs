@@ -11,7 +11,6 @@
 // not homozygous reference. It performs ZERO scientific logic or reconciliation, and
 // neither path can change a cell's value, only how fast it is reached.
 
-use crate::score::cells::{ExactPlan, Target};
 use crate::score::kernel_exact::{
     People, TableScratch, apply_table_rows, for_each_call, for_each_missing,
 };
@@ -150,36 +149,51 @@ pub fn run_dense_batch(
     Ok(())
 }
 
-/// One variant's entries as (score, where its terms go, terms of codes 00..11, whether a missing
-/// call counts).
+/// One variant's entries summed per call: for each code 00..11, what the call adds to every lane
+/// of a person's cell, and what a missing call adds to each score's missing count. The sums are
+/// a table of one variant, so they stay inside the plan's bounds as the dense tables do.
 #[derive(Default)]
 pub struct VariantTerms {
-    terms: Vec<(usize, Target, [i128; 4], bool)>,
+    table: Vec<i64>,
+    missing: Vec<u32>,
+    stride: usize,
 }
 
 impl VariantTerms {
     /// Loads the terms of `index`'s entries.
     pub fn load(&mut self, prep: &PreparationResult, index: ReconciledVariantIndex) {
         let exact = prep.exact();
-        self.terms.clear();
-        self.terms
-            .extend(prep.variant_csr_view(index).iter().map(|contribution| {
-                (
-                    contribution.score_column.0,
-                    exact.entry_target(contribution.entry, contribution.score_column.0),
-                    exact.entry_terms(contribution.entry),
-                    exact.counts_missing(contribution.entry),
-                )
-            }));
+        let stride = exact.stride();
+        self.stride = stride;
+        self.table.clear();
+        self.table.resize(4 * stride, 0);
+        self.missing.clear();
+        self.missing.resize(prep.score_names.len(), 0);
+        for contribution in prep.variant_csr_view(index).iter() {
+            let score = contribution.score_column.0;
+            let target = exact.entry_target(contribution.entry, score);
+            let terms = exact.entry_terms(contribution.entry);
+            // Code 00 adds nothing, so its row stays zero.
+            for (code, lanes) in self.table.chunks_exact_mut(stride).enumerate().skip(1) {
+                exact.add(target, terms[code], lanes);
+            }
+            if exact.counts_missing(contribution.entry) {
+                self.missing[score] += 1;
+            }
+        }
     }
 
     /// Adds one person's call to their cell and missing counts.
     #[inline(always)]
-    pub fn apply(&self, exact: &ExactPlan, code: u8, cell: &mut [i64], counts: &mut [u32]) {
-        for &(score, target, terms, counted) in &self.terms {
-            exact.add(target, terms[usize::from(code & 3)], cell);
-            if code & 3 == 1 && counted {
-                counts[score] += 1;
+    pub fn apply(&self, code: u8, cell: &mut [i64], counts: &mut [u32]) {
+        let code = usize::from(code & 3);
+        let terms = &self.table[code * self.stride..(code + 1) * self.stride];
+        for (lane, &term) in cell.iter_mut().zip(terms) {
+            *lane = lane.wrapping_add(term);
+        }
+        if code == 1 {
+            for (count, &add) in counts.iter_mut().zip(&self.missing) {
+                *count += add;
             }
         }
     }
@@ -203,7 +217,6 @@ pub fn run_variant_major_path(
     scratch.load(prep, reconciled_variant_index);
     for_each_call(variant_data, layout.people(), |person, code| {
         scratch.apply(
-            exact,
             code,
             &mut cells[person * stride..(person + 1) * stride],
             &mut counts[person * num_scores..(person + 1) * num_scores],
@@ -255,6 +268,7 @@ pub fn assess_variant_density_for_dispatch(variant_data: &[u8], total_people: us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::score::cells::ExactPlan;
     use crate::score::types::{BimRowIndex, OutputPersonIndex, PipelineKind};
     use std::path::PathBuf;
 

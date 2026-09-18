@@ -5,7 +5,7 @@
 // walks, batch sizes, thread counts and the order of rows cannot change a single bit.
 
 use crate::score::cells::LANE_WIDTH;
-use std::simd::{Simd, num::SimdUint};
+use std::simd::{Simd, cmp::SimdPartialEq, num::SimdUint};
 
 /// Four variants per table: a person's four two-bit calls form the table key.
 const VARIANTS_PER_TABLE: usize = 4;
@@ -119,6 +119,36 @@ fn transpose_calls(bytes: [u8; 4]) -> [u8; 4] {
     word.to_le_bytes()
 }
 
+/// Whether a group costs less through its table than through its rows' terms added person by
+/// person. Either way a carrier (a person with some call not 00) adds one term row; the table pays
+/// its 256 entries up front, and direct adds pay one more row for each further call of a carrier.
+/// A group whose code-00 terms are not zero adds to people without calls, so only a table holds it.
+fn prefers_table(terms: &[i64], group: usize, stride: usize, rows: [&[u8]; VARIANTS_PER_TABLE]) -> bool {
+    let code_zero_adds = (0..VARIANTS_PER_TABLE).any(|v| {
+        let at = (group * VARIANTS_PER_TABLE + v) * 4 * stride;
+        terms[at..at + stride].iter().any(|&lane| lane != 0)
+    });
+    if code_zero_adds {
+        return true;
+    }
+    let (mut calls, mut carriers) = (0u64, 0u64);
+    let mut count = |masks: [u64; VARIANTS_PER_TABLE]| {
+        calls += masks.iter().map(|mask| u64::from(mask.count_ones())).sum::<u64>();
+        carriers += u64::from((masks[0] | masks[1] | masks[2] | masks[3]).count_ones());
+    };
+    let whole = rows[0].len() / 8 * 8;
+    for start in (0..whole).step_by(8) {
+        count(rows.map(|row| {
+            let x = u64::from_le_bytes(std::array::from_fn(|i| row[start + i]));
+            (x | (x >> 1)) & M55
+        }));
+    }
+    for byte in whole..rows[0].len() {
+        count(rows.map(|row| u64::from((row[byte] | (row[byte] >> 1)) & 0x55)));
+    }
+    calls - carriers >= 256
+}
+
 /// Reusable per-thread scratch for [`apply_table_rows`].
 #[derive(Default)]
 pub(crate) struct TableScratch {
@@ -156,16 +186,14 @@ pub(crate) fn apply_table_rows(
         scratch.column_keys.resize(GROUPS_PER_BATCH * key_width, 0);
     }
     let whole = row_bytes / 8 * 8;
+    // A stride of one or two SIMD widths keeps each person's accumulator in registers, and reads
+    // every group through its table.
+    let striped = matches!(stride, 4 | 8);
     for batch in (0..groups).step_by(GROUPS_PER_BATCH) {
         let in_batch = (groups - batch).min(GROUPS_PER_BATCH);
+        let mut tabled = 0u32;
         for g in 0..in_batch {
             let group = batch + g;
-            build_table(
-                terms,
-                group,
-                stride,
-                &mut scratch.tables[g * 256 * stride..(g + 1) * 256 * stride],
-            );
             let source: [&[u8]; VARIANTS_PER_TABLE] = std::array::from_fn(|v| {
                 let r = group * VARIANTS_PER_TABLE + v;
                 if r < rows {
@@ -174,6 +202,15 @@ pub(crate) fn apply_table_rows(
                     &scratch.zero_row[..]
                 }
             });
+            if striped || prefers_table(terms, group, stride, source) {
+                build_table(
+                    terms,
+                    group,
+                    stride,
+                    &mut scratch.tables[g * 256 * stride..(g + 1) * 256 * stride],
+                );
+                tabled |= 1 << g;
+            }
             match people {
                 People::All(count) => {
                     let keys = &mut scratch.column_keys[g * key_width..(g + 1) * key_width];
@@ -198,18 +235,46 @@ pub(crate) fn apply_table_rows(
         }
         let tables = &scratch.tables[..in_batch * 256 * stride];
         let keys = &scratch.person_keys;
-        // A stride of one or two SIMD widths keeps each person's accumulator in registers.
         match stride {
             4 => apply_stripe_4(tables, keys, in_batch, cells),
             8 => apply_stripe_8(tables, keys, in_batch, cells),
             _ => {
-                for (p, cell) in cells.chunks_exact_mut(stride).enumerate() {
-                    for (g, &key) in keys[p * GROUPS_PER_BATCH..p * GROUPS_PER_BATCH + in_batch]
-                        .iter()
-                        .enumerate()
+                // A person adds only the groups whose entry adds something: a key other than 0,
+                // or a tabled group whose key-0 entry is not zero. On rare rows most keys are 0.
+                // An untabled group's code-00 terms are zero, so its key-0 entry adds nothing.
+                let mut zero_first = 0u32;
+                for g in 0..in_batch {
+                    if tabled & (1 << g) == 0
+                        || tables[g * 256 * stride..(g * 256 + 1) * stride].iter().all(|&lane| lane == 0)
                     {
-                        let at = (g * 256 + key as usize) * stride;
-                        add_assign(cell, &tables[at..at + stride]);
+                        zero_first |= 1 << g;
+                    }
+                }
+                let in_batch_groups = (1u32 << in_batch) - 1;
+                for (p, cell) in cells.chunks_exact_mut(stride).enumerate() {
+                    let row = &keys[p * GROUPS_PER_BATCH..(p + 1) * GROUPS_PER_BATCH];
+                    let nonzero = Simd::<u8, GROUPS_PER_BATCH>::from_slice(row)
+                        .simd_ne(Simd::splat(0))
+                        .to_bitmask() as u32;
+                    let mut active = (nonzero | !zero_first) & in_batch_groups;
+                    while active != 0 {
+                        let g = active.trailing_zeros() as usize;
+                        active &= active - 1;
+                        let key = usize::from(row[g]);
+                        if tabled & (1 << g) != 0 {
+                            let at = (g * 256 + key) * stride;
+                            add_assign(cell, &tables[at..at + stride]);
+                        } else {
+                            // The table's entry, summed from the rows of the calls that are not 00.
+                            let first_row = (batch + g) * VARIANTS_PER_TABLE;
+                            for v in 0..VARIANTS_PER_TABLE {
+                                let code = (key >> (2 * v)) & 3;
+                                if code != 0 {
+                                    let at = ((first_row + v) * 4 + code) * stride;
+                                    add_assign(cell, &terms[at..at + stride]);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -349,9 +414,30 @@ mod tests {
     #[test]
     fn tables_match_per_call_sums_for_every_stride_and_person_layout() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-        for (people, rows, stride) in [(1usize, 1usize, 4usize), (37, 5, 4), (64, 67, 8), (130, 13, 12), (33, 256, 8)] {
+        // (people, rows, stride, calls kept in one of how many in every other group of four rows):
+        // dense groups of 600 or more people take tables, groups of 130 people and sparse groups
+        // add rows directly, and alternating groups mix both within a batch.
+        for (people, rows, stride, sparse) in [
+            (1usize, 1usize, 4usize, 1u64),
+            (37, 5, 4, 1),
+            (64, 67, 8, 1),
+            (130, 13, 12, 1),
+            (33, 256, 8, 1),
+            (600, 9, 16, 1),
+            (600, 70, 12, 30),
+            (501, 131, 20, 3),
+            (1000, 67, 16, 40),
+        ] {
             let row_bytes = (people + 5).div_ceil(4);
-            let data: Vec<u8> = (0..rows * row_bytes).map(|_| rng.next() as u8).collect();
+            let data: Vec<u8> = (0..rows * row_bytes)
+                .map(|at| {
+                    let every = if (at / row_bytes / 4) % 2 == 1 { sparse } else { 1 };
+                    (0..4).fold(0u8, |byte, slot| {
+                        let call = if rng.next() % every == 0 { rng.next() as u8 & 3 } else { 0 };
+                        byte | call << (2 * slot)
+                    })
+                })
+                .collect();
             let groups = rows.div_ceil(4);
             let mut terms = vec![0i64; groups * 4 * 4 * stride];
             for r in 0..rows {
@@ -363,6 +449,61 @@ mod tests {
             }
             // Gathered people: every other slot of the row, reversed.
             let kept: Vec<usize> = (0..people).map(|p| (people - 1 - p) * 2 % (row_bytes * 4)).collect();
+            let bytes: Vec<u32> = kept.iter().map(|&f| (f / 4) as u32).collect();
+            let shifts: Vec<u8> = kept.iter().map(|&f| (2 * (f % 4)) as u8).collect();
+            for gathered in [false, true] {
+                let layout = if gathered {
+                    People::Gathered { bytes: &bytes, shifts: &shifts }
+                } else {
+                    People::All(people)
+                };
+                let mut cells = vec![0i64; people * stride];
+                let mut scratch = TableScratch::default();
+                apply_table_rows(&data, row_bytes, rows, &terms, stride, layout, &mut scratch, &mut cells);
+                let mut want = vec![0i64; people * stride];
+                for p in 0..people {
+                    let slot = if gathered { kept[p] } else { p };
+                    for r in 0..rows {
+                        let c = code(&data[r * row_bytes..(r + 1) * row_bytes], slot);
+                        for lane in 0..stride {
+                            want[p * stride + lane] =
+                                want[p * stride + lane].wrapping_add(terms[(r * 4 + c) * stride + lane]);
+                        }
+                    }
+                }
+                assert_eq!(cells, want, "people {people} rows {rows} stride {stride} gathered {gathered}");
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_rows_skip_only_groups_that_add_nothing() {
+        let mut rng = Rng(0x2354_0000_5a17_0001);
+        // (people, rows, stride, every how many rows code 00 adds terms; 0 for never)
+        for (people, rows, stride, flipped_every) in
+            [(45usize, 70usize, 16usize, 7usize), (33, 131, 32, 0), (100, 64, 12, 3), (7, 9, 16, 1), (70, 5, 24, 0)]
+        {
+            let row_bytes = people.div_ceil(4);
+            // About one call in fifty is not 00, so most keys are 0.
+            let data: Vec<u8> = (0..rows * row_bytes)
+                .map(|_| {
+                    (0..4).fold(0u8, |byte, slot| {
+                        let call = if rng.next() % 50 == 0 { (rng.next() % 3 + 1) as u8 } else { 0 };
+                        byte | call << (2 * slot)
+                    })
+                })
+                .collect();
+            let groups = rows.div_ceil(4);
+            let mut terms = vec![0i64; groups * 4 * 4 * stride];
+            for r in 0..rows {
+                let first = if flipped_every != 0 && r % flipped_every == 0 { 0 } else { 1 };
+                for code in first..4 {
+                    for lane in 0..stride {
+                        terms[(r * 4 + code) * stride + lane] = rng.next() as i64;
+                    }
+                }
+            }
+            let kept: Vec<usize> = (0..people).map(|p| (people - 1 - p) * 3 % (row_bytes * 4)).collect();
             let bytes: Vec<u32> = kept.iter().map(|&f| (f / 4) as u32).collect();
             let shifts: Vec<u8> = kept.iter().map(|&f| (2 * (f % 4)) as u8).collect();
             for gathered in [false, true] {

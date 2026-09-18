@@ -26,8 +26,9 @@ impl FixedPoint {
         if self.exp <= 0 && self.exp > -53 && v.unsigned_abs() < 1u128 << 53 {
             let shift = self.exp.unsigned_abs();
             if q < 1u128 << (53 - shift) {
-                // Both operands are exact doubles, so the one division rounds correctly.
-                return v as f64 / (q << shift) as f64;
+                // Both operands are exact doubles, so the one division rounds correctly. Below
+                // 2^53 they convert exactly through i64 and u64 as well, without a libcall.
+                return (v as i64) as f64 / ((q << shift) as u64) as f64;
             }
         }
         round_quotient(v, self.exp, q)
@@ -178,6 +179,67 @@ fn scale_by_power_of_two(mut m: u64, mut e: i32) -> f64 {
         // Subnormal: e == -1074, so m is the raw fraction field.
         f64::from_bits(m)
     }
+}
+
+/// 10^0 through 10^15, each an exact double.
+const POWERS_OF_TEN: [f64; 16] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
+];
+
+/// Whether some integer at `places` decimal places reads back as `value`, for an integer of
+/// magnitude below 2^50. Below that bound the product `value × 10^places` is within half of an
+/// integer's reach of its exact value, so the rounded product is the one integer that can read
+/// back as `value`, and dividing two exact doubles rounds as parsing the decimal does.
+#[inline(always)]
+fn integer_at(value: f64, places: usize) -> Option<f64> {
+    let power = POWERS_OF_TEN[places];
+    let scaled = (value * power).round();
+    (scaled.abs() < (1u64 << 50) as f64 && scaled / power == value).then_some(scaled)
+}
+
+/// `value` as a count of `10^-places`, when its shortest form has at most `places` decimal places
+/// and the count is below 2^50 in magnitude; `None` otherwise, and for every `places` past 15. Two
+/// decimals no longer than the other and reading back as one double cannot differ in places, so an
+/// integer at `places` places that reads back as `value` is the shortest form scaled: a score's
+/// weights need no search once its places are known.
+#[inline(always)]
+pub(crate) fn scaled_at_places(value: f64, places: i32) -> Option<i64> {
+    let places = usize::try_from(places).ok().filter(|&places| places < POWERS_OF_TEN.len())?;
+    integer_at(value, places).map(|scaled| scaled as i64)
+}
+
+/// [`shortest_decimal`], searching from `hint` decimal places, which becomes the places found.
+/// A decimal that reads back at some places also does at every larger number of places, so the
+/// fewest places are those that read back while one fewer does not; the fewest places give the
+/// fewest digits, which is ryu's shortest form. Values the search does not reach take ryu.
+pub(crate) fn shortest_decimal_hinted(value: f64, hint: &mut usize) -> (i64, i32) {
+    if value == 0.0 {
+        return (0, 0);
+    }
+    let mut places = (*hint).min(POWERS_OF_TEN.len() - 1);
+    let mut scaled = integer_at(value, places);
+    if let Some(mut found) = scaled {
+        while let Some(fewer) = places.checked_sub(1).and_then(|fewer| integer_at(value, fewer)) {
+            places -= 1;
+            found = fewer;
+        }
+        scaled = Some(found);
+    } else {
+        while scaled.is_none() && places + 1 < POWERS_OF_TEN.len() {
+            places += 1;
+            scaled = integer_at(value, places);
+        }
+    }
+    let Some(scaled) = scaled else {
+        return shortest_decimal(value);
+    };
+    *hint = places;
+    let (mut digits, mut exponent) = (scaled as i64, -(places as i32));
+    while digits % 10 == 0 {
+        digits /= 10;
+        exponent += 1;
+    }
+    (digits, exponent)
 }
 
 #[cfg(test)]
@@ -360,5 +422,62 @@ mod tests {
         }
         // Subnormal results keep the correctly rounded fraction field.
         assert_eq!(round_quotient(3, -1076, 1), f64::from_bits(1));
+    }
+
+    #[test]
+    fn the_hinted_search_finds_ryus_shortest_form() {
+        let mut rng = Rng(0x2354_5eed_c0ff_ee01);
+        let mut carried = 6usize;
+        for index in 0..400_000u64 {
+            let value = match index % 5 {
+                // Six-decimal weights, some with trailing zeros.
+                0 => (rng.next() % 4_000_001) as f64 / 1e6 - 2.0,
+                // Short decimals over a wide range of magnitudes.
+                1 => format!("{}e{}", rng.next() % 99_999 + 1, (rng.next() % 50) as i32 - 30)
+                    .parse()
+                    .unwrap(),
+                // Any finite double.
+                2 => f64::from_bits(rng.next()),
+                // Integers with trailing zeros, some past 2^50.
+                3 => ((rng.next() % 1_000_000) * 10u64.pow((rng.next() % 12) as u32)) as f64,
+                _ => -((rng.next() % 1_000_000_000) as f64 / 1e4),
+            };
+            if !value.is_finite() {
+                continue;
+            }
+            let want = shortest_decimal(value);
+            for start in [0usize, 5, 6, 15, 40] {
+                let mut hint = start;
+                assert_eq!(shortest_decimal_hinted(value, &mut hint), want, "{value:e} from {start}");
+            }
+            assert_eq!(shortest_decimal_hinted(value, &mut carried), want, "{value:e} carried");
+        }
+    }
+
+    #[test]
+    fn a_weight_at_known_places_is_its_shortest_form_scaled() {
+        let mut rng = Rng(0x2354_5ca1_ed00_0001);
+        for index in 0..200_000u64 {
+            let value: f64 = match index % 4 {
+                0 => (rng.next() % 4_000_001) as f64 / 1e6 - 2.0,
+                1 => format!("{}e{}", rng.next() % 99_999 + 1, (rng.next() % 40) as i32 - 25)
+                    .parse()
+                    .unwrap(),
+                2 => f64::from_bits(rng.next()),
+                // Integers with trailing zeros, some past 2^50.
+                _ => ((rng.next() % 1_000_000) * 10u64.pow((rng.next() % 12) as u32)) as f64,
+            };
+            if !value.is_finite() {
+                continue;
+            }
+            let (digits, exponent) = shortest_decimal(value);
+            for places in [0i32, 1, 3, 6, 9, 15, 16, 40] {
+                let want = u32::try_from(places + exponent)
+                    .ok()
+                    .and_then(|shift| i128::from(digits).checked_mul(10i128.checked_pow(shift)?))
+                    .filter(|scaled| places <= 15 && scaled.unsigned_abs() < 1 << 50);
+                assert_eq!(scaled_at_places(value, places).map(i128::from), want, "{value:e} at {places}");
+            }
+        }
     }
 }

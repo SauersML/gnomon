@@ -9,7 +9,9 @@
 //! and its bands are combined exactly when the cell is rounded. Lanes add with wrapping
 //! arithmetic: a one-limb value is exact modulo 2^64 and known to fit, so it is exact.
 
-use crate::score::exact::{FixedPoint, Split, shortest_decimal};
+use crate::score::exact::{
+    FixedPoint, Split, scaled_at_places, shortest_decimal, shortest_decimal_hinted,
+};
 use crate::score::types::GroupedComplexRule;
 use ahash::AHashMap;
 use rayon::prelude::*;
@@ -22,6 +24,8 @@ const FLIPPED: u8 = 1;
 const COUNTED: u8 = 2;
 /// Marks an entry whose weight does not fit i64; its weight is in `ExactPlan::wide`.
 const WIDE: i64 = i64::MIN;
+/// Entries a parallel pass over a plan takes per task.
+const PLAN_CHUNK: usize = 1 << 14;
 /// Fraction digits the long-division rounding writes before its sticky digit. A double's
 /// midpoints have at most 767 significant decimal digits, so the parse decides correctly.
 const ROUNDING_DIGITS: usize = 800;
@@ -175,33 +179,61 @@ impl ExactPlan {
             ))
         };
 
-        // Flags, and the terms each score's lanes receive: one per entry and application.
-        let mut flags = vec![0u8; entries];
-        let mut last_row = vec![usize::MAX; num_scores];
-        let mut terms = vec![0u64; num_scores];
-        for row in 0..offsets.len() - 1 {
-            for i in offsets[row] as usize..offsets[row + 1] as usize {
-                let column = columns[i] as usize;
-                if column >= num_scores {
-                    return Err(PlanError::Invariant(format!(
-                        "Plan entry {i} names score column {column} of {num_scores}."
-                    )));
-                }
-                if corrections[i] != 0.0 {
-                    if corrections[i].to_bits() != (-2.0 * weights[i]).to_bits() {
-                        return Err(PlanError::Invariant(format!(
-                            "Plan entry {i} carries a correction that is not its weight's flip."
-                        )));
-                    }
-                    flags[i] |= FLIPPED;
-                }
-                if last_row[column] != row {
-                    last_row[column] = row;
-                    flags[i] |= COUNTED;
-                }
-                terms[column] += 1;
-            }
+        // Flags, and the terms each score's lanes receive: one per entry and application. Rows are
+        // flagged in parallel; an entry counts a missing call when it is its score's first in its
+        // row, and a nonempty row is named by its first entry.
+        if offsets.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err(PlanError::Invariant(
+                "Plan row offsets decrease.".to_string(),
+            ));
         }
+        let mut flags = vec![0u8; entries];
+        let mut rows = Vec::with_capacity(offsets.len() - 1);
+        let mut rest = flags.as_mut_slice();
+        for pair in offsets.windows(2) {
+            let (row, tail) = std::mem::take(&mut rest).split_at_mut((pair[1] - pair[0]) as usize);
+            rows.push((pair[0] as usize, row));
+            rest = tail;
+        }
+        let mut terms = rows
+            .into_par_iter()
+            .try_fold(
+                || (vec![usize::MAX; num_scores], vec![0u64; num_scores]),
+                |(mut first_in_row, mut terms), (start, row)| {
+                    for (i, flag) in (start..).zip(row.iter_mut()) {
+                        let column = columns[i] as usize;
+                        if column >= num_scores {
+                            return Err(PlanError::Invariant(format!(
+                                "Plan entry {i} names score column {column} of {num_scores}."
+                            )));
+                        }
+                        if corrections[i] != 0.0 {
+                            if corrections[i].to_bits() != (-2.0 * weights[i]).to_bits() {
+                                return Err(PlanError::Invariant(format!(
+                                    "Plan entry {i} carries a correction that is not its weight's flip."
+                                )));
+                            }
+                            *flag |= FLIPPED;
+                        }
+                        if first_in_row[column] != start {
+                            first_in_row[column] = start;
+                            *flag |= COUNTED;
+                        }
+                        terms[column] += 1;
+                    }
+                    Ok((first_in_row, terms))
+                },
+            )
+            .map(|folded| folded.map(|(_, terms)| terms))
+            .try_reduce(
+                || vec![0u64; num_scores],
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(b) {
+                        *x += y;
+                    }
+                    Ok(a)
+                },
+            )?;
 
         // The single scale: the most decimal places any weight of the score needs, and the lcm of
         // its complex averaging denominators.
@@ -214,13 +246,18 @@ impl ExactPlan {
         let mut places = (0..entries)
             .into_par_iter()
             .fold(
-                || vec![0i32; num_scores],
-                |mut places, i| {
+                || (vec![0i32; num_scores], 0usize),
+                |(mut places, mut hint), i| {
                     let column = columns[i] as usize;
-                    places[column] = places[column].max(-shortest_decimal(weights[i]).1);
-                    places
+                    // A weight the score's places already hold leaves them as they are.
+                    if scaled_at_places(weights[i], places[column]).is_none() {
+                        places[column] =
+                            places[column].max(-shortest_decimal_hinted(weights[i], &mut hint).1);
+                    }
+                    (places, hint)
                 },
             )
+            .map(|(places, _)| places)
             .reduce(|| vec![0i32; num_scores], merge_max);
         let mut multiples = vec![1u64; num_scores];
         let mut applications = Vec::new();
@@ -254,43 +291,68 @@ impl ExactPlan {
             }
         }
 
-        // Each entry's weight at its score's single scale, or WIDE when it does not fit i64.
+        // Each entry's weight at its score's single scale, or WIDE when it does not fit i64 (its
+        // value is then in `wide`), and twice the sum and the largest of each score's term
+        // magnitudes at that scale, in parallel parts. Magnitudes are not negative, so some part's
+        // sum overflows exactly when the whole does: the parts cannot change a bound.
         let at_single = |value: f64, column: usize| {
             let (digits, exponent) = shortest_decimal(value);
             scale_digits(digits, exponent, places[column], multiples[column])
         };
-        let mut int_weights: Vec<i64> = (0..entries)
-            .into_par_iter()
-            .map(|i| {
-                at_single(weights[i], columns[i] as usize)
-                    .and_then(|w| i64::try_from(w).ok())
-                    .filter(|&w| w != WIDE)
-                    .unwrap_or(WIDE)
-            })
-            .collect();
+        let add_term =
+            |bound: &mut [Option<u128>], largest: &mut [u128], column: usize, weight: Option<i128>| {
+                let magnitude = weight.and_then(|w| w.unsigned_abs().checked_mul(2));
+                bound[column] = bound[column].zip(magnitude).and_then(|(b, m)| b.checked_add(m));
+                largest[column] = largest[column].max(magnitude.unwrap_or(0));
+            };
+        let mut int_weights = vec![0i64; entries];
+        let (mut bound, mut largest, wide_entries) = int_weights
+            .par_chunks_mut(PLAN_CHUNK)
+            .enumerate()
+            .fold(
+                || (vec![Some(0u128); num_scores], vec![0u128; num_scores], Vec::new(), 0usize),
+                |(mut bound, mut largest, mut wide, mut hint), (chunk, slots)| {
+                    for (i, slot) in (chunk * PLAN_CHUNK..).zip(slots.iter_mut()) {
+                        let column = columns[i] as usize;
+                        let exact = match scaled_at_places(weights[i], places[column]) {
+                            Some(scaled) => i128::from(scaled).checked_mul(i128::from(multiples[column])),
+                            None => {
+                                let (digits, exponent) = shortest_decimal_hinted(weights[i], &mut hint);
+                                scale_digits(digits, exponent, places[column], multiples[column])
+                            }
+                        };
+                        *slot = exact
+                            .and_then(|w| i64::try_from(w).ok())
+                            .filter(|&w| w != WIDE)
+                            .unwrap_or(WIDE);
+                        if let (WIDE, Some(value)) = (*slot, exact) {
+                            wide.push((i, value));
+                        }
+                        add_term(&mut bound, &mut largest, column, exact);
+                    }
+                    (bound, largest, wide, hint)
+                },
+            )
+            .map(|(bound, largest, wide, _)| (bound, largest, wide))
+            .reduce(
+                || (vec![Some(0u128); num_scores], vec![0u128; num_scores], Vec::new()),
+                |(mut bound, mut largest, mut wide), (other_bound, other_largest, other_wide)| {
+                    for (b, o) in bound.iter_mut().zip(other_bound) {
+                        *b = b.zip(o).and_then(|(b, o)| b.checked_add(o));
+                    }
+                    for (l, o) in largest.iter_mut().zip(other_largest) {
+                        *l = (*l).max(o);
+                    }
+                    wide.extend(other_wide);
+                    (bound, largest, wide)
+                },
+            );
         let mut wide = AHashMap::new();
-        // Twice the sum and the largest of each score's term magnitudes, at the single scale.
-        let mut bound = vec![Some(0u128); num_scores];
-        let mut largest = vec![0u128; num_scores];
-        let mut add_term = |column: usize, weight: Option<i128>| {
-            let magnitude = weight.and_then(|w| w.unsigned_abs().checked_mul(2));
-            bound[column] = bound[column].zip(magnitude).and_then(|(b, m)| b.checked_add(m));
-            largest[column] = largest[column].max(magnitude.unwrap_or(0));
-        };
-        for (i, &weight) in int_weights.iter().enumerate() {
-            let column = columns[i] as usize;
-            if weight == WIDE {
-                let exact = at_single(weights[i], column);
-                if let Some(value) = exact {
-                    wide.insert(i, value);
-                }
-                add_term(column, exact);
-            } else {
-                add_term(column, Some(i128::from(weight)));
-            }
+        for (i, value) in wide_entries {
+            wide.insert(i, value);
         }
         for &(column, weight) in &applications {
-            add_term(column, at_single(weight, column));
+            add_term(&mut bound, &mut largest, column, at_single(weight, column));
         }
         let single: Vec<Option<Option<Split>>> = (0..num_scores)
             .map(|column| {
@@ -415,16 +477,48 @@ impl ExactPlan {
             scores,
             stride: lane.div_ceil(LANE_WIDTH).max(1) * LANE_WIDTH,
         };
-        // The flipped-allele baseline of every band: two doses of each flipped entry's effect.
-        for i in 0..entries {
-            if plan.flags[i] & FLIPPED != 0 {
-                let column = columns[i] as usize;
-                let band = plan.band_of(i, column);
-                let weight = plan.weight(i);
-                let baseline = &mut plan.scores[column].bands[band].baseline;
-                *baseline = baseline
-                    .checked_sub(2 * weight)
-                    .ok_or_else(|| refusal(column))?;
+        // The flipped-allele baseline of every band: two doses of each flipped entry's effect, in
+        // parallel parts. A band's term magnitudes sum below 2^126, so no part's sum overflows.
+        let mut band_starts = vec![0usize; num_scores + 1];
+        for (column, score) in plan.scores.iter().enumerate() {
+            band_starts[column + 1] = band_starts[column] + score.bands.len();
+        }
+        let baselines = {
+            let plan = &plan;
+            let band_starts = &band_starts;
+            plan.flags
+                .par_chunks(PLAN_CHUNK)
+                .enumerate()
+                .fold(
+                    || vec![Some(0i128); band_starts[num_scores]],
+                    |mut sums, (chunk, flags)| {
+                        for (i, &flag) in (chunk * PLAN_CHUNK..).zip(flags) {
+                            if flag & FLIPPED != 0 {
+                                let column = columns[i] as usize;
+                                let sum = &mut sums[band_starts[column] + plan.band_of(i, column)];
+                                *sum = sum.and_then(|sum| sum.checked_sub(2 * plan.weight(i)));
+                            }
+                        }
+                        sums
+                    },
+                )
+                .reduce(
+                    || vec![Some(0i128); band_starts[num_scores]],
+                    |mut a, b| {
+                        for (x, y) in a.iter_mut().zip(b) {
+                            *x = x.zip(y).and_then(|(x, y)| x.checked_add(y));
+                        }
+                        a
+                    },
+                )
+        };
+        for (column, score) in plan.scores.iter_mut().enumerate() {
+            for (band, sum) in score
+                .bands
+                .iter_mut()
+                .zip(&baselines[band_starts[column]..band_starts[column + 1]])
+            {
+                band.baseline = sum.ok_or_else(|| refusal(column))?;
             }
         }
         Ok(plan)

@@ -1427,7 +1427,6 @@ fn run_small_keep_direct_single_file(
             };
             let packed = (byte >> ((fam_idx % 4) * 2)) & 0b11;
             terms.apply(
-                prep_result.exact(),
                 packed,
                 &mut final_scores[out_idx * stride..(out_idx + 1) * stride],
                 &mut final_counts[out_idx * num_scores..(out_idx + 1) * num_scores],
@@ -1532,7 +1531,6 @@ fn run_small_keep_direct_multi_file(
             };
             let packed = (byte >> ((fam_idx % 4) * 2)) & 0b11;
             terms.apply(
-                prep_result.exact(),
                 packed,
                 &mut final_scores[out_idx * stride..(out_idx + 1) * stride],
                 &mut final_counts[out_idx * num_scores..(out_idx + 1) * num_scores],
