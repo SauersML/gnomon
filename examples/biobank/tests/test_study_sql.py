@@ -254,3 +254,4 @@ def test_roots_descendants_and_manifest(exported):
     assert manifest["ehr_extended_by"] == {"procedure": 1 / 28, "drug": 0.0, "observation": 1 / 28,
                                            "measurement": 1 / 28}
     assert manifest["ehr_end_from_long_visit"] == 1 / 28  # person 1004's capped placeholder stay
+    assert manifest["ehr_people"] == 28  # the denominator of both shares

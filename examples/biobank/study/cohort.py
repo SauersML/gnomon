@@ -908,6 +908,7 @@ class AouSource(Source):
             known = ~np.isnan(end)
             share = (long_end[known] == end[known]).mean() if known.any() else 0.0
             self._facts["ehr_end_from_long_visit"] = float(share)
+            self._facts["ehr_people"] = int(known.sum())  # the two shares' denominator
             return person.drop_columns(["ehr_long_end"])
         if name == "condition":
             return self._query(name)
@@ -965,6 +966,7 @@ class AouSource(Source):
                         "ehr_domains_skipped": self._facts["ehr_skipped"],
                         "ehr_extended_by": self._facts["ehr_extended"],
                         "ehr_end_from_long_visit": self._facts["ehr_end_from_long_visit"],
+                        "ehr_people": self._facts["ehr_people"],
                         "bigquery": {"plan_bytes": plan, "bytes_billed": self.client.billed,
                                      "job_ids": list(self.client.job_ids)}}
             self._tables = {name: conform(name, raw[name], manifest) for name in TABLES}
