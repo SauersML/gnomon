@@ -251,18 +251,22 @@ class FakeClient:
 
     def estimate(self, sql, parameters=None):
         self.estimates.append((sql, parameters))
-        return self.estimate_bytes
+        return self.estimate_bytes(sql) if callable(self.estimate_bytes) else self.estimate_bytes
 
     def query(self, sql, parameters=None):
-        assert len(self.estimates) == 5, "a query ran before the whole plan was estimated"
+        assert len(self.estimates) == 9, "a query ran before the whole plan was estimated"
         self.queries.append((sql, parameters))
+        if "GROUP BY t.person_id" in sql:  # an extra EHR domain: nobody widens the fixture's range
+            return pa.table({"person_id": pa.array([], pa.int64()), "ehr_start": pa.array([], pa.date32()),
+                             "ehr_end": pa.array([], pa.date32())})
         if "ehr_cutoff_date" in sql or "MAX(observation_period_end_date)" in sql:
             return pa.table({"cutoff": pa.array([pd.Timestamp(self.spec["cdr_cutoff"]).date()], pa.date32())})
         if "Consent PII" in sql:
             person = self.tabs["person"]
             if not self.ses:
                 person = replace(person, "deprivation_index", pa.nulls(person.num_rows, pa.float64()))
-            # BigQuery returns INT64 for every integer column.
+            # BigQuery returns INT64 for every integer column, plus the long-visit diagnostic column.
+            person = person.append_column("ehr_long_end", pa.nulls(person.num_rows, pa.date32()))
             return replace(person, "zip3", person.column("zip3").cast(pa.int64()))
         members = {"codes": ("STRING", self.spec["snomed_codes"]), "branch_pairs": ("STRING", self.pairs)}
         if "n_persons > 20" in sql:
@@ -285,7 +289,7 @@ def by_key(name, table):
     return table.sort_by([(key, "ascending") for key in cohort.KEYS[name]])
 
 
-def aou_source(tmp_path, tabs, spec, client, codes=None, branches=None):
+def aou_source(tmp_path, tabs, spec, client, codes=None, branches=None, ehr_domains="auto"):
     tmp_path.mkdir(parents=True, exist_ok=True)
     frame = tabs["ancestry"].to_pandas()
     frame.rename(columns={"person_id": "research_id"})[["research_id", "ancestry_pred"]].to_csv(
@@ -306,7 +310,8 @@ def aou_source(tmp_path, tabs, spec, client, codes=None, branches=None):
         body.to_csv(cache / f"{pgs}.sscore", sep="\t", index=False, float_format="%.17g")
     return cohort.AouSource(client, "fc-aou-cdr-prod-ct.C2024Q3R5", snomed_codes=codes or spec["snomed_codes"],
                             scores=spec["scores"], ancestry=tmp_path / "anc.tsv", prune=tmp_path / "prune.tsv",
-                            projection=tmp_path / "pcs.parquet", score_cache=cache, excluded_branches=branches)
+                            projection=tmp_path / "pcs.parquet", score_cache=cache, excluded_branches=branches,
+                            ehr_domains=ehr_domains)
 
 
 def test_aou_source_exports_the_contract(tmp_path, tables):
@@ -319,7 +324,9 @@ def test_aou_source_exports_the_contract(tmp_path, tables):
     assert manifest["cdr_cutoff"] == spec["cdr_cutoff"]
     assert manifest["cdr_cutoff_source"] == "_cdr_metadata.ehr_cutoff_date"
     assert manifest["bigquery"] == {"bytes_billed": 123, "job_ids": ["job-1"], "plan_bytes": dict.fromkeys(
-        ["person", "condition", "root", "descendants", "cutoff"], 1000)}
+        ["person", "condition", "root", "descendants", "cutoff", "ehr_procedure", "ehr_drug", "ehr_observation",
+         "ehr_measurement"], 1000)}
+    assert manifest["ehr_domains"] == ["visit", "condition", "procedure", "drug", "observation", "measurement"]
     assert manifest["prune_unmatched"] == 0
     assert manifest["descendants"]["rows"] == 1
     assert pq.read_table(tmp_path / "out" / "descendants.parquet").equals(client.descendants)
@@ -332,8 +339,8 @@ def test_aou_source_exports_the_contract(tmp_path, tables):
     assert not any(root in sql for sql, _ in client.queries for root in spec["snomed_codes"])
     person_sql = next(q for q, _ in client.queries if "Consent PII" in q)
     assert "zip3_ses_map" in person_sql and "acs DESC" in person_sql
-    assert "visit_start_date < e.baseline_date" in person_sql
-    assert "condition_start_date < e.baseline_date" in person_sql
+    assert "COUNTIF(r.day < e.baseline_date) AS pre_baseline" in person_sql  # sites from pre-baseline rows
+    assert "IF(pre_baseline > 0, src_id, NULL)" in person_sql
 
 
 def test_aou_source_without_ses_or_metadata(tmp_path, tables):
@@ -358,7 +365,21 @@ def test_a_plan_over_budget_is_refused_before_anything_bills(tmp_path, tables):
     client = FakeClient(tabs, spec, estimate=11 * 10 ** 9)  # five queries at 11 GB each exceed 50 GB
     with pytest.raises(RuntimeError, match="plan would bill"):
         aou_source(tmp_path, tabs, spec, client).manifest
-    assert len(client.estimates) == 5 and client.queries == []
+    assert len(client.estimates) == 9 and client.queries == []
+
+
+def test_auto_ehr_domains_join_while_the_plan_fits(tmp_path, tables):
+    tabs, spec = tables
+    costs = lambda sql: 45 * 10 ** 9 if "measurement" in sql else 10 ** 9  # noqa: E731  (8 + 45 > 50 GB)
+    client = FakeClient(tabs, spec, estimate=costs)
+    manifest = aou_source(tmp_path / "auto", tabs, spec, client).manifest
+    assert manifest["ehr_domains"] == ["visit", "condition", "procedure", "drug", "observation"]
+    assert manifest["ehr_domains_skipped"] == ["measurement"]
+    assert not any("measurement" in sql for sql, _ in client.queries)
+    explicit = FakeClient(tabs, spec, estimate=costs)
+    source = aou_source(tmp_path / "explicit", tabs, spec, explicit, ehr_domains=("drug", "measurement"))
+    with pytest.raises(RuntimeError, match="plan would bill"):
+        source.manifest
 
 
 def test_excluded_branches_reach_the_queries_and_the_manifest(tmp_path, tables):

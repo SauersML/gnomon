@@ -53,6 +53,11 @@ def synthetic_tables(n, seed=0, roots=ROOTS, scores=SCORES, num_pcs=8, grid_days
     obs_start = np.where(covered, baseline - np.floor(rng.exponential(6 * 365.25, n)), np.nan)
     obs_end = np.where(covered, np.minimum(cutoff, snap(baseline + rng.uniform(0, 7 * 365.25, n))), np.nan)
     obs_end = np.where(covered, np.maximum(obs_end, baseline), np.nan)
+    # The EHR ends at or before the observation period, which also counts surveys and measurements.
+    has_ehr = covered & (rng.random(n) < 0.97)
+    ehr_start = np.where(has_ehr, obs_start, np.nan)
+    ehr_end = np.where(rng.random(n) < 0.6, obs_end, snap(obs_end - rng.exponential(200, n)))
+    ehr_end = np.where(has_ehr, np.maximum(ehr_end, ehr_start), np.nan)
     death = np.where(rng.random(n) < 0.08, snap(np.nan_to_num(baseline, nan=cutoff - 400)
                                                 + rng.uniform(1, 6 * 365.25, n)), np.nan)
     death = np.where(death > cutoff, np.nan, death)
@@ -73,6 +78,8 @@ def synthetic_tables(n, seed=0, roots=ROOTS, scores=SCORES, num_pcs=8, grid_days
         "baseline_date": date_array(baseline),
         "obs_start": date_array(obs_start),
         "obs_end": date_array(obs_end),
+        "ehr_start": date_array(ehr_start),
+        "ehr_end": date_array(ehr_end),
         "death_date": date_array(death),
         "state": pa.array(state, pa.string()),
         "ehr_site": pa.array(ehr_site, pa.string()),

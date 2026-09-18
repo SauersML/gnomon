@@ -72,8 +72,15 @@ def people():
         20: dict(records={T2D: (D(2021, 1, 1), D(2021, 6, 1), 2), T1D: (D(2020, 1, 1), D(2020, 9, 1), 2)}),
         21: dict(records={T2D: (D(2020, 1, 1), D(2020, 5, 5), 2), T1D: (D(2020, 2, 2), D(2020, 5, 5), 2)}),
         22: dict(death=D(2021, 3, 3), records={T1D: (D(2020, 1, 1), D(2021, 3, 3), 2)}),
+        # SPEC section 3 (21:22Z): follow-up ends at the last EHR record, not the observation period.
+        23: dict(ehr_end=D(2021, 12, 31)),
+        24: dict(ehr_end=D(2019, 5, 5)),
     }
-    return {pid: {**TEMPLATE, **row} for pid, row in rows.items()}
+    people = {pid: {**TEMPLATE, **row} for pid, row in rows.items()}
+    for row in people.values():  # by default the EHR spans the observation period
+        row.setdefault("ehr_start", row["obs_start"])
+        row.setdefault("ehr_end", row["obs_end"])
+    return people
 
 
 def to_tables(rows, scores=("PGS000011", "PGS000022", "PGS000033", "PGS000044"), prune_unmatched=0):
@@ -85,7 +92,8 @@ def to_tables(rows, scores=("PGS000011", "PGS000022", "PGS000033", "PGS000044"),
         "race_concept_id": pa.array([0] * len(ids), pa.int64()),
         "ethnicity_concept_id": pa.array([0] * len(ids), pa.int64()),
         "baseline_date": column("baseline", pa.date32()), "obs_start": column("obs_start", pa.date32()),
-        "obs_end": column("obs_end", pa.date32()), "death_date": column("death", pa.date32()),
+        "obs_end": column("obs_end", pa.date32()), "ehr_start": column("ehr_start", pa.date32()),
+        "ehr_end": column("ehr_end", pa.date32()), "death_date": column("death", pa.date32()),
         "state": column("state", pa.string()), "ehr_site": column("site", pa.string()),
         "zip3": column("zip3", pa.int32()),
         "zip3_post_baseline": pa.array([None if rows[i]["zip3"] is None else False for i in ids], pa.bool_()),
@@ -145,10 +153,10 @@ def steps(flow):
 def test_base_removes_one_person_per_rule(handmade):
     base = phenotypes.base_cohort(handmade, CONFIG)
     assert [(s["step"], s["n"], s["removed"]) for s in base.flow] == [
-        ("cdr_persons", 31, 0), ("in_ancestry", 30, 1), ("not_related_excluded", 29, 1), ("has_pcs", 28, 1),
-        ("scored", 27, 1), ("sex_male_or_female", 26, 1), ("has_baseline", 25, 1), ("adult_at_baseline", 24, 1),
-        ("covering_observation_period", 23, 1), ("lookback", 22, 1)]
-    assert sorted(base.frame.person_id) == list(range(1, 23))
+        ("cdr_persons", 33, 0), ("in_ancestry", 32, 1), ("not_related_excluded", 31, 1), ("has_pcs", 30, 1),
+        ("scored", 29, 1), ("sex_male_or_female", 28, 1), ("has_baseline", 27, 1), ("adult_at_baseline", 26, 1),
+        ("covering_observation_period", 25, 1), ("lookback", 24, 1)]
+    assert sorted(base.frame.person_id) == list(range(1, 25))
     frame = by_id(base.frame)
     assert (frame.loc[1, "division"], frame.loc[1, "region"]) == ("West North Central", "Midwest")
     assert (frame.loc[17, "division"], frame.loc[17, "region"], frame.loc[17, "ehr_site"]) == (
@@ -166,19 +174,19 @@ def test_base_removes_one_person_per_rule(handmade):
 def test_disease_rules_and_binary_outcome(handmade):
     base, frames = phenotypes.build_frames(handmade, [DIABETES, BREAST], CONFIG)
     t2d = frames["t2d"]
-    assert steps(t2d.flow["disease"]) == [("base", 22), ("pgs_present", 21)]
-    assert steps(t2d.flow["binary"]["steps"]) == [("disease_rows", 21), ("exclusion_46635009", 17)]
+    assert steps(t2d.flow["disease"]) == [("base", 24), ("pgs_present", 23)]
+    assert steps(t2d.flow["binary"]["steps"]) == [("disease_rows", 23), ("exclusion_46635009", 19)]
     binary = by_id(t2d.binary)
     assert 15 not in binary.index and 14 in binary.index
     assert not {13, 20, 21, 22} & set(binary.index)  # the exclusion rule met by the cutoff removes
     assert sorted(binary.index[binary.y == 1]) == [2, 4, 5, 8, 9, 10, 19]
     assert binary.loc[3, "y"] == 0 and binary.loc[3, "n_dates"] == 1  # a single record is a non-case
     assert {k: t2d.flow["binary"][k] for k in ("cases", "non_cases", "single_record")} == {
-        "cases": 7, "non_cases": 10, "single_record": 1}
+        "cases": 7, "non_cases": 12, "single_record": 1}
     # Audit S2: nothing measured after baseline enters the binary frame.
     assert not {"age_last", "exit_age", "entry_age", "event", "followup"} & set(binary.columns)
     breast = frames["breast"]
-    assert steps(breast.flow["disease"]) == [("base", 22), ("pgs_present", 22), ("sex_female", 2)]
+    assert steps(breast.flow["disease"]) == [("base", 24), ("pgs_present", 24), ("sex_female", 2)]
     assert dict(zip(breast.binary.person_id, breast.binary.y)) == {3: 0, 12: 1}
     assert t2d.flow["by_ancestry"]["eur"]["binary_cases"] == 7
 
@@ -187,29 +195,30 @@ def test_survival_entry_exit_competing_death_and_late_exclusions(handmade):
     base, frames = phenotypes.build_frames(handmade, [DIABETES], CONFIG)
     survival = frames["t2d"].flow["survival"]
     assert steps(survival["steps"]) == [
-        ("disease_rows", 21), ("exclusion_46635009_by_landmark", 20), ("no_record_by_landmark", 18),
-        ("alive_at_landmark", 17), ("observed_past_landmark", 16)]
+        ("disease_rows", 23), ("exclusion_46635009_by_landmark", 22), ("no_record_by_landmark", 20),
+        ("alive_at_landmark", 19), ("ehr_past_landmark", 17)]
     frame = by_id(frames["t2d"].survival)
-    assert sorted(frame.index) == [1, 2, 3, 8, 9, 10, 11, 12, 14, 16, 17, 18, 19, 20, 21, 22]
+    assert sorted(frame.index) == [1, 2, 3, 8, 9, 10, 11, 12, 14, 16, 17, 18, 19, 20, 21, 22, 23]
     expected = {1: (0, D(2023, 6, 1)), 2: (1, D(2020, 3, 1)), 3: (0, D(2023, 6, 1)), 8: (2, D(2021, 1, 1)),
                 9: (1, D(2021, 2, 2)), 10: (0, D(2023, 6, 1)), 11: (2, D(2023, 6, 1)),
                 16: (0, CUTOFF), 19: (1, D(2020, 1, 10)),
-                20: (3, D(2020, 9, 1)), 21: (3, D(2020, 5, 5)), 22: (2, D(2021, 3, 3))}
+                20: (3, D(2020, 9, 1)), 21: (3, D(2020, 5, 5)), 22: (2, D(2021, 3, 3)),
+                23: (0, D(2021, 12, 31))}  # censored at the EHR end, before the observation period's
     for pid, (event, exit_date) in expected.items():
         assert frame.loc[pid, "event"] == event, pid
         assert frame.loc[pid, "exit_age"] == age(exit_date), pid
     assert (frame.entry_age == age(LANDMARK)).all()  # entry at the landmark, not at baseline (audit M12)
     assert (frame.entry_year == 2019).all()
     assert np.allclose(frame.followup, frame.exit_age - frame.entry_age) and (frame.followup > 0).all()
-    assert survival["events"] == {"censored": 8, "disease": 3, "death": 3, "exclusion": 2}
-    assert survival["exclusion_exits"] == 2 and survival["exclusion_as"] == "competing"  # 2 of 16 > 1%
+    assert survival["events"] == {"censored": 9, "disease": 3, "death": 3, "exclusion": 2}
+    assert survival["exclusion_exits"] == 2 and survival["exclusion_as"] == "competing"  # 2 of 17 > 1%
     assert survival["single_record_at_risk"] == 1
     base = phenotypes.base_cohort(handmade, CONFIG)
     rows = phenotypes.disease_rows(base, handmade, DIABETES)
     censored, counts = phenotypes.survival_frame(rows, base, CONFIG, exclusion="censor")
     assert dict(zip(censored.person_id, censored.event))[20] == 0 and counts["events"]["exclusion"] == 0
     lenient = phenotypes.CohortConfig(seed=CONFIG.seed, exclusion_competing_fraction=0.2)
-    assert phenotypes.survival_frame(rows, base, lenient)[1]["exclusion_as"] == "censor"  # 2 of 16 < 20%
+    assert phenotypes.survival_frame(rows, base, lenient)[1]["exclusion_as"] == "censor"  # 2 of 17 < 20%
 
 
 def test_sensitivity_variants(handmade):
@@ -220,11 +229,13 @@ def test_sensitivity_variants(handmade):
     for pid, when in {2: D(2020, 1, 1), 8: D(2020, 6, 1), 9: D(2020, 2, 2), 10: D(2022, 1, 1),
                       21: D(2020, 1, 1)}.items():
         assert (first.loc[pid, "event"], first.loc[pid, "exit_age"]) == (1, age(when)), pid
-    assert (first.loc[20, "event"], first.loc[20, "exit_age"]) == (3, age(D(2020, 9, 1)))  # 1 of 16 > 1%
+    assert (first.loc[20, "event"], first.loc[20, "exit_age"]) == (3, age(D(2020, 9, 1)))  # 1 of 17 > 1%
     cutoff, counts = phenotypes.survival_frame(rows, base, CONFIG, censor="cutoff")
     cutoff = by_id(cutoff)
     assert (cutoff.loc[10, "event"], cutoff.loc[10, "exit_age"]) == (1, age(D(2023, 8, 1)))
     assert (cutoff.loc[1, "event"], cutoff.loc[1, "exit_age"]) == (0, age(CUTOFF))
+    # Censoring at the cutoff alone, the EHR end no longer ends follow-up.
+    assert (cutoff.loc[23, "event"], cutoff.loc[23, "exit_age"]) == (0, age(CUTOFF))
     assert cutoff.loc[11, "event"] == 2
     assert counts["steps"][-1]["step"] == "cutoff_past_landmark"
     with pytest.raises(ValueError):
@@ -260,7 +271,7 @@ def test_prune_outside_the_ancestry_universe_is_refused(tmp_path):
     with pytest.raises(ValueError, match="outside the ancestry universe"):
         phenotypes.base_cohort(source, CONFIG)
     allowed = phenotypes.CohortConfig(seed=CONFIG.seed, max_prune_unmatched=3)
-    assert len(phenotypes.base_cohort(source, allowed).frame) == 22
+    assert len(phenotypes.base_cohort(source, allowed).frame) == 24
 
 
 # --------------------------------------------------------------------------- #
@@ -346,7 +357,9 @@ def reference_frames(tables, spec, disease, config):
         if excluded is None or excluded > cutoff:
             binary[pid] = {**common, "y": int(n >= 2 and record["second_date"] <= cutoff)}
         landmark = baseline + datetime.timedelta(days=config.landmark_days)
-        observed_to = min(p["obs_end"], cutoff)
+        if p["ehr_end"] is None:
+            continue
+        observed_to = min(p["ehr_end"], cutoff)
         if excluded is not None and excluded <= landmark:
             continue
         if record and record["first_date"] <= landmark:
@@ -413,12 +426,16 @@ def test_followup_distribution_is_outcome_blind(tmp_path):
     result = phenotypes.followup_distribution(base, CONFIG)
     cutoff = D.fromisoformat(spec["cdr_cutoff"])
     ids = set(base.frame.person_id)
-    administrative, observed, years = [], [], {}
+    administrative, observed, years, after, with_ehr = [], [], {}, [], []
     for p in tabs["person"].to_pylist():
         if p["person_id"] not in ids:
             continue
         landmark = p["baseline_date"] + datetime.timedelta(days=CONFIG.landmark_days)
-        observed_to = min(p["obs_end"], cutoff)
+        after.append(p["ehr_end"] is not None and p["obs_end"] > p["ehr_end"])
+        with_ehr.append(p["ehr_end"] is not None)
+        if p["ehr_end"] is None:
+            continue
+        observed_to = min(p["ehr_end"], cutoff)
         if (p["death_date"] is None or p["death_date"] > landmark) and observed_to > landmark:
             administrative.append((cutoff - landmark).days / 365.25)
             observed.append((observed_to - landmark).days / 365.25)
@@ -429,6 +446,10 @@ def test_followup_distribution_is_outcome_blind(tmp_path):
         assert summary["fraction_reaching"]["2"] == sum(s >= 2 for s in spans) / len(spans)
         assert np.allclose(summary["quantiles"], [reference_quantile(spans, q) for q in result["quantiles"]])
     assert {y: v["n"] for y, v in result["by_entry_year"].items()} == years
+    ehr = result["ehr"]
+    assert ehr["n"] == len(with_ehr) and ehr["fraction_without_ehr"] == with_ehr.count(False) / len(with_ehr)
+    assert ehr["fraction_obs_end_after_ehr_end"] == sum(after) / sum(with_ehr)
+    assert 0 < ehr["fraction_obs_end_after_ehr_end"] < 1 and ehr["median_positive_gap_years"] > 0
     # No condition table is read: the same numbers come back with every record removed.
     empty = {**tabs, "condition": tabs["condition"].slice(0, 0)}
     cohort.write_tables(tmp_path / "empty", empty, spec)

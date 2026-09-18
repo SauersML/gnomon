@@ -43,6 +43,8 @@ FIXED_COLUMNS = {
         "baseline_date": (pa.date32(), True),
         "obs_start": (pa.date32(), True),
         "obs_end": (pa.date32(), True),
+        "ehr_start": (pa.date32(), True),
+        "ehr_end": (pa.date32(), True),
         "death_date": (pa.date32(), True),
         "state": (pa.string(), True),
         "ehr_site": (pa.string(), True),
@@ -106,7 +108,8 @@ def _conform_column(name, column, source, target):
             if pc.any(pc.not_equal(day.cast(source), column)).as_py():
                 raise SchemaError(f"{name} holds a time of day; dates are calendar days")
             return day
-    elif pa.types.is_string(target) and (pa.types.is_string(source) or pa.types.is_large_string(source)):
+    elif pa.types.is_string(target) and (pa.types.is_string(source) or pa.types.is_large_string(source)
+                                         or getattr(pa.types, "is_string_view", lambda _: False)(source)):
         return column.cast(target)
     elif pa.types.is_integer(target) and pa.types.is_integer(source):
         return column.cast(target)  # a safe cast refuses values that do not fit
@@ -209,6 +212,11 @@ def validate(tables, manifest):
     covered = ~np.isnan(start)
     _require(((start[covered] <= baseline[covered]) & (baseline[covered] <= end[covered])).all(),
              "person's observation period does not cover its baseline")
+    ehr_start, ehr_end = days(person.column("ehr_start")), days(person.column("ehr_end"))
+    _require((np.isnan(ehr_start) == np.isnan(ehr_end)).all(),
+             "person ehr_start and ehr_end must be null together")
+    both = ~np.isnan(ehr_start)
+    _require((ehr_start[both] <= ehr_end[both]).all(), "person ehr_start must not follow ehr_end")
     site_null = person.column("ehr_site").is_null().to_numpy()
     _require(site_null[np.isnan(baseline)].all(),
              "person has an ehr_site but no baseline (sites are pre-baseline)")
@@ -438,6 +446,9 @@ def person_sql(cdr, ses_columns):
 
     `ses_columns` are zip3_ses_map's columns, or None when the CDR lacks it.
     Should the map carry several ACS vintages of one zip3, the latest is used.
+    One pass over the EHR-sourced visit and condition rows gives both the
+    modal pre-baseline site and the EHR date range of these two domains
+    (`ehr_sql` adds the others).
     """
     cdr = _check_cdr(cdr)
     if ses_columns:
@@ -470,25 +481,42 @@ def person_sql(cdr, ses_columns):
         WHERE primary_death_record = TRUE AND death_date BETWEEN DATE '1900-01-01' AND CURRENT_DATE()
         GROUP BY person_id
       ), state AS (
-        SELECT pe.person_id, REGEXP_EXTRACT(c.concept_code, r'^PIIState_([A-Z]{{2}})$') AS state
+        SELECT pe.person_id, NULLIF(REGEXP_EXTRACT(c.concept_code, r'^PIIState_([A-Z]{{2}})$'), '') AS state
         FROM `{cdr}.person_ext` pe JOIN `{cdr}.concept` c ON c.concept_id = pe.state_of_residence_concept_id
-      ), site_rows AS (
-        SELECT vo.person_id, ve.src_id
+      ), ehr_rows AS (
+        -- A visit lasts to its end date (an inpatient stay to discharge), at most a year: a junk end before
+        -- the start is ignored, and a placeholder end (2099-12-31, an open stay) cannot grant follow-up.
+        SELECT vo.person_id, vo.visit_start_date AS day,
+               LEAST(GREATEST(vo.visit_start_date, IFNULL(vo.visit_end_date, vo.visit_start_date)),
+                     DATE_ADD(vo.visit_start_date, INTERVAL 365 DAY)) AS day_end,
+               IF(IFNULL(vo.visit_end_date, vo.visit_start_date) > DATE_ADD(vo.visit_start_date, INTERVAL 30 DAY),
+                  LEAST(vo.visit_end_date, DATE_ADD(vo.visit_start_date, INTERVAL 365 DAY)), NULL) AS long_end,
+               ve.src_id
         FROM `{cdr}.visit_occurrence` vo
         JOIN `{cdr}.visit_occurrence_ext` ve ON ve.visit_occurrence_id = vo.visit_occurrence_id
-        JOIN consent e ON e.person_id = vo.person_id
-        WHERE REGEXP_CONTAINS(ve.src_id, r'(?i)EHR site') AND vo.visit_start_date < e.baseline_date
+        WHERE REGEXP_CONTAINS(ve.src_id, r'(?i)EHR site')
+          AND vo.visit_start_date BETWEEN DATE '1900-01-01' AND CURRENT_DATE()
         UNION ALL
-        SELECT co.person_id, ce.src_id
+        SELECT co.person_id, co.condition_start_date AS day, co.condition_start_date AS day_end,
+               CAST(NULL AS DATE) AS long_end, ce.src_id
         FROM `{cdr}.condition_occurrence` co
         JOIN `{cdr}.condition_occurrence_ext` ce ON ce.condition_occurrence_id = co.condition_occurrence_id
-        JOIN consent e ON e.person_id = co.person_id
-        WHERE REGEXP_CONTAINS(ce.src_id, r'(?i)EHR site') AND co.condition_start_date < e.baseline_date
-      ), site AS (
-        SELECT person_id, src_id AS ehr_site
-        FROM (SELECT person_id, src_id, COUNT(*) AS n FROM site_rows GROUP BY person_id, src_id)
-        WHERE TRUE
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY person_id ORDER BY n DESC, src_id) = 1
+        WHERE REGEXP_CONTAINS(ce.src_id, r'(?i)EHR site')
+          AND co.condition_start_date BETWEEN DATE '1900-01-01' AND CURRENT_DATE()
+      ), ehr_sites AS (
+        SELECT r.person_id, r.src_id, COUNTIF(r.day < e.baseline_date) AS pre_baseline,
+               MIN(r.day) AS first_day, MAX(r.day_end) AS last_day, MAX(r.long_end) AS long_day
+        FROM ehr_rows r LEFT JOIN consent e ON e.person_id = r.person_id
+        GROUP BY r.person_id, r.src_id
+      ), ehr AS (
+        SELECT person_id, IF(pre_baseline > 0, src_id, NULL) AS ehr_site, ehr_start, ehr_end, ehr_long_end
+        FROM (SELECT person_id, src_id, pre_baseline,
+                     MIN(first_day) OVER (PARTITION BY person_id) AS ehr_start,
+                     MAX(last_day) OVER (PARTITION BY person_id) AS ehr_end,
+                     MAX(long_day) OVER (PARTITION BY person_id) AS ehr_long_end,
+                     ROW_NUMBER() OVER (PARTITION BY person_id ORDER BY pre_baseline DESC, src_id) AS k
+              FROM ehr_sites)
+        WHERE k = 1
       ), zip AS (
         -- The address nearest baseline: the latest at or before it, else the earliest after it (flagged).
         SELECT person_id, zip3, post_baseline
@@ -508,7 +536,9 @@ def person_sql(cdr, ses_columns):
              IFNULL(p.sex_at_birth_concept_id, 0) AS sex_at_birth_concept_id,
              IFNULL(p.race_concept_id, 0) AS race_concept_id,
              IFNULL(p.ethnicity_concept_id, 0) AS ethnicity_concept_id,
-             e.baseline_date, cv.obs_start, cv.obs_end, d.death_date, s.state, st.ehr_site,
+             e.baseline_date, cv.obs_start, cv.obs_end, h.ehr_start, h.ehr_end, h.ehr_long_end,
+             d.death_date, s.state,
+             IF(e.baseline_date IS NULL, NULL, h.ehr_site) AS ehr_site,
              CAST(z.zip3 AS INT64) AS zip3, z.post_baseline AS zip3_post_baseline,
              {deprivation} AS deprivation_index
       FROM `{cdr}.person` p
@@ -516,10 +546,59 @@ def person_sql(cdr, ses_columns):
       LEFT JOIN covering cv ON cv.person_id = p.person_id
       LEFT JOIN death d ON d.person_id = p.person_id
       LEFT JOIN state s ON s.person_id = p.person_id
-      LEFT JOIN site st ON st.person_id = p.person_id
+      LEFT JOIN ehr h ON h.person_id = p.person_id
       LEFT JOIN zip z ON z.person_id = p.person_id
       {ses_join}
     """
+
+
+# The EHR domains beyond visits and conditions (which `person_sql` reads):
+# name -> (table, id column, date column). Their _ext rows mark EHR-sourced rows.
+EHR_DOMAINS = {
+    "procedure": ("procedure_occurrence", "procedure_occurrence_id", "procedure_date"),
+    "drug": ("drug_exposure", "drug_exposure_id", "drug_exposure_start_date"),
+    "observation": ("observation", "observation_id", "observation_date"),
+    "measurement": ("measurement", "measurement_id", "measurement_date"),
+}
+
+
+def ehr_sql(cdr, domain):
+    """Each person's first and last EHR-sourced date in one more domain: one grouped pass over it."""
+    cdr = _check_cdr(cdr)
+    table, key, day = EHR_DOMAINS[domain]
+    return f"""
+      SELECT t.person_id, MIN(t.{day}) AS ehr_start, MAX(t.{day}) AS ehr_end
+      FROM `{cdr}.{table}` t JOIN `{cdr}.{table}_ext` x ON x.{key} = t.{key}
+      WHERE REGEXP_CONTAINS(x.src_id, r'(?i)EHR site') AND t.{day} BETWEEN DATE '1900-01-01' AND CURRENT_DATE()
+      GROUP BY t.person_id
+    """
+
+
+def merge_ehr(person, extra):
+    """The person table with its EHR range widened by each extra domain's (person_id, ehr_start, ehr_end).
+
+    `extra` maps a domain to its table. Also returns, per domain in order, the
+    fraction of people with EHR whose ehr_end that domain moved later: an
+    outcome-blind check of whether a skipped domain would matter."""
+    index = pd.Index(person.column("person_id").to_numpy())
+    start, end = days(person.column("ehr_start")), days(person.column("ehr_end"))
+    extended = {}
+    for domain, table in extra.items():
+        at = index.get_indexer(table.column("person_id").to_numpy())
+        found = at >= 0
+        later = days(table.column("ehr_end"))[found]
+        moved = ~(later <= end[at[found]])  # also counts people whose only EHR is in this domain
+        start[at[found]] = np.fmin(start[at[found]], days(table.column("ehr_start"))[found])
+        end[at[found]] = np.fmax(end[at[found]], later)
+        extended[domain] = float(moved.sum() / max(1, int((~np.isnan(end)).sum())))
+
+    def column(values):
+        null = np.isnan(values)
+        return pa.array(np.where(null, 0, values).astype(np.int32), pa.int32(), mask=null).cast(pa.date32())
+
+    for name, values in (("ehr_start", start), ("ehr_end", end)):
+        person = person.set_column(person.schema.get_field_index(name), name, column(values))
+    return person, extended
 
 
 # The disease and exclusion roots with their excluded branches, from one
@@ -720,6 +799,9 @@ class AouSource(Source):
     qualify for it. Resolved concepts must match the declarations
     (`phenotypes.phenotype_codes` builds both from diseases.json).
 
+    ehr_end widens the visit and condition EHR range by the EHR_DOMAINS in
+    `ehr_domains` ("auto": each in order while the plan fits the budget).
+
     Before any query bills, every query is dry-run and the plan is refused if
     it would exceed the client's remaining budget (SPEC 7a). Tables are built
     on first use; `export` writes them, plus the outcome-blind descendant log,
@@ -727,8 +809,11 @@ class AouSource(Source):
     """
 
     def __init__(self, client, cdr, *, snomed_codes, scores, ancestry, prune, projection, score_cache,
-                 excluded_branches=None, num_pcs=None):
+                 excluded_branches=None, ehr_domains="auto", num_pcs=None):
         self.client = client
+        if ehr_domains != "auto" and not set(ehr_domains) <= set(EHR_DOMAINS):
+            raise ValueError(f"EHR domains are chosen from {list(EHR_DOMAINS)}")
+        self.ehr_domains = ehr_domains
         self.cdr = _check_cdr(cdr)
         declared = snomed_codes if isinstance(snomed_codes, dict) else dict.fromkeys(snomed_codes)
         self.snomed_codes = [str(code) for code in declared]
@@ -768,23 +853,39 @@ class AouSource(Source):
         return {"codes": ("STRING", self.snomed_codes), "branch_pairs": ("STRING", pairs)}
 
     def _queries(self):
-        """Every billed query of an extraction: {name: (sql, parameters)}."""
+        """Every billed query of an extraction but the extra EHR domains: {name: (sql, parameters)}."""
         every_code = self.snomed_codes + sorted({b for branches in self.branches.values() for b in branches})
         return {"person": (person_sql(self.cdr, self._ses_columns()), None),
                 "condition": (condition_sql(self.cdr), self._members()),
                 "root": (root_sql(self.cdr), {"codes": ("STRING", every_code)}),
                 "descendants": (descendant_sql(self.cdr), self._members()),
-                "cutoff": (self._cutoff_sql()[0], None)}
+                "cutoff": (self._cutoff_sql()[0], None),
+                **{f"ehr_{domain}": (ehr_sql(self.cdr, domain), None) for domain in self._facts.get("ehr", ())}}
 
     def plan(self):
-        """Dry-run every query; refuse the plan if it would exceed the remaining budget. {name: bytes}."""
+        """Dry-run every query and refuse a plan over the remaining budget. {name: bytes}.
+
+        With ehr_domains="auto" the extra EHR domains join in EHR_DOMAINS order
+        while the plan stays within budget (outcome-blind and deterministic);
+        the manifest records which ones did. An explicit list must fit whole.
+        """
         if "plan" not in self._facts:
+            self._facts["ehr"] = ()
             estimates = {name: self.client.estimate(sql, parameters)
                          for name, (sql, parameters) in self._queries().items()}
+            chosen, skipped = [], []
+            for domain in (EHR_DOMAINS if self.ehr_domains == "auto" else self.ehr_domains):
+                cost = self.client.estimate(ehr_sql(self.cdr, domain))
+                if self.ehr_domains == "auto" and sum(estimates.values()) + cost > self.client.remaining:
+                    skipped.append(domain)
+                    continue
+                estimates[f"ehr_{domain}"] = cost
+                chosen.append(domain)
             total = sum(estimates.values())
             if total > self.client.remaining:
                 raise RuntimeError(f"the BigQuery plan would bill up to {total:,} bytes, over the remaining "
                                    f"budget of {self.client.remaining:,}: {estimates}")
+            self._facts["ehr"], self._facts["ehr_skipped"] = tuple(chosen), skipped
             self._facts["plan"] = estimates
         return self._facts["plan"]
 
@@ -794,7 +895,21 @@ class AouSource(Source):
         return self.client.query(sql, parameters)
 
     def _build(self, name):
-        if name in ("person", "condition"):
+        if name == "person":
+            person = self._query("person")
+            for name in ("ehr_start", "ehr_end", "ehr_long_end"):  # as calendar days, whatever the engine returns
+                column = person.column(name)
+                person = person.set_column(person.schema.get_field_index(name), name,
+                                           _conform_column(f"person.{name}", column, column.type, pa.date32()))
+            extra = {domain: self._query(f"ehr_{domain}") for domain in self._facts["ehr"]}
+            person, self._facts["ehr_extended"] = merge_ehr(person, extra)
+            # Outcome-blind check: how often the EHR end is a visit end more than 30 days after its start.
+            end, long_end = days(person.column("ehr_end")), days(person.column("ehr_long_end"))
+            known = ~np.isnan(end)
+            share = (long_end[known] == end[known]).mean() if known.any() else 0.0
+            self._facts["ehr_end_from_long_visit"] = float(share)
+            return person.drop_columns(["ehr_long_end"])
+        if name == "condition":
             return self._query(name)
         if name == "root":
             table = self._query("root")
@@ -846,6 +961,10 @@ class AouSource(Source):
                         "ses_available": self._ses_columns() is not None,
                         "cdr_cutoff": cutoff.isoformat(), "cdr_cutoff_source": self._cutoff_sql()[1],
                         "prune_unmatched": self._facts["prune_unmatched"],
+                        "ehr_domains": ["visit", "condition", *self._facts["ehr"]],
+                        "ehr_domains_skipped": self._facts["ehr_skipped"],
+                        "ehr_extended_by": self._facts["ehr_extended"],
+                        "ehr_end_from_long_visit": self._facts["ehr_end_from_long_visit"],
                         "bigquery": {"plan_bytes": plan, "bytes_billed": self.client.billed,
                                      "job_ids": list(self.client.job_ids)}}
             self._tables = {name: conform(name, raw[name], manifest) for name in TABLES}
