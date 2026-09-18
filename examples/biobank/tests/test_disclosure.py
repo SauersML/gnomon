@@ -194,3 +194,18 @@ def test_findings_do_not_depend_on_string_hashing():
                               capture_output=True, text=True, check=True).stdout for seed in range(8)}
     assert len(outputs) == 1
     assert ["group_sum", 10] in json.loads(outputs.pop())
+
+
+# evaluate.py's survival counts: n at h counts the rows whose potential follow-up reaches h, so it shrinks
+# across horizons; cases at h have no cumulative relation; both lie inside the binary cell.
+SURVIVAL_AS_EVALUATED = dict(horizon_invariant=(), cumulative={"survival": {"n": "decreasing"}},
+                             nested_models=[("survival", "binary", ("n", "cases"))],
+                             parts={"binary": [("n", ["cases", "controls"])]})
+
+
+def test_survival_counts_shrink_by_horizon_and_lie_inside_the_binary_cell():
+    rows = [row(n=500, cases=200),
+            row(model="survival", horizon="h1", n=480, cases=160),
+            row(model="survival", horizon="h2", n=470, cases=150)]
+    found = disclosure.audit(rows, REGISTRY, axes=AXES, **SURVIVAL_AS_EVALUATED)
+    assert values(found, "derived") == [10, 20]

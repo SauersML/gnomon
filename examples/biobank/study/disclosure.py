@@ -153,8 +153,9 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
                A "risk" stratum is a per-variant predicted-risk bin.
     parts      model -> [(whole, [part, ...])]: counts that split a cell (parts may be unreleased).
     cumulative model -> {count: "increasing" | "decreasing"} across horizons.
-    nested_models  [(inner, outer)]: the inner model's persons are a subset of the outer model's, per cell,
-               for the counts in horizon_invariant.
+    nested_models  [(inner, outer)] or [(inner, outer, counts)]: each named count (default: those in
+               horizon_invariant) of the inner model's cell is a subset of the outer model's same cell, at the
+               same horizon or at the outer model's horizon-free cell.
     chain      a compiled pattern whose first group orders a row's exclusion-flow steps (e.g.
                step_(\\d+)_\\w+): each matching metric is a count, and consecutive steps differ by a count.
     """
@@ -321,12 +322,16 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
                     system.equate([(key(disease, model, metric, small, conditions, population), 1), (step, 1),
                                    (key(disease, model, metric, large, conditions, population), -1)],
                                   f"{disease}/{model}/{metric} between horizons {a:g} and {b:g}")
-    for inner, outer in nested_models:
+    for inner, outer, *counted in nested_models:
+        counted = set(counted[0]) if counted else set(horizon_invariant)
         for disease, model, metric, horizon, conditions, population in sorted(cells, key=_order):
-            if model == inner and metric in horizon_invariant:
-                extra = ("nesting", disease, inner, outer, metric, conditions, population)
-                system.equate([(key(disease, inner, metric, None, conditions, population), 1), (extra, 1),
-                               (key(disease, outer, metric, None, conditions, population), -1)],
+            if model == inner and metric in counted:
+                # The inner cell at a horizon lies inside the outer cell at that horizon, or inside the outer
+                # model's only (horizon-free) cell when it has no horizons.
+                outer_horizon = horizon if horizon in horizons[(disease, outer)] else None
+                extra = ("nesting", disease, inner, outer, metric, horizon, conditions, population)
+                system.equate([(key(disease, inner, metric, horizon, conditions, population), 1), (extra, 1),
+                               (key(disease, outer, metric, outer_horizon, conditions, population), -1)],
                               f"{disease}: {inner} {metric} inside {outer}")
 
     # A proportion pins its numerator when exactly one integer prints as it; iterate as denominators resolve.
