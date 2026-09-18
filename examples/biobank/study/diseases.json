@@ -2,7 +2,7 @@
   "locked": "2026-09-18",
   "locked_by": "study-diseases",
   "spec_section": "SPEC section 2 (amended 20:45Z): case = at least 2 distinct qualifying dates, event date = the second; single-record people kept",
-  "phenotype_rule": "Qualifying record = a condition_occurrence whose condition_concept_id descends from snomed_code in concept_ancestor (root included). Sex restriction is applied on sex at birth. Each exclusion root removes people who meet that root's case rule (at least 2 distinct qualifying dates) at any date, as SCHEMA.md per-disease step 3 does.",
+  "phenotype_rule": "Qualifying record = a condition_occurrence whose condition_concept_id descends from snomed_code in concept_ancestor (root included). Sex restriction is applied on sex at birth. An exclusion is met when a person has at least 2 distinct qualifying dates for the exclusion root. When it counts depends on the model (SPEC section 2, audit C3). Survival: it counts only if met with records dated on or before the landmark; if it is met later, follow-up is censored at the date it is met (the second distinct exclusion-root date), not removed. Binary: it counts if met by the CDR cutoff.",
   "selection_rule": "Disease and score chosen from AoU Data Browser counts and published provenance only; no AUC or other result from any earlier AoU run was used (audit S8).",
   "aou_audit_rule": "A score is ineligible if All of Us participants contributed to its discovery GWAS, to any component score, or to its tuning or weight fitting (PGS004787-style). AoU used only as a later evaluation sample is allowed. Checked in the PGS Catalog record (samples_variants, samples_training cohorts) and in the full text of the development paper.",
   "cross_enrollment_caveat": "Several discovery or tuning sets include US health-system biobanks or programs whose institutions or members can also be AoU participants (for example BioVU at Vanderbilt, Mass General Brigham Biobank, the Million Veteran Program). Individual overlap with AoU test participants cannot be ruled out from public cohort names. This is not AoU involvement in development, and it is recorded per score.",
@@ -65,7 +65,8 @@
           "concept_name": "Type 1 diabetes mellitus",
           "omop_concept_id": 201254,
           "browser_any_record": 10160,
-          "reason": "Type 1 patients are often coded as type 2 in the EHR, so they would be false cases. The score targets type 2 diabetes, and type 1 is a different disease with different genetics (HLA)."
+          "reason": "Type 1 patients are often coded as type 2 in the EHR, so they would be false cases. The score targets type 2 diabetes, and type 1 is a different disease with different genetics (HLA).",
+          "bias_note": "The exclusion also removes insulin-treated type 2 patients whose charts carry type 1 (E10-type) codes on 2 or more dates. Those are long-duration, likely earlier-onset and higher-PGS type 2 cases, so in the binary model the rule depletes them. That biases the PGS association toward the null and undercounts cases. The prespecified rule stands. Written sensitivity analysis: exclude only people with more distinct type 1 dates than type 2 dates."
         }
       ],
       "pgs": "PGS002308",
@@ -372,6 +373,7 @@
       "genome_build": "GRCh37",
       "multi_ancestry": true,
       "multi_ancestry_note": "Discovery is the trans-ethnic eGFR GWAS and validation covered 15 cohorts of diverse ancestry, but tuning used European UK Biobank. The published GPS adds APOL1 recessive risk genotypes, and the Catalog scoring file contains only the genome-wide polygenic part (no APOL1 term). We score exactly the Catalog file.",
+      "interpretation_note": "APOL1 G1/G2 risk genotypes are common almost only in African-ancestry people and are missing from this score. So CKD slope and calibration in African-ancestry strata partly reflect that missing term, not transport of the polygenic score. CKD heterogeneity across ancestry must not be read as attenuation with genetic distance.",
       "cached": true,
       "audit": {
         "aou_involvement": "none found",

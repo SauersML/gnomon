@@ -8,7 +8,11 @@ directory. Changes after the lock need the lead's approval (SPEC section 2).
   `concept_ancestor`, the root included.
   - A confirmed case has at least 2 distinct qualifying dates. The event date is the second one.
   - People with a single record are kept.
-  - Each exclusion root removes people who meet that root's case rule at any date (SCHEMA.md, per-disease step 3).
+  - An exclusion is met when a person has at least 2 distinct dates for the exclusion root. When it counts depends
+    on the model (SPEC section 2, audit C3):
+    - survival: only if met with records dated on or before the landmark. If it is met later, follow-up is
+      censored at the date it is met;
+    - binary: if met by the CDR cutoff.
 - **One PGS Catalog score per disease.** Its trait matches the root.
 - **No AoU in development.** A score is ineligible if All of Us participants contributed to its discovery GWAS, to a
   component score, or to its tuning or weight fitting. This covers PRSmix scores such as PGS004787.
@@ -61,6 +65,11 @@ GRCh38 harmonized files.
 | PGS004885 | Wray 2018 PGC MDD (EUR) | none | none (MegaPRS auto, 1000G reference) | 0 hits in PMC11169548 |
 | PGS002237 | Wuttke 2019 trans-ethnic eGFR GWAS | polygenic part only; the paper's APOL1 term is not in the Catalog file | best of 19 P+T scores chosen in 70% of UKB EUR | 0 hits in PMC9329233 |
 
+**CKD and APOL1.** PGS002237 has no APOL1 G1/G2 term, and those risk genotypes are common almost only in
+African-ancestry people. So CKD slope and calibration in African-ancestry strata partly reflect that missing term,
+not transport of the polygenic score. CKD heterogeneity across ancestry must not be read as attenuation with
+genetic distance.
+
 **Cross-enrollment caveat.** Several development sets are US programs whose members can also be AoU participants,
 so individual overlap with the AoU test set cannot be excluded from public cohort names. The programs are MVP,
 BioVU, BioMe, MGB, eMERGE and the BCAC US cohorts. This is not AoU involvement in development, and it is recorded
@@ -77,6 +86,11 @@ per score.
 ## Exclusions
 - **type_2_diabetes excludes T1D (46635009).** T1D is often miscoded as T2D, and it is a different disease with
   different (HLA) genetics.
+  - Known bias: the rule also removes insulin-treated T2D patients whose charts carry T1D (E10-type) codes on 2 or
+    more dates. Those are long-duration, likely earlier-onset and higher-PGS cases. In the binary model this
+    biases the PGS association toward the null and undercounts cases.
+  - The prespecified rule stands. Written sensitivity analysis: exclude only people with more distinct T1D dates
+    than T2D dates.
 - **major_depressive_disorder excludes bipolar disorder (13746004).** Bipolar depression is often coded as MDD, and
   PGC MDD case definitions exclude bipolar disorder.
 
