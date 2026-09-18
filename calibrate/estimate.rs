@@ -531,19 +531,6 @@ fn train_survival_model_on_pool(
         ));
     }
 
-    let n = data.age_entry.len();
-    // Start on the observed time scale, away from the derivative barrier: a
-    // unit-shape Weibull baseline at the mean exit age. The time anchor is
-    // gam's to choose: marginal-slope centres the time basis at the median exit,
-    // because an earliest-entry anchor on delayed-entry ages inflates the
-    // unpenalized time column until every smoothing seed is refused (gam #751).
-    // The fitted anchor is saved with the model and replayed at prediction.
-    let baseline_scale: f64 = data.age_exit.iter().map(|time| time / n as f64).sum();
-    if !baseline_scale.is_finite() || baseline_scale <= 0.0 {
-        return Err(EstimationError::Domain(
-            "survival exit ages must have a positive finite mean".into(),
-        ));
-    }
     let time_wiggle = survival_cfg.time_wiggle.as_ref().map_or_else(String::new, |settings| {
         let options: Vec<String> = [
             settings.num_knots.map(|knots| format!("internal_knots={knots}")),
@@ -565,9 +552,6 @@ fn train_survival_model_on_pool(
         slope_formula: Some(slope_formula(&config.pcs)),
         z_column: Some(SCORE_COLUMN.to_string()),
         latent_measure: Some(config.latent_law.latent_measure().to_string()),
-        baseline_target: "weibull".to_string(),
-        baseline_scale: Some(baseline_scale),
-        baseline_shape: Some(1.0),
         ..base_fit_config()
     };
     // gam's I-spline time basis at its own degree and knot count unless the user

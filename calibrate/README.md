@@ -115,8 +115,7 @@ count unless `SurvivalModelConfig.baseline_knots` / `baseline_degree` (CLI
 `--survival-baseline-knots` / `--survival-baseline-degree`) name them; the
 `--survival-time-wiggle-*` options likewise fall back to gam's `timewiggle()`
 defaults. The baseline
-starts from unit-shape Weibull offsets at the mean exit age. gam chooses the time
-anchor: marginal-slope centres the time basis at the median exit age, because an
+target is gam's default. gam chooses the time anchor: marginal-slope centres the time basis at the median exit age, because an
 earliest-entry anchor on delayed-entry ages inflates the unpenalized time column
 until every smoothing seed is refused (gam #751). gam persists the anchor, knots and
 offsets. Under the empirical law gam anchors the index on a rigid baseline:
