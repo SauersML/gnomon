@@ -209,3 +209,68 @@ def test_survival_counts_shrink_by_horizon_and_lie_inside_the_binary_cell():
             row(model="survival", horizon="h2", n=470, cases=150)]
     found = disclosure.audit(rows, REGISTRY, axes=AXES, **SURVIVAL_AS_EVALUATED)
     assert values(found, "derived") == [10, 20]
+
+
+# The cutoff-censoring survival rows (study-pipe's sensitivity) are the survival cells evaluated under another
+# censoring rule: the same persons and counts, published once, on the survival rows. They carry no counts.
+TWINS = {"survival_cutoff": "survival"}
+TWIN_REGISTRY = {"n": "count", "cases": "count", "obs_risk": "proportion", "auc": "score",
+                 "prevalence": {"type": "proportion", "of": "cases", "per": "n"}}
+
+
+def twin_rows():
+    s = lambda stratum="overall", **m: row(stratum, model="survival", horizon="h1", **m)
+    c = lambda stratum="overall", **m: row(stratum, model="survival_cutoff", horizon="h1", **m)
+    return [s(n=1000, cases=300, obs_risk=0.3, auc=0.7), c(obs_risk=0.31, auc=0.7),
+            s("sex_0", n=600, cases=170, obs_risk=0.2833), c("sex_0", obs_risk=0.29),
+            s("sex_1", n=400, cases=130, obs_risk=0.325), c("sex_1", obs_risk=0.33)]
+
+
+def twin_audit(rows, twins=TWINS):
+    return disclosure.audit(rows, TWIN_REGISTRY, axes=AXES, twins=twins, horizon_invariant=())
+
+
+def test_cutoff_twins_beside_their_released_survival_cells_are_safe():
+    assert twin_audit(twin_rows()) == []
+
+
+def test_a_cutoff_proportion_beside_a_withheld_survival_count_fires_and_only_with_twins():
+    # The survival sex_0 cell's counts are withheld (scores only); its cutoff twin still shows obs_risk, which
+    # times the released n would give the withheld cases back. Without the twin map the twin's own model has no
+    # counts, so its proportion passes vacuously: the hole this option closes.
+    rows = [r for r in twin_rows() if not (r["model"] == "survival" and r["stratum"] == "sex_0")]
+    rows.append(row("sex_0", model="survival", horizon="h1", auc=0.69, counts="counts_withheld"))
+    assert [f["kind"] for f in twin_audit(rows)] == ["proportion_beside_withheld"]
+    assert "survival_cutoff" in twin_audit(rows)[0]["what"]
+    assert disclosure.audit(rows, TWIN_REGISTRY, axes=AXES, horizon_invariant=()) == []
+
+
+def test_a_cutoff_row_beside_a_suppressed_or_missing_survival_row_fires():
+    # The survival sex_1 cell is insufficient (its status alone); its cutoff twin still shows a score.
+    base = [r for r in twin_rows() if r["stratum"] != "sex_1"]
+    status = lambda model: row("sex_1", model=model, horizon="h1", support="insufficient_support")
+    rows = base + [status("survival"), row("sex_1", model="survival_cutoff", horizon="h1", auc=0.66)]
+    found = twin_audit(rows)
+    assert [f["kind"] for f in found] == ["twin_beside_suppressed"] and "a suppressed survival" in found[0]["what"]
+    # Given its twin's decision, the cutoff row keeps only the status, and the digest is safe.
+    assert twin_audit(base + [status("survival"), status("survival_cutoff")]) == []
+    # A twin with no survival row at all.
+    orphan = twin_rows() + [row("sex_2", model="survival_cutoff", horizon="h1", auc=0.6)]
+    found = twin_audit(orphan)
+    assert [f["kind"] for f in found] == ["twin_beside_suppressed"] and "no survival" in found[0]["what"]
+
+
+def test_a_cutoff_proportion_pins_the_survival_numerator_it_stands_beside():
+    # The survival sex_0 cell shows n but its cases are unreleased; the twin's prevalence 0.0120 over n = 1000
+    # pins cases = 12 there.
+    rows = [row(model="survival", horizon="h1", n=1000, cases=300),
+            row("sex_0", model="survival", horizon="h1", n=1000),
+            row("sex_0", model="survival_cutoff", horizon="h1", prevalence=0.012)]
+    found = twin_audit(rows)
+    assert 12 in values(found)
+
+
+def test_a_cutoff_row_carrying_a_count_is_refused():
+    rows = twin_rows() + [row("sex_0", model="survival_cutoff", horizon="h2", n=600)]
+    with pytest.raises(ValueError, match="twin model's counts are its primary's"):
+        twin_audit(rows)

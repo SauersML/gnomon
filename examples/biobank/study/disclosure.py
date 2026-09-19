@@ -17,7 +17,10 @@ models every count as an unknown with the linear relations that hold between the
 - a leave-one-group-out fit's cells are the pooled cells crossed with its held-out group;
 - a nested model's persons are a subset of the enclosing model's in the same cell;
 - an exclusion flow's steps are a decreasing chain, each step removing a non-negative count;
-- a proportion printed to four significant digits pins its numerator when only one integer rounds to it.
+- a proportion printed to four significant digits pins its numerator when only one integer rounds to it;
+- a twin model's rows (the cutoff-censoring survival rows) carry no counts of their own: their proportions stand
+  beside their primary model's cell counts, and a twin row published beside a suppressed or missing primary row
+  is a finding.
 Exact rational Gauss-Jordan elimination then finds every count, residual and increment the released numbers
 determine, and every group of unknown counts whose sum they determine. Each one in 1..LIMIT is a finding. A
 contradiction between released numbers and the relations is an error, since the relations model the digest
@@ -140,7 +143,7 @@ class _System:
 
 
 def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invariant=("n",),
-          nested_models=(), chain=None, hierarchy=CENSUS, limit=LIMIT):
+          nested_models=(), chain=None, hierarchy=CENSUS, twins=None, limit=LIMIT):
     """Findings: every released or derivable participant count in 1..limit, as dicts.
 
     rows       digest.parse output: KEYS (disease, model, variant, fit, stratum, horizon) plus metrics.
@@ -158,8 +161,14 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
                same horizon or at the outer model's horizon-free cell.
     chain      a compiled pattern whose first group orders a row's exclusion-flow steps (e.g.
                step_(\\d+)_\\w+): each matching metric is a count, and consecutive steps differ by a count.
+    twins      twin model -> primary model, e.g. {"survival_cutoff": "survival"}: the twin's rows are the
+               primary's cells evaluated another way, with the same persons and counts, which the digest publishes
+               once, on the primary. A twin row carrying a count is an error. Its proportions are checked, and
+               pin numerators, against the primary's cell. A twin row with any number is a finding
+               ("twin_beside_suppressed") unless the primary row with the same keys carries one too: the digest
+               gives every twin row its primary cell's decision.
     """
-    parts, cumulative = parts or {}, cumulative or {}
+    parts, cumulative, twins = parts or {}, cumulative or {}, twins or {}
     registry = {metric: {"type": spec} if isinstance(spec, str) else spec for metric, spec in registry.items()}
     system, findings = _System(), []
     axes = set(axes)
@@ -186,8 +195,11 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
     # A proportion without a declared numerator ("proportion" alone, as evaluate.METRICS writes it) times its
     # cell's counts gives a count, so it may appear only in a cell whose counts are all released.
     shown, released, vocabulary = [], defaultdict(set), defaultdict(set)
+    # (disease, model, variant, fit, stratum, horizon) -> whether the row shows any number, for the twin check.
+    numbered = {}
     for row in rows:
         disease, model, variant, fit = row["disease"], row["model"], row["variant"], row["fit"]
+        primary = twins.get(model)
         horizon = _horizon(row["horizon"])
         conditions = {}
         logo = None
@@ -207,6 +219,7 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
         if conditions is None:
             continue
         steps = []
+        numbered[(disease, model, variant, fit, row["stratum"], row["horizon"])] = False
         for metric, value in row.items():
             if metric in ("disease", "model", "variant", "fit", "stratum", "horizon") or isinstance(value, str):
                 continue
@@ -216,13 +229,19 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
             spec = COUNT_SPEC if step is not None else registry.get(metric)
             if spec is None:
                 raise ValueError(f"metric {metric!r} is not registered")
+            numbered[(disease, model, variant, fit, row["stratum"], row["horizon"])] = True
+            if primary is not None and spec["type"] == "count":
+                raise ValueError(f"{disease}/{model}/{variant}/{fit}/{row['stratum']}/{row['horizon']} carries the "
+                                 f"count {metric}: a twin model's counts are its primary's, published there alone")
             if spec["type"] == "score":
                 continue
             if spec["type"] == "proportion":
+                # A twin row's proportion stands beside its primary cell's counts.
+                cell_model = primary or model
                 if "of" in spec:
-                    proportions.append((disease, model, horizon, conditions, spec, value, logo, row))
+                    proportions.append((disease, cell_model, horizon, conditions, spec, value, logo, row))
                 else:
-                    shown.append((disease, model, horizon, conditions,
+                    shown.append((disease, cell_model, horizon, conditions,
                                   f"{disease}/{model}/{variant}/{fit}/{row['stratum']}/{row['horizon']}/{metric}"))
                 continue
             if spec["type"] != "count":
@@ -444,6 +463,15 @@ def audit(rows, registry, *, axes, parts=None, cumulative=None, horizon_invarian
         if missing:
             findings.append({"kind": "proportion_beside_withheld", "value": 0,
                              "what": f"{label} beside withheld {', '.join(missing)}"})
+    for (disease, model, variant, fit, stratum, horizon), shows in sorted(numbered.items(), key=_order):
+        if model not in twins or not shows:
+            continue
+        label = f"{disease}/{model}/{variant}/{fit}/{stratum}/{horizon}"
+        twin = numbered.get((disease, twins[model], variant, fit, stratum, horizon))
+        if not twin:
+            findings.append({"kind": "twin_beside_suppressed", "value": 0,
+                             "what": f"{label} published beside {'no' if twin is None else 'a suppressed'} "
+                                     f"{twins[model]} row"})
     return findings
 
 
