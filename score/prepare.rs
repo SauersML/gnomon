@@ -1649,7 +1649,7 @@ fn prepare_for_computation_with_retry(
 }
 
 fn assemble_preparation(
-    plan: cache::VariantPlan,
+    mut plan: cache::VariantPlan,
     fileset_paths: &[FilesetPaths],
     person_subset: PersonSubset,
     final_person_iids: Vec<String>,
@@ -1663,25 +1663,35 @@ fn assemble_preparation(
     }
     let num_people_to_score = final_person_iids.len();
     let num_reconciled_variants = plan.required.len();
+    // The join grows its arrays as it reads them, and a run keeps them to its end: the memory
+    // budget charges what they hold (csr_heap_bytes counts capacity), so a compiled plan gives back
+    // the capacity it grew past its length, which a loaded plan never had. On 140,000 variants and
+    // 256 scores that was 358.77 MiB of a cold run's floor, the weights' 238.56 of it once they
+    // became the exact plan's integers in place.
+    plan.columns.shrink_to_fit();
+    plan.offsets.shrink_to_fit();
     // A saved plan holds its exact plan; a compiled one's weights become theirs in place.
     let exact = match plan.weights {
         cache::PlanWeights::Exact(exact) => exact,
         cache::PlanWeights::Parsed {
-            weights,
+            mut weights,
             corrections,
             ..
-        } => ExactPlan::new(
-            weights,
-            &corrections,
-            &plan.columns,
-            &plan.offsets,
-            &plan.complex,
-            &plan.names,
-        )
-        .map_err(|error| match error {
-            PlanError::Invariant(message) => PrepError::Invariant(message),
-            PlanError::Unrepresentable(message) => PrepError::Parse(message),
-        })?,
+        } => {
+            weights.shrink_to_fit();
+            ExactPlan::new(
+                weights,
+                &corrections,
+                &plan.columns,
+                &plan.offsets,
+                &plan.complex,
+                &plan.names,
+            )
+            .map_err(|error| match error {
+                PlanError::Invariant(message) => PrepError::Invariant(message),
+                PlanError::Unrepresentable(message) => PrepError::Parse(message),
+            })?
+        }
     };
     let bytes_per_variant = (total_people_in_fam as u64).div_ceil(4);
     let bytes_per_variant_usize = bytes_per_variant as usize;
@@ -2506,6 +2516,41 @@ mod tests {
                 "the recompiled plan replaces the bad one"
             );
         }
+    }
+
+    #[test]
+    fn a_compiled_plan_charges_the_memory_its_saved_plan_does() {
+        // More entries and rows than the join's first capacities hold, so its arrays grow past
+        // their lengths. Inputs no other test compiles, so no other test writes this plan.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("charged_plan_panel");
+        let rows: Vec<String> = (0..37).map(|i| format!("1 v{i} 0 {} A G\n", 1000 + i)).collect();
+        write_bim_fileset(&prefix, &rows.iter().map(String::as_str).collect::<Vec<_>>(), 3);
+        let weights = dir.path().join("charged.tsv");
+        let lines: String = (0..37)
+            .map(|i| format!("1:{}\tG\tA\t0.{}\t-{i}.5\t{}e-3\n", 1000 + i, i + 1, i + 7))
+            .collect();
+        std::fs::write(&weights, format!("variant_id\teffect_allele\tother_allele\tS\tT\tU\n{lines}")).unwrap();
+        let files = build_fileset_paths(std::slice::from_ref(&prefix)).unwrap();
+        let Some(key) =
+            cache::PlanCache::discover(&files, std::slice::from_ref(&weights), None, None).unwrap()
+        else {
+            return;
+        };
+        let prepare = || {
+            prepare_for_computation(
+                std::slice::from_ref(&prefix),
+                std::slice::from_ref(&weights),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let compiled = prepare();
+        assert!(key.load().unwrap().is_some(), "the compiled plan was saved");
+        let loaded = prepare();
+        assert_eq!(compiled.sparse_score_columns().len(), 111);
+        assert_eq!(compiled.csr_heap_bytes(), loaded.csr_heap_bytes());
     }
 
     #[test]
