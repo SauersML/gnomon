@@ -22,8 +22,9 @@ makes it one) a competing event:
 
 G, the censoring survival, is an evaluation nuisance fitted on the evaluation rows themselves: a Cox model for
 loss to follow-up over [0, h] on the rows whose potential follow-up reaches h, given site, region, ancestry,
-entry age and entry year. Deaths and disease events end follow-up and are not censorings. Standard errors are
-conditional on the fitted G.
+entry age and entry year. Deaths and disease events end follow-up and are not censorings. The standard errors
+of the IPCW AUC, Brier, observed risk and their paired differences include G's own estimation (the Cox
+model's score residuals and the Breslow or Kaplan-Meier hazard's martingale); the calibration SEs hold G fixed.
 """
 from __future__ import annotations
 
@@ -258,7 +259,8 @@ def censoring_window(time, code, horizon):
 def cox_fit(time, event, X, ridge=1.0, iterations=50):
     """Breslow-tie Cox partial likelihood with the penalty ridge/2 |beta|^2 on centred covariates (R:
     coxph(ties = "breslow") with ridge(..., theta = ridge, scale = FALSE)), by damped Newton-Raphson.
-    Returns beta, the distinct event times and the Breslow cumulative baseline hazard at the covariate means."""
+    Returns beta, the distinct event times, the Breslow cumulative baseline hazard at the covariate means and
+    the penalised information at beta."""
     t, d, X = np.asarray(time, float), np.asarray(event, float), np.asarray(X, float)
     order = np.argsort(t, kind="mergesort")
     t, d = t[order], d[order]
@@ -279,14 +281,17 @@ def cox_fit(time, event, X, ridge=1.0, iterations=50):
         value = float(d @ eta - deaths[events] @ (np.log(s0[events]) + shift) - 0.5 * ridge * b @ b)
         return r, s0, s1, shift, value
 
+    def information_at(r, s0, s1):
+        m = s1[events] / s0[events, None]
+        cumulative = np.cumsum(np.where(events, deaths / s0, 0.0))[row_time]
+        return m, (X.T @ (X * (r * cumulative)[:, None]) - m.T @ (m * deaths[events, None])
+                   + ridge * np.eye(X.shape[1]))
+
     beta = np.zeros(X.shape[1])
     r, s0, s1, shift, current = pieces(beta)
     for _ in range(iterations if X.shape[1] else 0):
-        m = s1[events] / s0[events, None]
+        m, information = information_at(r, s0, s1)
         gradient = x_events - deaths[events] @ m - ridge * beta
-        cumulative = np.cumsum(np.where(events, deaths / s0, 0.0))[row_time]
-        information = (X.T @ (X * (r * cumulative)[:, None]) - m.T @ (m * deaths[events, None])
-                       + ridge * np.eye(X.shape[1]))
         step = np.linalg.solve(information, gradient)
         scale = 1.0
         while True:
@@ -301,7 +306,8 @@ def cox_fit(time, event, X, ridge=1.0, iterations=50):
     else:
         if X.shape[1]:
             raise MetricRefusal("censoring", "Cox censoring model did not converge")
-    return beta, times[events], np.cumsum(deaths[events] / (s0[events] * np.exp(shift)))
+    return (beta, times[events], np.cumsum(deaths[events] / (s0[events] * np.exp(shift))),
+            information_at(r, s0, s1)[1])
 
 
 def censoring_design(frame, covariates, minimum=CENSORING_LEVEL_MIN, categorical_levels=12):
@@ -334,25 +340,77 @@ class Censoring:
     evaluation rows over [0, horizon], in one form for every kind: G_i(t) = exp(-risk_i * L_c(i)(t)) with L_c a
     cumulative hazard curve. kind "cox": a Cox model for censoring given `covariates` (one Breslow curve, risk
     exp(x'beta)); "km": the marginal reverse Kaplan-Meier (one curve, risk 1); "strata": a reverse
-    Kaplan-Meier within each level of covariates[0] (a curve per level, risk 1)."""
+    Kaplan-Meier within each level of covariates[0] (a curve per level, risk 1).
+
+    `variance` adds G's own estimation to a metric's influence function: for an IPCW metric with sensitivity
+    d_j = d(metric)/d(log w_j), row i's influence gains sum_m C_m dM_i(u_m) / D_m + b' psi_beta_i, with
+    log w_j = risk_j L(T*_j) (T*_j = T_j- for an event by h, h for a row followed past it), C_m the total
+    d_j risk_j of the rows whose L(T*_j) includes the censoring time u_m, dM_i row i's censoring martingale
+    increment, D_m the curve's risk-set denominator (the Breslow S0, or the reverse KM's Y - dN with events
+    leaving first) and, for the Cox model, psi_beta = I^-1 U (U the score residuals) and
+    b = sum_j d_j risk_j (L(T*_j) x_j - sum_{u_m <= T*_j} xbar(u_m) dL_m)."""
 
     def __init__(self, frame, horizon, kind="cox", covariates=(), ridge=1.0):
-        t, censored = censoring_window(frame.followup, frame.event_code, horizon)
+        followup, code = frame.followup.to_numpy(float), frame.event_code.to_numpy(int)
+        t, censored = censoring_window(followup, code, horizon)
         n = len(t)
-        self.risk, self.curve = np.ones(n), np.zeros(n, np.int64)
+        self.risk, self.curve, self.psi_beta = np.ones(n), np.zeros(n, np.int64), None
         X = censoring_design(frame, covariates) if kind == "cox" else np.zeros((n, 0))
         if kind == "strata":
             _, self.curve = np.unique(frame[covariates[0]].astype(str).to_numpy(), return_inverse=True)
-            self.curves = [self._km(t[self.curve == c], censored[self.curve == c]) for c in range(self.curve.max() + 1)]
-        elif X.shape[1]:
-            beta, times, base = cox_fit(t, censored, X, ridge)
-            self.risk = np.exp((X - X.mean(axis=0)) @ beta)
-            self.curves = [(times, base)]
-        elif kind in ("cox", "km"):
-            # Without covariates the censoring survival is the product-limit reverse Kaplan-Meier.
-            self.curves = [self._km(t, censored)]
-        else:
+        elif kind not in ("cox", "km"):
             raise ValueError(f"unknown censoring model {kind}")
+        # Per curve: the censoring times u, the increments a of the hazard in dM, the denominators D, and the
+        # cumulative hazard L at each u that G is built from.
+        self.curves, self.pieces = [], []
+        if X.shape[1]:
+            beta, times, base, information = cox_fit(t, censored, X, ridge)
+            Xc = X - X.mean(axis=0)
+            self.risk = np.exp(Xc @ beta)
+            increments = np.diff(np.r_[0.0, base])
+            order = np.argsort(t, kind="mergesort")
+            tail = np.cumsum(self.risk[order][::-1])[::-1]
+            start = np.searchsorted(t[order], times, side="left")
+            s0 = tail[start]
+            xbar = np.cumsum((Xc * self.risk[:, None])[order][::-1], axis=0)[::-1][start] / s0[:, None]
+            self.curves.append((times, base))
+            self.pieces.append((times, increments, s0, np.searchsorted(times, t, side="right")))
+            # Score residuals U_i = int (x_i - xbar) dM_i and psi_beta = U I^-1, with the Breslow risk set.
+            at_risk = self.pieces[0][3]
+            cumulative = np.r_[0.0, base][at_risk]
+            xbar_lambda = np.vstack([np.zeros(Xc.shape[1]), np.cumsum(xbar * increments[:, None], axis=0)])
+            own = np.searchsorted(times, t, side="left")
+            U = (np.where(censored[:, None], Xc - xbar[np.minimum(own, len(times) - 1)], 0.0)
+                 - self.risk[:, None] * (Xc * cumulative[:, None] - xbar_lambda[at_risk]))
+            self.psi_beta = np.linalg.solve(information, U.T).T
+            self.design, self.xbar_lambda = Xc, xbar_lambda
+            self.psi_gram = self.psi_beta.T @ self.psi_beta
+            # psi_beta summed by each row's own censoring time and by its at-risk count, so that psi_beta' first
+            # costs O(censoring times x p) per metric instead of O(rows x p).
+            self.psi_by_own = np.zeros((len(times), Xc.shape[1]))
+            np.add.at(self.psi_by_own, own[censored], self.psi_beta[censored])
+            self.psi_by_risk = np.zeros((len(times) + 1, Xc.shape[1]))
+            np.add.at(self.psi_by_risk, at_risk, self.risk[:, None] * self.psi_beta)
+        else:
+            for c in range(self.curve.max() + 1):
+                rows = self.curve == c
+                self.curves.append(self._km(t[rows], censored[rows]))
+                times = np.unique(t[rows][censored[rows]])
+                k = np.searchsorted(times, t[rows], side="left")
+                d = np.bincount(k[censored[rows]], minlength=len(times)).astype(float)
+                ahead = len(t[rows]) - np.searchsorted(np.sort(t[rows]), times, side="right")
+                # Events leave first, so the censoring risk set at u is {T > u} plus the censorings at u.
+                self.pieces.append((times, d / (ahead + d), ahead.astype(float), k + censored[rows]))
+        # Each row's position in its curve: how many censoring times its weight's L(T*) includes, and its own.
+        event = (code != 0) & (followup <= horizon)
+        self.weight_position, self.own, self.censored = np.zeros(n, np.int64), np.zeros(n, np.int64), censored
+        self.at_risk = np.zeros(n, np.int64)
+        for c, (times, _, _, at_risk) in enumerate(self.pieces):
+            rows = self.curve == c
+            position = np.where(event[rows], np.searchsorted(times, followup[rows], side="left"), len(times))
+            self.weight_position[rows] = position
+            self.own[rows] = np.searchsorted(times, t[rows], side="left")
+            self.at_risk[rows] = at_risk
 
     @staticmethod
     def _km(t, censored):
@@ -360,7 +418,7 @@ class Censoring:
         return times, -np.log(np.maximum(g, 1e-300))
 
     def subset(self, mask):
-        """The same fitted curves for a subset of the rows."""
+        """The same fitted curves for a subset of the rows (for Uno's weights; no variance)."""
         out = object.__new__(Censoring)
         out.risk, out.curve, out.curves = self.risk[mask], self.curve[mask], self.curves
         return out
@@ -377,6 +435,50 @@ class Censoring:
             rows = self.curve == c
             cumulative[rows] = step_at(times, base, t[rows], left, start=0.0)
         return np.exp(-self.risk * cumulative)
+
+    def _parts(self, rows, fixed, sensitivity):
+        """The total influence of a metric over a cell as (first, b, projection): first per evaluation row (the
+        influence given G on the cell's rows plus each row's censoring martingale term); for the Cox model the
+        vector b with which psi_beta enters and projection = psi_beta' first (both None otherwise). rows: the
+        cell's indices among the evaluation rows; fixed: its influence given G on them (summing to the metric's
+        error, e.g. (x - mean) / n); sensitivity: its derivative in each of their log weights."""
+        first = np.zeros(len(self.risk))
+        first[rows] = fixed
+        b = projection = None
+        for c, (times, increments, denominator, _) in enumerate(self.pieces):
+            chosen = self.curve[rows] == c
+            if not len(times) or not chosen.any():
+                continue
+            members = rows[chosen]
+            weight = sensitivity[chosen] * self.risk[members]
+            position = self.weight_position[members]
+            mass = np.bincount(position, weights=weight, minlength=len(times) + 1)
+            # C_m: the weight of the rows whose L(T*) includes censoring time m.
+            C = weight.sum() - np.cumsum(mass)[:-1]
+            term = np.r_[0.0, np.cumsum(C * increments / denominator)]
+            curve_rows = np.flatnonzero(self.curve == c)
+            own = np.minimum(self.own[curve_rows], len(times) - 1)
+            first[curve_rows] += (np.where(self.censored[curve_rows], C[own] / denominator[own], 0.0)
+                                  - self.risk[curve_rows] * term[self.at_risk[curve_rows]])
+            if self.psi_beta is not None:
+                cumulative = np.r_[0.0, np.cumsum(increments)]
+                b = self.design[members].T @ (weight * cumulative[position]) - self.xbar_lambda.T @ mass
+                projection = (self.psi_beta[rows].T @ fixed + self.psi_by_own.T @ (C / denominator)
+                              - self.psi_by_risk.T @ term)
+        return first, b, projection
+
+    def influence(self, rows, fixed, sensitivity):
+        """Each evaluation row's total influence on a metric over a cell (see _parts)."""
+        first, b, _ = self._parts(rows, fixed, sensitivity)
+        return first if b is None else first + self.psi_beta @ b
+
+    def variance(self, rows, fixed, sensitivity):
+        """The sum of squared total influences, without forming psi_beta @ b row by row."""
+        first, b, projection = self._parts(rows, fixed, sensitivity)
+        total = float(first @ first)
+        if b is not None:
+            total += 2 * float(b @ projection) + float(b @ self.psi_gram @ b)
+        return total
 
 
 def ipcw(frame, horizon, censoring):
@@ -625,16 +727,17 @@ def cell_support(time, code, horizon):
     return int(np.sum(time > horizon)), upper
 
 
-def survival_cell(t, code, w, censoring, P, variants, fit, stratum, horizon, minimum, references=REFERENCES,
+def survival_cell(t, code, w, model, rows, P, variants, fit, stratum, horizon, minimum, references=REFERENCES,
                   pooled=None, truth=None):
     """Rows for one survival cell at a horizon: t the follow-up from entry; code 0 censored, 1 disease, 2 death,
-    3 an exclusion-rule exit (2 and 3 compete); w the IPCW weights and `censoring` the evaluation's censoring
-    model for these rows; P the (variants x rows) CIFs at the horizon.
+    3 an exclusion-rule exit (2 and 3 compete); w the IPCW weights of `model`, the evaluation's censoring model,
+    and `rows` the cell's indices among its rows; P the (variants x rows) CIFs at the horizon.
     truth (simulator only): (true CIF at h, uncensored follow-up, uncensored event code) per row.
 
-    Reported only where the prespecified support rule holds: at least `minimum` cases, known non-cases and
-    rows followed past h; the cell's own G(h) upper bound at or above POSITIVITY_FLOOR; and every known row's
-    weight at most 1/POSITIVITY_FLOOR."""
+    Every IPCW standard error carries the censoring model's own estimation (Censoring.variance). Reported only
+    where the prespecified support rule holds: at least `minimum` cases, known non-cases and rows followed past
+    h; the cell's own G(h) upper bound at or above POSITIVITY_FLOOR; and every known row's weight at most
+    1/POSITIVITY_FLOOR."""
     y = ((code == 1) & (t <= horizon)).astype(float)
     known = w > 0
     n, cases, controls = len(t), int(y.sum()), int(np.sum(known & (y == 0)))
@@ -644,20 +747,29 @@ def survival_cell(t, code, w, censoring, P, variants, fit, stratum, horizon, min
     followed, g_upper = cell_support(t, code, horizon)
     if followed < minimum or g_upper < POSITIVITY_FLOOR or w.max() > 1 / POSITIVITY_FLOOR:
         return [dict(base, variant=v, status=UNSUPPORTED) for v in variants]
+
+    def mean_se(x):
+        # A mean of weighted row terms: its influence given G, and its sensitivity to each log weight.
+        return float(np.sqrt(model.variance(rows, (x - x.mean()) / n, x / n)))
+
+    def auc_se(influence):
+        # The AUC's influence given G is also its derivative in each log weight.
+        return float(np.sqrt(model.variance(rows, influence / n, influence / n)))
+
     # The observed risk is the IPCW mean of the outcome, with the same weights as every other metric. With the
     # cell's own reverse Kaplan-Meier as G it is exactly the Aalen-Johansen incidence (n S(u-) G(u-) = Y(u));
     # a marginal Aalen-Johansen per cell would be biased wherever censoring depends on a covariate.
     observed = float(np.mean(w * y))
-    observed_se = float(np.std(w * y, ddof=1) / np.sqrt(n))
+    observed_se = mean_se(w * y)
     shared = {"obs_risk": observed, "obs_risk_se": observed_se, "w_max": float(w.max()),
               "n_eff": float(w.sum() ** 2 / np.sum(w ** 2))}
     stacked = P if pooled is None else np.vstack([P, pooled])
     fits = [weighted_auc(p, y, w) for p in stacked]
     losses = w[None, :] * (y[None, :] - stacked) ** 2
     concordance = {}
-    for name, model in (("c_harrell", None), ("c_uno", censoring)):
+    for name, censoring in (("c_harrell", None), ("c_uno", model.subset(rows))):
         try:
-            concordance[name] = wolbers_concordance(t, code, P, horizon, model)
+            concordance[name] = wolbers_concordance(t, code, P, horizon, censoring)
         except MetricRefusal as refusal:
             concordance[name] = refusal
     truth_rows = [{} for _ in variants]
@@ -670,12 +782,12 @@ def survival_cell(t, code, w, censoring, P, variants, fit, stratum, horizon, min
                                  brier_unc=float(np.mean((y_unc - p) ** 2)))
             if 0 < y_unc.sum() < n:
                 truth_rows[a]["auc_unc"] = weighted_auc(p, y_unc, np.ones(n))[0]
-    rows = []
+    out = []
     for a, variant in enumerate(variants):
         p, (auc, influence) = P[a], fits[a]
-        row = dict(base, variant=variant, status="ok", auc=auc, auc_se=float(np.sqrt(np.sum(influence ** 2)) / n),
-                   brier=float(losses[a].mean()), brier_se=float(losses[a].std(ddof=1) / np.sqrt(n)),
-                   mean_risk=float(p.mean()), **shared, **truth_rows[a])
+        row = dict(base, variant=variant, status="ok", auc=auc, auc_se=auc_se(influence),
+                   brier=float(losses[a].mean()), brier_se=mean_se(losses[a]), mean_risk=float(p.mean()),
+                   **shared, **truth_rows[a])
         if observed > 0:
             oe, half = observed / row["mean_risk"], Z95 * observed_se / observed
             row.update(oe=oe, oe_lo=oe * math.exp(-half), oe_hi=oe * math.exp(half))
@@ -689,10 +801,13 @@ def survival_cell(t, code, w, censoring, P, variants, fit, stratum, horizon, min
         others = [(ref, variants.index(ref)) for ref in references if ref in variants and ref != variant]
         others += [("pooled", len(variants) + a)] if pooled is not None else []
         for ref, b in others:
-            _paired(row, ref, auc - fits[b][0], np.sqrt(np.sum((influence - fits[b][1]) ** 2)) / n,
-                    losses[a] - losses[b])
-        rows.append(row)
-    return rows
+            difference = losses[a] - losses[b]
+            row[f"d_auc_{ref}"] = float(auc - fits[b][0])
+            row[f"d_auc_{ref}_se"] = auc_se(influence - fits[b][1])
+            row[f"d_brier_{ref}"] = float(difference.mean())
+            row[f"d_brier_{ref}_se"] = mean_se(difference)
+        out.append(row)
+    return out
 
 
 def _fits(predictions):
@@ -796,7 +911,8 @@ def evaluate(kind, test, predictions, horizons, config, train=None, truth=None):
                              known.uncensored_exit_age.to_numpy(float) - frame.entry_age.to_numpy(float),
                              known.uncensored_event.to_numpy(int))
             for stratum, mask in cells(frame, strata):
-                rows += survival_cell(t[mask], code[mask], w[mask], model.subset(mask), P_all[:, mask], have, fit,
-                                      stratum, horizon, minimum, pooled=None if Q_all is None else Q_all[:, mask],
+                rows += survival_cell(t[mask], code[mask], w[mask], model, np.flatnonzero(mask), P_all[:, mask],
+                                      have, fit, stratum, horizon, minimum,
+                                      pooled=None if Q_all is None else Q_all[:, mask],
                                       truth=None if truth_all is None else tuple(v[mask] for v in truth_all))
     return rows

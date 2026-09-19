@@ -217,20 +217,24 @@ def released_cell(s, censoring="km"):
     frame = frame_of(s)
     model = ev.Censoring(frame, H, censoring, ("site", "age"))
     w = ev.ipcw(frame, H, model)
-    return ev.survival_cell(s.t.to_numpy(), s.code.to_numpy(), w, model, np.vstack([s.p1, s.p2]),
-                            ["ours", "standard"], "pooled", "overall", H, 21)[0]
+    return ev.survival_cell(s.t.to_numpy(), s.code.to_numpy(), w, model, np.arange(len(s)),
+                            np.vstack([s.p1, s.p2]), ["ours", "standard"], "pooled", "overall", H, 21)[0]
 
 
 @pytest.mark.parametrize("kind", ["cont", "tied"])
-def test_observed_risk_is_r_survfit_aalen_johansen_under_a_marginal_g(ref, kind):
+def test_observed_risk_and_its_se_are_r_survfit_aalen_johansen_under_a_marginal_g(ref, kind):
     values, _ = ref
     s = survival_data(ties=kind == "tied")
     row = released_cell(s)
     assert abs(row["obs_risk"] - values[f"aj_{kind}"]) < 1e-12
-    # The SE holds G fixed; R's infinitesimal jackknife also carries G's estimation, which only narrows it.
-    ratio = row["obs_risk_se"] / values[f"aj_se_{kind}"]
-    print(f"obs_risk {kind}: SE given G / R IJ SE = {ratio:.4f}")
-    assert 0.98 <= ratio <= 1.3
+    # Under a reverse-KM G the IPCW mean is the Aalen-Johansen estimator as a function of the case weights, so
+    # its total influence (G's estimation included) is survfit's infinitesimal jackknife exactly.
+    assert abs(row["obs_risk_se"] / values[f"aj_se_{kind}"] - 1) < 1e-8
+    frame = frame_of(s)
+    x = ev.ipcw(frame, H, ev.Censoring(frame, H, "km")) * ((s.code == 1) & (s.t <= H)).to_numpy(float)
+    given_g = x.std() / np.sqrt(len(x))
+    print(f"obs_risk {kind}: SE given G alone / R IJ SE = {given_g / values[f'aj_se_{kind}']:.4f}")
+    fails(abs(given_g / values[f"aj_se_{kind}"] - 1), 1e-8)
     # Planted: 1 - KM with deaths censored.
     times, km, _ = ev.reverse_km(s.t, np.where(s.code == 1, 0, 1))
     fails(abs(1 - float(ev.step_at(times, km, H)) - values[f"aj_{kind}"]), 1e-12)
@@ -338,14 +342,28 @@ def test_competing_risk_auc_and_se_match_timeroc_and_riskregression(ref, kind):
     y = ((s.code == 1) & (s.t <= H)).to_numpy(float)
     auc, influence = ev.weighted_auc(s.p1, y, w)
     reference = need(values, f"timeroc_auc2_{kind}")
-    tolerance = 1e-10 if kind == "cont" else 1e-3
+    # timeROC (timeROC_3.R) counts cases T < t and controls T > t, strictly, so an event exactly at the horizon
+    # is neither; ours, like the cumulative incidence, counts it a case by h. Its weights come from prodlim's
+    # reverse Kaplan-Meier, in which events leave the censoring risk set first, as in ours. With timeROC's
+    # inequalities and our G our weighted AUC must be timeROC's to rounding on tied times too.
+    t = s.t.to_numpy()
+    model = ev.Censoring(frame, H, "km")
+    strict_event = (s.code.to_numpy() != 0) & (t < H)
+    w_strict = np.where(strict_event, 1 / model.at(t, left=True), np.where(t > H, 1 / model.at(H), 0.0))
+    strict = ev.weighted_auc(s.p1, ((s.code == 1) & (s.t < H)).to_numpy(float), w_strict)[0]
+    print(f"IPCW AUC {kind}: ours {auc:.8f}, with timeROC's inequalities {strict:.8f}, timeROC {reference:.8f}")
+    assert abs(strict - reference) < 1e-10
+    tolerance = 1e-10 if kind == "cont" else 5e-3
     assert abs(auc - reference) < tolerance
-    se = np.sqrt(np.sum(influence ** 2)) / len(s)
-    print(f"IPCW AUC SE {kind}: ours (fixed G) {se:.6f} timeROC iid {values[f'timeroc_auc2_se_{kind}']:.6f}")
-    assert abs(se / values[f"timeroc_auc2_se_{kind}"] - 1) < 0.1
+    row = released_cell(s)
+    given_g = np.sqrt(np.sum(influence ** 2)) / len(s)
+    iid = values[f"timeroc_auc2_se_{kind}"]
+    print(f"IPCW AUC SE {kind}: released {row['auc_se']:.6f} given G alone {given_g:.6f} timeROC iid {iid:.6f}")
+    assert abs(row["auc_se"] / iid - 1) < (0.01 if kind == "cont" else 0.02)
     if f"rr_auc_{kind}" in values:
         assert abs(auc - values[f"rr_auc_{kind}"]) < tolerance
         assert abs(float(np.mean(w * (y - s.p1) ** 2)) - values[f"rr_brier_{kind}"]) < tolerance
+        print(f"IPCW AUC SE {kind}: riskRegression {values[f'rr_auc_se_{kind}']:.6f}")
 
 
 @pytest.mark.parametrize("ridge", [0, 1])
@@ -433,6 +451,38 @@ def test_ipcw_estimator_gate_on_every_released_column_under_site_dependent_censo
             print(f"mean SE / replicate SD, overall: {ratio.round(3).to_dict()}")
             assert ((ratio > 0.8) & (ratio < 1.25)).all()
             assert not ((ratio / 2 > 0.8) & (ratio / 2 < 1.25)).any()
+
+
+def test_ipcw_standard_errors_match_the_replicate_spread():
+    """Over 400 replicate samples of the gate scenario (site-dependent censoring; a Cox G on site, ancestry and
+    entry age, like production), the released SEs of the IPCW AUC, paired dAUC, Brier and observed risk, which
+    carry G's own estimation, match the replicate standard deviations. The SEs that hold G fixed are printed
+    beside them; a planted half-width SE fails."""
+    rng = np.random.default_rng(32)
+    reps, n = 400, 3000
+    everyone = np.arange(n)
+    values, total, fixed = [], [], []
+    for _ in range(reps):
+        frame, _, predictions = gate_sample(rng, n)
+        frame = frame.rename(columns={"event": "event_code"})
+        model = ev.Censoring(frame, H, "cox", ("ehr_site", "ancestry", "entry_age"))
+        w = ev.ipcw(frame, H, model)
+        y = ((frame.event_code == 1) & (frame.followup <= H)).to_numpy(float)
+        p, q = predictions[("ours", "pooled")][:, 0], predictions[("standard", "pooled")][:, 0]
+        (auc_p, inf_p), (auc_q, inf_q) = ev.weighted_auc(p, y, w), ev.weighted_auc(q, y, w)
+        loss, observed = w * (y - p) ** 2, w * y
+        values.append({"auc": auc_p, "d_auc": auc_p - auc_q, "brier": loss.mean(), "obs_risk": observed.mean()})
+        parts = {"auc": (inf_p / n, inf_p / n), "d_auc": ((inf_p - inf_q) / n, (inf_p - inf_q) / n),
+                 "brier": ((loss - loss.mean()) / n, loss / n),
+                 "obs_risk": ((observed - observed.mean()) / n, observed / n)}
+        total.append({k: np.sqrt(model.variance(everyone, *v)) for k, v in parts.items()})
+        fixed.append({k: np.sqrt(np.sum(v[0] ** 2)) for k, v in parts.items()})
+    spread = pd.DataFrame(values).std(ddof=1)
+    ratio_total, ratio_fixed = pd.DataFrame(total).mean() / spread, pd.DataFrame(fixed).mean() / spread
+    print(f"mean SE / replicate SD over {reps}: total {ratio_total.round(3).to_dict()}; "
+          f"G fixed {ratio_fixed.round(3).to_dict()}")
+    assert ((ratio_total > 0.9) & (ratio_total < 1.1)).all()
+    assert not ((ratio_total / 2 > 0.9) & (ratio_total / 2 < 1.1)).any()
 
 
 def test_binary_oe_interval_and_brier_standard_errors_cover_the_truth():

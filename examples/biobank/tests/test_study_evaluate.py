@@ -201,18 +201,77 @@ def test_cox_censoring_model_solves_its_score_equation_and_reduces_to_nelson_aal
                           "site": z.astype(str), "entry_age": a})
     X = ev.censoring_design(frame, ("site", "entry_age"))
     t, d = frame.followup.to_numpy(), (frame.event_code == 0).to_numpy(float)
-    beta, times, base = ev.cox_fit(t, d, X, ridge=0.0)
+    beta, times, base, _ = ev.cox_fit(t, d, X, ridge=0.0)
     Xc = X - X.mean(axis=0)
     r = np.exp(Xc @ beta)
     score = sum(d[i] * (Xc[i] - (r[t >= t[i]] @ Xc[t >= t[i]]) / r[t >= t[i]].sum()) for i in range(0, n)
                 if d[i])
     assert np.max(np.abs(score)) < 1e-6
     # No covariates: the Breslow baseline is the Nelson-Aalen of censoring with every row at risk at its time.
-    _, times0, base0 = ev.cox_fit(t, d, np.zeros((n, 0)), ridge=0.0)
+    _, times0, base0, _ = ev.cox_fit(t, d, np.zeros((n, 0)), ridge=0.0)
     u = np.unique(t[d > 0])
     nelson = np.cumsum([np.sum((t == s) & (d > 0)) / np.sum(t >= s) for s in u])
     np.testing.assert_allclose(times0, u)
     np.testing.assert_allclose(base0, nelson, rtol=1e-12)
+
+
+@pytest.mark.parametrize("kind", ["cox", "km", "strata"])
+def test_total_influence_is_the_jackknife_of_the_whole_estimator(kind):
+    """The total influence (given G, plus G's own estimation) of the IPCW AUC, Brier and observed risk is the
+    first-order change when one row is dropped and G refitted without it; the influence given G alone is not."""
+    rng = np.random.default_rng(24)
+    n, horizon = 3600, 2.0
+    site, x = rng.integers(0, 3, size=n), rng.normal(size=n)
+    t1 = rng.exponential(1 / (0.15 * np.exp(0.7 * x)))
+    t2 = rng.exponential(1 / 0.05, size=n)
+    c = rng.exponential(1 / (0.2 * np.exp(0.6 * site)))
+    t = np.minimum.reduce([t1, t2, c])
+    frame = pd.DataFrame({"followup": t, "event_code": np.select([t == t1, t == t2], [1, 2], 0),
+                          "site": site.astype(str), "age": rng.normal(size=n)})
+    p = 1 / (1 + np.exp(-(x - 1)))
+    covariates = ("site",) if kind == "strata" else ("site", "age")
+
+    def metrics(rows):
+        part = frame.loc[rows].reset_index(drop=True)
+        model = ev.Censoring(part, horizon, kind, covariates)
+        w = ev.ipcw(part, horizon, model)
+        y = ((part.event_code == 1) & (part.followup <= horizon)).to_numpy(float)
+        auc, influence = ev.weighted_auc(p[rows], y, w)
+        return model, {"auc": (auc, influence, influence),
+                       "brier": ((w * (y - p[rows]) ** 2).mean(), None, w * (y - p[rows]) ** 2),
+                       "risk": ((w * y).mean(), None, w * y)}
+
+    everyone = np.arange(n)
+    model, full = metrics(everyone)
+    fixed, total = {}, {}
+    for name, (value, influence, x_rows) in full.items():
+        given = influence / n if influence is not None else (x_rows - x_rows.mean()) / n
+        sensitivity = influence / n if influence is not None else x_rows / n
+        fixed[name], total[name] = given, model.influence(everyone, given, sensitivity)
+        variance = model.variance(everyone, given, sensitivity)
+        assert abs(variance - np.sum(total[name] ** 2)) < 1e-10 * variance
+    sample = rng.choice(n, size=40, replace=False)
+    jack = {name: [] for name in full}
+    for i in sample:
+        _, dropped = metrics(everyone[everyone != i])
+        for name in full:
+            jack[name].append((n - 1) / n * (full[name][0] - dropped[name][0]))
+    # The agreement is judged in the norm the variance uses, the root sum of squares over the sampled rows; the
+    # largest single-row error, dominated by high-leverage rows' second-order terms, is printed beside it.
+    errors = {}
+    for name in full:
+        jackknife = np.array(jack[name])
+        norm = np.linalg.norm(jackknife)
+        errors[name] = {"total": np.linalg.norm(total[name][sample] - jackknife) / norm,
+                        "given_g": np.linalg.norm(fixed[name][sample] - jackknife) / norm,
+                        "total_max": np.max(np.abs(total[name][sample] - jackknife)) / np.max(np.abs(jackknife))}
+    print(f"{kind}: relative |influence - jackknife| {errors}")
+    for name, error in errors.items():
+        assert error["total"] < 0.02, name
+    # Planted: for a mean of weighted terms the influence given G alone misses G's own estimation by far more
+    # (a censored row moves G, not the terms). For the AUC the censoring term is small at the row level.
+    for name in ("brier", "risk"):
+        assert errors[name]["given_g"] > 3 * errors[name]["total"], name
 
 
 def test_ipcw_weights_are_one_without_censoring_and_zero_for_censored_rows():
