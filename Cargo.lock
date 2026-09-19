@@ -4714,7 +4714,6 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-queue",
  "crossterm 0.28.1",
- "cudarc",
  "dirs",
  "dyn-stack",
  "faer 0.23.2",

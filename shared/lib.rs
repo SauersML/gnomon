@@ -37,8 +37,6 @@ pub mod cpu;
 
 mod range_fetch;
 
-pub(crate) mod cuda_utils;
-
 pub mod shared {
     pub use super::files;
 }

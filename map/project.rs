@@ -9,18 +9,11 @@ use super::progress::{
 use super::variant_filter::MatchKind;
 use crate::genotype_table;
 use core::cmp::min;
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
-use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
-    PushKernelArg,
-};
-use cudarc::nvrtc::compile_ptx;
 use faer::prelude::ReborrowMut;
 use faer::{Accum, Mat, MatMut, Par};
 use rayon::prelude::*;
 use std::error::Error;
 use std::mem::size_of;
-use std::path::Path;
 use std::simd::Simd;
 use std::sync::OnceLock;
 
@@ -258,7 +251,6 @@ pub const PROJECTION_CONDITIONING_COLUMNS: usize = 3;
 /// answer rather than as a missing one.
 const _: () = assert!(PROJECTION_CONDITIONING_COLUMNS == 3);
 
-const DEFAULT_PROJECT_CUDA_MIN_WORK: usize = 50_000_000;
 const SPARSE_MISSING_WOODBURY_MAX: usize = 1;
 
 /// The retention floor, as a fraction of the model's information.
@@ -296,776 +288,6 @@ const MIN_RETAINED_INFORMATION_FRACTION: f64 = 1.0e-5;
 /// spelled, so the test scales with the rounding actually incurred and nothing
 /// else.
 const PROJECTION_IDENTITY_ROUNDING_UNITS: f64 = 8.0;
-const PROJECT_CUDA_UNPACK_KERNELS: &str = r#"
-extern "C" __global__ void unpack_weighted_plink(
-    const unsigned char* packed,
-    const float* coeffs,
-    int num_people,
-    int batch_variants,
-    int bytes_per_variant,
-    float* out_matrix
-) {
-    // 2D grid: blockIdx.x indexes people (the fast / coalesced dimension),
-    // blockIdx.y indexes variants. The variant axis is grid-strided so a launch
-    // never needs gridDim.y to exceed the 65535 hardware cap.
-    //
-    // This replaces the flat-1D mapping (idx = person*... ; variant = idx /
-    // num_people), which forced a per-thread integer divide. GPUs have no
-    // hardware integer division, so NVRTC lowered `idx / num_people` to a
-    // ~20+ instruction software divide (verified in PTX). Indexing the two
-    // axes directly removes the divide entirely.
-    unsigned long long person =
-        (unsigned long long)blockIdx.x * (unsigned long long)blockDim.x +
-        (unsigned long long)threadIdx.x;
-    if (person >= (unsigned long long)num_people) return;
-
-    // The person's genotype byte offset and bit shift are invariant across all
-    // variants, so decode them once and amortize over the grid-stride loop
-    // (the old one-element-per-thread mapping recomputed them every element).
-    unsigned long long byte_idx = person >> 2;
-    int bit_shift = (int)((person & 3ull) << 1);
-
-    for (unsigned long long variant = blockIdx.y;
-         variant < (unsigned long long)batch_variants;
-         variant += (unsigned long long)gridDim.y) {
-        unsigned long long packed_offset =
-            variant * (unsigned long long)bytes_per_variant + byte_idx;
-        unsigned char b = packed[packed_offset];
-        unsigned char gt = (b >> bit_shift) & 0x3u;
-
-        float value = 0.0f;
-        if (gt == 0u) {
-            value = coeffs[(size_t)variant * 3u + 0u];
-        } else if (gt == 2u) {
-            value = coeffs[(size_t)variant * 3u + 1u];
-        } else if (gt == 3u) {
-            value = coeffs[(size_t)variant * 3u + 2u];
-        }
-
-        // Output layout is unchanged: column-major (variant-major) over people.
-        out_matrix[variant * (unsigned long long)num_people + person] = value;
-    }
-}
-"#;
-
-struct ProjectionCudaRhs {
-    _ctx: std::sync::Arc<CudaContext>,
-    stream: std::sync::Arc<CudaStream>,
-    blas: CudaBlas,
-    d_a: Option<CudaSlice<f64>>,
-    d_b: Option<CudaSlice<f64>>,
-    d_c: Option<CudaSlice<f64>>,
-    a_cap: usize,
-    b_cap: usize,
-    c_cap: usize,
-    h_c: Vec<f64>,
-    // Set by on-device calibration: when true, the projection GEMM runs in f32
-    // (sgemm) instead of f64 (dgemm). On a T4 f64 runs at 1/32 the f32 rate and
-    // this projection GEMM is compute-bound, so f32 is ~10x faster. Only enabled
-    // if the f32 result matched f64 to tight tolerance on this device, else the
-    // exact f64 path is kept.
-    use_f32: bool,
-}
-
-struct ProjectionCudaPacked {
-    _ctx: std::sync::Arc<CudaContext>,
-    stream: std::sync::Arc<CudaStream>,
-    blas: CudaBlas,
-    unpack_kernel: CudaFunction,
-    d_packed: Option<CudaSlice<u8>>,
-    d_coeffs: Option<CudaSlice<f32>>,
-    d_a: Option<CudaSlice<f32>>,
-    d_b: Option<CudaSlice<f32>>,
-    d_scores_accum: Option<CudaSlice<f32>>,
-    packed_cap: usize,
-    coeffs_cap: usize,
-    a_cap: usize,
-    b_cap: usize,
-    scores_cap: usize,
-    h_scores: Vec<f32>,
-}
-
-impl ProjectionCudaPacked {
-    fn new() -> Result<Self, String> {
-        // Refuse to proceed if two distinct files share a CUDA SONAME in this
-        // process (the AoU "double free or corruption" abort class). Shared with
-        // the score backend.
-        crate::cuda_utils::detect_cuda_library_conflicts()?;
-        let ctx = select_projection_cuda_device()?;
-        let stream = ctx
-            .new_stream()
-            .map_err(|e| format!("Failed to create CUDA stream: {e:?}"))?;
-        let blas = CudaBlas::new(stream.clone())
-            .map_err(|e| format!("Failed to initialize cuBLAS: {e:?}"))?;
-        // The packed path accumulates scores in f32 on the device. Only take it if
-        // this device proved f32 SGEMM matches f64 DGEMM (and the host reference);
-        // otherwise refuse so the caller falls back to the exact CPU path rather
-        // than emitting uncalibrated f32 PCA scores.
-        if !calibrate_projection_f32(&stream, &blas) {
-            return Err(
-                "packed projection f32 GEMM did not match f64 on this device; using CPU"
-                    .to_string(),
-            );
-        }
-        let ptx = compile_ptx(PROJECT_CUDA_UNPACK_KERNELS)
-            .map_err(|e| format!("NVRTC compile failed for projection kernel: {e:?}"))?;
-        let module = match ctx.load_module(ptx) {
-            Ok(module) => module,
-            Err(load_err) if crate::cuda_utils::should_retry_with_cubin(load_err) => {
-                let (cc_major, cc_minor) = ctx
-                    .compute_capability()
-                    .map_err(|e| format!("Failed to query device compute capability: {e:?}"))?;
-                eprintln!(
-                    "> Projection CUDA module load rejected PTX ({:?}); retrying with CUBIN for sm_{}{}.",
-                    load_err.0, cc_major, cc_minor
-                );
-                let cubin = crate::cuda_utils::compile_cubin_for_device(
-                    PROJECT_CUDA_UNPACK_KERNELS,
-                    cc_major,
-                    cc_minor,
-                )?;
-                ctx.load_module(cudarc::nvrtc::Ptx::from_binary(cubin)).map_err(|e| {
-                    format!(
-                        "Failed to load projection CUDA module after CUBIN fallback (PTX error: {load_err:?}): {e:?}"
-                    )
-                })?
-            }
-            Err(e) => return Err(format!("Failed to load projection CUDA module: {e:?}")),
-        };
-        let unpack_kernel = module
-            .load_function("unpack_weighted_plink")
-            .map_err(|e| format!("Failed to load unpack_weighted_plink kernel: {e:?}"))?;
-        Ok(Self {
-            _ctx: ctx,
-            stream,
-            blas,
-            unpack_kernel,
-            d_packed: None,
-            d_coeffs: None,
-            d_a: None,
-            d_b: None,
-            d_scores_accum: None,
-            packed_cap: 0,
-            coeffs_cap: 0,
-            a_cap: 0,
-            b_cap: 0,
-            scores_cap: 0,
-            h_scores: Vec::new(),
-        })
-    }
-
-    fn ensure_capacity(
-        &mut self,
-        packed_len: usize,
-        coeffs_len: usize,
-        a_len: usize,
-        b_len: usize,
-        scores_len: usize,
-    ) -> Result<(), String> {
-        if self.packed_cap < packed_len {
-            self.d_packed = Some(
-                self.stream
-                    .alloc_zeros::<u8>(packed_len)
-                    .map_err(|e| format!("Failed to allocate packed CUDA buffer: {e:?}"))?,
-            );
-            self.packed_cap = packed_len;
-        }
-        if self.coeffs_cap < coeffs_len {
-            self.d_coeffs = Some(
-                self.stream
-                    .alloc_zeros::<f32>(coeffs_len)
-                    .map_err(|e| format!("Failed to allocate coeff CUDA buffer: {e:?}"))?,
-            );
-            self.coeffs_cap = coeffs_len;
-        }
-        if self.a_cap < a_len {
-            self.d_a = Some(
-                self.stream
-                    .alloc_zeros::<f32>(a_len)
-                    .map_err(|e| format!("Failed to allocate A CUDA buffer: {e:?}"))?,
-            );
-            self.a_cap = a_len;
-        }
-        if self.b_cap < b_len {
-            self.d_b = Some(
-                self.stream
-                    .alloc_zeros::<f32>(b_len)
-                    .map_err(|e| format!("Failed to allocate B CUDA buffer: {e:?}"))?,
-            );
-            self.b_cap = b_len;
-        }
-        if self.scores_cap < scores_len {
-            self.d_scores_accum = Some(
-                self.stream
-                    .alloc_zeros::<f32>(scores_len)
-                    .map_err(|e| format!("Failed to allocate score-accum CUDA buffer: {e:?}"))?,
-            );
-            self.scores_cap = scores_len;
-        }
-        if self.h_scores.len() < scores_len {
-            self.h_scores.resize(scores_len, 0.0);
-        }
-        Ok(())
-    }
-
-    fn init_scores_accum(&mut self, n_samples: usize, components: usize) -> Result<(), String> {
-        let score_len = n_samples
-            .checked_mul(components)
-            .ok_or_else(|| "projection CUDA overflow for score_accum".to_string())?;
-        self.ensure_capacity(1, 1, 1, 1, score_len)?;
-        self.d_scores_accum = Some(
-            self.stream
-                .alloc_zeros::<f32>(score_len)
-                .map_err(|e| format!("Failed to zero-init score-accum CUDA buffer: {e:?}"))?,
-        );
-        self.scores_cap = score_len;
-        Ok(())
-    }
-
-    fn compute_scores_block(
-        &mut self,
-        packed: &[u8],
-        coeffs: &[f32],
-        loadings_col_major: &[f32],
-        n_samples: usize,
-        filled: usize,
-        components: usize,
-    ) -> Result<(), String> {
-        let a_len = n_samples
-            .checked_mul(filled)
-            .ok_or_else(|| "projection CUDA overflow for A".to_string())?;
-        let b_len = filled
-            .checked_mul(components)
-            .ok_or_else(|| "projection CUDA overflow for B".to_string())?;
-        let score_len = n_samples
-            .checked_mul(components)
-            .ok_or_else(|| "projection CUDA overflow for score_accum".to_string())?;
-        self.ensure_capacity(packed.len(), coeffs.len(), a_len, b_len, score_len)?;
-
-        let d_packed = self
-            .d_packed
-            .as_mut()
-            .expect("packed CUDA buffer must be allocated");
-        let d_coeffs = self
-            .d_coeffs
-            .as_mut()
-            .expect("coeff CUDA buffer must be allocated");
-        let d_a = self.d_a.as_mut().expect("A CUDA buffer must be allocated");
-        let d_b = self.d_b.as_mut().expect("B CUDA buffer must be allocated");
-        let d_scores_accum = self
-            .d_scores_accum
-            .as_mut()
-            .expect("score-accum CUDA buffer must be allocated");
-
-        let mut d_packed_view = d_packed.slice_mut(0..packed.len());
-        let mut d_coeffs_view = d_coeffs.slice_mut(0..coeffs.len());
-        let mut d_b_view = d_b.slice_mut(0..b_len);
-        let mut d_a_view = d_a.slice_mut(0..a_len);
-        let mut d_scores_view = d_scores_accum.slice_mut(0..score_len);
-
-        self.stream
-            .memcpy_htod(packed, &mut d_packed_view)
-            .map_err(|e| format!("Failed to copy packed block to GPU: {e:?}"))?;
-        self.stream
-            .memcpy_htod(coeffs, &mut d_coeffs_view)
-            .map_err(|e| format!("Failed to copy coeffs to GPU: {e:?}"))?;
-        self.stream
-            .memcpy_htod(loadings_col_major, &mut d_b_view)
-            .map_err(|e| format!("Failed to copy loadings to GPU: {e:?}"))?;
-
-        let n_samples_i32 =
-            i32::try_from(n_samples).map_err(|_| format!("n_samples too large: {n_samples}"))?;
-        let filled_i32 =
-            i32::try_from(filled).map_err(|_| format!("filled too large: {filled}"))?;
-        let bytes_per_variant_i32 = i32::try_from(packed_bytes_per_variant(n_samples))
-            .map_err(|_| format!("bytes_per_variant too large for n_samples={n_samples}"))?;
-        // 2D launch matching the grid-strided `unpack_weighted_plink`: x covers
-        // people (256-wide, coalesced), y covers variants and is capped at the
-        // 65535 gridDim.y limit (the kernel's grid-stride loop handles any
-        // overflow).
-        let unpack_cfg = {
-            const UNPACK_BLOCK: u32 = 256;
-            let people_u32 = u32::try_from(n_samples)
-                .map_err(|_| format!("n_samples too large: {n_samples}"))?;
-            let variants_u32 =
-                u32::try_from(filled).map_err(|_| format!("filled too large: {filled}"))?;
-            let grid_x = people_u32.div_ceil(UNPACK_BLOCK).max(1);
-            let grid_y = variants_u32.min(65_535).max(1);
-            LaunchConfig {
-                grid_dim: (grid_x, grid_y, 1),
-                block_dim: (UNPACK_BLOCK, 1, 1),
-                shared_mem_bytes: 0,
-            }
-        };
-        unsafe {
-            self.stream
-                .launch_builder(&self.unpack_kernel)
-                .arg(&d_packed.slice(0..packed.len()))
-                .arg(&d_coeffs.slice(0..coeffs.len()))
-                .arg(&n_samples_i32)
-                .arg(&filled_i32)
-                .arg(&bytes_per_variant_i32)
-                .arg(&mut d_a_view)
-                .launch(unpack_cfg)
-                .map_err(|e| format!("Failed to launch unpack_weighted_plink: {e:?}"))?;
-        }
-
-        let m = i32::try_from(n_samples).map_err(|_| format!("m too large: {n_samples}"))?;
-        let n = i32::try_from(components).map_err(|_| format!("n too large: {components}"))?;
-        let k = i32::try_from(filled).map_err(|_| format!("k too large: {filled}"))?;
-        let cfg = GemmConfig {
-            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-            m,
-            n,
-            k,
-            alpha: 1.0f32,
-            lda: m,
-            ldb: k,
-            beta: 1.0f32,
-            ldc: m,
-        };
-        unsafe {
-            let a_view = d_a.slice(0..a_len);
-            let b_view = d_b.slice(0..b_len);
-            self.blas
-                .gemm(cfg, &a_view, &b_view, &mut d_scores_view)
-                .map_err(|e| format!("projection cuBLAS GEMM failed: {e:?}"))?;
-        }
-        // Block-level barrier. The HtoD copies above are async and the host
-        // staging buffers (packed/coeffs/loadings) are reused for the next block;
-        // without this sync the CPU could overwrite them while the DMA is still
-        // reading. It also makes this block's accumulation into `d_scores_accum`
-        // fully committed (and surfaces any async kernel/GEMM error here), so the
-        // caller can treat each successful call as an atomic, completed block.
-        self.stream
-            .synchronize()
-            .map_err(|e| format!("Failed to synchronize projection score block: {e:?}"))?;
-        Ok(())
-    }
-
-    fn copy_scores_to_host(
-        &mut self,
-        n_samples: usize,
-        components: usize,
-        out_f64: &mut [f64],
-    ) -> Result<(), String> {
-        let len = n_samples
-            .checked_mul(components)
-            .ok_or_else(|| "projection CUDA overflow for score dtoh".to_string())?;
-        let d_scores = self
-            .d_scores_accum
-            .as_ref()
-            .ok_or_else(|| "score-accum CUDA buffer is not initialized".to_string())?;
-        if out_f64.len() < len {
-            return Err("score output buffer too small for dtoh".to_string());
-        }
-        if self.h_scores.len() < len {
-            self.h_scores.resize(len, 0.0);
-        }
-        self.stream
-            .memcpy_dtoh(&d_scores.slice(0..len), &mut self.h_scores[..len])
-            .map_err(|e| format!("Failed to copy projection scores from GPU: {e:?}"))?;
-        // `memcpy_dtoh` issues cuMemcpyDtoHAsync and cudarc does not implicitly
-        // sync for an existing host slice, so we must barrier before reading
-        // `h_scores`, or the loop below races the in-flight DMA (stale/torn data).
-        self.stream
-            .synchronize()
-            .map_err(|e| format!("Failed to synchronize projection score DtoH: {e:?}"))?;
-        // The GEMM writes C column-major (ldc == n_samples), so the device buffer
-        // is laid out as [k * n_samples + sample]. The rest of the pipeline stores
-        // scores row-major ([sample * components + k]); reconcile the two here.
-        // Copying linearly would transpose-scramble every sample's components.
-        accumulate_col_major_scores_into_row_major(
-            &mut out_f64[..len],
-            &self.h_scores[..len],
-            n_samples,
-            components,
-        );
-        Ok(())
-    }
-}
-
-/// Accumulates a cuBLAS **column-major** `n_samples × components` score block
-/// (element `(sample, k)` at `k * n_samples + sample`) into a **row-major** host
-/// buffer (`sample * components + k`).
-///
-/// The packed CUDA projection GEMM produces column-major output, while every
-/// other layer of the projection pipeline (CPU accumulation, the final copy into
-/// the score matrix, the serialized scores) is row-major. Without this transpose
-/// on copy-back, each sample would be assigned components drawn from unrelated
-/// offsets in the flattened column-major matrix — finite, large, structured, and
-/// biologically meaningless scores.
-fn accumulate_col_major_scores_into_row_major(
-    dst_row_major: &mut [f64],
-    src_col_major: &[f32],
-    n_samples: usize,
-    components: usize,
-) {
-    for sample in 0..n_samples {
-        let row = sample * components;
-        for k in 0..components {
-            dst_row_major[row + k] += src_col_major[k * n_samples + sample] as f64;
-        }
-    }
-}
-
-impl Drop for ProjectionCudaPacked {
-    fn drop(&mut self) {
-        // cudarc enqueues device-buffer frees on the stream; tearing the context
-        // down while async work (copies/kernels/GEMM) is still in flight can
-        // corrupt CUDA/cuBLAS/glibc state. Bind the context and drain the stream
-        // first, matching the score backend's CudaRuntime::drop.
-        let _ = self._ctx.bind_to_thread();
-        let _ = self.stream.synchronize();
-    }
-}
-
-impl Drop for ProjectionCudaRhs {
-    fn drop(&mut self) {
-        let _ = self._ctx.bind_to_thread();
-        let _ = self.stream.synchronize();
-    }
-}
-
-impl ProjectionCudaRhs {
-    fn new() -> Result<Self, String> {
-        crate::cuda_utils::detect_cuda_library_conflicts()?;
-        let ctx = select_projection_cuda_device()?;
-        let stream = ctx
-            .new_stream()
-            .map_err(|e| format!("Failed to create CUDA stream: {e:?}"))?;
-        let blas = CudaBlas::new(stream.clone())
-            .map_err(|e| format!("Failed to initialize cuBLAS: {e:?}"))?;
-        let use_f32 = calibrate_projection_f32(&stream, &blas);
-        if use_f32 {
-            eprintln!(
-                "> Projection GEMM: f32 sgemm (calibrated == f64 on this device; ~10x on T4-class f64)"
-            );
-        } else {
-            eprintln!("> Projection GEMM: f64 dgemm (f32 path not validated on this device)");
-        }
-        Ok(Self {
-            _ctx: ctx,
-            stream,
-            blas,
-            d_a: None,
-            d_b: None,
-            d_c: None,
-            a_cap: 0,
-            b_cap: 0,
-            c_cap: 0,
-            h_c: Vec::new(),
-            use_f32,
-        })
-    }
-
-    fn ensure_capacity(&mut self, a_len: usize, b_len: usize, c_len: usize) -> Result<(), String> {
-        if self.a_cap < a_len {
-            self.d_a = Some(
-                self.stream
-                    .alloc_zeros::<f64>(a_len)
-                    .map_err(|e| format!("Failed to allocate CUDA A buffer: {e:?}"))?,
-            );
-            self.a_cap = a_len;
-        }
-        if self.b_cap < b_len {
-            self.d_b = Some(
-                self.stream
-                    .alloc_zeros::<f64>(b_len)
-                    .map_err(|e| format!("Failed to allocate CUDA B buffer: {e:?}"))?,
-            );
-            self.b_cap = b_len;
-        }
-        if self.c_cap < c_len {
-            self.d_c = Some(
-                self.stream
-                    .alloc_zeros::<f64>(c_len)
-                    .map_err(|e| format!("Failed to allocate CUDA C buffer: {e:?}"))?,
-            );
-            self.c_cap = c_len;
-        }
-        if self.h_c.len() < c_len {
-            self.h_c.resize(c_len, 0.0);
-        }
-        Ok(())
-    }
-
-    fn compute_rhs(
-        &mut self,
-        a_col_major: &[f64],
-        b_col_major: &[f64],
-        m_rows: usize,
-        k_shared: usize,
-        n_cols: usize,
-    ) -> Result<&[f64], String> {
-        if self.use_f32 {
-            return self.compute_rhs_f32(a_col_major, b_col_major, m_rows, k_shared, n_cols);
-        }
-        let a_len = m_rows
-            .checked_mul(k_shared)
-            .ok_or_else(|| "CUDA rhs overflow for A".to_string())?;
-        let b_len = k_shared
-            .checked_mul(n_cols)
-            .ok_or_else(|| "CUDA rhs overflow for B".to_string())?;
-        let c_len = m_rows
-            .checked_mul(n_cols)
-            .ok_or_else(|| "CUDA rhs overflow for C".to_string())?;
-        self.ensure_capacity(a_len, b_len, c_len)?;
-
-        let d_a = self
-            .d_a
-            .as_mut()
-            .expect("CUDA A buffer must be allocated before use");
-        let d_b = self
-            .d_b
-            .as_mut()
-            .expect("CUDA B buffer must be allocated before use");
-        let d_c = self
-            .d_c
-            .as_mut()
-            .expect("CUDA C buffer must be allocated before use");
-        let mut d_a_view: CudaViewMut<'_, f64> = d_a.slice_mut(0..a_len);
-        let mut d_b_view: CudaViewMut<'_, f64> = d_b.slice_mut(0..b_len);
-        let mut d_c_view: CudaViewMut<'_, f64> = d_c.slice_mut(0..c_len);
-
-        self.stream
-            .memcpy_htod(a_col_major, &mut d_a_view)
-            .map_err(|e| format!("Failed to copy projection block to device: {e:?}"))?;
-        self.stream
-            .memcpy_htod(b_col_major, &mut d_b_view)
-            .map_err(|e| format!("Failed to copy loading block to device: {e:?}"))?;
-
-        let m = i32::try_from(m_rows).map_err(|_| format!("m_rows too large: {m_rows}"))?;
-        let n = i32::try_from(n_cols).map_err(|_| format!("n_cols too large: {n_cols}"))?;
-        let k = i32::try_from(k_shared).map_err(|_| format!("k_shared too large: {k_shared}"))?;
-        let cfg = GemmConfig {
-            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-            m,
-            n,
-            k,
-            alpha: 1.0f64,
-            lda: m,
-            ldb: k,
-            beta: 0.0f64,
-            ldc: m,
-        };
-        unsafe {
-            let a_view: CudaView<'_, f64> = d_a.slice(0..a_len);
-            let b_view: CudaView<'_, f64> = d_b.slice(0..b_len);
-            self.blas
-                .gemm(cfg, &a_view, &b_view, &mut d_c_view)
-                .map_err(|e| format!("cuBLAS GEMM failed for projection rhs: {e:?}"))?;
-        }
-
-        let d_c_ref = self
-            .d_c
-            .as_ref()
-            .expect("CUDA C buffer must be allocated before dtoh");
-        self.stream
-            .memcpy_dtoh(&d_c_ref.slice(0..c_len), &mut self.h_c[..c_len])
-            .map_err(|e| format!("Failed to copy projection rhs from device: {e:?}"))?;
-        // Barrier before the caller reads `h_c`: the DtoH above is async and
-        // cudarc does not implicitly sync for an existing host slice.
-        self.stream
-            .synchronize()
-            .map_err(|e| format!("Failed to synchronize projection rhs DtoH: {e:?}"))?;
-        Ok(&self.h_c[..c_len])
-    }
-
-    /// f32 (sgemm) variant of `compute_rhs`, used only after `calibrate_projection_f32`
-    /// confirmed it matches f64 on this device. Inputs are converted f64->f32 on
-    /// the host, multiplied with sgemm, and the result widened back to f64. The
-    /// genotype/loadings magnitudes are O(1), so f32 holds the projection scores
-    /// to ~1e-5 relative — negligible for PCA, and bounded by the calibration.
-    fn compute_rhs_f32(
-        &mut self,
-        a_col_major: &[f64],
-        b_col_major: &[f64],
-        m_rows: usize,
-        k_shared: usize,
-        n_cols: usize,
-    ) -> Result<&[f64], String> {
-        let a_len = m_rows
-            .checked_mul(k_shared)
-            .ok_or_else(|| "CUDA rhs overflow for A".to_string())?;
-        let b_len = k_shared
-            .checked_mul(n_cols)
-            .ok_or_else(|| "CUDA rhs overflow for B".to_string())?;
-        let c_len = m_rows
-            .checked_mul(n_cols)
-            .ok_or_else(|| "CUDA rhs overflow for C".to_string())?;
-
-        let a32: Vec<f32> = a_col_major.iter().map(|&x| x as f32).collect();
-        let b32: Vec<f32> = b_col_major.iter().map(|&x| x as f32).collect();
-        let d_a = self
-            .stream
-            .clone_htod(&a32)
-            .map_err(|e| format!("Failed to copy f32 projection block to device: {e:?}"))?;
-        let d_b = self
-            .stream
-            .clone_htod(&b32)
-            .map_err(|e| format!("Failed to copy f32 loading block to device: {e:?}"))?;
-        let mut d_c = self
-            .stream
-            .alloc_zeros::<f32>(c_len)
-            .map_err(|e| format!("Failed to allocate f32 projection output: {e:?}"))?;
-
-        let m = i32::try_from(m_rows).map_err(|_| format!("m_rows too large: {m_rows}"))?;
-        let n = i32::try_from(n_cols).map_err(|_| format!("n_cols too large: {n_cols}"))?;
-        let k = i32::try_from(k_shared).map_err(|_| format!("k_shared too large: {k_shared}"))?;
-        let cfg = GemmConfig {
-            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-            m,
-            n,
-            k,
-            alpha: 1.0f32,
-            lda: m,
-            ldb: k,
-            beta: 0.0f32,
-            ldc: m,
-        };
-        unsafe {
-            self.blas
-                .gemm(
-                    cfg,
-                    &d_a.slice(0..a_len),
-                    &d_b.slice(0..b_len),
-                    &mut d_c.slice_mut(0..c_len),
-                )
-                .map_err(|e| format!("cuBLAS sgemm failed for projection rhs: {e:?}"))?;
-        }
-        let c32 = self
-            .stream
-            .clone_dtoh(&d_c.slice(0..c_len))
-            .map_err(|e| format!("Failed to copy f32 projection rhs from device: {e:?}"))?;
-        // Barrier before reading the copied data: the DtoH is async on this stream.
-        self.stream
-            .synchronize()
-            .map_err(|e| format!("Failed to synchronize f32 projection rhs DtoH: {e:?}"))?;
-        if self.h_c.len() < c_len {
-            self.h_c.resize(c_len, 0.0);
-        }
-        for i in 0..c_len {
-            self.h_c[i] = c32[i] as f64;
-        }
-        Ok(&self.h_c[..c_len])
-    }
-}
-
-/// One-time on-device check: run the projection GEMM in f64 and in f32 on
-/// identical known inputs and return true only if they agree to a tight relative
-/// tolerance. Any CUDA error or mismatch returns false, so the projection keeps
-/// the exact f64 path. This is what makes the f32 fast path safe to enable
-/// automatically — it can never be used unless this device proved it equals f64.
-fn calibrate_projection_f32(stream: &std::sync::Arc<CudaStream>, blas: &CudaBlas) -> bool {
-    let run = || -> Result<bool, String> {
-        // Tall-skinny shape like the real projection: m samples x k variants x n PCs.
-        const M: usize = 128;
-        const K: usize = 256;
-        const N: usize = 16;
-        let a: Vec<f64> = (0..M * K)
-            .map(|i| ((i as i64 * 13 % 197) - 98) as f64 / 41.0)
-            .collect();
-        let b: Vec<f64> = (0..K * N)
-            .map(|i| ((i as i64 * 7 % 101) - 50) as f64 / 29.0)
-            .collect();
-        let (mi, ni, ki) = (M as i32, N as i32, K as i32);
-        let cfg64 = GemmConfig {
-            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-            m: mi,
-            n: ni,
-            k: ki,
-            alpha: 1.0f64,
-            lda: mi,
-            ldb: ki,
-            beta: 0.0f64,
-            ldc: mi,
-        };
-        let cfg32 = GemmConfig {
-            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-            m: mi,
-            n: ni,
-            k: ki,
-            alpha: 1.0f32,
-            lda: mi,
-            ldb: ki,
-            beta: 0.0f32,
-            ldc: mi,
-        };
-        // f64 reference.
-        let d_a64 = stream.clone_htod(&a).map_err(|e| format!("{e:?}"))?;
-        let d_b64 = stream.clone_htod(&b).map_err(|e| format!("{e:?}"))?;
-        let mut d_c64 = stream
-            .alloc_zeros::<f64>(M * N)
-            .map_err(|e| format!("{e:?}"))?;
-        unsafe {
-            blas.gemm(
-                cfg64,
-                &d_a64.slice(0..M * K),
-                &d_b64.slice(0..K * N),
-                &mut d_c64.slice_mut(0..M * N),
-            )
-            .map_err(|e| format!("{e:?}"))?;
-        }
-        // f32 candidate.
-        let a32: Vec<f32> = a.iter().map(|&x| x as f32).collect();
-        let b32: Vec<f32> = b.iter().map(|&x| x as f32).collect();
-        let d_a32 = stream.clone_htod(&a32).map_err(|e| format!("{e:?}"))?;
-        let d_b32 = stream.clone_htod(&b32).map_err(|e| format!("{e:?}"))?;
-        let mut d_c32 = stream
-            .alloc_zeros::<f32>(M * N)
-            .map_err(|e| format!("{e:?}"))?;
-        unsafe {
-            blas.gemm(
-                cfg32,
-                &d_a32.slice(0..M * K),
-                &d_b32.slice(0..K * N),
-                &mut d_c32.slice_mut(0..M * N),
-            )
-            .map_err(|e| format!("{e:?}"))?;
-        }
-        stream.synchronize().map_err(|e| format!("{e:?}"))?;
-        let ref64 = stream
-            .clone_dtoh(&d_c64.slice(0..M * N))
-            .map_err(|e| format!("{e:?}"))?;
-        let test32 = stream
-            .clone_dtoh(&d_c32.slice(0..M * N))
-            .map_err(|e| format!("{e:?}"))?;
-        let mut max_rel = 0.0f64;
-        for (r, t) in ref64.iter().zip(test32.iter()) {
-            let denom = r.abs().max(1.0);
-            max_rel = max_rel.max((r - *t as f64).abs() / denom);
-        }
-        // Host f64 reference (cuBLAS column-major: C[i + j*M] = Σ_l A[i+l*M]·B[l+j*K]).
-        // The GPU-f64-vs-GPU-f32 check above cannot catch a host/GPU layout mismatch
-        // because both GPU paths share the same layout; comparing the GPU f64 result
-        // against an independent CPU computation does.
-        let mut cpu_ref = vec![0.0f64; M * N];
-        for j in 0..N {
-            for l in 0..K {
-                let b_lj = b[l + j * K];
-                for i in 0..M {
-                    cpu_ref[i + j * M] += a[i + l * M] * b_lj;
-                }
-            }
-        }
-        let mut max_rel_cpu = 0.0f64;
-        for (g, c) in ref64.iter().zip(cpu_ref.iter()) {
-            let denom = c.abs().max(1.0);
-            max_rel_cpu = max_rel_cpu.max((g - c).abs() / denom);
-        }
-        // f32 sgemm vs f64 dgemm differs by ~1e-5; 1e-3 rejects a broken f32 path
-        // (wrong layout / no f32 support). GPU f64 vs CPU f64 should match to ~1e-12;
-        // 1e-9 rejects a layout/correctness bug shared by both GPU paths.
-        Ok(max_rel < 1.0e-3 && max_rel_cpu < 1.0e-9)
-    };
-    run().unwrap_or(false)
-}
 
 impl HwePcaModel {
     pub fn projector(&self) -> HwePcaProjector<'_> {
@@ -1284,7 +506,6 @@ impl<'model> HwePcaProjector<'model> {
                 projection_score_vectors,
                 scaler,
                 loadings,
-                ld_weights,
                 &mut scores,
                 &mut missing_variants,
                 progress,
@@ -1337,30 +558,6 @@ impl<'model> HwePcaProjector<'model> {
             let mut block_storage = vec![0.0f64; elements];
             let mut block_info_contrib = vec![0.0f64; block_capacity * packed_info_size];
             let mut processed = 0usize;
-            let total_work = n_samples
-                .saturating_mul(expected_variants)
-                .saturating_mul(components);
-            let mut cuda_rhs = match projection_gpu_rejection_reason(total_work) {
-                Some(reason) => {
-                    eprintln!("> Projection backend: CPU ({reason})");
-                    None
-                }
-                None => match init_projection_cuda_rhs_safely() {
-                    Ok(runtime) => {
-                        eprintln!(
-                            "> Projection backend: GPU (CUDA RHS acceleration enabled; CPU solves remain active)"
-                        );
-                        Some(runtime)
-                    }
-                    Err(reason) => {
-                        eprintln!("> Projection backend: CPU (CUDA init failed: {reason})");
-                        None
-                    }
-                },
-            };
-            let mut logged_cuda_fallback = false;
-            let mut packed_loadings = Vec::<f64>::new();
-            let mut packed_block = Vec::<f64>::new();
 
             loop {
                 let filled = source
@@ -1478,66 +675,13 @@ impl<'model> HwePcaProjector<'model> {
                 let standardized = block.as_ref();
 
                 // RHS: scores += (x × w) × V = V^T × W × x
-                let mut used_cuda = false;
-                if let Some(runtime) = cuda_rhs.as_mut() {
-                    let packed_len = filled.saturating_mul(components);
-                    if packed_loadings.len() < packed_len {
-                        packed_loadings.resize(packed_len, 0.0);
-                    }
-                    for col in 0..components {
-                        let col_offset = col * filled;
-                        for row in 0..filled {
-                            packed_loadings[col_offset + row] = loadings_block[(row, col)];
-                        }
-                    }
-
-                    let a_len = n_samples.saturating_mul(filled);
-                    if packed_block.len() < a_len {
-                        packed_block.resize(a_len, 0.0);
-                    }
-                    for col in 0..filled {
-                        let col_offset = col * n_samples;
-                        for row in 0..n_samples {
-                            packed_block[col_offset + row] = block[(row, col)];
-                        }
-                    }
-                    match runtime.compute_rhs(
-                        &packed_block[..a_len],
-                        &packed_loadings[..packed_len],
-                        n_samples,
-                        filled,
-                        components,
-                    ) {
-                        Ok(rhs) => {
-                            for col in 0..components {
-                                let col_offset = col * n_samples;
-                                for row in 0..n_samples {
-                                    scores[(row, col)] += rhs[col_offset + row];
-                                }
-                            }
-                            used_cuda = true;
-                        }
-                        Err(_) => {
-                            if !logged_cuda_fallback {
-                                eprintln!(
-                                    "> Projection backend switch: CPU (CUDA RHS step failed during execution)"
-                                );
-                                logged_cuda_fallback = true;
-                            }
-                            cuda_rhs = None;
-                        }
-                    }
-                }
-
-                if !used_cuda {
-                    mul_rows(
-                        scores.as_mut(),
-                        Accum::Add,
-                        standardized,
-                        loadings_block,
-                        1.0,
-                    );
-                }
+                mul_rows(
+                    scores.as_mut(),
+                    Accum::Add,
+                    standardized,
+                    loadings_block,
+                    1.0,
+                );
 
                 processed += filled;
                 progress.on_stage_advance(ProjectionProgressStage::Projection, processed);
@@ -2606,156 +1750,6 @@ fn projection_block_capacity(
 /// gets the tile the many-core setting chose.
 const PROJECTION_BLOCK_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-fn projection_gpu_rejection_reason(total_work: usize) -> Option<String> {
-    let min_work = project_cuda_min_work();
-    if total_work < min_work {
-        return Some(format!(
-            "workload below CUDA threshold ({total_work} < {min_work})"
-        ));
-    }
-    if !cuda_driver_likely_available() {
-        return Some("no CUDA driver/device detected".to_string());
-    }
-    if let Err(reason) = projection_cuda_libraries_loadable() {
-        return Some(reason);
-    }
-    None
-}
-
-/// Non-panicking preflight that the CUDA runtime libraries the projection GEMM
-/// path needs (NVRTC for kernel compilation, cuBLAS for the matrix products) are
-/// actually loadable.
-///
-/// The driver device node (`/dev/nvidiactl`) can be present while the CUDA
-/// runtime libraries are absent from the loader path — e.g. a slim container
-/// where CUDA lives only inside a Python venv, or a GPU host that never had the
-/// CUDA toolkit installed. `cudarc` loads those libraries lazily via `dlopen` and
-/// aborts the process (SIGABRT, "Unable to dynamically load ...") on first use if
-/// they are missing, before any `Result` can be returned. `is_culib_present()`
-/// probes loadability without triggering that abort, so projection can fall back
-/// to the CPU backend with a clear reason instead of crashing. Mirrors the score
-/// backend's `preflight_cuda_dynamic_libraries`. See issue #2327.
-fn projection_cuda_libraries_loadable() -> Result<(), String> {
-    if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
-        return Err(format!(
-            "CUDA NVRTC library not loadable (searched: {})",
-            cudarc::get_lib_name_candidates("nvrtc").join(", ")
-        ));
-    }
-    if !unsafe { cudarc::cublas::sys::is_culib_present() } {
-        return Err(format!(
-            "CUDA cuBLAS library not loadable (searched: {})",
-            cudarc::get_lib_name_candidates("cublas").join(", ")
-        ));
-    }
-    Ok(())
-}
-
-/// Select the visible CUDA device with the most free memory and return its bound
-/// context. Projection previously always used device 0, which can land on a
-/// busy/small GPU when a better one is present; this mirrors the score backend's
-/// multi-GPU selection (kept simple here: rank by free memory).
-fn select_projection_cuda_device() -> Result<std::sync::Arc<CudaContext>, String> {
-    let device_count = CudaContext::device_count()
-        .map_err(|e| format!("Failed to query CUDA device count: {e:?}"))?;
-    if device_count <= 0 {
-        return Err("CUDA reported zero visible devices".to_string());
-    }
-    let mut best: Option<(usize, usize, std::sync::Arc<CudaContext>)> = None;
-    let mut rejections = Vec::new();
-    for ordinal in 0..device_count as usize {
-        let ctx = match CudaContext::new(ordinal) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                rejections.push(format!("ordinal {ordinal}: init failed: {e:?}"));
-                continue;
-            }
-        };
-        if let Err(e) = ctx.bind_to_thread() {
-            rejections.push(format!("ordinal {ordinal}: bind failed: {e:?}"));
-            continue;
-        }
-        let free_mem = match ctx.mem_get_info() {
-            Ok((free, _total)) => free,
-            Err(e) => {
-                rejections.push(format!("ordinal {ordinal}: memory query failed: {e:?}"));
-                continue;
-            }
-        };
-        if best
-            .as_ref()
-            .map(|(_, bf, _)| free_mem > *bf)
-            .unwrap_or(true)
-        {
-            best = Some((ordinal, free_mem, ctx));
-        }
-    }
-    let (ordinal, _free, ctx) = best.ok_or_else(|| {
-        if rejections.is_empty() {
-            "No CUDA device could be initialized".to_string()
-        } else {
-            format!(
-                "No visible CUDA device usable for projection:\n  {}",
-                rejections.join("\n  ")
-            )
-        }
-    })?;
-    ctx.bind_to_thread()
-        .map_err(|e| format!("Failed to bind selected CUDA device: {e:?}"))?;
-    eprintln!(
-        "> Projection CUDA device selection: chose ordinal {ordinal} of {device_count} visible device(s)"
-    );
-    Ok(ctx)
-}
-
-/// Panic-safe construction of the packed projection CUDA runtime. cudarc can
-/// panic (not just `Err`) on dynamic-load/driver problems; converting that into
-/// an `Err` lets projection degrade to CPU instead of aborting the process.
-fn init_projection_cuda_packed_safely() -> Result<ProjectionCudaPacked, String> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(ProjectionCudaPacked::new)) {
-        Ok(result) => result,
-        Err(payload) => Err(format!(
-            "projection CUDA init panicked ({})",
-            crate::cuda_utils::panic_payload_to_string(payload)
-        )),
-    }
-}
-
-/// Panic-safe construction of the RHS projection CUDA runtime. See
-/// [`init_projection_cuda_packed_safely`].
-fn init_projection_cuda_rhs_safely() -> Result<ProjectionCudaRhs, String> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(ProjectionCudaRhs::new)) {
-        Ok(result) => result,
-        Err(payload) => Err(format!(
-            "projection CUDA init panicked ({})",
-            crate::cuda_utils::panic_payload_to_string(payload)
-        )),
-    }
-}
-
-fn project_cuda_min_work() -> usize {
-    DEFAULT_PROJECT_CUDA_MIN_WORK
-}
-
-fn cuda_driver_likely_available() -> bool {
-    if let Ok(devices) = std::env::var("CUDA_VISIBLE_DEVICES") {
-        let v = devices.trim();
-        if v.is_empty() || v == "-1" || v.eq_ignore_ascii_case("none") {
-            return false;
-        }
-    }
-
-    if cfg!(target_os = "linux") && Path::new("/dev/nvidiactl").exists() {
-        return true;
-    }
-
-    std::process::Command::new("nvidia-smi")
-        .arg("-L")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 #[inline]
 fn packed_tri_size(components: usize) -> usize {
     components.saturating_mul(components.saturating_add(1)) / 2
@@ -2776,7 +1770,6 @@ fn project_from_packed_hard_calls<P>(
     packed_score_vectors: &[f64],
     scaler: &HweScaler,
     loadings: faer::MatRef<'_, f64>,
-    ld_weights: Option<&[f64]>,
     scores: &mut MatMut<'_, f64>,
     missing_variants: &mut [Vec<u32>],
     progress: &P,
@@ -2813,39 +1806,17 @@ where
     }
 
     let packed_info_size = packed_tri_size(components);
-    let weights_slice = ld_weights.unwrap_or(&[]);
     let block_variants = packed_projection_variant_block(components, n_samples, expected_variants);
     let sample_chunk = packed_projection_sample_chunk(n_samples);
     eprintln!(
         "> Projection packed batch: {block_variants} variants/block; {sample_chunk} samples/chunk"
     );
-    let total_work = n_samples
-        .saturating_mul(expected_variants)
-        .saturating_mul(components);
-    let mut packed_cuda = match projection_gpu_rejection_reason(total_work) {
-        Some(reason) => {
-            eprintln!("> Projection backend: CPU ({reason})");
-            None
-        }
-        None => match init_projection_cuda_packed_safely() {
-            Ok(runtime) => {
-                eprintln!(
-                    "> Projection backend: GPU (CUDA fused decode + SGEMM; packed-byte missing-info scan and CPU solves remain active)"
-                );
-                Some(runtime)
-            }
-            Err(reason) => {
-                eprintln!("> Projection backend: CPU (CUDA init failed: {reason})");
-                None
-            }
-        },
-    };
     let mut scores_row_major = vec![0.0f64; n_samples * components];
     // A missing-index list can otherwise grow with people × variants. Count
     // packed missing calls until dense information storage becomes cheaper;
     // usually this examines only a small prefix of a large cohort's markers.
-    let use_dense_missing = packed_cuda.is_some()
-        || prefer_dense_packed_missing(&packed, n_samples, expected_variants, packed_info_size)?;
+    let use_dense_missing =
+        prefer_dense_packed_missing(&packed, n_samples, expected_variants, packed_info_size)?;
     let mut dense_missing_info_storage =
         use_dense_missing.then(|| vec![0.0f64; n_samples * packed_info_size]);
     // Model variants the dataset lacks are missing for every sample alike. With
@@ -2853,7 +1824,8 @@ where
     // and their information loss is summed once and added to every sample after
     // it, instead of once per sample per variant. On a sparse overlap that is
     // almost the whole model.
-    let present_order = (dense_missing_info_storage.is_some() && packed_cuda.is_none())
+    let present_order = dense_missing_info_storage
+        .is_some()
         .then(|| {
             (0..expected_variants)
                 .filter(|&variant| !packed.is_model_gap(variant))
@@ -2868,42 +1840,13 @@ where
             "sparse indices"
         }
     );
-    let mut gpu_loadings_col_major = vec![0.0f32; block_variants * components];
-    let mut gpu_coeffs = vec![0.0f32; block_variants * 3];
-    let mut gpu_scores_active = packed_cuda.is_some();
-    // Whether at least one block has been committed into the device score
-    // accumulator. Once true, a later GPU failure cannot be salvaged by CPU
-    // fallback (it would mix a partial device accumulator with CPU sums), so we
-    // fail hard; before it, falling back to CPU is safe (accumulator is zero).
-    let mut gpu_block_committed = false;
-    let mut logged_cuda_fallback = false;
-    if let Some(runtime) = packed_cuda.as_mut()
-        && runtime.init_scores_accum(n_samples, components).is_err()
-    {
-        eprintln!("> Projection backend switch: CPU (failed to initialize GPU score accumulator)");
-        packed_cuda = None;
-        gpu_scores_active = false;
-        logged_cuda_fallback = true;
-    }
-
     let mut processed = 0usize;
-    let mut block_loading = if packed_cuda.is_some() {
-        vec![0.0f64; block_variants * components]
-    } else {
-        Vec::new()
-    };
-    let mut block_coeffs = if packed_cuda.is_some() {
-        vec![0.0f64; block_variants * 3]
-    } else {
-        Vec::new()
-    };
     let mut block_info_contrib = if dense_missing_info_storage.is_some() {
         vec![0.0f64; block_variants * packed_info_size]
     } else {
         Vec::new()
     };
     let mut block_variant_bytes: Vec<&[u8]> = Vec::with_capacity(block_variants);
-    let mut staged_packed_block = Vec::<u8>::new();
     let mut block_swapped = vec![false; block_variants];
 
     // Positions in `present_order` when it is set, model variants otherwise.
@@ -2915,10 +1858,7 @@ where
             .as_deref()
             .map(|order| &order[processed..processed + filled]);
         block_variant_bytes.clear();
-        let load_len = filled * components;
-        let coeff_len = filled * 3;
         let contrib_len = filled * packed_info_size;
-        let packed_len = filled * packed_bytes_per_variant(n_samples);
         let score_len = filled * components * 3;
         let block_score_vectors = match block_order {
             None => {
@@ -2936,20 +1876,7 @@ where
                 &gathered_score_vectors[..]
             }
         };
-        let needs_gpu_block = packed_cuda.is_some();
         let needs_dense_missing_info = dense_missing_info_storage.is_some();
-        if needs_gpu_block {
-            if block_loading.len() < load_len {
-                block_loading.resize(load_len, 0.0);
-            } else {
-                block_loading[..load_len].fill(0.0);
-            }
-            if block_coeffs.len() < coeff_len {
-                block_coeffs.resize(coeff_len, 0.0);
-            } else {
-                block_coeffs[..coeff_len].fill(0.0);
-            }
-        }
         if needs_dense_missing_info {
             if block_info_contrib.len() < contrib_len {
                 block_info_contrib.resize(contrib_len, 0.0);
@@ -2967,31 +1894,6 @@ where
             let swapped = packed.match_kind(j_global) == MatchKind::Swap;
             block_swapped[j_local] = swapped;
 
-            if needs_gpu_block {
-                let mean = 2.0 * freqs[j_global];
-                let denom = scales[j_global];
-                let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
-                let weight = weights_slice.get(j_global).copied().unwrap_or(1.0);
-                let coeff0 = (0.0 - mean) * inv * weight;
-                let coeff1 = (1.0 - mean) * inv * weight;
-                let coeff2 = (2.0 - mean) * inv * weight;
-                if swapped {
-                    block_coeffs[j_local * 3] = coeff2;
-                    block_coeffs[j_local * 3 + 1] = coeff1;
-                    block_coeffs[j_local * 3 + 2] = coeff0;
-                } else {
-                    block_coeffs[j_local * 3] = coeff0;
-                    block_coeffs[j_local * 3 + 1] = coeff1;
-                    block_coeffs[j_local * 3 + 2] = coeff2;
-                }
-
-                let loading_row =
-                    &mut block_loading[j_local * components..(j_local + 1) * components];
-                for k in 0..components {
-                    loading_row[k] = loadings[(j_global, k)];
-                }
-            }
-
             if needs_dense_missing_info {
                 populate_packed_info_contrib_from_model_row(
                     loadings,
@@ -3003,116 +1905,29 @@ where
             }
         }
 
-        let mut used_gpu = false;
-        let block_bytes_for_gpu = if packed_cuda.is_some() {
-            if let Some(block_bytes) = packed.slice(processed, filled) {
-                Some(block_bytes)
-            } else {
-                if staged_packed_block.len() < packed_len {
-                    staged_packed_block.resize(packed_len, 0);
-                }
-                for (variant, bytes) in block_variant_bytes.iter().enumerate() {
-                    let start = variant * packed_bytes_per_variant(n_samples);
-                    let end = start + packed_bytes_per_variant(n_samples);
-                    staged_packed_block[start..end].copy_from_slice(bytes);
-                }
-                Some(&staged_packed_block[..packed_len])
-            }
-        } else {
-            None
-        };
-        if let (Some(runtime), Some(block_bytes)) = (packed_cuda.as_mut(), block_bytes_for_gpu) {
-            debug_assert_eq!(block_bytes.len(), packed_len);
-
-            if gpu_loadings_col_major.len() < load_len {
-                gpu_loadings_col_major.resize(load_len, 0.0);
-            }
-            if gpu_coeffs.len() < coeff_len {
-                gpu_coeffs.resize(coeff_len, 0.0);
-            }
-            for col in 0..components {
-                let col_offset = col * filled;
-                for row in 0..filled {
-                    gpu_loadings_col_major[col_offset + row] =
-                        block_loading[row * components + col] as f32;
-                }
-            }
-            for idx in 0..coeff_len {
-                gpu_coeffs[idx] = block_coeffs[idx] as f32;
-            }
-
-            match runtime.compute_scores_block(
-                block_bytes,
-                &gpu_coeffs[..coeff_len],
-                &gpu_loadings_col_major[..load_len],
-                n_samples,
-                filled,
+        if let Some(missing_info_storage) = dense_missing_info_storage.as_mut() {
+            accumulate_packed_cpu_block_row_major_dense_missing(
+                &block_variant_bytes,
+                block_score_vectors,
+                &block_swapped[..filled],
+                &block_info_contrib[..contrib_len],
+                sample_chunk,
                 components,
-            ) {
-                Ok(()) => {
-                    if let Some(missing_info_storage) = dense_missing_info_storage.as_mut() {
-                        accumulate_packed_missing_info_only(
-                            &block_variant_bytes,
-                            &block_info_contrib[..contrib_len],
-                            sample_chunk,
-                            packed_info_size,
-                            missing_info_storage,
-                        );
-                    }
-                    used_gpu = true;
-                    gpu_block_committed = true;
-                }
-                Err(_) => {
-                    // If earlier blocks already accumulated on the device, the
-                    // device accumulator holds a partial result that cannot be
-                    // safely merged with a CPU continuation (and recomputing the
-                    // failed block on CPU could double-count it). Fail loudly
-                    // rather than emit silently-wrong scores.
-                    if gpu_block_committed {
-                        return Err(HwePcaError::InvalidInput(
-                            "GPU projection failed mid-run after partial device accumulation; \
-                             refusing to fall back to CPU and produce inconsistent scores",
-                        ));
-                    }
-                    // No GPU block has committed yet, so the device accumulator is
-                    // still zero: discard the GPU path and run entirely on CPU.
-                    if !logged_cuda_fallback {
-                        eprintln!(
-                            "> Projection backend switch: CPU (GPU score block compute failed before any block committed)"
-                        );
-                        logged_cuda_fallback = true;
-                    }
-                    packed_cuda = None;
-                    gpu_scores_active = false;
-                }
-            }
-        }
-
-        if !used_gpu {
-            if let Some(missing_info_storage) = dense_missing_info_storage.as_mut() {
-                accumulate_packed_cpu_block_row_major_dense_missing(
-                    &block_variant_bytes,
-                    block_score_vectors,
-                    &block_swapped[..filled],
-                    &block_info_contrib[..contrib_len],
-                    sample_chunk,
-                    components,
-                    packed_info_size,
-                    &mut scores_row_major,
-                    missing_info_storage,
-                );
-            } else {
-                accumulate_packed_cpu_block_row_major_sparse_missing(
-                    &block_variant_bytes,
-                    block_score_vectors,
-                    &block_swapped[..filled],
-                    processed,
-                    sample_chunk,
-                    components,
-                    &mut scores_row_major,
-                    missing_variants,
-                );
-            }
+                packed_info_size,
+                &mut scores_row_major,
+                missing_info_storage,
+            );
+        } else {
+            accumulate_packed_cpu_block_row_major_sparse_missing(
+                &block_variant_bytes,
+                block_score_vectors,
+                &block_swapped[..filled],
+                processed,
+                sample_chunk,
+                components,
+                &mut scores_row_major,
+                missing_variants,
+            );
         }
 
         processed += filled;
@@ -3140,20 +1955,6 @@ where
             .par_chunks_mut(packed_info_size)
             .for_each(|row| add_score_vector(row, &absent_info));
         progress.on_stage_advance(ProjectionProgressStage::Projection, expected_variants);
-    }
-
-    if gpu_scores_active {
-        // Final flush of device-accumulated scores. A failure here means
-        // `scores_row_major` never received the GPU results, so returning it
-        // would yield silently zeroed/partial projections — fail loudly instead.
-        let runtime = packed_cuda.as_mut().ok_or(HwePcaError::InvalidInput(
-            "GPU projection scores marked active without an initialized runtime",
-        ))?;
-        runtime
-            .copy_scores_to_host(n_samples, components, &mut scores_row_major)
-            .map_err(|_| {
-                HwePcaError::InvalidInput("failed to copy final GPU projection scores to host")
-            })?;
     }
 
     for sample in 0..n_samples {
@@ -3364,54 +2165,6 @@ fn accumulate_packed_cpu_block_row_major_dense_missing(
                     while mask != 0 {
                         let lane = mask.trailing_zeros() as usize;
                         mask &= mask - 1;
-                        let sample = sample_base + lane;
-                        let missing_offset = sample * packed_info_size;
-                        let dst =
-                            &mut missing_chunk[missing_offset..missing_offset + packed_info_size];
-                        for idx in 0..packed_info_size {
-                            dst[idx] += contrib[idx];
-                        }
-                    }
-                }
-            }
-        });
-}
-
-fn accumulate_packed_missing_info_only(
-    block_variant_bytes: &[&[u8]],
-    block_info_contrib: &[f64],
-    sample_chunk: usize,
-    packed_info_size: usize,
-    missing_info_storage: &mut [f64],
-) {
-    let samples = missing_info_storage.len() / packed_info_size;
-    let chunk_missing = sample_chunk * packed_info_size;
-    let missing_masks = plink_missing_lane_masks();
-    missing_info_storage
-        .par_chunks_mut(chunk_missing)
-        .enumerate()
-        .for_each(|(chunk_idx, missing_chunk)| {
-            let sample_start = chunk_idx * sample_chunk;
-            let chunk_samples = missing_chunk.len() / packed_info_size;
-            let byte_start = sample_start >> 2;
-            let byte_len = packed_bytes_per_variant(chunk_samples);
-
-            for (variant, variant_bytes) in block_variant_bytes.iter().enumerate() {
-                debug_assert_eq!(variant_bytes.len(), packed_bytes_per_variant(samples));
-                let bytes = &variant_bytes[byte_start..byte_start + byte_len];
-                let contrib = &block_info_contrib
-                    [variant * packed_info_size..(variant + 1) * packed_info_size];
-
-                for (byte_idx, &byte) in bytes.iter().enumerate() {
-                    let sample_base = byte_idx << 2;
-                    let lanes = (chunk_samples - sample_base).min(4);
-                    let mut missing_mask = missing_masks[byte as usize];
-                    if lanes < 4 {
-                        missing_mask &= (1u8 << lanes) - 1;
-                    }
-                    while missing_mask != 0 {
-                        let lane = missing_mask.trailing_zeros() as usize;
-                        missing_mask &= missing_mask - 1;
                         let sample = sample_base + lane;
                         let missing_offset = sample * packed_info_size;
                         let dst =
@@ -3730,29 +2483,6 @@ fn packed_bytes_per_variant(n_samples: usize) -> usize {
     (n_samples + 3) >> 2
 }
 
-#[inline]
-/// Free GPU memory in bytes, or `None` if CUDA is unavailable. Guarded by the same
-/// driver + library preflight the projection gate uses, so it never triggers a
-/// `dlopen` abort on a CPU-only host.
-fn gpu_free_bytes() -> Option<usize> {
-    if !cuda_driver_likely_available() || projection_cuda_libraries_loadable().is_err() {
-        return None;
-    }
-    // Report the max free memory across visible devices, matching
-    // `select_projection_cuda_device`, which picks the most-free GPU.
-    let device_count = CudaContext::device_count().ok()?;
-    let mut best: Option<usize> = None;
-    for ordinal in 0..device_count as usize {
-        if let Ok(ctx) = CudaContext::new(ordinal)
-            && ctx.bind_to_thread().is_ok()
-            && let Ok((free, _total)) = ctx.mem_get_info()
-        {
-            best = Some(best.map_or(free, |b| b.max(free)));
-        }
-    }
-    best
-}
-
 fn packed_projection_variant_block(
     components: usize,
     n_samples: usize,
@@ -3763,19 +2493,15 @@ fn packed_projection_variant_block(
     }
     let packed_info_size = packed_tri_size(components);
     let bytes_per_variant_host = (components + packed_info_size + 3) * size_of::<f64>();
-    let bytes_per_variant_gpu = n_samples
+    let bytes_per_variant = n_samples
         .saturating_mul(size_of::<f32>())
         .saturating_add(packed_bytes_per_variant(n_samples))
         .saturating_add(bytes_per_variant_host);
-    // Size the GPU staging block to the device's free memory so it never OOMs and
-    // still uses big blocks on big GPUs: take 60% of free VRAM (leaves headroom for
-    // loadings/scores buffers + driver/context overhead); fall back to a
-    // conservative 4 GiB if free VRAM can't be queried.
-    // ~9 GiB on a 16 GiB T4, ~24 GiB on a 40 GiB A100 — adaptive and safe.
-    let staging_cap = gpu_free_bytes()
-        .map(|free| free.saturating_mul(3) / 5)
-        .unwrap_or(4 * 1024 * 1024 * 1024usize);
-    let mut block = (staging_cap / bytes_per_variant_gpu.max(1)).max(16);
+    // Block boundaries decide which variants the grouped kernel sums together,
+    // so this rule fixes the rounding of every score. It is a function of the
+    // shape alone, never of the host.
+    let block_budget = 4 * 1024 * 1024 * 1024usize;
+    let mut block = (block_budget / bytes_per_variant.max(1)).max(16);
     if n_samples < 50_000 {
         block = block.min(DEFAULT_BLOCK_WIDTH);
     }
@@ -4176,27 +2902,6 @@ fn missing_scan_chunk_samples() -> usize {
 mod tests {
     use super::*;
     use std::convert::Infallible;
-
-    #[test]
-    fn col_major_gpu_scores_transpose_into_row_major() {
-        // GPU column-major scores for 3 samples × 2 components:
-        //   sample0 -> [10, 40], sample1 -> [20, 50], sample2 -> [30, 60]
-        // stored column-major as [PC1 column][PC2 column].
-        let n_samples = 3;
-        let components = 2;
-        let src_col_major = vec![
-            10.0f32, 20.0, 30.0, // PC1 for samples 0,1,2
-            40.0, 50.0, 60.0, // PC2 for samples 0,1,2
-        ];
-        let mut dst = vec![0.0f64; n_samples * components];
-        accumulate_col_major_scores_into_row_major(&mut dst, &src_col_major, n_samples, components);
-        // Row-major: sample*components + k.
-        assert_eq!(dst, vec![10.0, 40.0, 20.0, 50.0, 30.0, 60.0]);
-
-        // Accumulation must add, not overwrite (GPU blocks accumulate via beta=1).
-        accumulate_col_major_scores_into_row_major(&mut dst, &src_col_major, n_samples, components);
-        assert_eq!(dst, vec![20.0, 80.0, 40.0, 100.0, 60.0, 120.0]);
-    }
 
     use std::sync::Arc;
 

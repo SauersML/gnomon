@@ -478,9 +478,9 @@ enum CalibrateCommands {
 /// handlers.
 ///
 /// Background: every meaningful artifact has already been flushed to disk
-/// by the time `main` returns, and map projection's CUDA runtime and cuBLAS
-/// handle have been explicitly torn down at the end of its GPU stage. What's
-/// left is the libcudart / cuBLAS / cudarc dlopen-based at-exit teardown,
+/// by the time `main` returns. What a GPU-using dependency (gam's CUDA
+/// routes) leaves behind is the libcudart / cuBLAS / cudarc dlopen-based
+/// at-exit teardown,
 /// which on Linux occasionally interleaves with glibc and aborts the
 /// process with "double free or corruption (!prev)" *after* the run
 /// succeeded. Any wrapper using `subprocess.run(..., check=True)` or
