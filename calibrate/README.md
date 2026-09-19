@@ -33,10 +33,10 @@ c(x) = β₀ + γ_sex·sex + f(PC₁, …, PC_k)
 (`s(PC1, …, PCk, type=duchon, centers=m)`), never a smooth per component, and
 `γ_sex` is a penalized linear term. The kernel is gam's scale-free structural
 default: no length scale, an affine null space (`k + 1` columns) and spectral
-power `s = (k − 1)/2`, the kernel `r³` in every dimension, which satisfies
-Duchon's existence condition `2(p + s) > k` (`p = 2`) at every `k`. The formula
-text, and the equivalent term specifications of the Gaussian model, are
-assembled in [`construction.rs`](construction.rs).
+power `s = (k − 1)/2`, the kernel `r³` in every dimension, which meets both of
+gam's conditions on a pure Duchon kernel, `2s < k` and `2(p + s) > k + 2` (`p = 2`),
+at every `k`. The formula text is assembled in [`construction.rs`](construction.rs);
+the Gaussian model's terms are gam's own term builder applied to that text.
 
 `PcSmoothConfig::for_pcs(k)` derives the joint smooth's center counts from
 `k`: `⌈3k/2⌉` in the context and `⌈5k/4⌉` in the slope (9 and 8 at `k = 6`,
@@ -100,8 +100,8 @@ centers) and `c` the context skeleton above;
 both channels share the same terms, and gam's cubic triple-penalty link wiggle
 lets the mean flex away from a strict additive form. gam's formula route
 refuses `linkwiggle()` for a non-binomial family, so the fit is a direct
-`GaussianLocationScaleFitRequest` over the term specifications from
-`construction.rs`. gam standardizes the response for the fit; the saved model
+`GaussianLocationScaleFitRequest`, over the terms gam's term builder makes from the
+saved formula text, so the fitted model is exactly the one the text describes. gam standardizes the response for the fit; the saved model
 records that scale and the link wiggle, so prediction reproduces both.
 
 ### Survival path — Survival marginal-slope

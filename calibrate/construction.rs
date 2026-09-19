@@ -6,20 +6,17 @@
 //! score is the latent coordinate (`z_column`), so it never appears among the
 //! context terms of the marginal or slope formulas. The Gaussian location-scale
 //! fit is requested directly, because gam's formula route refuses its link
-//! wiggle, so its terms are built here as specifications that match what the
-//! formula route builds from the same text: gam's scale-free default Duchon
-//! kernel (no length scale, no power) and the center geometry gam chooses for an
-//! explicit count.
+//! wiggle, but its terms are gam's own term builder applied to the model's
+//! formula text, so the fitted terms are exactly the saved formula's.
+
+use std::collections::HashMap;
 
 use crate::calibrate::model::{PcSmoothConfig, SmoothConfig};
-use gam::terms::basis::{
-    CenterStrategy, DuchonBasisSpec, DuchonOperatorPenaltySpec, OneDimensionalBoundary,
-    SpatialIdentifiability, default_spatial_center_strategy, duchon_cubic_default,
-};
-use gam::terms::smooth::{
-    LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
-    TermCollectionSpec,
-};
+use gam::data::EncodedDataset;
+use gam::solver::fit_orchestration::WorkflowError;
+use gam::terms::inference::formula_dsl::parse_formula;
+use gam::terms::smooth::TermCollectionSpec;
+use gam::terms::term_builder::build_termspec;
 
 pub(crate) const SCORE_COLUMN: &str = "score";
 pub(crate) const SEX_COLUMN: &str = "sex";
@@ -71,95 +68,82 @@ pub(crate) fn slope_formula(pcs: &PcSmoothConfig) -> String {
         .join(" + ")
 }
 
-/// The Gaussian location-scale channels' terms over the predictor table in
-/// `predictor_headers` order (score | sex | PC1..PCk): the score's Duchon
-/// smooth, the penalized linear sex term and the joint smooth of the PCs (the
-/// context formula's, with its center count), each as the formula route builds
-/// it from `score_smooth` and `context_formula`.
-pub(crate) fn marginal_termspec(
+/// The right-hand side of the Gaussian location-scale model, shared by its mean
+/// and log-scale channels: the score's smooth and the context.
+pub(crate) fn gaussian_rhs(score_basis: &SmoothConfig, pcs: &PcSmoothConfig) -> String {
+    format!("{} + {}", score_smooth(score_basis), context_formula(pcs))
+}
+
+/// The Gaussian location-scale channels' terms over `dataset`, built by gam's own
+/// term builder from `gaussian_rhs`, exactly as gam's formula route builds them
+/// (no scale dimensions, no overrides: gam's defaults). One route, so the terms
+/// fitted cannot drift from the saved formula (#2393).
+pub(crate) fn gaussian_termspec(
     score_basis: &SmoothConfig,
     pcs: &PcSmoothConfig,
-) -> TermCollectionSpec {
-    let score = duchon_term(SCORE_COLUMN, vec![0], score_basis.num_centers, None);
-    let joint = (pcs.num_pcs > 0).then(|| {
-        duchon_term(
-            &pc_columns(pcs.num_pcs).join("_"),
-            (2..2 + pcs.num_pcs).collect(),
-            pcs.context_centers,
-            pcs.power,
-        )
-    });
-    TermCollectionSpec {
-        // A bare formula term: the null-recovery ridge is gam's default for a
-        // parametric term (SPEC rules 12, 14).
-        linear_terms: vec![LinearTermSpec {
-            name: SEX_COLUMN.to_string(),
-            feature_col: 1,
-            feature_cols: vec![1],
-            categorical_levels: Vec::new(),
-            double_penalty: true,
-            coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
-            coefficient_min: None,
-            coefficient_max: None,
-            frozen_function_mass: None,
-        }],
-        random_effect_terms: Vec::new(),
-        smooth_terms: std::iter::once(score).chain(joint).collect(),
-    }
-}
-
-/// The center geometry gam's formula route gives a Duchon smooth with an
-/// explicit count (gam-terms `duchon_center_strategy`): an even grid on the
-/// interval in one dimension, otherwise gam's spatial default for the dimension.
-fn duchon_center_strategy(num_centers: usize, dimension: usize) -> CenterStrategy {
-    if dimension == 1 {
-        CenterStrategy::UniformGrid {
-            points_per_dim: num_centers,
-        }
-    } else {
-        default_spatial_center_strategy(num_centers, dimension)
-    }
-}
-
-/// A Duchon term on gam's default kernel for its dimension (`duchon_cubic_default`:
-/// affine null space, spectral power `(d - 1)/2`), unless `power` names one.
-fn duchon_term(
-    name: &str,
-    feature_cols: Vec<usize>,
-    num_centers: usize,
-    power: Option<f64>,
-) -> SmoothTermSpec {
-    let dimension = feature_cols.len();
-    let (nullspace_order, default_power) = duchon_cubic_default(dimension);
-    SmoothTermSpec {
-        name: name.to_string(),
-        basis: SmoothBasisSpec::Duchon {
-            feature_cols,
-            spec: DuchonBasisSpec {
-                center_strategy: duchon_center_strategy(num_centers, dimension),
-                periodic: None,
-                length_scale: None,
-                power: power.unwrap_or(default_power),
-                nullspace_order,
-                identifiability: SpatialIdentifiability::default(),
-                aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
-                boundary: OneDimensionalBoundary::Open,
-                radial_reparam: None,
-            },
-            input_scale: None,
-        },
-        shape: ShapeConstraint::None,
-        joint_null_rotation: None,
-        frozen_parametric_residualization: None,
-    }
+    dataset: &EncodedDataset,
+) -> Result<TermCollectionSpec, WorkflowError> {
+    let parsed = parse_formula(&format!("{PHENOTYPE_COLUMN} ~ {}", gaussian_rhs(score_basis, pcs)))?;
+    let columns: HashMap<String, usize> = dataset
+        .headers
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index))
+        .collect();
+    Ok(build_termspec(&parsed.terms, dataset, &columns, &mut Vec::new())?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam::terms::smooth::build_term_collection_design;
+    use gam::data::{ColumnKindTag, DataSchema, SchemaColumn};
+    use gam::terms::basis::DuchonOperatorPenaltySpec;
+    use gam::terms::smooth::{SmoothBasisSpec, build_term_collection_design};
     use ndarray::Array2;
+
+    /// A predictor table in `predictor_headers` order (score | sex | PC1..PCk).
+    fn predictor_table(rows: usize, num_pcs: usize) -> EncodedDataset {
+        let mut headers = vec![SCORE_COLUMN.to_string(), SEX_COLUMN.to_string()];
+        headers.extend(pc_columns(num_pcs));
+        let values = Array2::from_shape_fn((rows, headers.len()), |(row, column)| {
+            if column == 1 {
+                (row % 2) as f64
+            } else {
+                ((row * (column + 3) + 7 * column) as f64 * 0.618_033_988_749_895).fract() * 2.0 - 1.0
+            }
+        });
+        EncodedDataset {
+            schema: DataSchema {
+                columns: headers
+                    .iter()
+                    .map(|name| SchemaColumn {
+                        name: name.clone(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: Vec::new(),
+                    })
+                    .collect(),
+            },
+            column_kinds: vec![ColumnKindTag::Continuous; headers.len()],
+            headers,
+            values,
+        }
+    }
+
+    fn duchon_terms(terms: &TermCollectionSpec) -> Vec<(Vec<usize>, Option<f64>, f64, String)> {
+        terms
+            .smooth_terms
+            .iter()
+            .filter_map(|term| match &term.basis {
+                SmoothBasisSpec::Duchon { feature_cols, spec, .. } => Some((
+                    feature_cols.clone(),
+                    spec.length_scale,
+                    spec.power,
+                    format!("{:?}", spec.operator_penalties),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
 
     #[test]
     fn formulas_carry_one_joint_pc_smooth_and_keep_the_score_out_of_the_context() {
@@ -183,109 +167,45 @@ mod tests {
         assert!(!context_formula(&pcs).contains(SCORE_COLUMN));
     }
 
+    /// The Gaussian terms are gam's formula route's: the score's and the joint PC
+    /// smooth on gam's default kernel, with none of the collocated mass or tension
+    /// penalties the formula route leaves off (#2393), and the linear sex term.
     #[test]
-    fn gaussian_terms_read_score_sex_and_the_joint_pc_smooth_from_the_predictor_table() {
-        let terms = marginal_termspec(&SmoothConfig { num_centers: 5 }, &PcSmoothConfig::for_pcs(2));
-        let smooths: Vec<(Vec<usize>, Option<f64>, f64)> = terms
-            .smooth_terms
-            .iter()
-            .filter_map(|term| match &term.basis {
-                SmoothBasisSpec::Duchon { feature_cols, spec, .. } => {
-                    Some((feature_cols.clone(), spec.length_scale, spec.power))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(smooths, vec![(vec![0], None, 0.0), (vec![2, 3], None, 0.5)]);
+    fn gaussian_terms_are_the_formula_routes_terms() {
+        let table = predictor_table(96, 2);
+        let terms =
+            gaussian_termspec(&SmoothConfig { num_centers: 5 }, &PcSmoothConfig::for_pcs(2), &table)
+                .expect("gam builds the terms");
+        let off = format!("{:?}", DuchonOperatorPenaltySpec::all_disabled());
+        assert_eq!(
+            duchon_terms(&terms),
+            vec![(vec![0], None, 0.0, off.clone()), (vec![2, 3], None, 0.5, off)]
+        );
         assert_eq!(terms.smooth_terms.len(), 2);
         assert_eq!(terms.linear_terms.len(), 1);
-        assert_eq!(terms.linear_terms[0].name, SEX_COLUMN);
         assert_eq!(terms.linear_terms[0].feature_col, 1);
     }
 
     /// gam builds the joint smooth at its default kernel and the derived center
-    /// counts for every PC count up to 16.
+    /// counts for every PC count up to 16, in the context and in the slope.
     #[test]
     fn gam_builds_the_default_joint_pc_smooth_at_every_pc_count_to_sixteen() {
-        let rows = 96;
         for num_pcs in 1..=16 {
             let pcs = PcSmoothConfig::for_pcs(num_pcs);
             pcs.validate().expect("the derived configuration is valid");
-            let columns = 2 + num_pcs;
-            let data = Array2::from_shape_fn((rows, columns), |(row, column)| {
-                let phase = (row * (column + 3) + 7 * column) as f64;
-                (phase * 0.618_033_988_749_895).fract() * 2.0 - 1.0
-            });
+            let table = predictor_table(96, num_pcs);
             for centers in [pcs.context_centers, pcs.slope_centers] {
-                let terms = marginal_termspec(
+                let terms = gaussian_termspec(
                     &SmoothConfig { num_centers: 5 },
                     &PcSmoothConfig { context_centers: centers, ..pcs },
-                );
-                build_term_collection_design(data.view(), &terms).unwrap_or_else(|error| {
+                    &table,
+                )
+                .unwrap_or_else(|error| panic!("{num_pcs} PCs with {centers} centers: {error}"));
+                build_term_collection_design(table.values.view(), &terms).unwrap_or_else(|error| {
                     panic!("{num_pcs} PCs with {centers} centers: {error}")
                 });
             }
         }
-    }
-
-    /// The Gaussian model's term specifications are the ones gam's formula route
-    /// builds from the same text: same center geometry, kernel power, null space
-    /// and length scale, for the score and for the joint smooth of 16 PCs.
-    #[test]
-    fn gaussian_terms_match_what_the_formula_route_builds_from_the_same_text() {
-        use gam::data::{ColumnKindTag, DataSchema, EncodedDataset, SchemaColumn};
-        use gam::terms::inference::formula_dsl::parse_formula;
-        use gam::terms::term_builder::build_termspec;
-        use std::collections::HashMap;
-
-        let pcs = PcSmoothConfig::for_pcs(16);
-        let score_basis = SmoothConfig { num_centers: 10 };
-        let mut headers = vec![SCORE_COLUMN.to_string(), SEX_COLUMN.to_string()];
-        headers.extend(pc_columns(16));
-        let rows = 96;
-        let values = Array2::from_shape_fn((rows, headers.len()), |(row, column)| {
-            if column == 1 {
-                (row % 2) as f64
-            } else {
-                ((row * (column + 3) + 7 * column) as f64 * 0.618_033_988_749_895).fract()
-            }
-        });
-        let dataset = EncodedDataset {
-            schema: DataSchema {
-                columns: headers
-                    .iter()
-                    .map(|name| SchemaColumn {
-                        name: name.clone(),
-                        kind: ColumnKindTag::Continuous,
-                        levels: Vec::new(),
-                    })
-                    .collect(),
-            },
-            column_kinds: vec![ColumnKindTag::Continuous; headers.len()],
-            headers: headers.clone(),
-            values,
-        };
-        let columns: HashMap<String, usize> =
-            headers.iter().enumerate().map(|(index, name)| (name.clone(), index)).collect();
-        let formula = format!("y ~ {} + {}", score_smooth(&score_basis), context_formula(&pcs));
-        let parsed = parse_formula(&formula).expect("parse the formula");
-        let from_formula = build_termspec(&parsed.terms, &dataset, &columns, &mut Vec::new())
-            .expect("the formula route's terms");
-        let kernel = |terms: &TermCollectionSpec| -> Vec<String> {
-            terms
-                .smooth_terms
-                .iter()
-                .filter_map(|term| match &term.basis {
-                    SmoothBasisSpec::Duchon { feature_cols, spec, .. } => Some(format!(
-                        "{feature_cols:?} {:?} power={} {:?} length_scale={:?}",
-                        spec.center_strategy, spec.power, spec.nullspace_order, spec.length_scale
-                    )),
-                    _ => None,
-                })
-                .collect()
-        };
-        assert_eq!(kernel(&marginal_termspec(&score_basis, &pcs)), kernel(&from_formula));
-        assert_eq!(kernel(&from_formula).len(), 2);
     }
 
     #[test]

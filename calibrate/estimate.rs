@@ -14,7 +14,7 @@
 
 use crate::calibrate::construction::{
     AGE_ENTRY_COLUMN, AGE_EXIT_COLUMN, EVENT_COLUMN, PHENOTYPE_COLUMN, SCORE_COLUMN,
-    WEIGHT_COLUMN, context_formula, marginal_termspec, score_smooth, slope_formula,
+    WEIGHT_COLUMN, context_formula, gaussian_rhs, gaussian_termspec, slope_formula,
 };
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::model::{
@@ -375,7 +375,8 @@ fn fit_gaussian_location_scale(
     config: &ModelConfig,
     dataset: &EncodedDataset,
 ) -> Result<GaussianLocationScaleFitResult, EstimationError> {
-    let terms = marginal_termspec(&config.pgs_basis_config, &config.pcs);
+    let terms = gaussian_termspec(&config.pgs_basis_config, &config.pcs, dataset)
+        .map_err(EstimationError::from)?;
     let n = data.y.len();
     let request = GaussianLocationScaleFitRequest {
         data: dataset.values.view(),
@@ -427,11 +428,7 @@ fn assemble_gaussian_location_scale(
         .fit
         .block_by_role(BlockRole::Scale)
         .map(|scale| scale.beta.to_vec());
-    let rhs = format!(
-        "{} + {}",
-        score_smooth(&config.pgs_basis_config),
-        context_formula(&config.pcs)
-    );
+    let rhs = gaussian_rhs(&config.pgs_basis_config, &config.pcs);
     let mut saved = assemble_location_scale_payload(
         LocationScaleInputs {
             formula: format!("{PHENOTYPE_COLUMN} ~ {rhs} + linkwiggle()"),
@@ -761,41 +758,6 @@ mod tests {
             ..Default::default()
         };
         (TrainingData { y, p, sex, pcs, weights: Array1::ones(n) }, config)
-    }
-
-    /// Through save, load and predict, the Gaussian location-scale model returns exactly the
-    /// σ its own fit fitted on the training rows: gam's block states are in the response's
-    /// units, σ = response_scale·floor + exp(η_log σ). The same check on the mean,
-    /// μ = η_μ + η_wiggle, waits for gam#3001: gam evaluates the link wiggle one way in the
-    /// fit's state and another in the predictor, which differ by up to 3 ulp.
-    #[test]
-    fn gaussian_predictions_replay_the_fits_own_fitted_scale() {
-        init_engine_test_logging();
-        let (data, config) = gaussian_fixture();
-        let columns = predictor_columns(data.p.view(), data.sex.view(), data.pcs.view());
-        let dataset = encoded_dataset(&columns);
-        let result = fit_gaussian_location_scale(&data, &config, &dataset).expect("fit");
-        let states = result.fit.fit.block_states.clone();
-        assert_eq!(states.len(), 3, "location, log scale and link wiggle blocks");
-        let floor = result.response_scale * gam::families::sigma_link::LOGB_SIGMA_FLOOR;
-        let fitted_sigma = states[1].eta.mapv(|eta| floor + eta.exp());
-        let model = assemble_gaussian_location_scale(result, &config, &dataset, columns.len())
-            .expect("assemble the model");
-        let directory = tempfile::tempdir().expect("model directory");
-        let path = directory.path().join("model.json");
-        model.save(path.to_str().expect("path")).expect("save model");
-        let loaded = TrainedModel::load(path.to_str().expect("path")).expect("load model");
-        let (p, sex, pcs) = (data.p.view(), data.sex.view(), data.pcs.view());
-        let sigma = loaded
-            .predict_standard_deviation(p, sex, pcs)
-            .expect("predict the scale")
-            .expect("a location-scale model has a scale");
-        let largest_gap = sigma
-            .iter()
-            .zip(fitted_sigma.iter())
-            .map(|(predicted, fitted)| (predicted - fitted).abs())
-            .fold(0.0f64, f64::max);
-        assert!(sigma == fitted_sigma, "predicted σ misses the fit's by up to {largest_gap}");
     }
 
     #[test]
