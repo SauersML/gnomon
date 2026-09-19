@@ -5,8 +5,8 @@ probit link (SPEC section 4):
 
     s(age_baseline) + sex + duchon(PC1..PCk) + s(admin_years) + s(lookback_years)
 
-(the PCs enter as ONE joint Duchon smooth; a sex-restricted disease, whose rows
-share one sex, has no sex term in any fit), and differ only in how z enters:
+(the PCs enter as ONE joint Duchon smooth; a disease declared for one sex has
+no sex term in any fit), and differ only in how z enters:
 - ours: Bernoulli marginal slope. The covariate part is the marginal index
   q(x), the slope is 1 + duchon(PCs) (+ s(age) where the simulator shows it
   helps), and the anchor integrates an empirical latent law of the training z,
@@ -102,6 +102,19 @@ def components(variant, settings):
     return ["disease"]
 
 
+def has_sex_term(disease):
+    """The single-sex rule: a disease declared for one sex has no sex term in any fit."""
+    if disease["sex"] not in (None, "female", "male"):
+        raise ValueError(f"disease sex must be null, female or male, not {disease['sex']!r}")
+    return disease["sex"] is None
+
+
+def covariates(variant, component, settings, disease):
+    """The frame columns a fit's design uses."""
+    components(variant, settings)
+    return columns(variant, settings_of(settings), has_sex_term(disease))
+
+
 def duchon(s, centers):
     return f"duchon({', '.join(pc_columns(s))}, centers={centers})"
 
@@ -120,7 +133,7 @@ def shipped_centers(num_pcs):
 
 def formulas(variant, s, sex=True):
     """(formula, extra gamfit.fit keywords) of a variant. `sex` is False for a
-    sex-restricted disease, whose rows all share one sex: no fit then has a sex term."""
+    disease declared for one sex: no fit then has a sex term."""
     if variant == "shipped":
         context, slope = shipped_centers(s["num_pcs"])
         pcs = ", ".join(pc_columns(s))
@@ -190,7 +203,7 @@ def convergence_summary(payload):
             "certified": record.get("inner_status") == "Converged" and "ncertified" not in json.dumps(record)}
 
 
-def fit(variant, component, train, settings, out_dir, reference=None):
+def fit(variant, component, train, settings, out_dir, reference=None, *, disease):
     import gamfit
     s = settings_of(settings)
     components(variant, s)
@@ -201,8 +214,7 @@ def fit(variant, component, train, settings, out_dir, reference=None):
     check_frame(train, s, True)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    # A sex-restricted disease's rows share one sex; a sex term would be identically constant.
-    sex = bool(train.sex.nunique() > 1)
+    sex = has_sex_term(disease)
     formula, keywords = formulas(variant, s, sex)
     data = design(variant, train, s, sex)
     data["y"] = train.y.to_numpy(float)
@@ -239,14 +251,15 @@ def ndtri(p):
     return _INV_CDF(p).astype(float)
 
 
-def predict(variant, model_dirs, frame, settings, horizons=None):
+def predict(variant, model_dirs, frame, settings, horizons=None, *, disease):
     import gamfit
     s = settings_of(settings)
     check_frame(frame, s, False)
     out = Path(model_dirs["disease"])
     spec = json.loads((out / "spec.json").read_text())
-    if spec["variant"] != variant:
-        raise ValueError(f"{out} holds {spec['variant']!r}, not {variant!r}")
+    if spec["variant"] != variant or spec["sex_term"] != has_sex_term(disease):
+        raise ValueError(f"{out} holds {spec['variant']!r} with sex_term {spec['sex_term']}, not {variant!r} "
+                         f"for a disease declared for sex {disease['sex']!r}")
     model = gamfit.load(out / "model.gamfit")
 
     def risk_at(shift):

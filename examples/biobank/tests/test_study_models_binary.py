@@ -25,6 +25,7 @@ LOGIT_SLOPE = 0.7
 N = 4000
 SETTINGS = {"num_pcs": 6, "q_centers": 10, "slope_centers": 10, "windows": ["admin_years", "lookback_years"],
             "latent_law": "global-empirical", "slope_age_k": 4}
+DISEASE = {"slug": "test", "sex": None}
 
 
 def expit(x):
@@ -61,8 +62,9 @@ def fitted(frames, tmp_path_factory):
     def get(variant):
         if variant not in cache:
             directory = tmp_path_factory.mktemp(variant)
-            info = binary.fit(variant, "disease", train, SETTINGS, directory)
-            cache[variant] = (directory, info, binary.predict(variant, {"disease": directory}, test, SETTINGS, None))
+            info = binary.fit(variant, "disease", train, SETTINGS, directory, disease=DISEASE)
+            prediction = binary.predict(variant, {"disease": directory}, test, SETTINGS, None, disease=DISEASE)
+            cache[variant] = (directory, info, prediction)
         return cache[variant]
     return get
 
@@ -78,10 +80,11 @@ def test_variant_fits_and_replays(frames, fitted, variant):
     assert info["variant"] == variant and info["rows"] == 3000 and isinstance(info["converged"], bool)
     assert first["risk"].shape == (len(test),) and first["slope"].shape == (len(test),)
     assert np.all((first["risk"] > 0) & (first["risk"] < 1)) and np.isfinite(first["slope"]).all()
-    again = binary.predict(variant, {"disease": directory}, test, SETTINGS, None)
+    again = binary.predict(variant, {"disease": directory}, test, SETTINGS, None, disease=DISEASE)
     assert np.array_equal(first["risk"], again["risk"]) and np.array_equal(first["slope"], again["slope"])
     # Row order does not change a row's prediction.
-    reversed_rows = binary.predict(variant, {"disease": directory}, test.iloc[::-1], SETTINGS, None)
+    reversed_rows = binary.predict(variant, {"disease": directory}, test.iloc[::-1], SETTINGS, None,
+                                   disease=DISEASE)
     assert np.allclose(reversed_rows["risk"][::-1], first["risk"], rtol=1e-12, atol=0)
 
 
@@ -153,28 +156,37 @@ def test_refusals(frames, tmp_path):
     with pytest.raises(ValueError, match="Duchon null space"):
         binary.settings_of({**SETTINGS, "q_centers": 7})
     with pytest.raises(ValueError, match="cold"):
-        binary.fit("standard", "disease", train, SETTINGS, tmp_path / "a", reference=tmp_path)
+        binary.fit("standard", "disease", train, SETTINGS, tmp_path / "a", reference=tmp_path, disease=DISEASE)
     with pytest.raises(ValueError, match="lacks"):
-        binary.fit("standard", "disease", train.drop(columns="admin_years"), SETTINGS, tmp_path / "b")
+        binary.fit("standard", "disease", train.drop(columns="admin_years"), SETTINGS, tmp_path / "b",
+                   disease=DISEASE)
     bad = train.copy()
     bad.loc[0, "y"] = 2
     with pytest.raises(ValueError, match="0/1"):
-        binary.fit("standard", "disease", bad, SETTINGS, tmp_path / "c")
+        binary.fit("standard", "disease", bad, SETTINGS, tmp_path / "c", disease=DISEASE)
 
 
-def test_sex_restricted_disease_has_no_sex_term(frames, tmp_path):
+def test_single_sex_disease_has_no_sex_term(frames, tmp_path):
     train, test = frames
-    one_sex = train.assign(sex=0)
-    info = binary.fit("standard", "disease", one_sex, SETTINGS, tmp_path)
+    female = {"slug": "breast_cancer", "sex": "female"}
+    info = binary.fit("standard", "disease", train.assign(sex=0), SETTINGS, tmp_path, disease=female)
     spec = json.loads((tmp_path / "spec.json").read_text())
     assert info["sex_term"] is False and "sex" not in spec["formula"]
-    risk = binary.predict("standard", {"disease": tmp_path}, test.assign(sex=0), SETTINGS, None)["risk"]
+    risk = binary.predict("standard", {"disease": tmp_path}, test.assign(sex=0), SETTINGS, None, disease=female)["risk"]
     assert np.all((risk > 0) & (risk < 1))
+    # A model fitted under one declaration never predicts under another.
+    with pytest.raises(ValueError, match="sex_term"):
+        binary.predict("standard", {"disease": tmp_path}, test, SETTINGS, None, disease=DISEASE)
     s = binary.settings_of(SETTINGS)
-    assert "sex" not in binary.formulas("shipped", s, sex=False)[0] and "sex" not in binary.columns("ours", s, sex=False)
+    for variant in binary.VARIANTS:
+        assert "sex" not in binary.covariates(variant, "disease", SETTINGS, female)
+        assert "sex" in binary.covariates(variant, "disease", SETTINGS, DISEASE)
+        formula, keywords = binary.formulas(variant, s, sex=False)
+        assert "sex" not in formula and "sex" not in (keywords.get("slope_formula") or "")
+        assert "sex" not in (keywords.get("noise_formula") or "")
 
 
 def test_predict_refuses_another_variants_directory(frames, fitted):
     _, test = frames
     with pytest.raises(ValueError, match="holds"):
-        binary.predict("standard", {"disease": fitted("z_pc")[0]}, test, SETTINGS, None)
+        binary.predict("standard", {"disease": fitted("z_pc")[0]}, test, SETTINGS, None, disease=DISEASE)
