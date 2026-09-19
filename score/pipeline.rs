@@ -216,6 +216,16 @@ impl MemoryBudget {
         }
     }
 
+    /// A budget of `max_ram_bytes` read while this process held `resident_bytes`, as a test
+    /// states the memory a run plans against.
+    #[cfg(test)]
+    pub(crate) fn of(max_ram_bytes: usize, resident_bytes: usize) -> Self {
+        Self {
+            max_ram_bytes,
+            resident_bytes,
+        }
+    }
+
     #[inline]
     pub fn max_ram_bytes(self) -> usize {
         self.max_ram_bytes
@@ -3019,7 +3029,7 @@ const SCORING_THREADS: usize = 2;
 
 /// The stack a thread scoring starts may touch: std's default for a spawned thread, 2 MiB, or
 /// `RUST_MIN_STACK` when it is set. Its pages count toward the peak like any other.
-fn thread_stack_bytes() -> usize {
+pub(crate) fn thread_stack_bytes() -> usize {
     std::env::var("RUST_MIN_STACK")
         .ok()
         .and_then(|bytes| bytes.parse().ok())

@@ -5,6 +5,7 @@ use crate::score::exact::{FixedPoint, shortest_decimal_hinted};
 use crate::score::prepare::{
     EffectOnlyMatches, OtherAlleleMatch, names_no_single_other_allele, resolve_other_allele,
 };
+use crate::score::pipeline::MemoryBudget;
 use crate::score::types::{GenomicRegion, parse_chromosome_label};
 use crate::shared::files::open_variant_source;
 use ahash::{AHashMap, AHashSet};
@@ -96,7 +97,23 @@ impl NativeVcfScoreResult {
 struct ScoreRule {
     effect_allele: (usize, usize),
     other_allele: (usize, usize),
-    applications: (usize, usize),
+    /// Where the run of rules this rule is in ends: the rules at its position that match a
+    /// record's alleles alike, naming one allele pair in either orientation, or one effect allele
+    /// with the same other-allele text.
+    run_end: usize,
+    /// Its run's weights, in `ScoreRules::merged`.
+    merged: (usize, usize),
+}
+
+/// One weight of a run of rules, by its score and orientation.
+#[derive(Debug, Clone, Copy)]
+struct MergedApplication {
+    score_index: usize,
+    /// The weight's shortest round-trip decimal: `digits × 10^exponent`.
+    digits: i64,
+    exponent: i32,
+    /// Whether its rule's effect allele is the run's first rule's.
+    same_effect: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,21 +132,22 @@ struct ScoreApplication {
 /// file order, the order their weights are summed in.
 #[derive(Debug)]
 struct ScoreRules {
-    /// Rules grouped by position, in file order within a position.
+    /// Rules grouped by position, and within a position into runs that match a record's alleles
+    /// alike, in the order of each run's first row and in file order within a run.
     rules: Vec<ScoreRule>,
     /// Each position's range of `rules`.
     ranges: AHashMap<VariantKey, (usize, usize)>,
     alleles: String,
-    applications: Vec<ScoreApplication>,
+    /// Each run's weights, by score, once: a record's allele refers to its run by its first rule.
+    merged: Vec<MergedApplication>,
+    /// The most runs at one position, the most weights one run gives one score, and the most
+    /// weights at one position.
+    most_runs: usize,
+    most_per_score: usize,
+    most_weights: usize,
 }
 
 impl ScoreRules {
-    fn get(&self, key: &VariantKey) -> Option<&[ScoreRule]> {
-        self.ranges
-            .get(key)
-            .map(|&(start, end)| &self.rules[start..end])
-    }
-
     fn contains_key(&self, key: &VariantKey) -> bool {
         self.ranges.contains_key(key)
     }
@@ -138,15 +156,26 @@ impl ScoreRules {
         &self.alleles[span.0..span.1]
     }
 
-    fn applications(&self, rule: &ScoreRule) -> &[ScoreApplication] {
-        &self.applications[rule.applications.0..rule.applications.1]
+    /// The weights of the run of rules `rule` is in, by score.
+    fn merged(&self, rule: usize) -> &[MergedApplication] {
+        let (start, end) = self.rules[rule].merged;
+        &self.merged[start..end]
+    }
+
+    /// The first rule of each run among `start..end`, a position's rules.
+    fn runs(&self, start: usize, end: usize) -> impl Iterator<Item = usize> + '_ {
+        std::iter::successors((start < end).then_some(start), move |&run| {
+            let next = self.rules[run].run_end;
+            (next < end).then_some(next)
+        })
     }
 }
 
-/// `ScoreRules` under construction: rows in file order, not yet grouped.
+/// `ScoreRules` under construction: rows in file order, not yet grouped, each with its range of
+/// `applications`.
 #[derive(Debug, Default)]
 struct ScoreRulesBuilder {
-    rows: Vec<(VariantKey, ScoreRule)>,
+    rows: Vec<(VariantKey, ScoreRule, (usize, usize))>,
     alleles: String,
     applications: Vec<ScoreApplication>,
 }
@@ -171,8 +200,10 @@ impl ScoreRulesBuilder {
             ScoreRule {
                 effect_allele,
                 other_allele,
-                applications: (applications_start, self.applications.len()),
+                run_end: 0,
+                merged: (0, 0),
             },
+            (applications_start, self.applications.len()),
         ));
     }
 
@@ -184,22 +215,74 @@ impl ScoreRulesBuilder {
 
     fn finish(mut self) -> ScoreRules {
         // A stable sort groups each position's rules and keeps their file order.
-        self.rows.sort_by_key(|(key, _)| *key);
+        self.rows.sort_by_key(|(key, _, _)| *key);
+        let alleles = self.alleles;
+        let applications = self.applications;
+        let allele = |span: (usize, usize)| &alleles[span.0..span.1];
+        // Rules match a record's alleles alike when they name one allele pair, in either order,
+        // or one effect allele with the same other-allele text.
+        let alike = |a: &ScoreRule, b: &ScoreRule| {
+            let (a_effect, a_other) = (allele(a.effect_allele), allele(a.other_allele));
+            let (b_effect, b_other) = (allele(b.effect_allele), allele(b.other_allele));
+            if names_no_single_other_allele(a_other) || names_no_single_other_allele(b_other) {
+                return a_effect == b_effect && a_other == b_other;
+            }
+            (a_effect, a_other) == (b_effect, b_other) || (a_effect, a_other) == (b_other, b_effect)
+        };
         let mut rules = Vec::with_capacity(self.rows.len());
         let mut ranges: AHashMap<VariantKey, (usize, usize)> =
             AHashMap::with_capacity(self.rows.len());
-        for (index, (key, rule)) in self.rows.into_iter().enumerate() {
-            rules.push(rule);
-            ranges
-                .entry(key)
-                .and_modify(|range| range.1 = index + 1)
-                .or_insert((index, index + 1));
+        let mut merged = Vec::with_capacity(applications.len());
+        let (mut most_runs, mut most_per_score, mut most_weights) = (0usize, 0usize, 0usize);
+        for position in self.rows.chunk_by(|a, b| a.0 == b.0) {
+            let start = rules.len();
+            // Each run, in the order of its first rule: its rules in file order.
+            let mut runs: Vec<Vec<(ScoreRule, (usize, usize))>> = Vec::new();
+            for &(_, rule, weights) in position {
+                match runs.iter_mut().find(|run| alike(&run[0].0, &rule)) {
+                    Some(run) => run.push((rule, weights)),
+                    None => runs.push(vec![(rule, weights)]),
+                }
+            }
+            most_runs = most_runs.max(runs.len());
+            for run in runs {
+                let first = rules.len();
+                let merged_start = merged.len();
+                let first_effect = allele(run[0].0.effect_allele);
+                for (rule, weights) in &run {
+                    let same_effect = allele(rule.effect_allele) == first_effect;
+                    merged.extend(applications[weights.0..weights.1].iter().map(|application| {
+                        MergedApplication {
+                            score_index: application.score_index,
+                            digits: application.digits,
+                            exponent: application.exponent,
+                            same_effect,
+                        }
+                    }));
+                }
+                let weights = &mut merged[merged_start..];
+                weights.sort_by_key(|weight| (weight.score_index, weight.same_effect));
+                for score in weights.chunk_by(|a, b| a.score_index == b.score_index) {
+                    most_per_score = most_per_score.max(score.len());
+                }
+                let run_end = first + run.len();
+                rules.extend(run.into_iter().map(|(rule, _)| ScoreRule {
+                    run_end,
+                    merged: (merged_start, merged.len()),
+                    ..rule
+                }));
+            }
+            most_weights = most_weights.max(merged.len() - rules[start].merged.0);
+            ranges.insert(position[0].0, (start, rules.len()));
         }
         ScoreRules {
             rules,
             ranges,
-            alleles: self.alleles,
-            applications: self.applications,
+            alleles,
+            merged,
+            most_runs,
+            most_per_score,
+            most_weights,
         }
     }
 }
@@ -223,7 +306,7 @@ pub fn score_vcf_streaming(
 ) -> Result<NativeVcfScoreResult, Box<dyn Error + Send + Sync>> {
     let (score_names, rules_by_key) = load_score_rules(native_score_files, score_regions)?;
     let source = open_variant_source(input_path)?;
-    stream::score_source(source, input_path, keep, score_names, &rules_by_key)
+    stream::score_source(source, input_path, keep, score_names, &rules_by_key, MemoryBudget::default)
 }
 
 /// What decoding a record needs besides the record.
@@ -303,7 +386,8 @@ impl<'a> RecordAccumulator<'a> {
                 .into());
             }
             self.totals.add_allele(
-                std::mem::take(&mut allele.matched_rules),
+                rules_by_key,
+                &[(allele.first_rule, allele.first_rule_effect_is_ref)],
                 std::mem::take(&mut allele.column),
                 allele.scale.take(),
                 |score_index| {
@@ -320,7 +404,76 @@ impl<'a> RecordAccumulator<'a> {
 
     /// Adds the terms of every allele taken so far to the sums.
     fn apply(&mut self) {
-        self.totals.apply();
+        self.totals.apply(self.rules_by_key);
+    }
+
+    /// What the accumulator holds between batches besides [`RecordAccumulator::bytes`]: the
+    /// records taken at a position not yet decided, and the buffers of its queues, which keep
+    /// their size once emptied.
+    fn held_bytes(&self) -> usize {
+        let pending = &self.pending;
+        let totals = &self.totals;
+        [
+            pending.refs.capacity() * std::mem::size_of::<String>(),
+            pending.rows.capacity() * std::mem::size_of::<(usize, String)>(),
+            pending.alleles.capacity() * std::mem::size_of::<(usize, DecodedAllele)>(),
+            pending.matched.capacity() * std::mem::size_of::<(usize, bool)>(),
+            totals.unapplied.capacity() * std::mem::size_of::<ScoredAllele>(),
+            totals.unapplied_runs.capacity() * std::mem::size_of::<(usize, bool)>(),
+            totals.unapplied_weights.capacity() * std::mem::size_of::<i64>(),
+            totals.lane_weights.capacity() * std::mem::size_of::<i64>(),
+            totals.walk.cursors.capacity() * std::mem::size_of::<usize>(),
+            totals.walk.weights.capacity() * std::mem::size_of::<MatchedRule>(),
+            totals.walk.rules.capacity() * std::mem::size_of::<ExactRule>(),
+            totals.groups.capacity() * std::mem::size_of::<(usize, u128)>(),
+        ]
+        .into_iter()
+        .fold(pending.held, usize::saturating_add)
+    }
+
+    /// What an accumulator for `people` and `scores` over `rules_by_key` allocates besides the
+    /// records it takes: each person-score's i128 cell, i64 lane and u32 missing count (the lanes
+    /// are freed before [`ScoreTotals::finish`] puts the missing counts in person order); each
+    /// score's headroom, matched count, weight and dosage places and output places, and the scores
+    /// an allele grows or flushes; each rule's claim and decision; each range of people's wide cell
+    /// parts and, as it adds, a cursor a run and one score's weights of an allele; the same once
+    /// more to take alleles; and the smallest buffers of its queues. Its rules and weights are the
+    /// plan's, held before the budget was read.
+    fn bytes(people: usize, scores: usize, rules_by_key: &ScoreRules) -> usize {
+        let cells = people.saturating_mul(scores);
+        let rules = rules_by_key.rules.len();
+        let ranges = rayon::current_num_threads().max(1) * RANGES_PER_WORKER;
+        let per_score = rules_by_key.most_runs.saturating_mul(rules_by_key.most_per_score);
+        let walk = grown_bytes(rules_by_key.most_runs, std::mem::size_of::<usize>())
+            .saturating_add(grown_bytes(per_score, std::mem::size_of::<MatchedRule>()))
+            .saturating_add(grown_bytes(per_score, std::mem::size_of::<ExactRule>()));
+        [
+            cells.saturating_mul(std::mem::size_of::<i128>()),
+            cells.saturating_mul(std::mem::size_of::<i64>()),
+            cells.saturating_mul(std::mem::size_of::<u32>()),
+            scores * std::mem::size_of::<u128>(),
+            scores * std::mem::size_of::<u32>(),
+            scores * std::mem::size_of::<i32>(),
+            scores * std::mem::size_of::<u8>(),
+            scores * std::mem::size_of::<u32>(),
+            rules.saturating_mul(std::mem::size_of::<Option<bool>>()),
+            rules.saturating_mul(std::mem::size_of::<bool>()),
+            ranges * std::mem::size_of::<AHashMap<usize, Wide>>(),
+        ]
+        .into_iter()
+        .map(allocation_bytes)
+        .fold(0usize, usize::saturating_add)
+        .saturating_add(grown_bytes(scores, std::mem::size_of::<usize>()))
+        .saturating_add(grown_bytes(scores, std::mem::size_of::<(usize, u128)>()))
+        .saturating_add(grown_bytes(rules_by_key.most_weights, std::mem::size_of::<i64>()))
+        .saturating_add(vec_base(std::mem::size_of::<i64>()))
+        .saturating_add(ranges.saturating_add(1).saturating_mul(walk))
+        .saturating_add(vec_base(std::mem::size_of::<ScoredAllele>()))
+        .saturating_add(vec_base(std::mem::size_of::<(usize, bool)>()))
+        .saturating_add(vec_base(std::mem::size_of::<String>()))
+        .saturating_add(vec_base(std::mem::size_of::<(usize, String)>()))
+        .saturating_add(vec_base(std::mem::size_of::<(usize, DecodedAllele)>()))
+        .saturating_add(vec_base(std::mem::size_of::<(usize, bool)>()))
     }
 
     /// Accumulates the records at the last open position and returns the totals.
@@ -331,7 +484,7 @@ impl<'a> RecordAccumulator<'a> {
             &mut self.effect_only_matches,
             &mut self.totals,
         )?;
-        self.totals.finish();
+        self.totals.finish(self.rules_by_key);
         self.effect_only_matches.report();
         Ok(self.totals)
     }
@@ -402,20 +555,25 @@ struct DecodedRecord {
     /// alleles such a rule scores is decided by `PendingPosition`, so this
     /// record's alleles carry no matched rules yet.
     effect_only: bool,
-    /// Every (REF, ALT) pair of an `effect_only` record, in ALT order.
-    rows: Vec<(String, String)>,
+    /// An `effect_only` record's REF, and its ALT alleles in order: its (REF, ALT) rows.
+    ref_allele: String,
+    rows: Vec<String>,
     /// Alleles with at least one matched rule, in ALT order. Only the first
     /// `allele_count` belong to this record; the rest keep their buffers.
     alleles: Vec<DecodedAllele>,
     allele_count: usize,
     /// The first error scoring this record raises.
     error: Option<Box<dyn Error + Send + Sync>>,
+    /// The bytes counted for decoding and adding this record, before any of it was allocated.
+    need: usize,
 }
 
 impl DecodedRecord {
-    /// The next allele slot, for ALT ordinal `alt_offset`.
+    /// The next allele slot, for ALT ordinal `alt_offset`. Slots are reserved one at a time: a
+    /// record has few alleles, most have one, and [`scored_record_need`] counts no spare slot.
     fn next_allele(&mut self, alt_offset: usize) -> &mut DecodedAllele {
         if self.alleles.len() == self.allele_count {
+            self.alleles.reserve_exact(1);
             self.alleles.push(DecodedAllele::default());
         }
         let allele = &mut self.alleles[self.allele_count];
@@ -424,13 +582,252 @@ impl DecodedRecord {
     }
 }
 
+/// What the records one part of a batch decodes may still allocate.
+struct Share {
+    left: usize,
+}
+
+impl Share {
+    /// Counts `need` bytes against the share, or leaves it as it was and gives `false` when they
+    /// do not fit.
+    fn take(&mut self, need: usize) -> bool {
+        match self.left.checked_sub(need) {
+            Some(left) => {
+                self.left = left;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Returns what a transient allocation took, once it is freed.
+    fn give(&mut self, need: usize) {
+        self.left = self.left.saturating_add(need);
+    }
+}
+
+/// Whether a record fit what its part may still allocate.
+enum Fit {
+    Decoded,
+    /// Nothing of the record was allocated: at `locus`, it needs `need` bytes, more than its part
+    /// had left.
+    Beyond { need: usize, locus: String },
+}
+
+/// The most bytes glibc's malloc takes for an allocation of `bytes`: its 8-byte chunk header and
+/// rounding to 16 bytes, 32 bytes at least; or, for a chunk it maps, which it does only for
+/// allocations of 128 KiB or more, rounding to 4 KiB pages, at most a thirty-second of it.
+fn allocation_bytes(bytes: usize) -> usize {
+    if bytes == 0 {
+        return 0;
+    }
+    bytes.saturating_add(32).saturating_add(bytes / 32)
+}
+
+/// The most a `Vec` of `len` elements of `size` bytes, grown one push at a time, holds at once:
+/// a buffer of up to twice its length and eight elements at least, and while it grows, the
+/// buffer it moves from.
+fn grown_bytes(len: usize, size: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let bytes = len.saturating_mul(size);
+    allocation_bytes(bytes.saturating_mul(2).max(size.saturating_mul(8))).saturating_add(allocation_bytes(bytes))
+}
+
+/// What `count` elements of `size` bytes add to a `Vec` grown one push at a time, beyond its
+/// [`vec_base`]: three slots each (a buffer of up to twice its length, and while it grows, the
+/// buffer it moves from), with the allocator's rounding of a large buffer.
+fn slots(count: usize, size: usize) -> usize {
+    let slot = 3 * size;
+    count.saturating_mul(slot + slot.div_ceil(32))
+}
+
+/// What a `Vec` of elements of `size` bytes, grown one push at a time, holds before [`slots`]
+/// counts its elements: its smallest buffer, and the allocator's chunks of two buffers.
+fn vec_base(size: usize) -> usize {
+    grown_bytes(1, size)
+}
+
+/// What decoding and adding a scored record allocates besides its alleles: its slot among its
+/// part's records, its chromosome, its list of `alts` ALT alleles while it is decoded (both grown
+/// one push at a time), and its `columns` allele slots, reserved one at a time.
+fn record_need(chromosome: usize, alts: usize, columns: usize) -> usize {
+    let allele = std::mem::size_of::<DecodedAllele>();
+    slots(1, std::mem::size_of::<DecodedRecord>())
+        .saturating_add(allocation_bytes(chromosome.max(8)))
+        .saturating_add(grown_bytes(alts, std::mem::size_of::<&str>()))
+        .saturating_add(allocation_bytes(columns.saturating_mul(allele)))
+        .saturating_add(allocation_bytes(columns.saturating_sub(1).saturating_mul(allele)))
+}
+
+/// What a part of a batch allocates before its records: its records' `Vec`.
+fn part_need() -> usize {
+    vec_base(std::mem::size_of::<DecodedRecord>())
+}
+
+/// What one allele of a scored record allocates until its batch is added: its dosage column, at
+/// most two i64 digits and two places a kept person (hard calls take a byte), and once it is
+/// taken, its slot among the alleles waiting to be added, the slots of its references to the
+/// `runs` of rules that score it, and the one word of its own each of their `weights` holds, its
+/// lane weight at the allele's scale. Its rules and weights are the plan's, referred to by index.
+fn allele_need(people: usize, runs: usize, weights: usize) -> usize {
+    allocation_bytes(people.saturating_mul(std::mem::size_of::<[i64; 2]>()))
+        .saturating_add(allocation_bytes(people.saturating_mul(std::mem::size_of::<[u8; 2]>())))
+        .saturating_add(slots(1, std::mem::size_of::<ScoredAllele>()))
+        .saturating_add(slots(runs, std::mem::size_of::<(usize, bool)>()))
+        .saturating_add(slots(weights, std::mem::size_of::<i64>()))
+}
+
+/// What a record at a position where a rule names no single other allele adds besides its
+/// record and allele needs, until the position is decided: its REF once and its ALT alleles, and
+/// their slots among the position's REFs and rows; each of its `columns` alleles' slot among the
+/// position's alleles; the runs an allele matches as the position is decided; and the position's
+/// copy of the chromosome and its decisions over its `runs`, with which row took each.
+fn pending_need(
+    chromosome: usize,
+    ref_allele: usize,
+    alt_alleles: impl Iterator<Item = usize>,
+    columns: usize,
+    runs: usize,
+) -> usize {
+    let mut alts = 0usize;
+    let mut strings = allocation_bytes(ref_allele.max(8));
+    for alt_allele in alt_alleles {
+        alts += 1;
+        strings = strings.saturating_add(allocation_bytes(alt_allele));
+    }
+    allocation_bytes(alts.saturating_mul(std::mem::size_of::<String>()))
+        .saturating_add(strings)
+        .saturating_add(slots(1, std::mem::size_of::<String>()))
+        .saturating_add(slots(alts, std::mem::size_of::<(usize, String)>()))
+        .saturating_add(slots(columns, std::mem::size_of::<(usize, DecodedAllele)>()))
+        .saturating_add(grown_bytes(runs, std::mem::size_of::<(usize, bool)>()))
+        .saturating_add(allocation_bytes(chromosome))
+        .saturating_add(allocation_bytes(runs.saturating_mul(std::mem::size_of::<(usize, OtherAlleleMatch)>())))
+        .saturating_add(allocation_bytes(runs.saturating_mul(std::mem::size_of::<Option<bool>>())))
+}
+
+/// The runs of the rules at a position, from rule `rules_start` on.
+fn position_runs(rules_by_key: &ScoreRules, rules_start: usize, score_rules: &[ScoreRule]) -> usize {
+    rules_by_key.runs(rules_start, rules_start + score_rules.len()).count()
+}
+
+/// The weights of every run of the rules at a position, from rule `rules_start` on.
+fn position_weights(rules_by_key: &ScoreRules, rules_start: usize, score_rules: &[ScoreRule]) -> usize {
+    rules_by_key.runs(rules_start, rules_start + score_rules.len()).map(|run| rules_by_key.merged(run).len()).sum()
+}
+
+/// How many runs of rules, and how many of their weights, score an allele `(ref_allele,
+/// alt_allele)` of a record at a position, at most, when the record decodes a column for it: the
+/// run naming its pair, or at an `effect_only` position, decided with the position, any of the
+/// position's runs.
+fn allele_runs(
+    rules_by_key: &ScoreRules,
+    rules_start: usize,
+    score_rules: &[ScoreRule],
+    effect_only: bool,
+    ref_allele: &str,
+    alt_allele: &str,
+) -> Option<(usize, usize)> {
+    if effect_only {
+        return may_score_at_effect_only_position(rules_by_key, score_rules, ref_allele, alt_allele).then(|| {
+            (
+                position_runs(rules_by_key, rules_start, score_rules),
+                position_weights(rules_by_key, rules_start, score_rules),
+            )
+        });
+    }
+    rules_for_allele(rules_by_key, rules_start, score_rules, false, ref_allele, alt_allele)
+        .map(|(run, _)| (1, rules_by_key.merged(run).len()))
+}
+
+/// What decoding and adding a scored record needs, from its chromosome, REF and ALT alleles and
+/// the rules at its position (`score_rules`, from rule `rules_start` on), counted before any of it
+/// is allocated: [`record_need`], an [`allele_need`] for each allele it decodes a column for, and
+/// at an `effect_only` position, [`pending_need`]. It does not depend on how many scores the
+/// rules weigh.
+#[allow(clippy::too_many_arguments)]
+fn scored_record_need<'a, I: Iterator<Item = &'a str>>(
+    rules_by_key: &ScoreRules,
+    rules_start: usize,
+    score_rules: &[ScoreRule],
+    effect_only: bool,
+    people: usize,
+    chromosome: &str,
+    ref_allele: &str,
+    alt_alleles: impl Fn() -> I,
+) -> usize {
+    let mut alts = 0usize;
+    let mut columns = 0usize;
+    let mut alleles = 0usize;
+    for alt_allele in alt_alleles() {
+        alts += 1;
+        if let Some((runs, weights)) =
+            allele_runs(rules_by_key, rules_start, score_rules, effect_only, ref_allele, alt_allele)
+        {
+            columns += 1;
+            alleles = alleles.saturating_add(allele_need(people, runs, weights));
+        }
+    }
+    let pending = if effect_only {
+        pending_need(
+            chromosome.len(),
+            ref_allele.len(),
+            alt_alleles().map(str::len),
+            columns,
+            position_runs(rules_by_key, rules_start, score_rules),
+        )
+    } else {
+        0
+    };
+    record_need(chromosome.len(), alts, columns).saturating_add(alleles).saturating_add(pending)
+}
+
+/// What a record at the neediest and at the least needy scored position needs to decode and add,
+/// were it to carry an allele for each of its position's runs of rules, with a one-byte
+/// chromosome, REF and ALT alleles: each longer byte adds at most itself and a thirty-second to
+/// its allocation.
+fn position_needs(rules_by_key: &ScoreRules, people: usize) -> (usize, usize) {
+    let mut most = 0usize;
+    let mut least = usize::MAX;
+    for &(start, end) in rules_by_key.ranges.values() {
+        let score_rules = &rules_by_key.rules[start..end];
+        let effect_only = is_effect_only_position(rules_by_key, score_rules);
+        let runs = position_runs(rules_by_key, start, score_rules);
+        let alleles = if effect_only {
+            let weights = position_weights(rules_by_key, start, score_rules);
+            runs.saturating_mul(allele_need(people, runs, weights))
+        } else {
+            rules_by_key
+                .runs(start, end)
+                .map(|run| allele_need(people, 1, rules_by_key.merged(run).len()))
+                .fold(0usize, usize::saturating_add)
+        };
+        let pending = if effect_only {
+            pending_need(1, 1, std::iter::repeat_n(1, runs), runs, runs)
+        } else {
+            0
+        };
+        let need = record_need(1, runs, runs).saturating_add(alleles).saturating_add(pending);
+        most = most.max(need);
+        least = least.min(need);
+    }
+    (most, least.min(most))
+}
+
+/// The ALT alleles of a record's ALT field, none for a missing ALT.
+fn alt_alleles_of(bases: &str) -> impl Iterator<Item = &str> {
+    (!bases.is_empty()).then_some(bases).into_iter().flat_map(|bases| bases.split(','))
+}
+
 #[derive(Default)]
 struct DecodedAllele {
     /// The allele's ALT ordinal, from 0.
     alt_offset: usize,
-    matched_rules: Vec<MatchedRule>,
-    /// The first rule the allele matched, as an index into every position's rules; the allele
-    /// pair it names is the allele's. Unused at an `effect_only` position.
+    /// The first rule of the run naming the allele's pair, as an index into every position's
+    /// rules: the pair it names is the allele's, and the run's weights score it. Unused at an
+    /// `effect_only` position.
     first_rule: usize,
     /// Whether that rule's effect allele is this record's REF.
     first_rule_effect_is_ref: bool,
@@ -661,6 +1058,27 @@ struct ScoreTotals {
     /// Alleles counted in `score_variant_counts` whose terms are not yet in the
     /// cells, in input order.
     unapplied: Vec<ScoredAllele>,
+    /// The runs of rules the unapplied alleles are scored by, and their weights' lane weights,
+    /// each allele's in turn: the one word of its own a weight holds, its weight at the scale of its
+    /// allele's column, or `IN_CELLS`.
+    unapplied_runs: Vec<(usize, bool)>,
+    unapplied_weights: Vec<i64>,
+    /// What walking an allele's weights score by score holds as it is added, the scores it grows
+    /// or flushes, and each of its scores' lane bound where its weights add into the lanes.
+    walk: Walk,
+    scores: Vec<usize>,
+    groups: Vec<(usize, u128)>,
+    /// The lane weights of the allele being added, queued once the scores it fills are flushed.
+    lane_weights: Vec<i64>,
+}
+
+/// What walking an allele's weights score by score holds: a cursor a run, one score's weights,
+/// and those weights at their scores' scales.
+#[derive(Default)]
+struct Walk {
+    cursors: Vec<usize>,
+    weights: Vec<MatchedRule>,
+    rules: Vec<ExactRule>,
 }
 
 /// A signed integer too wide for i128, in base-10^9 limbs, least significant first.
@@ -697,12 +1115,66 @@ impl Wide {
     }
 }
 
-/// One scored allele's rules at their scores' scales, and every kept person's dosage of it.
+/// One scored allele: the runs of rules it is scored by, in `ScoreTotals::unapplied_runs`; each of
+/// their weights' lane weight at its score's scale, in `ScoreTotals::unapplied_weights`, in the
+/// order a [`ScoreWalk`] walks them; every kept person's dosage of it; and its column's scale.
 struct ScoredAllele {
-    rules: Vec<ExactRule>,
-    /// The distinct scores of `rules`, each counted once for a missing dosage.
-    missing_scores: Vec<usize>,
+    runs: (usize, usize),
+    weights: (usize, usize),
     column: DosageColumn,
+    scale: ColumnScale,
+}
+
+/// The lane weight of a queued weight that adds into the cells. A weight of `i64::MIN` itself,
+/// whose magnitude passes the lane bound unless every dose is zero, adds into the cells too:
+/// exactly, as any weight may.
+const IN_CELLS: i64 = i64::MIN;
+
+/// The weights `runs` give each score, score by score in increasing order. A run is its first rule
+/// and whether that rule's effect allele is the allele's REF; each run's weights are by score
+/// already, so they are walked together with a cursor each.
+struct ScoreWalk<'w> {
+    plan: &'w ScoreRules,
+    runs: &'w [(usize, bool)],
+    cursors: &'w mut Vec<usize>,
+}
+
+impl<'w> ScoreWalk<'w> {
+    fn new(plan: &'w ScoreRules, runs: &'w [(usize, bool)], cursors: &'w mut Vec<usize>) -> Self {
+        cursors.clear();
+        cursors.extend(runs.iter().map(|&(rule, _)| plan.rules[rule].merged.0));
+        Self { plan, runs, cursors }
+    }
+
+    /// Puts the next score's weights in `weights`, giving `false` once every weight is walked.
+    fn next_score(&mut self, weights: &mut Vec<MatchedRule>) -> bool {
+        let plan = self.plan;
+        let next = self
+            .runs
+            .iter()
+            .zip(self.cursors.iter())
+            .filter(|&(&(rule, _), &cursor)| cursor < plan.rules[rule].merged.1)
+            .map(|(_, &cursor)| plan.merged[cursor].score_index)
+            .min();
+        let Some(score) = next else {
+            return false;
+        };
+        weights.clear();
+        for (&(rule, first_is_ref), cursor) in self.runs.iter().zip(self.cursors.iter_mut()) {
+            let end = plan.rules[rule].merged.1;
+            while *cursor < end && plan.merged[*cursor].score_index == score {
+                let weight = plan.merged[*cursor];
+                weights.push(MatchedRule {
+                    score_index: score,
+                    digits: weight.digits,
+                    exponent: weight.exponent,
+                    effect_is_ref: weight.same_effect == first_is_ref,
+                });
+                *cursor += 1;
+            }
+        }
+        true
+    }
 }
 
 /// The most the terms added to a score's lanes between two flushes may sum to, in magnitude, so
@@ -711,7 +1183,6 @@ const LANE_LIMIT: u128 = i64::MAX as u128;
 
 /// A matched rule's weight at its score's scale.
 struct ExactRule {
-    score_index: usize,
     effect_is_ref: bool,
     digits: i64,
     /// The power of ten that puts `digits` at the score's weight places.
@@ -726,8 +1197,76 @@ struct ExactRule {
     weight: i64,
 }
 
+/// `rule` at its score's scale, for a column whose doses are at `places` decimal places and whose
+/// largest dose of each side, when known, is `largest`, with each score's weight and dosage places.
+fn exact_rule(
+    weight_places: &[i32],
+    dosage_places: &[u8],
+    rule: &MatchedRule,
+    places: u8,
+    largest: Option<[u128; 2]>,
+) -> ExactRule {
+    let score = rule.score_index;
+    // A score's weight places are at least any of its weights' own, so the shift is nonnegative.
+    let shift = (weight_places[score] + rule.exponent) as u32;
+    let scaled = pow10(shift).and_then(|power| i128::from(rule.digits).checked_mul(power));
+    // A score's dosage places are at least any column's it has taken.
+    let weight = scaled
+        .zip(pow10(u32::from(dosage_places[score] - places)))
+        .and_then(|(weight, power)| i64::try_from(weight.checked_mul(power)?).ok());
+    let side = usize::from(rule.effect_is_ref);
+    let bound = weight
+        .zip(largest)
+        .and_then(|(weight, largest)| u128::from(weight.unsigned_abs()).checked_mul(largest[side]))
+        .filter(|&bound| bound <= LANE_LIMIT);
+    ExactRule {
+        effect_is_ref: rule.effect_is_ref,
+        digits: rule.digits,
+        shift,
+        scaled,
+        bound,
+        weight: weight.unwrap_or(0),
+    }
+}
+
+/// Puts one score's `weights` of an allele whose column has `scale` at their scores' scales, into
+/// `rules`, queuing each as its lane weight into `queued`, and the score's lane bound into `groups`
+/// when they add into the lanes: the weights of a score whose bounds alone pass the limit add into
+/// the cells.
+fn queue_score(
+    weights: &[MatchedRule],
+    at: Places<'_>,
+    scale: &ColumnScale,
+    rules: &mut Vec<ExactRule>,
+    groups: &mut Vec<(usize, u128)>,
+    queued: &mut Vec<i64>,
+) {
+    rules.clear();
+    rules.extend(weights.iter().map(|weight| exact_rule(at.weight, at.dosage, weight, scale.places, scale.largest)));
+    let bound: u128 = rules.iter().filter_map(|rule| rule.bound).sum();
+    let in_lanes = bound <= LANE_LIMIT;
+    queued.extend(rules.iter().map(|rule| match rule.bound {
+        Some(_) if in_lanes => rule.weight,
+        _ => IN_CELLS,
+    }));
+    if in_lanes {
+        groups.push((weights[0].score_index, bound));
+    }
+}
+
+/// Every power of ten an i128 holds, `10^0` through `10^38`.
+const POWERS_OF_TEN: [i128; 39] = {
+    let mut powers = [1i128; 39];
+    let mut digits = 1;
+    while digits < powers.len() {
+        powers[digits] = powers[digits - 1] * 10;
+        digits += 1;
+    }
+    powers
+};
+
 fn pow10(digits: u32) -> Option<i128> {
-    10i128.checked_pow(digits)
+    POWERS_OF_TEN.get(digits as usize).copied()
 }
 
 /// Adds `term` to a cell, moving the cell's value into its wide part when the sum leaves i128.
@@ -779,9 +1318,9 @@ fn add_exact(
 impl ScoreTotals {
     fn new(num_people: usize, num_scores: usize, rules_by_key: &ScoreRules) -> Self {
         let mut weight_places = vec![0i32; num_scores];
-        for application in &rules_by_key.applications {
-            let places = &mut weight_places[application.score_index];
-            *places = (*places).max(-application.exponent);
+        for weight in &rules_by_key.merged {
+            let places = &mut weight_places[weight.score_index];
+            *places = (*places).max(-weight.exponent);
         }
         let range_people = num_people
             .div_ceil(rayon::current_num_threads().max(1) * RANGES_PER_WORKER)
@@ -800,115 +1339,120 @@ impl ScoreTotals {
                 .map(|_| AHashMap::new())
                 .collect(),
             unapplied: Vec::new(),
+            unapplied_runs: Vec::new(),
+            unapplied_weights: Vec::new(),
+            walk: Walk::default(),
+            scores: Vec::new(),
+            groups: Vec::new(),
+            lane_weights: Vec::new(),
         }
     }
 
-    /// Counts the allele once in each score it scores, and queues each rule's
-    /// weight times every kept person's dosage of its effect allele for
+    /// Counts the allele once in each score it scores, and queues it, scored by the weights of
+    /// `runs`, times every kept person's dosage of its effect allele, for
     /// [`ScoreTotals::apply`]. A REF-effect rule fails when some person's dosage
     /// has no REF dosage. `scale` is the column's, when it was normalized where it was decoded.
     fn add_allele(
         &mut self,
-        matched_rules: Vec<MatchedRule>,
+        plan: &ScoreRules,
+        runs: &[(usize, bool)],
         mut column: DosageColumn,
         scale: Option<ColumnScale>,
         ref_effect_error: impl Fn(usize) -> String,
     ) -> Result<(), String> {
         let scale = scale.unwrap_or_else(|| column.normalize());
-        if let Some(rule) = matched_rules.iter().find(|rule| rule.effect_is_ref)
-            && scale.incomplete_ref
-        {
-            return Err(ref_effect_error(rule.score_index));
-        }
-        let mut missing_scores = Vec::new();
-        for rule in &matched_rules {
-            if missing_scores.last() != Some(&rule.score_index) {
-                missing_scores.push(rule.score_index);
-                self.score_variant_counts[rule.score_index] += 1;
+        let places = scale.places;
+        let mut ref_effect = None;
+        let mut scored = false;
+        self.scores.clear();
+        self.groups.clear();
+        self.lane_weights.clear();
+        let at = Places {
+            weight: &self.weight_places,
+            dosage: &self.dosage_places,
+        };
+        let (counts, growing, groups, queued) = (
+            &mut self.score_variant_counts,
+            &mut self.scores,
+            &mut self.groups,
+            &mut self.lane_weights,
+        );
+        let Walk { cursors, weights, rules } = &mut self.walk;
+        let mut walk = ScoreWalk::new(plan, runs, cursors);
+        while walk.next_score(weights) {
+            let score = weights[0].score_index;
+            scored = true;
+            if ref_effect.is_none() && weights.iter().any(|weight| weight.effect_is_ref) {
+                ref_effect = Some(score);
+            }
+            counts[score] += 1;
+            if places > at.dosage[score] {
+                growing.push(score);
+            }
+            // While no score grows, each is put at scale as it is counted.
+            if growing.is_empty() {
+                queue_score(weights, at, &scale, rules, groups, queued);
             }
         }
-        if matched_rules.is_empty() {
+        // A failing allele fails the run, so the counts it took are never read.
+        if let Some(score) = ref_effect
+            && scale.incomplete_ref
+        {
+            return Err(ref_effect_error(score));
+        }
+        if !scored {
             return Ok(());
         }
         // A dosage with more decimal places than a score has taken rescales that score, after
-        // the queued alleles are added at the old scale.
-        let places = scale.places;
-        let growing: Vec<usize> = missing_scores
-            .iter()
-            .copied()
-            .filter(|&score| places > self.dosage_places[score])
-            .collect();
-        if !growing.is_empty() {
-            self.apply();
-            for score in growing {
+        // the queued alleles are added at the old scale, and every weight is put at the new one.
+        if !self.scores.is_empty() {
+            self.apply(plan);
+            let growing = std::mem::take(&mut self.scores);
+            for &score in &growing {
                 self.rescale(score, places);
             }
-        }
-        let mut rules: Vec<ExactRule> = matched_rules
-            .iter()
-            .map(|rule| self.exact_rule(rule, places, scale.largest))
-            .collect();
-        // A score whose lanes cannot take this allele's bounds is flushed first. The rules of a
-        // score whose bounds alone pass the limit add into the cells.
-        let mut bounds = Vec::with_capacity(missing_scores.len());
-        let mut full = Vec::new();
-        for group in rules.chunk_by_mut(|a, b| a.score_index == b.score_index) {
-            let score = group[0].score_index;
-            let bound = group.iter().filter_map(|rule| rule.bound).sum::<u128>();
-            if bound > LANE_LIMIT {
-                group.iter_mut().for_each(|rule| rule.bound = None);
-                continue;
+            self.scores = growing;
+            self.groups.clear();
+            self.lane_weights.clear();
+            let at = Places {
+                weight: &self.weight_places,
+                dosage: &self.dosage_places,
+            };
+            let Walk { cursors, weights, rules } = &mut self.walk;
+            let mut walk = ScoreWalk::new(plan, runs, cursors);
+            while walk.next_score(weights) {
+                queue_score(weights, at, &scale, rules, &mut self.groups, &mut self.lane_weights);
             }
-            if self.headroom[score] + bound > LANE_LIMIT {
-                full.push(score);
-            }
-            bounds.push((score, bound));
         }
-        if !full.is_empty() {
-            self.apply();
+        // A score whose lanes cannot take this allele's bounds is flushed first.
+        self.scores.clear();
+        let headroom = &self.headroom;
+        self.scores.extend(
+            self.groups
+                .iter()
+                .filter(|&&(score, bound)| headroom[score] + bound > LANE_LIMIT)
+                .map(|&(score, _)| score),
+        );
+        if !self.scores.is_empty() {
+            self.apply(plan);
+            let full = std::mem::take(&mut self.scores);
             self.flush(&full);
+            self.scores = full;
         }
-        for (score, bound) in bounds {
+        for &(score, bound) in &self.groups {
             self.headroom[score] += bound;
         }
+        let first_weight = self.unapplied_weights.len();
+        self.unapplied_weights.extend_from_slice(&self.lane_weights);
+        let first_run = self.unapplied_runs.len();
+        self.unapplied_runs.extend_from_slice(runs);
         self.unapplied.push(ScoredAllele {
-            rules,
-            missing_scores,
+            runs: (first_run, self.unapplied_runs.len()),
+            weights: (first_weight, self.unapplied_weights.len()),
             column,
+            scale,
         });
         Ok(())
-    }
-
-    /// `rule` at its score's scale, for a column whose doses are at `places` decimal places and
-    /// whose largest dose of each side, when known, is `largest`.
-    fn exact_rule(
-        &self,
-        rule: &MatchedRule,
-        places: u8,
-        largest: Option<[u128; 2]>,
-    ) -> ExactRule {
-        let score = rule.score_index;
-        // A score's weight places are at least any of its weights' own, so the shift is nonnegative.
-        let shift = (self.weight_places[score] + rule.exponent) as u32;
-        let scaled = pow10(shift).and_then(|power| i128::from(rule.digits).checked_mul(power));
-        // A score's dosage places are at least any column's it has taken.
-        let weight = scaled
-            .zip(pow10(u32::from(self.dosage_places[score] - places)))
-            .and_then(|(weight, power)| i64::try_from(weight.checked_mul(power)?).ok());
-        let side = usize::from(rule.effect_is_ref);
-        let bound = weight
-            .zip(largest)
-            .and_then(|(weight, largest)| u128::from(weight.unsigned_abs()).checked_mul(largest[side]))
-            .filter(|&bound| bound <= LANE_LIMIT);
-        ExactRule {
-            score_index: score,
-            effect_is_ref: rule.effect_is_ref,
-            digits: rule.digits,
-            shift,
-            scaled,
-            bound,
-            weight: weight.unwrap_or(0),
-        }
     }
 
     /// Moves the lanes of `scores` into their cells.
@@ -948,10 +1492,13 @@ impl ScoreTotals {
 
     /// Adds every queued allele, moves every lane into its cell, and puts the missing counts in
     /// person × score order.
-    fn finish(&mut self) {
-        self.apply();
+    fn finish(&mut self, plan: &ScoreRules) {
+        self.apply(plan);
         let scores: Vec<usize> = (0..self.num_scores).collect();
         self.flush(&scores);
+        // Every lane is in its cell, so the lanes are freed before the missing counts are copied
+        // into person order.
+        self.lanes = Vec::new();
         let num_scores = self.num_scores;
         let range_cells = self.range_people * num_scores;
         let mut by_person = vec![0u32; self.missing_counts.len()];
@@ -999,7 +1546,7 @@ impl ScoreTotals {
 
     /// Adds the terms of every queued allele to the cells, over ranges of people
     /// on the rayon pool. Integer sums do not depend on how the people are split.
-    fn apply(&mut self) {
+    fn apply(&mut self, plan: &ScoreRules) {
         if self.unapplied.is_empty() {
             return;
         }
@@ -1007,7 +1554,12 @@ impl ScoreTotals {
         let range_people = self.range_people;
         let range_cells = range_people * num_scores;
         let alleles = &self.unapplied;
-        let dosage_places = &self.dosage_places;
+        let runs = &self.unapplied_runs;
+        let lane_weights = &self.unapplied_weights;
+        let places = Places {
+            weight: &self.weight_places,
+            dosage: &self.dosage_places,
+        };
         self.cells
             .par_chunks_mut(range_cells)
             .zip(self.lanes.par_chunks_mut(range_cells))
@@ -1015,22 +1567,26 @@ impl ScoreTotals {
             .zip(self.spills.par_iter_mut())
             .enumerate()
             .for_each(|(range, (((cells, lanes), missing), spill))| {
+                let mut walk = Walk::default();
                 for allele in alleles {
                     allele.apply(
-                        range * range_people,
-                        range * range_cells,
-                        num_scores,
-                        dosage_places,
+                        plan,
+                        (&runs[allele.runs.0..allele.runs.1], &lane_weights[allele.weights.0..allele.weights.1]),
+                        places,
+                        (range * range_people, range * range_cells, num_scores),
                         Accumulators {
                             cells,
                             lanes,
                             missing,
                             spill,
                         },
+                        &mut walk,
                     );
                 }
             });
         self.unapplied.clear();
+        self.unapplied_runs.clear();
+        self.unapplied_weights.clear();
     }
 }
 
@@ -1104,18 +1660,27 @@ struct Accumulators<'a> {
     spill: &'a mut AHashMap<usize, Wide>,
 }
 
+/// Each score's weight places and dosage places.
+#[derive(Clone, Copy)]
+struct Places<'a> {
+    weight: &'a [i32],
+    dosage: &'a [u8],
+}
+
 impl ScoredAllele {
     /// Adds this allele's terms for the people from `first_person` on, whose accumulators, from
-    /// global cell `first_cell`, `into` holds. Each rule adds to its score's run of lanes, eight
-    /// people a step, and each score the allele scores counts its missing people once; a rule
-    /// whose terms can pass the lane bound adds into the cells, exactly, person by person.
+    /// global cell `first_cell`, `into` holds, with `walk` to walk the weights of its `runs`
+    /// score by score beside their `lane_weights`. Each weight with a lane weight adds to its
+    /// score's run of lanes, eight people a step, and each score the allele scores counts its
+    /// missing people once; a weight in the cells adds there, exactly, person by person.
     fn apply(
         &self,
-        first_person: usize,
-        first_cell: usize,
-        num_scores: usize,
-        dosage_places: &[u8],
+        plan: &ScoreRules,
+        (runs, lane_weights): (&[(usize, bool)], &[i64]),
+        places: Places<'_>,
+        (first_person, first_cell, num_scores): (usize, usize, usize),
         into: Accumulators<'_>,
+        walk: &mut Walk,
     ) {
         let Accumulators {
             cells,
@@ -1126,31 +1691,42 @@ impl ScoredAllele {
         let range = missing.len() / num_scores;
         let people = first_person..first_person + range;
         let run = |score: usize| score * range..(score + 1) * range;
+        let ColumnScale {
+            places: column_places,
+            largest,
+            ..
+        } = self.scale;
+        let at_scale = |weight: &MatchedRule| exact_rule(places.weight, places.dosage, weight, column_places, largest);
+        let mut lane_weights = lane_weights.iter().copied();
+        let Walk { cursors, weights, .. } = walk;
         match &self.column {
             DosageColumn::Calls(codes) => {
                 let codes = &codes[people];
-                for rule in &self.rules {
-                    if rule.bound.is_some() {
-                        let lanes = &mut lanes[run(rule.score_index)];
-                        match rule.effect_is_ref {
-                            false => add_call_terms::<0>(codes, rule.weight, lanes),
-                            true => add_call_terms::<4>(codes, rule.weight, lanes),
-                        }
-                        continue;
-                    }
-                    let shift = if rule.effect_is_ref { 4 } else { 0 };
-                    let places = u32::from(dosage_places[rule.score_index]);
-                    for (offset, &code) in codes.iter().enumerate() {
-                        if code != MISSING_CALL {
-                            let copies = i64::from((code >> shift) & 0x0f);
-                            let index = offset * num_scores + rule.score_index;
-                            let cell = &mut cells[index];
-                            add_exact(cell, first_cell + index, spill, rule, copies, places);
-                        }
-                    }
-                }
                 let missing_call = u8x8::splat(MISSING_CALL);
-                for &score in &self.missing_scores {
+                let mut walk = ScoreWalk::new(plan, runs, cursors);
+                while walk.next_score(weights) {
+                    let score = weights[0].score_index;
+                    for (weight, lane_weight) in weights.iter().zip(&mut lane_weights) {
+                        if lane_weight != IN_CELLS {
+                            let lanes = &mut lanes[run(score)];
+                            match weight.effect_is_ref {
+                                false => add_call_terms::<0>(codes, lane_weight, lanes),
+                                true => add_call_terms::<4>(codes, lane_weight, lanes),
+                            }
+                            continue;
+                        }
+                        let rule = at_scale(weight);
+                        let shift = if rule.effect_is_ref { 4 } else { 0 };
+                        let dose_places = u32::from(places.dosage[score]);
+                        for (offset, &code) in codes.iter().enumerate() {
+                            if code != MISSING_CALL {
+                                let copies = i64::from((code >> shift) & 0x0f);
+                                let index = offset * num_scores + score;
+                                let cell = &mut cells[index];
+                                add_exact(cell, first_cell + index, spill, &rule, copies, dose_places);
+                            }
+                        }
+                    }
                     count_missing(
                         codes,
                         &mut missing[run(score)],
@@ -1161,29 +1737,32 @@ impl ScoredAllele {
             }
             DosageColumn::Dosages(doses) => {
                 let digits = &doses.digits[people.clone()];
-                let places = &doses.places[people];
-                for rule in &self.rules {
-                    let side = usize::from(rule.effect_is_ref);
-                    if rule.bound.is_some() {
-                        let lanes = &mut lanes[run(rule.score_index)];
-                        match side {
-                            0 => add_dose_terms::<0>(digits, rule.weight, lanes),
-                            _ => add_dose_terms::<1>(digits, rule.weight, lanes),
+                let dose_places = &doses.places[people];
+                let mut walk = ScoreWalk::new(plan, runs, cursors);
+                while walk.next_score(weights) {
+                    let score = weights[0].score_index;
+                    for (weight, lane_weight) in weights.iter().zip(&mut lane_weights) {
+                        let side = usize::from(weight.effect_is_ref);
+                        if lane_weight != IN_CELLS {
+                            let lanes = &mut lanes[run(score)];
+                            match side {
+                                0 => add_dose_terms::<0>(digits, lane_weight, lanes),
+                                _ => add_dose_terms::<1>(digits, lane_weight, lanes),
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    for (offset, (digits, places)) in digits.iter().zip(places).enumerate() {
-                        if places[0] != u8::MAX {
-                            let shift = u32::from(dosage_places[rule.score_index] - places[side]);
-                            let index = offset * num_scores + rule.score_index;
-                            let cell = &mut cells[index];
-                            add_exact(cell, first_cell + index, spill, rule, digits[side], shift);
+                        let rule = at_scale(weight);
+                        for (offset, (digits, dose)) in digits.iter().zip(dose_places).enumerate() {
+                            if dose[0] != u8::MAX {
+                                let shift = u32::from(places.dosage[score] - dose[side]);
+                                let index = offset * num_scores + score;
+                                let cell = &mut cells[index];
+                                add_exact(cell, first_cell + index, spill, &rule, digits[side], shift);
+                            }
                         }
                     }
-                }
-                for &score in &self.missing_scores {
                     count_missing(
-                        places,
+                        dose_places,
                         &mut missing[run(score)],
                         |places| {
                             let places = u8x16::from_slice(places.as_flattened());
@@ -1206,12 +1785,20 @@ impl ScoredAllele {
 struct PendingPosition {
     key: Option<VariantKey>,
     chromosome: String,
-    /// The (REF, ALT) pair of every ALT allele read at the position, in input order.
-    rows: Vec<(String, String)>,
+    /// The REF of every record read at the position, in input order.
+    refs: Vec<String>,
+    /// Every ALT allele read at the position, in input order, with its record's index in `refs`:
+    /// the position's (REF, ALT) rows.
+    rows: Vec<(usize, String)>,
     /// Alleles some rule may score, each with its index in `rows`.
     alleles: Vec<(usize, DecodedAllele)>,
     /// Which positions have been resolved, by the index of their first rule.
     resolved: Vec<bool>,
+    /// The runs of rules an allele matches as the position is decided, each as its first rule
+    /// and whether that rule's effect allele is the allele's REF.
+    matched: Vec<(usize, bool)>,
+    /// What the records taken at the open position were counted to need.
+    held: usize,
 }
 
 impl PendingPosition {
@@ -1239,8 +1826,11 @@ impl PendingPosition {
 
     /// Takes the rows and alleles of a record at the open position.
     fn push(&mut self, decoded: &mut DecodedRecord) {
+        self.held = self.held.saturating_add(decoded.need);
         let first_row = self.rows.len();
-        self.rows.append(&mut decoded.rows);
+        let reference = self.refs.len();
+        self.refs.push(std::mem::take(&mut decoded.ref_allele));
+        self.rows.extend(decoded.rows.drain(..).map(|alt_allele| (reference, alt_allele)));
         for allele in &mut decoded.alleles[..decoded.allele_count] {
             self.alleles
                 .push((first_row + allele.alt_offset, std::mem::take(allele)));
@@ -1248,7 +1838,9 @@ impl PendingPosition {
     }
 
     /// Decides every rule at the open position over all of its rows, as Stage 3
-    /// does over `.bim` rows, and adds the alleles they score to `totals`.
+    /// does over `.bim` rows, and adds the alleles they score to `totals`. The
+    /// rules of a run name one pair, or one effect allele and other-allele text,
+    /// so a run is decided as its first rule is.
     fn resolve(
         &mut self,
         rules_by_key: &ScoreRules,
@@ -1259,33 +1851,40 @@ impl PendingPosition {
         let Some(key) = self.key.take() else {
             return Ok(());
         };
-        let rules = rules_by_key.get(&key).unwrap_or_default();
-        let decisions: Vec<OtherAlleleMatch> = rules
-            .iter()
-            .map(|rule| {
+        let (start, end) = rules_by_key.ranges.get(&key).copied().unwrap_or_default();
+        let rows = || {
+            self.rows
+                .iter()
+                .map(|(reference, alt_allele)| (self.refs[*reference].as_str(), alt_allele.as_str()))
+        };
+        let decisions: Vec<(usize, OtherAlleleMatch)> = rules_by_key
+            .runs(start, end)
+            .map(|run| {
+                let rule = &rules_by_key.rules[run];
                 let decision = resolve_other_allele(
                     rules_by_key.allele(rule.effect_allele),
                     rules_by_key.allele(rule.other_allele),
-                    self.rows
-                        .iter()
-                        .map(|(ref_allele, alt_allele)| (ref_allele.as_str(), alt_allele.as_str())),
+                    rows(),
                 );
-                for _ in rules_by_key.applications(rule) {
+                for _ in rules_by_key.merged(run) {
                     effect_only_matches.record(decision, key);
                 }
-                decision
+                (run, decision)
             })
             .collect();
 
-        // A rule's allele pair scores one row; a second row carrying it repeats the variant.
-        // Per rule, whether a row has taken it, and if so whether its effect allele was that row's REF.
-        let mut taken: Vec<Option<bool>> = vec![None; rules.len()];
+        // A run's allele pair scores one row; a second row carrying it repeats the variant.
+        // Per run, whether a row has taken it, and if so whether its first rule's effect allele was
+        // that row's REF.
+        let mut taken: Vec<Option<bool>> = vec![None; decisions.len()];
         for (row, allele) in &mut self.alleles {
-            let (ref_allele, alt_allele) = &self.rows[*row];
-            let mut matched = Vec::new();
-            for (index, (rule, decision)) in rules.iter().zip(&decisions).enumerate() {
+            let (reference, alt_allele) = &self.rows[*row];
+            let ref_allele = self.refs[*reference].as_str();
+            self.matched.clear();
+            for (index, &(run, decision)) in decisions.iter().enumerate() {
+                let rule = &rules_by_key.rules[run];
                 let effect_allele = rules_by_key.allele(rule.effect_allele);
-                let effect_is_ref = match *decision {
+                let effect_is_ref = match decision {
                     OtherAlleleMatch::Pair => pair_orientation(
                         effect_allele,
                         rules_by_key.allele(rule.other_allele),
@@ -1308,25 +1907,21 @@ impl PendingPosition {
                             effect_is_ref,
                         ));
                     }
-                    matched.extend(rules_by_key.applications(rule).iter().map(|application| {
-                        MatchedRule {
-                            score_index: application.score_index,
-                            digits: application.digits,
-                            exponent: application.exponent,
-                            effect_is_ref,
-                        }
-                    }));
+                    self.matched.push((run, effect_is_ref));
                 }
             }
             totals.add_allele(
-                merge_matched_rules(matched),
+                rules_by_key,
+                &self.matched,
                 std::mem::take(&mut allele.column),
                 allele.scale.take(),
                 |score_index| ref_effect_error(&score_names[score_index], &self.chromosome, key.1),
             )?;
         }
+        self.refs.clear();
         self.rows.clear();
         self.alleles.clear();
+        self.held = 0;
         Ok(())
     }
 }
@@ -1343,19 +1938,34 @@ struct VcfFields<'r> {
 }
 
 /// Decodes one VCF record line, with its newline when it has one, into
-/// `decoded`. A line `split_vcf_line` cannot split is read by noodles, so a
-/// line noodles cannot read fails as noodles fails.
+/// `decoded`, when it fits `share`. A line `split_vcf_line` cannot split is read
+/// by noodles, into a record of the line's length, so a line noodles cannot read
+/// fails as noodles fails.
 fn decode_vcf_line(
     line: &[u8],
     context: &DecodeContext<'_>,
     decoded: &mut DecodedRecord,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+    share: &mut Share,
+) -> Result<Fit, Box<dyn Error + Send + Sync>> {
     if let Some(fields) = split_vcf_line(line.strip_suffix(b"\n").unwrap_or(line)) {
-        return decode_scored_fields(fields, context, decoded);
+        return decode_scored_fields(fields, context, decoded, share);
+    }
+    let read = grown_bytes(line.len(), 1);
+    if !share.take(read) {
+        let mut fields = line.split(|&byte| byte == b'\t');
+        let (chromosome, position) = (fields.next().unwrap_or_default(), fields.next().unwrap_or_default());
+        return Ok(Fit::Beyond {
+            need: read,
+            locus: format!("{}:{}", String::from_utf8_lossy(chromosome), String::from_utf8_lossy(position)),
+        });
     }
     let mut record = noodles_vcf::Record::default();
-    VcfReader::new(line).read_record(&mut record)?;
-    decode_scored_record(&record, context, decoded)
+    let fit = VcfReader::new(line)
+        .read_record(&mut record)
+        .map_err(Into::into)
+        .and_then(|_| decode_scored_record(&record, context, decoded, share));
+    share.give(read);
+    fit
 }
 
 /// A record line's fields as noodles reads them, for a line whose bytes cannot
@@ -1401,7 +2011,8 @@ fn decode_scored_record(
     record: &noodles_vcf::Record,
     context: &DecodeContext<'_>,
     decoded: &mut DecodedRecord,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+    share: &mut Share,
+) -> Result<Fit, Box<dyn Error + Send + Sync>> {
     let alternate_bases = record.alternate_bases();
     let samples = record.samples();
     let fields = VcfFields {
@@ -1413,40 +2024,55 @@ fn decode_scored_record(
         alternate_bases: alternate_bases.as_ref(),
         samples: samples.as_ref(),
     };
-    decode_scored_fields(fields, context, decoded)
+    decode_scored_fields(fields, context, decoded, share)
 }
 
 /// Decodes the dosages a VCF record contributes to its matched rules into
 /// `decoded`, stopping at the first error a sequential scan raises for this
 /// record: a malformed position, a missing dosage FORMAT field, an undecodable
-/// sample, or a REF-effect rule without a complete REF dosage.
+/// sample, or a REF-effect rule without a complete REF dosage. A scored record
+/// whose need does not fit `share` is left undecoded, with nothing allocated.
 fn decode_scored_fields(
     fields: VcfFields<'_>,
     context: &DecodeContext<'_>,
     decoded: &mut DecodedRecord,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+    share: &mut Share,
+) -> Result<Fit, Box<dyn Error + Send + Sync>> {
     let rules_by_key = context.rules_by_key;
     let Ok(chr) = parse_chromosome_label(fields.chromosome) else {
-        return Ok(());
+        return Ok(Fit::Decoded);
     };
     let Some(start) = fields.variant_start else {
-        return Ok(());
+        return Ok(Fit::Decoded);
     };
     let pos = start? as u32;
     let Some(&(rules_start, rules_end)) = rules_by_key.ranges.get(&(chr, pos)) else {
-        return Ok(());
+        return Ok(Fit::Decoded);
     };
     let score_rules = &rules_by_key.rules[rules_start..rules_end];
+    let need = scored_record_need(
+        rules_by_key,
+        rules_start,
+        score_rules,
+        is_effect_only_position(rules_by_key, score_rules),
+        context.kept_indices.len(),
+        fields.chromosome,
+        fields.reference_bases,
+        || alt_alleles_of(fields.alternate_bases),
+    );
+    if !share.take(need) {
+        return Ok(Fit::Beyond {
+            need,
+            locus: format!("{}:{pos}", fields.chromosome),
+        });
+    }
+    decoded.need = need;
     decoded.position = pos;
     decoded.key = Some((chr, pos));
     decoded.chromosome.clear();
     decoded.chromosome.push_str(fields.chromosome);
 
-    let alt_alleles: Vec<&str> = if fields.alternate_bases.is_empty() {
-        Vec::new()
-    } else {
-        fields.alternate_bases.split(',').collect()
-    };
+    let alt_alleles: Vec<&str> = alt_alleles_of(fields.alternate_bases).collect();
     decode_rows(
         rules_by_key,
         score_rules,
@@ -1455,8 +2081,9 @@ fn decode_scored_fields(
         decoded,
     );
     for (alt_offset, alt_allele) in alt_alleles.iter().enumerate() {
-        let Some((matched_rules, first_rule)) = rules_for_allele(
+        let Some((first_rule, first_rule_effect_is_ref)) = rules_for_allele(
             rules_by_key,
+            rules_start,
             score_rules,
             decoded.effect_only,
             fields.reference_bases,
@@ -1464,10 +2091,8 @@ fn decode_scored_fields(
         ) else {
             continue;
         };
-        let ref_effect_rule = matched_rules
-            .iter()
-            .find(|rule| rule.effect_is_ref)
-            .map(|rule| rule.score_index);
+        let ref_effect_rule =
+            ref_effect_score(rules_by_key, decoded.effect_only, first_rule, first_rule_effect_is_ref);
         let allele = decoded.next_allele(alt_offset);
         decode_vcf_column(
             fields.samples,
@@ -1482,13 +2107,11 @@ fn decode_scored_fields(
             },
         )?;
         allele.scale = Some(allele.column.normalize());
-        allele.matched_rules = matched_rules;
-        allele.first_rule = rules_start + first_rule;
-        allele.first_rule_effect_is_ref =
-            rules_by_key.allele(score_rules[first_rule].effect_allele) == fields.reference_bases;
+        allele.first_rule = first_rule;
+        allele.first_rule_effect_is_ref = first_rule_effect_is_ref;
         decoded.allele_count += 1;
     }
-    Ok(())
+    Ok(Fit::Decoded)
 }
 
 /// Marks `decoded` as `effect_only` when a rule at its position names no single
@@ -1500,50 +2123,92 @@ fn decode_rows(
     alt_alleles: &[&str],
     decoded: &mut DecodedRecord,
 ) {
-    decoded.effect_only = score_rules
-        .iter()
-        .any(|rule| names_no_single_other_allele(rules_by_key.allele(rule.other_allele)));
+    decoded.effect_only = is_effect_only_position(rules_by_key, score_rules);
     if decoded.effect_only {
+        decoded.ref_allele.clear();
+        decoded.ref_allele.push_str(ref_allele);
         decoded.rows.clear();
-        decoded.rows.extend(
-            alt_alleles
-                .iter()
-                .map(|alt_allele| (ref_allele.to_string(), alt_allele.to_string())),
-        );
+        decoded.rows.extend(alt_alleles.iter().map(|alt_allele| alt_allele.to_string()));
     }
 }
 
-/// The rules scoring `(ref_allele, alt_allele)`, merged, with the first of `score_rules` among
-/// them, or `None` when no rule may. At an `effect_only` position the rules are matched once
-/// every record there has been read, so an allele some rule may score gets no rules yet.
+/// Whether a rule at a position with `score_rules` names no single other allele.
+fn is_effect_only_position(rules_by_key: &ScoreRules, score_rules: &[ScoreRule]) -> bool {
+    score_rules
+        .iter()
+        .any(|rule| names_no_single_other_allele(rules_by_key.allele(rule.other_allele)))
+}
+
+/// The run of the rules at a position, `score_rules` from rule `rules_start` on, naming the pair
+/// `(ref_allele, alt_allele)`: its first rule, and whether that rule's effect allele is REF; or
+/// `None` when no rule may score it. At an `effect_only` position the rules are matched once every
+/// record there has been read, so an allele some rule may score is `Some` with no run yet.
 fn rules_for_allele(
     rules_by_key: &ScoreRules,
+    rules_start: usize,
     score_rules: &[ScoreRule],
     effect_only: bool,
     ref_allele: &str,
     alt_allele: &str,
-) -> Option<(Vec<MatchedRule>, usize)> {
+) -> Option<(usize, bool)> {
     if effect_only {
-        let may_score = score_rules.iter().any(|rule| {
-            let effect_allele = rules_by_key.allele(rule.effect_allele);
-            let other_allele = rules_by_key.allele(rule.other_allele);
-            match resolve_other_allele(
-                effect_allele,
-                other_allele,
-                std::iter::once((ref_allele, alt_allele)),
-            ) {
-                OtherAlleleMatch::Pair => {
-                    pair_orientation(effect_allele, other_allele, ref_allele, alt_allele).is_some()
-                }
-                OtherAlleleMatch::EffectOnly(_) => true,
-                OtherAlleleMatch::SeveralRows | OtherAlleleMatch::NoRow => false,
-            }
-        });
-        return may_score.then(|| (Vec::new(), 0));
+        return may_score_at_effect_only_position(rules_by_key, score_rules, ref_allele, alt_allele)
+            .then_some((rules_start, false));
     }
-    let (matched, first_rule) =
-        match_rules_for_allele(rules_by_key, score_rules, ref_allele, alt_allele);
-    (!matched.is_empty()).then_some((matched, first_rule))
+    rules_by_key.runs(rules_start, rules_start + score_rules.len()).find_map(|run| {
+        let rule = &rules_by_key.rules[run];
+        pair_orientation(
+            rules_by_key.allele(rule.effect_allele),
+            rules_by_key.allele(rule.other_allele),
+            ref_allele,
+            alt_allele,
+        )
+        .map(|effect_is_ref| (run, effect_is_ref))
+    })
+}
+
+/// The first score a REF-effect weight of the run `first_rule` starts scores, for an allele whose
+/// orientation to that rule is `first_rule_effect_is_ref`: the one whose incomplete REF dosages
+/// are refused. None at an `effect_only` position, whose runs are matched later.
+fn ref_effect_score(
+    rules_by_key: &ScoreRules,
+    effect_only: bool,
+    first_rule: usize,
+    first_rule_effect_is_ref: bool,
+) -> Option<usize> {
+    if effect_only {
+        return None;
+    }
+    rules_by_key
+        .merged(first_rule)
+        .iter()
+        .find(|weight| weight.same_effect == first_rule_effect_is_ref)
+        .map(|weight| weight.score_index)
+}
+
+/// Whether some rule at a position where a rule names no single other allele may score
+/// `(ref_allele, alt_allele)`, once every record there has been read.
+fn may_score_at_effect_only_position(
+    rules_by_key: &ScoreRules,
+    score_rules: &[ScoreRule],
+    ref_allele: &str,
+    alt_allele: &str,
+) -> bool {
+    score_rules.iter().any(|rule| {
+        let effect_allele = rules_by_key.allele(rule.effect_allele);
+        let other_allele = rules_by_key.allele(rule.other_allele);
+        match resolve_other_allele(
+            effect_allele,
+            other_allele,
+            std::iter::once((ref_allele, alt_allele)),
+        ) {
+            OtherAlleleMatch::Pair => {
+                pair_orientation(effect_allele, other_allele, ref_allele, alt_allele).is_some()
+            }
+            OtherAlleleMatch::EffectOnly(_) => true,
+            OtherAlleleMatch::SeveralRows | OtherAlleleMatch::NoRow => false,
+        }
+    })
 }
 
 /// Decodes the dosages a BCF `record` contributes to its matched rules into
@@ -1553,33 +2218,55 @@ fn decode_scored_bcf_record(
     header: &noodles_vcf::Header,
     context: &DecodeContext<'_>,
     decoded: &mut DecodedRecord,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+    share: &mut Share,
+) -> Result<Fit, Box<dyn Error + Send + Sync>> {
     let rules_by_key = context.rules_by_key;
     let chromosome = record.reference_sequence_name(header.string_maps())?;
     let Ok(chr) = parse_chromosome_label(chromosome) else {
-        return Ok(());
+        return Ok(Fit::Decoded);
     };
     let Some(start) = record.variant_start() else {
-        return Ok(());
+        return Ok(Fit::Decoded);
     };
     let pos = start?.get() as u32;
     let Some(&(rules_start, rules_end)) = rules_by_key.ranges.get(&(chr, pos)) else {
-        return Ok(());
+        return Ok(Fit::Decoded);
     };
     let score_rules = &rules_by_key.rules[rules_start..rules_end];
+    let reference_bases = record.reference_bases();
+    let ref_allele = std::str::from_utf8(reference_bases.as_ref())?;
+    let alternate_bases = record.alternate_bases();
+    for alt_allele in alternate_bases.iter() {
+        alt_allele?;
+    }
+    let need = scored_record_need(
+        rules_by_key,
+        rules_start,
+        score_rules,
+        is_effect_only_position(rules_by_key, score_rules),
+        context.kept_indices.len(),
+        chromosome,
+        ref_allele,
+        || alternate_bases.iter().filter_map(Result::ok),
+    );
+    if !share.take(need) {
+        return Ok(Fit::Beyond {
+            need,
+            locus: format!("{chromosome}:{pos}"),
+        });
+    }
+    decoded.need = need;
     decoded.position = pos;
     decoded.key = Some((chr, pos));
     decoded.chromosome.clear();
     decoded.chromosome.push_str(chromosome);
 
-    let reference_bases = record.reference_bases();
-    let ref_allele = std::str::from_utf8(reference_bases.as_ref())?;
-    let alternate_bases = record.alternate_bases();
     let alt_alleles = alternate_bases.iter().collect::<Result<Vec<_>, _>>()?;
     decode_rows(rules_by_key, score_rules, ref_allele, &alt_alleles, decoded);
     for (alt_offset, alt_allele) in alt_alleles.iter().enumerate() {
-        let Some((matched_rules, first_rule)) = rules_for_allele(
+        let Some((first_rule, first_rule_effect_is_ref)) = rules_for_allele(
             rules_by_key,
+            rules_start,
             score_rules,
             decoded.effect_only,
             ref_allele,
@@ -1587,10 +2274,8 @@ fn decode_scored_bcf_record(
         ) else {
             continue;
         };
-        let ref_effect_rule = matched_rules
-            .iter()
-            .find(|rule| rule.effect_is_ref)
-            .map(|rule| rule.score_index);
+        let ref_effect_rule =
+            ref_effect_score(rules_by_key, decoded.effect_only, first_rule, first_rule_effect_is_ref);
         let allele = decoded.next_allele(alt_offset);
         decode_bcf_column(
             record,
@@ -1606,12 +2291,11 @@ fn decode_scored_bcf_record(
             },
         )?;
         allele.scale = Some(allele.column.normalize());
-        allele.matched_rules = matched_rules;
-        allele.first_rule = rules_start + first_rule;
-        allele.first_rule_effect_is_ref = rules_by_key.allele(score_rules[first_rule].effect_allele) == ref_allele;
+        allele.first_rule = first_rule;
+        allele.first_rule_effect_is_ref = first_rule_effect_is_ref;
         decoded.allele_count += 1;
     }
-    Ok(())
+    Ok(Fit::Decoded)
 }
 
 fn ref_effect_error(score_name: &str, chromosome: &str, position: u32) -> String {
@@ -1956,41 +2640,6 @@ fn read_score_headers(
     Ok(headers)
 }
 
-/// The rules of `rules` scoring `(ref_allele, alt_allele)`, merged, and the index in `rules` of
-/// the first of them.
-fn match_rules_for_allele(
-    rules_by_key: &ScoreRules,
-    rules: &[ScoreRule],
-    ref_allele: &str,
-    alt_allele: &str,
-) -> (Vec<MatchedRule>, usize) {
-    let capacity = rules
-        .iter()
-        .map(|rule| rule.applications.1 - rule.applications.0)
-        .sum();
-    let mut matched = Vec::with_capacity(capacity);
-    let mut first_rule = None;
-    for (index, rule) in rules.iter().enumerate() {
-        let effect_allele = rules_by_key.allele(rule.effect_allele);
-        let other_allele = rules_by_key.allele(rule.other_allele);
-        let Some(effect_is_ref) =
-            pair_orientation(effect_allele, other_allele, ref_allele, alt_allele)
-        else {
-            continue;
-        };
-        first_rule.get_or_insert(index);
-        for application in rules_by_key.applications(rule) {
-            matched.push(MatchedRule {
-                score_index: application.score_index,
-                digits: application.digits,
-                exponent: application.exponent,
-                effect_is_ref,
-            });
-        }
-    }
-    (merge_matched_rules(matched), first_rule.unwrap_or(0))
-}
-
 /// Whether the effect allele is the REF, when a rule's allele pair is `(ref_allele,
 /// alt_allele)` in either order.
 fn pair_orientation(
@@ -2006,13 +2655,6 @@ fn pair_orientation(
     } else {
         None
     }
-}
-
-/// Every rule at a position scoring one allele, the rules of one score and orientation adjacent
-/// and in rule order. Duplicates stay separate rules: each is one written weight, added exactly.
-fn merge_matched_rules(mut matched: Vec<MatchedRule>) -> Vec<MatchedRule> {
-    matched.sort_by_key(|rule| (rule.score_index, rule.effect_is_ref));
-    matched
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3743,7 +4385,7 @@ mod tests {
     }
 
     /// `text` as a plain VCF, a BGZF VCF in small blocks and a BCF, in `dir`.
-    fn cohort_files(dir: &Path, text: &str) -> [PathBuf; 3] {
+    pub(super) fn cohort_files(dir: &Path, text: &str) -> [PathBuf; 3] {
         use noodles_vcf::variant::io::Write as _;
 
         let vcf = dir.join("cohort.vcf");
