@@ -36,9 +36,6 @@ const BGZF_BLOCKS_PER_WORKER: usize = 64;
 const PARTS_PER_WORKER: usize = 4;
 /// Bytes requested from the source per read: compressed bytes of BGZF, or text.
 const SOURCE_READ_LEN: usize = 1 << 20;
-/// Batches of decoded records resident at once: the batch being taken. A pipeline that decodes
-/// the next batch while it takes one holds two, and sets this to 2.
-const DECODED_BATCHES_IN_FLIGHT: usize = 1;
 
 /// What the text and compressed buffers hold: the bytes each has touched, which it keeps, and
 /// the bytes it may hold before it moves to a larger buffer.
@@ -64,9 +61,11 @@ fn buffer_bytes(held: usize, capacity: usize, needed: usize) -> usize {
 /// ahead, what the accumulator holds between batches, and the decoded records of a batch. Each
 /// scored record is counted before any of it is allocated ([`super::scored_record_need`]), so a
 /// batch holds what its part of the budget holds, and one that meets a record beyond it stops
-/// there. A batch is read at a size whose records fit even were every one of them as short as a
-/// record carrying its samples can be, and as needy as a record at the neediest position, or
-/// when that is not one block, at one block.
+/// there. A batch is decoded while the one before it is taken, so what that batch's records took
+/// of their shares counts as held while the next is sized and decoded. A batch is read at a size
+/// whose records fit even were every one of them as short as a record carrying its samples can
+/// be, and as needy as a record at the neediest position, or when that is not one block, at one
+/// block.
 struct MemoryCharge {
     budget: MemoryBudget,
     sums: usize,
@@ -153,7 +152,7 @@ impl MemoryCharge {
         self.fixed(held)
             .saturating_add(buffer_bytes(buffers.text, buffers.text_capacity, text))
             .saturating_add(buffer_bytes(buffers.compressed, buffers.compressed_capacity, self.compressed(blocks)))
-            .saturating_add(DECODED_BATCHES_IN_FLIGHT.saturating_mul(self.planned(text)))
+            .saturating_add(self.planned(text))
     }
 
     /// Refuses a run that cannot hold its sums and a batch of one record: the shortest record's
@@ -208,9 +207,7 @@ impl MemoryCharge {
             .fixed(held)
             .saturating_add(buffer_bytes(buffers.text, buffers.text_capacity, leftover.saturating_add(BGZF_MAX_DATA_LEN)))
             .saturating_add(buffer_bytes(buffers.compressed, buffers.compressed_capacity, self.compressed(1)))
-            .saturating_add(DECODED_BATCHES_IN_FLIGHT.saturating_mul(
-                self.parts.saturating_mul(super::part_need()).saturating_add(self.least_need),
-            ));
+            .saturating_add(self.parts.saturating_mul(super::part_need()).saturating_add(self.least_need));
         if one <= self.budget.max_ram_bytes() {
             return Ok(1);
         }
@@ -233,7 +230,6 @@ impl MemoryCharge {
             .saturating_sub(self.fixed(held))
             .saturating_sub(buffers.text)
             .saturating_sub(buffers.compressed)
-            .saturating_div(DECODED_BATCHES_IN_FLIGHT)
             .saturating_sub(self.parts.saturating_mul(super::part_need()))
     }
 
@@ -352,75 +348,57 @@ pub(super) fn score_source(
         format_bytes(charge.required(batch_blocks * BGZF_MAX_DATA_LEN, batch_blocks, empty, 0) - charge.fixed(0)),
     );
     let mut accumulator = RecordAccumulator::new(rules_by_key, &score_names, person_iids.len());
-    // The records the header's last block holds past the header are taken before more is read,
-    // so that besides its new blocks a batch holds at most the part of one record the last left.
-    let mut read = bytes.filled().is_empty();
-    // Whether the text past the records taken holds complete records a cut batch left.
-    let mut carried = false;
-    let mut source_error = None;
+    let mut reading = Reading {
+        stream,
+        bytes,
+        at_end,
+        // The records the header's last block holds past the header are taken before more is
+        // read, so that besides its new blocks a batch holds at most the part of one record the
+        // last left.
+        read: false,
+        carried: false,
+        source_error: None,
+    };
+    reading.read = reading.bytes.filled().is_empty();
+    let plan = BatchPlan {
+        charge: &charge,
+        layout,
+        batch_blocks,
+        context: &context,
+    };
+    // Batch i is taken and applied while batch i + 1 is read, sized and decoded. Batch i + 1
+    // starts once batch i is decoded and cut, so nothing past a cut is decoded ahead; it is sized
+    // with what batch i's records took of their shares counted as held, so the two in flight fit
+    // the budget together; and it is acted on only after batch i is taken, so the terms and the
+    // first error are a one-batch-at-a-time scan's. A batch i + 1 refused beside batch i is read
+    // again once batch i is taken, with nothing else held, so a run is refused only where one
+    // batch at a time is.
+    let mut batch = next_batch(&mut reading, &plan, accumulator.held_bytes())?;
     loop {
-        if !at_end && source_error.is_none() && std::mem::replace(&mut read, true) {
-            let blocks = charge.blocks(
-                bytes.filled().len(),
-                stream.buffers(&bytes),
-                accumulator.held_bytes(),
-                batch_blocks,
-                carried,
-            )?;
-            if blocks > 0 {
-                match stream.fill(&mut bytes, blocks) {
-                    Ok(more) => at_end = !more,
-                    Err(err) => source_error = Some(err),
-                }
-            }
-        }
-        let allowance = charge.decode_allowance(stream.buffers(&bytes), accumulator.held_bytes());
-        let filled = bytes.filled();
-        // A read that failed leaves its last record unread, as noodles leaves it.
-        let (complete, stops) = complete_records(layout, filled, at_end);
-        let records = &filled[..complete];
-        // Each part may allocate its share of the allowance, by its share of the text.
-        let ranges = parts(layout, records, charge.parts);
-        let share = |len: usize| Share {
-            left: (allowance as u128 * len as u128 / complete.max(1) as u128) as usize,
+        let Batch {
+            records,
+            complete,
+            stops,
+            ends,
+            source_error,
+            used,
+        } = batch;
+        let (taken, next) = if ends {
+            (take_batch(&mut accumulator, records), None)
+        } else {
+            let held = accumulator.held_bytes().saturating_add(used);
+            let (taken, next) = rayon::join(
+                || take_batch(&mut accumulator, records),
+                || next_batch(&mut reading, &plan, held),
+            );
+            (taken, Some(next))
         };
-        let decoded: Vec<DecodedPart> = ranges
-            .par_iter()
-            .map(|range| decode_part(layout, &records[range.clone()], &context, share(range.len())))
-            .collect();
-        // The records before the first one a part could not hold are taken; the rest wait.
-        let mut taken = complete;
-        let mut cut = false;
-        for (range, part) in ranges.iter().zip(decoded) {
-            for mut record in part.records {
-                accumulator.take(&mut record)?;
-            }
-            if let Some((offset, _, _)) = part.cut {
-                taken = range.start + offset;
-                cut = true;
-                break;
-            }
-        }
-        if cut && taken == 0 {
-            // The first record needs more than its part's share: it is decoded alone, with all
-            // that the batch may allocate, or refused.
-            let first = first_record_len(layout, records);
-            let alone = decode_part(layout, &records[..first], &context, Share { left: allowance });
-            if let Some((_, need, locus)) = alone.cut {
-                return Err(charge.record_refusal(need, &locus, allowance).into());
-            }
-            for mut record in alone.records {
-                accumulator.take(&mut record)?;
-            }
-            taken = first;
-        }
-        accumulator.apply();
-        carried = taken < complete;
-
-        if !carried && let Some(err) = source_error {
+        taken?;
+        if let Some(err) = source_error {
             return Err(err.into());
         }
-        if (at_end || stops) && !carried {
+        let Some(next) = next else {
+            let filled = reading.bytes.filled();
             if matches!(layout, Layout::Bcf(_)) && !stops && complete < filled.len() {
                 // A final record cut short fails as noodles fails to read it.
                 BcfReader::from(&filled[complete..])
@@ -428,9 +406,156 @@ pub(super) fn score_source(
             }
             let (totals, report) = accumulator.finish()?;
             return Ok(native_result(totals, report, person_iids, score_names));
+        };
+        batch = match next {
+            Ok(next) => next,
+            Err(_) => next_batch(&mut reading, &plan, accumulator.held_bytes())?,
+        };
+    }
+}
+
+/// The input as it is read: its stream and text, and what reading it has met.
+struct Reading {
+    stream: InflatedStream,
+    bytes: Bytes,
+    at_end: bool,
+    /// Whether the next batch reads before it decodes.
+    read: bool,
+    /// Whether the text past the records taken holds complete records a cut batch left.
+    carried: bool,
+    source_error: Option<io::Error>,
+}
+
+/// What sizing and decoding a batch needs besides the input.
+struct BatchPlan<'a, 'h> {
+    charge: &'a MemoryCharge,
+    layout: Layout<'h>,
+    batch_blocks: usize,
+    context: &'a DecodeContext<'a>,
+}
+
+/// One batch's records, decoded and cut, with what reading them met.
+struct Batch {
+    /// The records to take, in input order, in the vectors their parts decoded them into.
+    records: Vec<Vec<DecodedRecord>>,
+    /// How many leading bytes of the text held the batch's complete records.
+    complete: usize,
+    stops: bool,
+    /// Whether the scan ends with this batch: the input is exhausted or a read failed, and
+    /// nothing it holds waits for the next. Its text is then left unconsumed.
+    ends: bool,
+    /// The failed read the scan ends on, returned once the batch is taken.
+    source_error: Option<io::Error>,
+    /// What its kept parts hold: what their records took of their shares (what they hold decoded,
+    /// and once taken), and each part's vector.
+    used: usize,
+}
+
+/// Reads, sizes and decodes the next batch with `held` held besides it, cuts it before the first
+/// record its share cannot hold, and drops the bytes of the records it takes from the text unless
+/// the scan ends with it. A batch refused leaves the reading as a batch read with less held
+/// continues it: from the text it was refused in, or when no block fit, from before its read.
+fn next_batch(
+    reading: &mut Reading,
+    plan: &BatchPlan<'_, '_>,
+    held: usize,
+) -> Result<Batch, BoxError> {
+    let Reading {
+        stream,
+        bytes,
+        at_end,
+        read,
+        carried,
+        source_error,
+    } = reading;
+    let charge = plan.charge;
+    let layout = plan.layout;
+    if !*at_end && source_error.is_none() && std::mem::replace(read, true) {
+        let blocks = charge.blocks(
+            bytes.filled().len(),
+            stream.buffers(bytes),
+            held,
+            plan.batch_blocks,
+            *carried,
+        )?;
+        if blocks > 0 {
+            match stream.fill(bytes, blocks) {
+                Ok(more) => *at_end = !more,
+                Err(err) => *source_error = Some(err),
+            }
         }
+    }
+    let allowance = charge.decode_allowance(stream.buffers(bytes), held);
+    let filled = bytes.filled();
+    // A read that failed leaves its last record unread, as noodles leaves it.
+    let (complete, stops) = complete_records(layout, filled, *at_end);
+    let records = &filled[..complete];
+    // Each part may allocate its share of the allowance, by its share of the text.
+    let ranges = parts(layout, records, charge.parts);
+    let share = |len: usize| Share {
+        left: (allowance as u128 * len as u128 / complete.max(1) as u128) as usize,
+    };
+    let decoded: Vec<DecodedPart> = ranges
+        .par_iter()
+        .map(|range| decode_part(layout, &records[range.clone()], plan.context, share(range.len())))
+        .collect();
+    // The records before the first one a part could not hold are taken; the rest wait.
+    let mut kept = Vec::new();
+    let mut taken = complete;
+    let mut used = 0usize;
+    let mut cut = false;
+    for (range, part) in ranges.iter().zip(decoded) {
+        kept.push(part.records);
+        used = used
+            .saturating_add(part.used)
+            .saturating_add(super::part_need());
+        if let Some((offset, _, _)) = part.cut {
+            taken = range.start + offset;
+            cut = true;
+            break;
+        }
+    }
+    if cut && taken == 0 {
+        // The first record needs more than its part's share: it is decoded alone, with all that
+        // the batch may allocate, or refused.
+        let first = first_record_len(layout, records);
+        let alone = decode_part(layout, &records[..first], plan.context, Share { left: allowance });
+        if let Some((_, need, locus)) = alone.cut {
+            // Read again once less is held, the batch decodes this text before it reads more.
+            *read = false;
+            return Err(charge.record_refusal(need, &locus, allowance).into());
+        }
+        kept.push(alone.records);
+        used = used
+            .saturating_add(alone.used)
+            .saturating_add(super::part_need());
+        taken = first;
+    }
+    *carried = taken < complete;
+    let ends = !*carried && (source_error.is_some() || *at_end || stops);
+    if !ends {
         bytes.consume(taken);
     }
+    Ok(Batch {
+        records: kept,
+        complete,
+        stops,
+        ends,
+        source_error: if ends { source_error.take() } else { None },
+        used,
+    })
+}
+
+/// Takes a batch's records in input order and adds their terms to the sums.
+fn take_batch(
+    accumulator: &mut RecordAccumulator<'_>,
+    records: Vec<Vec<DecodedRecord>>,
+) -> Result<(), BoxError> {
+    for mut record in records.into_iter().flatten() {
+        accumulator.take(&mut record)?;
+    }
+    accumulator.apply();
+    Ok(())
 }
 
 /// The length of the first of complete `records`.
@@ -526,6 +651,7 @@ fn parts(layout: Layout<'_>, bytes: &[u8], count: usize) -> Vec<Range<usize>> {
 /// position, up to and including the first record that raises an error, and
 /// before the first record whose need does not fit `share`.
 fn decode_part(layout: Layout<'_>, bytes: &[u8], context: &DecodeContext<'_>, mut share: Share) -> DecodedPart {
+    let limit = share.left;
     let mut decoded = Vec::new();
     let mut cut = None;
     match layout {
@@ -571,7 +697,11 @@ fn decode_part(layout: Layout<'_>, bytes: &[u8], context: &DecodeContext<'_>, mu
             }
         }
     }
-    DecodedPart { records: decoded, cut }
+    DecodedPart {
+        records: decoded,
+        cut,
+        used: limit - share.left,
+    }
 }
 
 /// A part's decoded records, and where it stopped when a record did not fit its share.
@@ -580,6 +710,8 @@ struct DecodedPart {
     /// The offset in the part of the first record left undecoded, with what it needs and where
     /// it is.
     cut: Option<(usize, usize, String)>,
+    /// The bytes its records' needs took from its share: what they hold decoded, and once taken.
+    used: usize,
 }
 
 /// Keeps `record` when the scorer acts on it, returning whether it failed, which
@@ -1071,6 +1203,120 @@ mod tests {
         assert_eq!(
             charge(10 << 30).decode_allowance(read, 500),
             (10 << 30) - fixed(500) - 200_000 - (3 << 20) - parts * part_need()
+        );
+    }
+
+    /// A batch refused beside another leaves the reading as a batch read with less held continues
+    /// it (#2362): the batch decoded while one is taken reads a block, and its first record needs
+    /// a byte more than it may allocate beside what that one holds; read again with nothing held,
+    /// it decodes that record from the text it was refused in, and reads nothing more.
+    #[test]
+    fn a_batch_refused_beside_another_decodes_its_text_once_less_is_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let names: Vec<String> = (0..20).map(|sample| format!("s{sample}")).collect();
+        let calls = ["0|1"; 20].join("\t");
+        let lines = "##fileformat=VCFv4.2\n##contig=<ID=1>\n\
+                     ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n";
+        let columns = format!(
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{}\n",
+            names.join("\t")
+        );
+        // A header of one block, so the batch after it starts a block.
+        let pad = 65_536 - lines.len() - columns.len() - "##pad=\n".len();
+        let header = format!("{lines}##pad={}\n{columns}", "x".repeat(pad));
+        let bases = ["A", "C", "G", "T"];
+        let alts = (0..60)
+            .map(|index| {
+                format!(
+                    "C{}{}{}",
+                    bases[index / 16],
+                    bases[index / 4 % 4],
+                    bases[index % 4]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let light: String = (101..=1_100)
+            .map(|position| format!("1\t{position}\t.\tA\tG\t.\t.\t.\tGT\t{calls}\n"))
+            .collect();
+        let body = format!("1\t100\t.\tA\t{alts}\t.\t.\t.\tGT\t{calls}\n{light}");
+        let path = dir.path().join("cohort.vcf");
+        std::fs::write(&path, format!("{header}{body}")).expect("write vcf");
+        let rows: String = (101..=1_100)
+            .map(|position| format!("1:{position}\tG\tA\t0.5\n"))
+            .collect();
+        let score = format!("variant_id\teffect_allele\tother_allele\tS\n1:100\tA\t.\t1\n{rows}");
+        let score_path = dir.path().join("score.gnomon.tsv");
+        std::fs::write(&score_path, score).expect("write score");
+        let (score_names, rules) =
+            load_score_rules(std::slice::from_ref(&score_path), None, false).expect("rules");
+        let (start, end) = rules
+            .ranges
+            .values()
+            .copied()
+            .find(|&(start, end)| {
+                rules.rules[start..end]
+                    .iter()
+                    .any(|rule| names_no_single_other_allele(rules.allele(rule.other_allele)))
+            })
+            .expect("the position whose rule names no other allele");
+        let score_rules = &rules.rules[start..end];
+        let alleles = || alt_alleles_of(&alts);
+        let need = scored_record_need(&rules, start, score_rules, 20, "1", "A", alleles);
+
+        let budget = 1 << 30;
+        let limits = MemoryBudget::of(budget, 0);
+        let charge = super::MemoryCharge::new(limits, Layout::Vcf, false, 20, 20, 1, &rules, 1);
+        let kept: Vec<usize> = (0..20).collect();
+        let context = DecodeContext {
+            rules_by_key: &rules,
+            kept_indices: &kept,
+            score_names: &score_names,
+        };
+        let plan = super::BatchPlan {
+            charge: &charge,
+            layout: Layout::Vcf,
+            batch_blocks: 1,
+            context: &context,
+        };
+        let mut stream = InflatedStream::new(open_variant_source(&path).expect("source"));
+        let mut bytes = Bytes::default();
+        assert!(stream.fill(&mut bytes, 1).expect("read the header"));
+        assert_eq!(bytes.filled(), header.as_bytes());
+        bytes.consume(header.len());
+        let mut reading = super::Reading {
+            stream,
+            bytes,
+            at_end: false,
+            read: true,
+            carried: false,
+            source_error: None,
+        };
+        // Held beside the batch, what leaves its one block of text a byte short of the record.
+        let stack = crate::score::pipeline::thread_stack_bytes();
+        let fixed = RecordAccumulator::bytes(20, 1, &rules) + stack;
+        let held = budget - fixed - 65_536 - 4 * part_need() - (need - 1);
+        let refused = super::next_batch(&mut reading, &plan, held)
+            .err()
+            .expect("refused beside");
+        assert!(
+            refused.to_string().starts_with("Scoring 1:100 requires"),
+            "{refused}"
+        );
+        assert_eq!(
+            reading.bytes.filled().len(),
+            65_536,
+            "the batch read its block"
+        );
+
+        let batch = super::next_batch(&mut reading, &plan, 0).expect("decoded with nothing held");
+        let first = batch.records.iter().flatten().next().expect("a record");
+        assert_eq!(first.position, 100);
+        assert!(!batch.ends);
+        assert_eq!(
+            reading.bytes.filled().len() + batch.complete,
+            65_536,
+            "it read nothing more"
         );
     }
 
