@@ -88,6 +88,16 @@ for (kind in c("cont", "tied")) {
     put(paste0("timeroc_auc2_", kind), tr$AUC_2[length(tr$AUC_2)])
     put(paste0("timeroc_auc2_se_", kind), tr$inference$vect_sd_2[length(tr$inference$vect_sd_2)])
   }
+  if (has("pec") && has("prodlim")) {
+    suppressMessages(library(prodlim))
+    for (model in c("marginal", "none")) {
+      ci <- suppressWarnings(pec::cindex(list(m = as.matrix(s$p1)), formula = Hist(t, code) ~ 1, data = s,
+                                         eval.times = h, pred.times = h, cause = 1, cens.model = model,
+                                         splitMethod = "none", verbose = FALSE))
+      value <- ci$AppCindex$m[1]
+      put(paste0("pec_cindex_", model, "_", kind), if (value > 1) value / 100 else value)  # pec prints percent
+    }
+  }
   if (has("riskRegression") && has("prodlim")) {
     suppressMessages(library(prodlim))
     sc <- riskRegression::Score(list(m = as.matrix(s$p1)), formula = Hist(t, code) ~ 1, data = s,

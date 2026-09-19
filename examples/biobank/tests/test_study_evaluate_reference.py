@@ -265,6 +265,22 @@ def test_harrell_wolbers_concordance_matches_r_and_sksurv(ref, kind):
     fails(abs(ev.wolbers_concordance(t, np.where(code == 2, 0, code), p, H) - values[f"c_harrell_{kind}"]), 1e-12)
 
 
+def test_competing_risk_concordance_matches_pec_cindex(ref):
+    """pec::cindex with cause = 1 is Wolbers' competing-risk C; with cens.model "marginal" its pairs carry
+    1/(G(T_i-) G(T_i)) when j outlives the case and 1/(G(T_i-) G(T_j-)) when j died first, which on continuous
+    times is our marginal-G Uno weight."""
+    values, _ = ref
+    s = survival_data()
+    t, code, p = s.t.to_numpy(), s.code.to_numpy(), s.p1.to_numpy()
+    marginal = ev.Censoring(frame_of(s), H, "km")
+    harrell, uno = ev.wolbers_concordance(t, code, p, H), ev.wolbers_concordance(t, code, p, H, marginal)
+    print(f"Wolbers C: ours Harrell {harrell:.10f} Uno {uno:.10f}; pec none "
+          f"{need(values, 'pec_cindex_none_cont'):.10f} marginal {values['pec_cindex_marginal_cont']:.10f}")
+    assert abs(harrell - values["pec_cindex_none_cont"]) < 1e-9
+    assert abs(uno - values["pec_cindex_marginal_cont"]) < 1e-9
+    fails(abs(harrell - values["pec_cindex_marginal_cont"]), 1e-9)
+
+
 @pytest.mark.parametrize("kind", ["cont", "tied"])
 def test_single_event_uno_matches_r_and_sksurv(ref, kind):
     from sksurv.metrics import concordance_index_ipcw

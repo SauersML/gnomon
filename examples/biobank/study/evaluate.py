@@ -355,7 +355,8 @@ class Censoring:
         t, censored = censoring_window(followup, code, horizon)
         n = len(t)
         self.risk, self.curve, self.psi_beta = np.ones(n), np.zeros(n, np.int64), None
-        X = censoring_design(frame, covariates) if kind == "cox" else np.zeros((n, 0))
+        # Nobody censored in the window (the censor-at-cutoff frames, whose potential follow-up reaches h): G = 1.
+        X = censoring_design(frame, covariates) if kind == "cox" and censored.any() else np.zeros((n, 0))
         if kind == "strata":
             _, self.curve = np.unique(frame[covariates[0]].astype(str).to_numpy(), return_inverse=True)
         elif kind not in ("cox", "km"):

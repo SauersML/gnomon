@@ -274,6 +274,22 @@ def test_total_influence_is_the_jackknife_of_the_whole_estimator(kind):
         assert errors[name]["given_g"] > 3 * errors[name]["total"], name
 
 
+@pytest.mark.parametrize("kind", ["cox", "km", "strata"])
+def test_a_window_without_censorings_weighs_every_row_one(kind):
+    # Censoring only at the CDR cutoff, past the horizon for every eligible row (the censor="cutoff" frames).
+    t, code, risk, x = survival_sample(2000, 25)
+    code = np.where(code == 0, 2, code)
+    frame = pd.DataFrame({"followup": t, "event_code": code, "site": np.where(x > 0, "a", "b"), "x": x})
+    horizon = 2.0
+    model = ev.Censoring(frame, horizon, kind, ("site",) if kind == "strata" else ("site", "x"))
+    w = ev.ipcw(frame, horizon, model)
+    np.testing.assert_array_equal(w, np.ones(len(t)))
+    y = ((code == 1) & (t <= horizon)).astype(float)
+    rows = np.arange(len(t))
+    # With nothing to estimate in G the total variance is the one given G.
+    assert abs(model.variance(rows, (y - y.mean()) / len(t), y / len(t)) - np.sum(((y - y.mean()) / len(t)) ** 2)) < 1e-15
+
+
 def test_ipcw_weights_are_one_without_censoring_and_zero_for_censored_rows():
     frame = pd.DataFrame({"followup": [0.5, 1.5, 2.5, 0.7], "event_code": [1, 2, 0, 0]})
     model = ev.Censoring(frame, 2.0, "km")
