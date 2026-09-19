@@ -3441,10 +3441,16 @@ fn decode_main_track_packed(
             if *cursor + need > len {
                 return Err(ioerr("Truncated type-0 main track"));
             }
-            for (word, bytes) in cats.iter_mut().zip(buf[*cursor..*cursor + need].chunks(8)) {
+            // Whole words are loaded as words; only the last, short one is copied
+            // into a zeroed word.
+            let (whole, rest) = buf[*cursor..*cursor + need].as_chunks::<8>();
+            for (word, bytes) in cats.iter_mut().zip(whole) {
+                *word = u64::from_le_bytes(*bytes);
+            }
+            if !rest.is_empty() {
                 let mut chunk = [0u8; 8];
-                chunk[..bytes.len()].copy_from_slice(bytes);
-                *word = u64::from_le_bytes(chunk);
+                chunk[..rest.len()].copy_from_slice(rest);
+                cats[whole.len()] = u64::from_le_bytes(chunk);
             }
             *cursor += need;
         }
@@ -3469,15 +3475,19 @@ fn decode_main_track_packed(
             }
             let low_fields = repeated_category(low);
             let high_fields = repeated_category(high);
-            for (word, bytes) in cats
-                .iter_mut()
-                .zip(buf[*cursor..*cursor + nbytes].chunks(4))
-            {
-                let mut chunk = [0u8; 4];
-                chunk[..bytes.len()].copy_from_slice(bytes);
-                let set = spread_to_low_bits(u32::from_le_bytes(chunk));
+            let categories = |bits: u32| {
+                let set = spread_to_low_bits(bits);
                 let fields = set | (set << 1);
-                *word = (low_fields & !fields) | (high_fields & fields);
+                (low_fields & !fields) | (high_fields & fields)
+            };
+            let (whole, rest) = buf[*cursor..*cursor + nbytes].as_chunks::<4>();
+            for (word, bytes) in cats.iter_mut().zip(whole) {
+                *word = categories(u32::from_le_bytes(*bytes));
+            }
+            if !rest.is_empty() {
+                let mut chunk = [0u8; 4];
+                chunk[..rest.len()].copy_from_slice(rest);
+                cats[whole.len()] = categories(u32::from_le_bytes(chunk));
             }
             *cursor += nbytes;
             patch_packed_categories(buf, cursor, n, cats)?;
@@ -3618,15 +3628,22 @@ fn count_set_bits(bytes: &[u8], start: usize, count: usize) -> usize {
 /// `cats_to_a1dosage` and `VirtualBed::pack_to_block` give together: hom REF 11,
 /// het 10, hom ALT 00, missing and padding 01.
 fn write_packed_calls(cats: &[u64], n: usize, block: &mut [u8]) {
-    for (w, &word) in cats.iter().enumerate() {
+    let codes = |word: u64| {
         let low = word & LOW_BITS;
         let high = (word >> 1) & LOW_BITS;
         let out_low = !(low ^ high) & LOW_BITS;
         let out_high = !high & LOW_BITS;
-        let out = (out_low | (out_high << 1)).to_le_bytes();
-        let start = w * 8;
-        let end = (start + 8).min(block.len());
-        block[start..end].copy_from_slice(&out[..end - start]);
+        (out_low | (out_high << 1)).to_le_bytes()
+    };
+    // Whole words are stored as words; only the last, short one is copied.
+    let (whole, rest) = block.as_chunks_mut::<8>();
+    for (chunk, &word) in whole.iter_mut().zip(cats) {
+        *chunk = codes(word);
+    }
+    if let Some(&word) = cats.get(whole.len())
+        && !rest.is_empty()
+    {
+        rest.copy_from_slice(&codes(word)[..rest.len()]);
     }
     let tail = n % 4;
     if tail != 0
