@@ -38,11 +38,12 @@ PLANTS = {"no_competing_death": "survival", "entry_at_baseline": "survival", "fi
           "no_undiagnosed_prevalent": "survival", "no_slope_attenuation": "both", "no_exit": "binary"}
 
 
-@functools.lru_cache(maxsize=4)
-def world_and_sample(n: int, seed: int, scenario: str = "realistic"):
+@functools.lru_cache(maxsize=6)
+def world_and_sample(n: int, seed: int, scenario: str = "realistic", full: bool = True):
+    """full: the truth for every person it is defined for (the gates need it); False is the fixtures' mode."""
     ref, src = sim.load_reference(REFERENCE, 20260918)
     world = sim.make_world(20260918, scenario, sim.load_diseases(sim.DEFAULT_DISEASES), ref, src)
-    return world, sim.simulate(world, n, seed, workers=sim.default_workers(), log=lambda *_: None)
+    return world, sim.simulate(world, n, seed, workers=sim.default_workers(), log=lambda *_: None, full_truth=full)
 
 
 def _bisect(fn, lo, hi, iters=64):
@@ -474,9 +475,10 @@ def test_tables_follow_schema_and_latent_world():
 
 def test_truth_frames_match_study_phenotypes():
     """truth.parquet's rows and in_survival must be exactly phenotypes.build_frames' disease population and survival
-    frame, on the simulator's own tables (the truth is nulled with an independent implementation)."""
+    frame, on the simulator's own tables (the truth is nulled with an independent implementation). The sample uses
+    the fixtures' mode, whose truth is computed only on those rows, so a missed row shows up as a null."""
     from study import cohort, phenotypes
-    world, s = world_and_sample(20000, 3)
+    world, s = world_and_sample(20000, 3, "realistic", False)
     with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as d:
         for censoring in sim.CENSORING:
             out = Path(d) / censoring
@@ -494,6 +496,7 @@ def test_truth_frames_match_study_phenotypes():
                 assert set(surv.person_id) == set(rows.person_id[rows.in_survival]), (censoring, disease.slug)
                 assert set(binary.person_id) <= set(rows.person_id), (censoring, disease.slug)
                 assert (surv.event != 3).all(), (censoring, disease.slug)   # exclusions censor (below 1%)
+                assert rows.p_ever.notna().all() and rows.cif_1y[rows.in_survival].notna().all()
 
 
 def main():

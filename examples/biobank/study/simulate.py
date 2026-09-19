@@ -1123,7 +1123,10 @@ def binary_truth(dp, link, ix, e0, a_b, a_c, omega, mu0, mu1, rate_x, quad: Quad
     return out[0][0], out[1][0], out[0][1]
 
 
-def compute_truth(world, dp, terms, s_latent, people, horizons, quad=None, plant=None, chunk=8192):
+def compute_truth(world, dp, terms, s_latent, people, horizons, quad=None, plant=None, chunk=8192, rows=None):
+    """Truth arrays for one disease. ``rows`` = (binary mask, survival mask) limits the work to the rows that are
+    published (the disease population, and the survival frame under either censoring rule); None computes every
+    person the truth is defined for, as the tests need."""
     quad = quad or Quad()
     n = people["n"]
     beta = terms["beta"]
@@ -1144,7 +1147,8 @@ def compute_truth(world, dp, terms, s_latent, people, horizons, quad=None, plant
     out = {k: np.full(n, np.nan) for k in ("p_ever", "p_ever_noexit", "dp_ever", "den")}
     for k in ("cif", "dcif", "death"):
         out[k] = np.full((n, len(horizons)), np.nan)
-    idx = np.flatnonzero(ok)
+    want_bin, want_surv = rows if rows is not None else (ok, ok)
+    idx = np.flatnonzero(ok & want_bin)
     for lo in range(0, len(idx), chunk):
         j = idx[lo:lo + chunk]
         sub = ix.take(j)
@@ -1158,6 +1162,10 @@ def compute_truth(world, dp, terms, s_latent, people, horizons, quad=None, plant
                                                people["omega"][k], terms["mu0"][k], terms["mu1"][k],
                                                people["rate_x"][k], quad, plant)
         out["p_ever"][j], out["p_ever_noexit"][j], out["dp_ever"][j] = p, p_no, dp_
+    idx = np.flatnonzero(ok & want_surv)
+    for lo in range(0, len(idx), chunk):
+        j = idx[lo:lo + chunk]
+        sub = ix.take(j)
         cif, dcif, den, death = survival_truth(dp, world.link, sub, e0[j], a_l[j], people["omega"][j],
                                                terms["mu0"][j], terms["mu1"][j], horizons, quad, plant, lag)
         out["cif"][j], out["dcif"][j], out["den"][j], out["death"][j] = cif, dcif, den, death
@@ -1175,7 +1183,10 @@ def probit_slope(p, dp_ds, ds_dz):
 # --------------------------------------------------------------------------------------------------------------
 # one simulated world sample
 # --------------------------------------------------------------------------------------------------------------
-def simulate(world: World, n: int, seed: int, horizons=HORIZONS, quad=None, workers=1, log=print) -> dict:
+def simulate(world: World, n: int, seed: int, horizons=HORIZONS, quad=None, workers=1, log=print,
+             full_truth=False) -> dict:
+    """One sample of the world. The truth covers the published rows only unless ``full_truth`` (the tests' mode:
+    every person with the base lookback)."""
     rng = np.random.default_rng([seed, 11])
     t0 = time.time()
     people = sample_people(world, n, rng)
@@ -1217,27 +1228,36 @@ def simulate(world: World, n: int, seed: int, horizons=HORIZONS, quad=None, work
     horizon = np.minimum(day(CDR_CUTOFF) + 1.0, birth + people["t_m"] * DAYS)
     people["survey_end"] = np.floor(people["baseline"] + later * rng.random(n)
                                     * np.maximum(horizon - people["baseline"], 0.0)).astype(np.int64)
+    out = dict(people=people, diseases=diseases, ehr_end_age=ehr_end, w_rec=w_rec, horizons=tuple(horizons),
+               seed=seed)
+    rows = None
+    if not full_truth:
+        per_rule = [build_frames(out, rule)[1] for rule in CENSORING]
+        rows = {i: (per_rule[0][rec["dp"].spec.slug][0],
+                    per_rule[0][rec["dp"].spec.slug][1] | per_rule[1][rec["dp"].spec.slug][1])
+                for i, rec in enumerate(diseases) if rec["dp"].spec.pgs is not None}
     t1 = time.time()
-    parallel_truth(world, people, diseases, horizons, quad, workers)
+    parallel_truth(world, people, diseases, horizons, quad, workers, rows)
     log(f"  truth: {time.time() - t1:.1f}s on {workers} worker(s)")
-    return dict(people=people, diseases=diseases, ehr_end_age=ehr_end, w_rec=w_rec, horizons=tuple(horizons),
-                seed=seed)
+    return out
 
 
 _TRUTH_CONTEXT = None
 
 
 def _truth_task(i):
-    world, people, diseases, horizons, quad, plant = _TRUTH_CONTEXT
+    world, people, diseases, horizons, quad, plant, rows = _TRUTH_CONTEXT
     rec = diseases[i]
-    return i, compute_truth(world, rec["dp"], rec["terms"], rec["s"], people, horizons, quad, plant)
+    return i, compute_truth(world, rec["dp"], rec["terms"], rec["s"], people, horizons, quad, plant,
+                            rows=None if rows is None else rows[i])
 
 
-def truths(world, people, diseases, horizons, quad=None, plant=None, workers=1):
-    """{index: truth} for every scored disease, one disease per forked worker (inputs shared copy-on-write)."""
+def truths(world, people, diseases, horizons, quad=None, plant=None, workers=1, rows=None):
+    """{index: truth} for every scored disease, one disease per forked worker (inputs shared copy-on-write).
+    ``rows`` maps a disease index to its (binary, survival) row masks; None computes every defined row."""
     global _TRUTH_CONTEXT
     todo = [i for i, rec in enumerate(diseases) if rec["dp"].spec.pgs is not None]
-    _TRUTH_CONTEXT = (world, people, diseases, horizons, quad, plant)
+    _TRUTH_CONTEXT = (world, people, diseases, horizons, quad, plant, rows)
     try:
         if workers <= 1:
             return dict(map(_truth_task, todo))
@@ -1247,8 +1267,8 @@ def truths(world, people, diseases, horizons, quad=None, plant=None, workers=1):
         _TRUTH_CONTEXT = None
 
 
-def parallel_truth(world, people, diseases, horizons, quad, workers):
-    for i, truth in truths(world, people, diseases, horizons, quad, None, workers).items():
+def parallel_truth(world, people, diseases, horizons, quad, workers, rows=None):
+    for i, truth in truths(world, people, diseases, horizons, quad, None, workers, rows).items():
         diseases[i]["truth"] = truth
 
 
