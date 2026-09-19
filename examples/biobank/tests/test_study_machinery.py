@@ -188,12 +188,25 @@ def test_pool_times_out_restarts_after_a_signal_and_orders_dependencies(tmp_path
             python_job(tmp_path, "first", f"open({str(order)!r}, 'a').write('first ')"),
             python_job(tmp_path, "second", f"open({str(order)!r}, 'a').write('second')", deps=["first"],
                        priority=10)]
-    jobs.append(python_job(tmp_path, "spin", "while True: pass", timeout=1.5))
+    # The spinning job records its worker's CPU clock (the one rusage reads) every 0.05 s of
+    # it: since the job started, and in all.
+    spent = tmp_path / "spin_cpu"
+    spin = (f"import os, pathlib, time\nout = pathlib.Path({str(spent)!r}); tmp = out.with_name('spin_cpu.tmp')\n"
+            "start = last = time.process_time(); tmp.write_text(f'0.0 {start!r}'); os.replace(tmp, out)\n"
+            "while True:\n"
+            "    now = time.process_time()\n"
+            "    if now - last >= 0.05:\n"
+            "        tmp.write_text(f'{now - start!r} {now!r}'); os.replace(tmp, out); last = now\n")
+    jobs.append(python_job(tmp_path, "spin", spin, timeout=1.5))
     started = time.monotonic()
     outcomes = pool(jobs, 8)
     assert outcomes["slow"].status == "timeout" and time.monotonic() - started < 15
-    # A job killed at its cap is charged the CPU its worker spent on it.
-    assert outcomes["spin"].status == "timeout" and outcomes["spin"].cpu_seconds > 0.8
+    # A job killed at its cap is charged the CPU its worker spent on it: at least what the job
+    # had spent by its last record, at most the worker's whole CPU then plus one record interval.
+    # Both sides are the process's own CPU clock, so a shared core moves them alike.
+    since_start, total = map(float, spent.read_text().split())
+    assert outcomes["spin"].status == "timeout"
+    assert since_start - 0.002 <= outcomes["spin"].cpu_seconds <= total + 0.1, (since_start, total, outcomes["spin"])
     assert outcomes["killed"].status == "ok" and outcomes["killed"].restarted
     assert order.read_text() == "first second"
 
