@@ -41,7 +41,14 @@
     "variants": ["ours", "covariates", "standard"]
   },
   "models": {
-    "binary": {},
+    "binary": {
+      "num_pcs": 6,
+      "q_centers": 24,
+      "slope_centers": 20,
+      "windows": ["admin_years", "lookback_years"],
+      "latent_law": "global-empirical",
+      "slope_age_k": 4
+    },
     "survival": {
       "num_pcs": 6,
       "q_centers": 24,
@@ -59,6 +66,12 @@
     "fit_gate.min_events": "SPEC section 8 (23:45Z): a model with fewer training events than about its coefficients is not estimable by any solver; 100, the bar shared competing fits already use",
     "data.maximum_bytes_billed": "SPEC section 7a 01:00Z: the six-domain EHR end is estimated at about 70 GB (66-95), see SCHEMA.md Byte estimate; plan() dry-run gates",
     "cohort.num_pcs": "user 23:40Z: 6 PCs if much faster; K=16 is a benchmark only",
+    "models.binary.num_pcs": "user decision 2026-09-18 23:40Z: K = 6, as every model",
+    "models.binary.q_centers": "a joint 6-D Duchon with a linear null space needs more than 7 centers, and gam's default grows with n (gam#2993); 24 is the lead's interim until study-pcs sweeps it",
+    "models.binary.slope_centers": "as q_centers: more than 7 needed; 20 for the slope surface, interim until study-pcs",
+    "models.binary.windows": "SPEC section 4 / audit N3: both window covariates in q for every method, as gam's default smooths",
+    "models.binary.latent_law": "SPEC section 4: an empirical latent law, never standard-normal or auto",
+    "models.binary.slope_age_k": "SPEC section 4 lets ours add age to the slope where the simulator shows it helps: on study-sim v1 medium dev seeds s(age, k=4) raised slope recovery from 0.30-0.60 to 0.67-0.88 and lowered risk RMSE for hypertension, T2D and AF; k=6 was no better",
     "models.survival.num_pcs": "user decision 2026-09-18 23:40Z: K = 6 (K = 16 cycles in gam's constrained QP; filed as a gam bug)",
     "models.survival.q_centers": "a joint 6-D Duchon with a linear null space needs more than 7 centers, and gam's default grows with n; 24 is interim until study-pcs sweeps it",
     "models.survival.slope_centers": "as q_centers: more than 7 needed; 20 for the slope surface, interim until study-pcs",
