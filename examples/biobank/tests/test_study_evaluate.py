@@ -303,7 +303,8 @@ def test_a_cell_with_a_row_weighted_above_twenty_is_unsupported():
         model = ev.Censoring(part, horizon, "cox", ("site",))
         w = ev.ipcw(part, horizon, model)
         cell = ev.survival_cell(part.followup.to_numpy(), part.event_code.to_numpy(), w, model,
-                                np.arange(len(part)), p[:, rows], ["ours"], "pooled", "overall", horizon, 21)
+                                np.arange(len(part)), p[:, rows], ["ours"], "pooled", "overall", horizon, 21,
+                                released=True)
         return cell[0]["status"], float(w.max()), ev.cell_support(part.followup.to_numpy(),
                                                                   part.event_code.to_numpy(), horizon)[1]
 
@@ -431,6 +432,16 @@ def table_frame(n, seed, kind):
     return frame, x
 
 
+def open_development(frame, kind):
+    """Development rows under which the release rule passes every cell of about 84 test rows or more: the test
+    rows' covariates, every other row a case (survival: a disease event at 0.01 y, the others followed past every
+    horizon). For tests of what a released cell holds, not of which cells are released."""
+    half = np.arange(len(frame)) % 2 == 0
+    if kind == "binary":
+        return frame.assign(y=half.astype(int))
+    return frame.assign(followup=np.where(half, 0.01, 1e3), event=half.astype(int))
+
+
 def predictions_for(frame, x, kind, horizons, logo=None):
     rng = np.random.default_rng(11)
     out = {}
@@ -464,7 +475,7 @@ def test_every_released_field_is_in_the_registry_and_every_axis_partitions(kind)
     horizons = [1.0, 2.0]
     frame, x = table_frame(6000, 12, kind)
     predictions = predictions_for(frame, x, kind, horizons, logo="logo:ancestry:afr")
-    rows = ev.evaluate(kind, frame, predictions, horizons, {"report": {"small_cell_max": 20}},
+    rows = ev.evaluate(kind, frame, predictions, horizons, {"report": {"small_cell_max": 20}}, train=frame,
                        truth=truth_for(frame, kind, horizons),
                        slopes={key: np.full_like(risk, 0.3) for key, risk in predictions.items()})
     assert any("rmse_true" in r and "slope_rmse_true" in r and "auc_true" in r for r in rows)
@@ -496,19 +507,167 @@ def test_a_cell_with_twenty_cases_is_withheld_and_a_planted_minimum_releases_it(
     frame.loc[:59, "y"] = np.r_[np.ones(20, int), np.zeros(40, int)]
     predictions = predictions_for(frame, x, "binary", [])
     status = lambda rows: {r["status"] for r in rows if r["stratum"] == "ancestry_mid"}
-    rows = ev.evaluate("binary", frame, predictions, [], {"report": {"small_cell_max": 20}})
+    rows = ev.evaluate("binary", frame, predictions, [], {"report": {"small_cell_max": 20}}, train=frame)
     assert status(rows) == {ev.INSUFFICIENT}
     # Without a report block the AoU rule (counts 1 to 20 withheld) still holds.
-    assert status(ev.evaluate("binary", frame, predictions, [], {})) == {ev.INSUFFICIENT}
+    assert status(ev.evaluate("binary", frame, predictions, [], {}, train=frame)) == {ev.INSUFFICIENT}
     assert all(min(r["n"], r["cases"], r["n"] - r["cases"]) > 20 for r in rows if r["status"] == "ok")
-    planted = ev.evaluate("binary", frame, predictions, [], {"report": {"small_cell_max": 4}})
+    planted = ev.evaluate("binary", frame, predictions, [], {"report": {"small_cell_max": 4}}, train=frame)
     assert status(planted) == {"ok"}
+
+
+INSUFFICIENT_KEYS = {"model", "fit", "stratum", "horizon", "n", "cases", "variant", "status"}
+
+
+@pytest.mark.parametrize("kind", ["binary", "survival"])
+def test_a_cell_passing_the_test_floor_but_not_the_development_rule_is_insufficient_with_its_counts(kind):
+    """The release rule (SPEC section 3, 17:50Z): a cell whose development cases, scaled to its test rows, fall
+    under 2 x 21 is withheld even where its test counts pass the floor. It comes out exactly as a cell under the
+    floor does: insufficient_support with its test n and cases, the same values and types as when it is released,
+    and nothing else, no development count among them. Every other cell is unchanged."""
+    horizons = [1.0, 2.0]
+    frame, x = table_frame(6000, 40, kind)
+    predictions = predictions_for(frame, x, kind, horizons)
+    open_dev = open_development(frame, kind)
+    # The amr cell's development rows keep 10 cases; in every other cell half the rows stay cases.
+    amr = np.flatnonzero((frame.ancestry == "amr").to_numpy())
+    short = open_dev.copy()
+    if kind == "binary":
+        short.loc[amr[10:], "y"] = 0
+    else:
+        short.loc[amr[10:], ["followup", "event"]] = (1e3, 0)
+    key = lambda r: (r["variant"], r["fit"], r["stratum"], r["horizon"])
+    released = {key(r): r for r in ev.evaluate(kind, frame, predictions, horizons, {}, train=open_dev)}
+    withheld = {key(r): r for r in ev.evaluate(kind, frame, predictions, horizons, {}, train=short)}
+    assert released.keys() == withheld.keys()
+    cells = [k for k in released if k[2] == "ancestry_amr"]
+    assert cells and all(released[k]["status"] == "ok" for k in cells)
+    assert all(min(released[k]["cases"], released[k]["n"] - released[k]["cases"]) > 20 for k in cells)
+    floor = [r for r in released.values() if r["status"] == ev.INSUFFICIENT]
+    assert floor and all(r.keys() == INSUFFICIENT_KEYS for r in floor)
+    for k in cells:
+        row = withheld[k]
+        assert row["status"] == ev.INSUFFICIENT and row.keys() == INSUFFICIENT_KEYS
+        for field in ("n", "cases"):
+            assert type(row[field]) is type(released[k][field]) is int and row[field] == released[k][field]
+    for k in released.keys() - set(cells):
+        assert withheld[k].keys() == released[k].keys(), k
+        for field, value in released[k].items():
+            same = withheld[k][field] == value or (value != value and withheld[k][field] != withheld[k][field])
+            assert same, (k, field)
+
+
+def development_side(kind, test, dev, horizon, minimum=21):
+    """Brute force, per pooled cell: whether its development cases and known non-cases, scaled to its test rows
+    at the horizon, are both at least 2 x minimum; whether its test counts pass the floor; its test cases."""
+    def at(frame):
+        if kind == "binary":
+            y = frame.y.to_numpy()
+            return frame, y == 1, y == 0
+        frame = frame.loc[frame.max_followup >= horizon]
+        t, code = frame.followup.to_numpy(), frame.event.to_numpy()
+        return frame, (code == 1) & (t <= horizon), (t > horizon) | ((code == 2) & (t <= horizon))
+    (d, d_case, d_control), (s, s_case, s_control) = at(dev), at(test)
+    pairs = [("overall", None, None)] + [(f"{axis}_{value}", axis, value) for axis in ev.AXES[kind]
+                                         for value in sorted(set(ev.stratum_labels(s[axis])))]
+    out = {}
+    for stratum, axis, value in pairs:
+        dm = np.ones(len(d), bool) if axis is None else ev.stratum_labels(d[axis]) == value
+        sm = np.ones(len(s), bool) if axis is None else ev.stratum_labels(s[axis]) == value
+        n, rows, cases = int(sm.sum()), int(dm.sum()), int(s_case[sm].sum())
+        dev_ok = rows > 0 and min(d_case[dm].sum(), d_control[dm].sum()) * n / rows >= 2 * minimum
+        out[stratum] = (dev_ok, min(n, cases, int(s_control[sm].sum())) >= minimum, cases)
+    return out
+
+
+@pytest.mark.parametrize("kind", ["binary", "survival"])
+def test_permuting_the_test_outcomes_never_moves_the_development_side_of_the_release(kind):
+    """The release decision's development side reads no test outcome. Across permutations of the test outcomes
+    (binary y; survival follow-up and event together), a cell is released exactly when its development rows pass
+    the rule and its permuted test counts pass the floor (survival: unless the support rule refuses the horizon),
+    against a brute-force count. Two planted cells give the check its teeth: sas, whose development rows keep 10
+    cases, is withheld while its test counts pass the floor; mid, about 150 test rows whose development rows are 60%
+    cases, is released with fewer than 42 test cases. A rule on the test counts fails both."""
+    horizons = [1.0, 2.0] if kind == "survival" else [None]
+    frame, x = table_frame(6000, 41, kind)
+    dev = table_frame(9000, 42, kind)[0]
+    frame.loc[:119, "ancestry"], dev.loc[:179, "ancestry"] = "mid", "mid"
+    sas = np.flatnonzero((dev.ancestry == "sas").to_numpy())[10:]
+    mid = np.flatnonzero((dev.ancestry == "mid").to_numpy())
+    heavy = mid[: int(0.6 * len(mid))]
+    if kind == "binary":
+        dev.loc[sas, "y"] = 0
+        dev.loc[mid, "y"] = 0
+        dev.loc[heavy, "y"] = 1
+    else:
+        dev.loc[sas, ["followup", "event"]] = (1e3, 0)
+        dev.loc[mid, ["followup", "event"]] = (1e3, 0)
+        dev.loc[heavy, ["followup", "event"]] = (0.01, 1)
+    predictions = predictions_for(frame, x, kind, [h for h in horizons if h is not None])
+    rng = np.random.default_rng(43)
+    columns = ["y"] if kind == "binary" else ["followup", "event"]
+    teeth = {"sas_withheld_above_the_floor": False, "mid_released_under_42_cases": False}
+    for permutation in range(4):
+        test = frame.copy()
+        if permutation:
+            test[columns] = frame[columns].to_numpy()[rng.permutation(len(frame))]
+        rows = ev.evaluate(kind, test, predictions, [h for h in horizons if h is not None], {}, train=dev)
+        for h in horizons:
+            expected = development_side(kind, test, dev, h)
+            got = {r["stratum"]: r["status"] for r in rows if r["variant"] == "ours" and r["horizon"] == h}
+            assert got.keys() <= expected.keys()
+            for stratum, status in got.items():
+                dev_ok, floor_ok, cases = expected[stratum]
+                if status == "ok":
+                    assert dev_ok and floor_ok, (permutation, h, stratum)
+                elif status == ev.INSUFFICIENT:
+                    assert not (dev_ok and floor_ok), (permutation, h, stratum)
+                else:
+                    assert kind == "survival" and status == ev.UNSUPPORTED and dev_ok and floor_ok
+            teeth["sas_withheld_above_the_floor"] |= (got.get("ancestry_sas") == ev.INSUFFICIENT
+                                                      and expected["ancestry_sas"][1])
+            teeth["mid_released_under_42_cases"] |= got.get("ancestry_mid") == "ok" and expected["ancestry_mid"][2] < 42
+    assert all(teeth.values()), teeth
+
+
+def test_the_digest_of_the_released_cells_passes_the_disclosure_audit():
+    """The rule restricts the test floor cell by cell and publishes the same counts, so the digest of its rows
+    (binary, survival and a leave-one-group-out fit) passes study-audit's differencing audit after the digest's
+    own suppression. Planted: restoring the counts the suppression withheld from the axis of a small category
+    (5 binary cases) lets that category be derived, and the audit must find it."""
+    from study import digest
+    rows = []
+    for kind, seed in (("binary", 44), ("survival", 45)):
+        frame, x = table_frame(6000, seed, kind)
+        dev = table_frame(9000, seed + 100, kind)[0]
+        # The digest's audit holds a division inside its Census region, as study-cohort's frames do.
+        for part in (frame, dev):
+            part["region"] = part.division.map({"New England": "Northeast", "Pacific": "West"})
+        if kind == "binary":
+            # A small ancestry category (5 cases), which the digest must suppress with its whole axis.
+            mid = np.flatnonzero((frame.ancestry == "mid").to_numpy())
+            frame.loc[mid, "y"] = (np.arange(len(mid)) < 5).astype(int)
+        horizons = [1.0, 2.0] if kind == "survival" else []
+        for row in ev.evaluate(kind, frame, predictions_for(frame, x, kind, horizons, logo="logo:ancestry:afr"),
+                               horizons, {}, train=dev):
+            rows.append({**row, "disease": "t2d"})
+    registry = digest.Registry()
+    safe = digest.suppress(rows, digest.LIMIT, registry)
+    assert digest.audit(safe, registry) == []
+    assert any(r.get("status") == "ok" for r in safe) and any(r.get("support") == ev.INSUFFICIENT for r in safe)
+    key = lambda r: (r["model"], r["fit"], r["stratum"], r.get("horizon"), r["variant"])
+    original = {key(r): r for r in rows}
+    withheld = [r for r in safe if r.get("counts") == digest.WITHHELD]
+    assert {r["stratum"] for r in withheld if r["model"] == "binary"} >= {"ancestry_afr", "ancestry_eur"}
+    restored = [dict(r, n=original[key(r)]["n"], cases=original[key(r)]["cases"])
+                if r.get("counts") == digest.WITHHELD else r for r in safe]
+    assert digest.audit(restored, registry)
 
 
 def test_logo_transport_difference_is_logo_minus_pooled_on_the_held_out_rows():
     frame, x = table_frame(6000, 16, "binary")
     rows = ev.evaluate("binary", frame, predictions_for(frame, x, "binary", [], logo="logo:ancestry:afr"), [],
-                       {})
+                       {}, train=frame)
     pooled = {r["variant"]: r for r in rows if r["fit"] == "pooled" and r["stratum"] == "ancestry_afr"}
     for row in (r for r in rows if r["fit"] == "logo:ancestry:afr"):
         assert abs(row["d_auc_pooled"] - (row["auc"] - pooled[row["variant"]]["auc"])) < 1e-12
@@ -524,7 +683,7 @@ def test_logo_predictions_must_cover_exactly_the_held_out_group():
     risk[np.flatnonzero(frame.ancestry != "afr")[0]] = 0.5
     leaked[("ours", "logo:ancestry:afr")] = risk
     with pytest.raises(ValueError, match="held-out group"):
-        ev.evaluate("binary", frame, leaked, [], {})
+        ev.evaluate("binary", frame, leaked, [], {}, train=frame)
 
 
 def test_a_horizon_evaluates_only_rows_whose_administrative_follow_up_reaches_it():
@@ -533,7 +692,7 @@ def test_a_horizon_evaluates_only_rows_whose_administrative_follow_up_reaches_it
     frame["admin_years"] = np.random.default_rng(20).uniform(1.0, 4.0, size=len(frame))
     horizons = [1.0, 2.0]
     rows = ev.evaluate("survival", frame, predictions_for(frame, x, "survival", horizons), horizons,
-                       {"cohort": {"landmark_days": 180}})
+                       {"cohort": {"landmark_days": 180}}, train=frame)
     for horizon in horizons:
         overall = [r for r in rows if r["stratum"] == "overall" and r["horizon"] == horizon][0]
         assert overall["n"] == int(np.sum(frame.admin_years - 180 / 365.25 >= horizon))
@@ -545,17 +704,17 @@ def test_an_event_code_other_than_censored_disease_or_death_is_refused():
     horizons = [1.0]
     frame, x = table_frame(3000, 22, "survival")
     predictions = predictions_for(frame, x, "survival", horizons)
-    assert any(r["status"] == "ok" for r in ev.evaluate("survival", frame, predictions, horizons, {}))
+    assert any(r["status"] == "ok" for r in ev.evaluate("survival", frame, predictions, horizons, {}, train=frame))
     three = frame.assign(event=np.where(frame.event == 2, 3, frame.event))
     assert (three.event == 3).sum() > 0
     with pytest.raises(ValueError, match="events 0, 1 or 2"):
-        ev.evaluate("survival", three, predictions, horizons, {})
+        ev.evaluate("survival", three, predictions, horizons, {}, train=frame)
 
 
 def test_paired_differences_are_differences_of_the_rows_own_metrics():
     horizons = [1.0, 2.0]
     frame, x = table_frame(8000, 15, "survival")
-    rows = ev.evaluate("survival", frame, predictions_for(frame, x, "survival", horizons), horizons, {})
+    rows = ev.evaluate("survival", frame, predictions_for(frame, x, "survival", horizons), horizons, {}, train=frame)
     at = {(r["variant"], r["stratum"], r["horizon"]): r for r in rows if r["status"] == "ok"}
     for (variant, stratum, horizon), row in at.items():
         for ref in ev.REFERENCES:
@@ -585,7 +744,7 @@ def test_the_uncensored_difference_se_counts_every_case_chance_of_censoring():
     t_unc = np.where(code == 1, t, 2.0)
     truth = pd.DataFrame({"cif_1y": p, "uncensored_event": code, "uncensored_exit_age": entry + t_unc})
     rows = ev.evaluate("survival", frame, {("ours", "pooled"): p[:, None]}, [h], {"evaluate": {"censoring": "km"}},
-                       truth=truth)
+                       train=open_development(frame, "survival"), truth=truth)
     row = next(r for r in rows if r["stratum"] == "overall" and r["status"] == "ok")
     # G(T-) of each case by the reverse Kaplan-Meier (no ties: the risk set at u is every row with t >= u).
     cuts = np.sort(t[cases:cases + censored])
@@ -623,7 +782,7 @@ def test_a_row_censored_at_entry_is_a_censoring_at_time_zero():
 
     def overall(f, p):
         rows = ev.evaluate("survival", f, {("ours", "pooled"): np.column_stack([p, p])}, horizons,
-                           {"evaluate": {"censoring": "km"}})
+                           {"evaluate": {"censoring": "km"}}, train=open_development(f, "survival"))
         return {r["horizon"]: r for r in rows if r["stratum"] == "overall" and r["status"] == "ok"}
 
     alone = overall(frame, risk)
@@ -640,11 +799,11 @@ def test_a_row_censored_at_entry_is_a_censoring_at_time_zero():
         planted = both.copy()
         planted.loc[len(frame), "event"] = bad
         with pytest.raises(ValueError, match="exiting at entry must be censored"):
-            ev.evaluate("survival", planted, predictions, horizons, {})
+            ev.evaluate("survival", planted, predictions, horizons, {}, train=both)
     planted = both.copy()
     planted.loc[len(frame), "followup"] = -0.01
     with pytest.raises(ValueError, match="follow-up must be non-negative"):
-        ev.evaluate("survival", planted, predictions, horizons, {})
+        ev.evaluate("survival", planted, predictions, horizons, {}, train=both)
 
 
 def test_a_truth_row_without_an_uncensored_outcome_leaves_the_uncensored_comparisons_only():
@@ -679,7 +838,7 @@ def test_a_truth_row_without_an_uncensored_outcome_leaves_the_uncensored_compari
         for column, row in null.items():
             truth.loc[row, column] = np.nan
         rows = ev.evaluate("survival", frame, {("ours", "pooled"): p[:n + k, None]}, [h],
-                           {"evaluate": {"censoring": "km"}}, truth=truth)
+                           {"evaluate": {"censoring": "km"}}, train=open_development(frame, "survival"), truth=truth)
         return next(r for r in rows if r["stratum"] == "overall" and r["status"] == "ok")
 
     alone, with_null = run(0), run(silent)
@@ -760,8 +919,8 @@ def test_an_arm_without_predictions_is_omitted_with_its_comparisons_and_nothing_
     drop = {(variant, logo)} if missing.endswith("@logo") else {(variant, "pooled"), (variant, logo)}
     partial = {k: v for k, v in full.items() if k not in drop}
     key = lambda r: (r["variant"], r["fit"], r["stratum"], r["horizon"])
-    with_arm = {key(r): r for r in ev.evaluate(kind, frame, full, horizons, {})}
-    without = {key(r): r for r in ev.evaluate(kind, frame, partial, horizons, {})}
+    with_arm = {key(r): r for r in ev.evaluate(kind, frame, full, horizons, {}, train=frame)}
+    without = {key(r): r for r in ev.evaluate(kind, frame, partial, horizons, {}, train=frame)}
     assert set(without) == {k for k in with_arm if (k[0], k[1]) not in drop}
     for k, row in without.items():
         against = (variant, k[1]) in drop

@@ -141,7 +141,8 @@ def test_delong_variance_and_paired_difference_match_proc(ref):
 def test_brier_matches_sklearn():
     from sklearn.metrics import brier_score_loss
     b = binary_data()
-    rows = ev.binary_cell(b.y.to_numpy(), np.vstack([b.p1, b.p2]), ["ours", "standard"], "pooled", "overall", 21)
+    rows = ev.binary_cell(b.y.to_numpy(), np.vstack([b.p1, b.p2]), ["ours", "standard"], "pooled", "overall", 21,
+                          released=True)
     assert abs(rows[0]["brier"] - brier_score_loss(b.y, b.p1)) < 1e-15
     fails(abs(np.mean(np.abs(b.y - b.p1)) - brier_score_loss(b.y, b.p1)), 1e-15)
 
@@ -237,7 +238,8 @@ def released_cell(s, censoring="km"):
     model = ev.Censoring(frame, H, censoring, ("site", "age"))
     w = ev.ipcw(frame, H, model)
     return ev.survival_cell(s.t.to_numpy(), s.code.to_numpy(), w, model, np.arange(len(s)),
-                            np.vstack([s.p1, s.p2]), ["ours", "standard"], "pooled", "overall", H, 21)[0]
+                            np.vstack([s.p1, s.p2]), ["ours", "standard"], "pooled", "overall", H, 21,
+                            released=True)[0]
 
 
 @pytest.mark.parametrize("kind", ["cont", "tied"])
@@ -448,6 +450,13 @@ def gate_sample(rng, n, year_effect=YEAR_EFFECT):
     return frame, truth, {("ours", "pooled"): p[:, None], ("standard", "pooled"): q[:, None]}
 
 
+def development_releasing_every_cell(frame):
+    """Development rows under which the release rule passes every gate cell (every other row a disease event at
+    0.01, the others followed past H), so the gate's cells are the test floor's, as they were before the rule."""
+    half = np.arange(len(frame)) % 2 == 0
+    return frame.assign(followup=np.where(half, 0.01, 1e3), event=half.astype(int))
+
+
 def gate_rows(rows):
     """Every released column with an uncensored counterpart, per (metric, variant, stratum): the released value,
     its SE, the uncensored value's difference and the released paired SE of that difference. The paired dAUC is
@@ -510,7 +519,8 @@ def test_ipcw_estimator_gate_on_every_released_column_under_site_dependent_censo
         frame, truth, predictions = gate_sample(rng, n)
         known_g += known_g_differences(frame, truth, predictions)
         for name, settings in configs.items():
-            rows = ev.evaluate("survival", frame, predictions, [H], {"evaluate": settings}, truth=truth)
+            rows = ev.evaluate("survival", frame, predictions, [H], {"evaluate": settings},
+                               train=development_releasing_every_cell(frame), truth=truth)
             records[name] += [dict(r, rep=rep) for r in gate_rows(rows)]
     from statistics import NormalDist
     worst_by = {}
@@ -608,7 +618,7 @@ def test_binary_oe_interval_and_brier_standard_errors_cover_the_truth():
         p = 1 / (1 + np.exp(-(-1.5 + x)))
         q = 1 / (1 + np.exp(-(-1.5 + 0.6 * x)))
         y = (rng.random(n) < p).astype(int)
-        row = ev.binary_cell(y, np.vstack([p, q]), ["ours", "standard"], "pooled", "overall", 21)[0]
+        row = ev.binary_cell(y, np.vstack([p, q]), ["ours", "standard"], "pooled", "overall", 21, released=True)[0]
         covered["oe"] += row["oe_lo"] <= 1 <= row["oe_hi"]
         half = (row["oe_hi"] - row["oe_lo"]) / 4
         covered["oe_half"] += row["oe"] - half <= 1 <= row["oe"] + half

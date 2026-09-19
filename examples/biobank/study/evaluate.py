@@ -27,6 +27,12 @@ estimation (the Cox model's score residuals and the Breslow or Kaplan-Meier haza
 simulator-only SEs of each released-minus-uncensored difference are instead the censoring's variance given the
 uncensored outcomes, with G's estimation (and, in the _known_g columns, without it: conservative).
 
+Release (SPEC section 3, 17:50Z): a cell's metrics are released only when its development rows, scaled to its
+test rows, hold at least RELEASE_MARGIN x the smallest releasable count of cases and of known non-cases, and its
+test counts pass the floor; a decision on the test counts alone would select cells on their own outcomes and bias
+every released value upward (the winner's curse, +4-10% in 5 simulated worlds). A withheld cell carries only its
+test counts and insufficient_support, whichever side withheld it.
+
 Ties at the horizon: an event at exactly h is a case by h, as in the cumulative incidence F(h) = P(T <= h);
 a row followed past h is a known non-case and one censored at exactly h is unknown. (timeROC counts cases T < t
 strictly, so the two differ only where events fall exactly on the horizon.)
@@ -43,6 +49,12 @@ ONE_SIDED_95 = 1.6448536269514722
 # The AoU dissemination rule: no released count, and no count derivable from released ones, in 1..20. A cell
 # needs more than config["report"]["small_cell_max"] (default this) cases, non-cases and rows.
 SMALL_CELL_MAX = 20
+# The release rule (SPEC section 3, 17:50Z): a cell's metrics are released only when its development rows at the
+# horizon, scaled to its test rows, hold at least this many times the smallest releasable count of cases and of
+# known non-cases. The decision reads no test outcome, so the released values carry no winner's curse; the test
+# counts must still pass the floor, which at this margin almost never decides (0 of 2,115 cells in 5 simulated
+# worlds; at 1.5x it decided 14).
+RELEASE_MARGIN = 2
 # A censoring-model category level with fewer rows is merged with the other small levels.
 CENSORING_LEVEL_MIN = 20
 # The prespecified support rule for a horizon in a cell: the one-sided 95% upper bound on the cell's own
@@ -770,14 +782,16 @@ def truth_metrics(P, true_risk, S=None, true_slope=None):
     return rows
 
 
-def binary_cell(y, P, variants, fit, stratum, minimum, references=REFERENCES, pooled=None, true_risk=None,
-                slopes=None):
-    """Rows for one binary cell: y the outcomes, P the (variants x rows) predictions, pooled the pooled fit's
-    predictions of the same variants for a LOGO cell, true_risk the simulator's p_ever, and slopes (simulator only)
-    the (variants x rows) predicted PGS slopes with the true slopes, both on the pooled model's z scale."""
+def binary_cell(y, P, variants, fit, stratum, minimum, *, released, references=REFERENCES, pooled=None,
+                true_risk=None, slopes=None):
+    """Rows for one binary cell: y the outcomes, P the (variants x rows) predictions, released the release rule's
+    development side (release_by_development), pooled the pooled fit's predictions of the same variants for a LOGO
+    cell, true_risk the simulator's p_ever, and slopes (simulator only) the (variants x rows) predicted PGS slopes
+    with the true slopes, both on the pooled model's z scale. A cell the release rule withholds carries its counts
+    and the same status as one under the test floor."""
     n, cases = len(y), int(y.sum())
     base = {"model": "binary", "fit": fit, "stratum": stratum, "horizon": None, "n": n, "cases": cases}
-    if min(n, cases, n - cases) < minimum:
+    if not released or min(n, cases, n - cases) < minimum:
         return [dict(base, variant=v, status=INSUFFICIENT) for v in variants]
     stacked = P if pooled is None else np.vstack([P, pooled])
     aucs, cov = delong(y, stacked)
@@ -815,8 +829,8 @@ def cell_support(time, code, horizon):
     return int(np.sum(time > horizon)), upper
 
 
-def survival_cell(t, code, w, model, rows, P, variants, fit, stratum, horizon, minimum, references=REFERENCES,
-                  pooled=None, truth=None, slopes=None):
+def survival_cell(t, code, w, model, rows, P, variants, fit, stratum, horizon, minimum, *, released,
+                  references=REFERENCES, pooled=None, truth=None, slopes=None):
     """Rows for one survival cell at a horizon: t the follow-up from entry; code 0 censored, 1 disease, 2 death
     (competing); w the IPCW weights of `model`, the evaluation's censoring model,
     and `rows` the cell's indices among its rows; P the (variants x rows) CIFs at the horizon.
@@ -825,14 +839,15 @@ def survival_cell(t, code, w, model, rows, P, variants, fit, stratum, horizon, m
     uncensored outcome at all) per row.
 
     Every IPCW standard error carries the censoring model's own estimation (Censoring.variance). Reported only
-    where the prespecified support rule holds: at least `minimum` cases, known non-cases and rows followed past
-    h; the cell's own G(h) upper bound at or above POSITIVITY_FLOOR; and every known row's weight at most
-    1/POSITIVITY_FLOOR."""
+    where the release rule's development side passes (`released`, release_by_development) and the prespecified
+    support rule holds: at least `minimum` cases, known non-cases and rows followed past h; the cell's own G(h)
+    upper bound at or above POSITIVITY_FLOOR; and every known row's weight at most 1/POSITIVITY_FLOOR. A cell the
+    release rule withholds carries its counts and the same status as one under the test floor."""
     y = ((code == 1) & (t <= horizon)).astype(float)
     known = w > 0
     n, cases, controls = len(t), int(y.sum()), int(np.sum(known & (y == 0)))
     base = {"model": "survival", "fit": fit, "stratum": stratum, "horizon": horizon, "n": n, "cases": cases}
-    if min(n, cases, controls) < minimum:
+    if not released or min(n, cases, controls) < minimum:
         return [dict(base, variant=v, status=INSUFFICIENT) for v in variants]
     followed, g_upper = cell_support(t, code, horizon)
     if followed < minimum or g_upper < POSITIVITY_FLOOR or w.max() > 1 / POSITIVITY_FLOOR:
@@ -928,6 +943,35 @@ def survival_cell(t, code, w, model, rows, P, variants, fit, stratum, horizon, m
     return out
 
 
+def development_counts(kind, dev, strata, config, horizon=None):
+    """stratum -> (cases, known non-cases, rows) of the development rows (study.py's train: every row outside the
+    outer test) in each cell: the counts the release rule reads. For survival, at a horizon, over the rows whose
+    potential follow-up reaches it, with the test cells' definitions: a case is a disease event by h, and a known
+    non-case a row followed past h or dead by it."""
+    if kind == "binary":
+        y = dev.y.to_numpy(int)
+        if not np.isin(y, (0, 1)).all():
+            raise ValueError("binary development outcome must be 0/1")
+        case, control = y == 1, y == 0
+    else:
+        potential = potential_followup(dev, config)
+        dev = dev.loc[np.ones(len(dev), bool) if potential is None else potential >= horizon].reset_index(drop=True)
+        t, code = dev.followup.to_numpy(float), dev.event.to_numpy(int)
+        if (t < 0).any() or not np.isin(code, (0, 1, 2)).all() or ((t == 0) & (code != 0)).any():
+            raise ValueError("development follow-up must be non-negative, events 0, 1 or 2, censored at entry")
+        case = (code == 1) & (t <= horizon)
+        control = (t > horizon) | ((code == 2) & (t <= horizon))
+    return {stratum: (int(case[mask].sum()), int(control[mask].sum()), int(mask.sum()))
+            for stratum, mask in cells(dev, strata)}
+
+
+def release_by_development(counts, n, minimum):
+    """The release rule's development side (SPEC section 3, 17:50Z): a cell's development cases and known
+    non-cases, scaled to its n test rows, both at least RELEASE_MARGIN x minimum. It reads no test outcome."""
+    cases, controls, rows = counts
+    return rows > 0 and min(cases, controls) * n / rows >= RELEASE_MARGIN * minimum
+
+
 def _fits(predictions):
     """variant -> fits, "pooled" first, from the (variant, fit) keys of the predictions."""
     out = {}
@@ -959,12 +1003,14 @@ def potential_followup(frame, config):
     return None
 
 
-def evaluate(kind, test, predictions, horizons, config, train=None, truth=None, slopes=None):
+def evaluate(kind, test, predictions, horizons, config, train, truth=None, slopes=None):
     """Every row of the single results table for one disease and model, from its outer-test rows.
 
     kind: "binary" or "survival". test: the outer-test frame (binary: `y`; survival: `followup`, `event` (0
     censored, 1 disease, 2 death, competing; a follow-up of 0 only censored at entry) and `entry_age`; both: the
-    axis and censoring columns, and admin_years). predictions: (variant, fit) ->
+    axis and censoring columns, and admin_years). train: the development rows, the same columns; their counts
+    decide which cells are released (release_by_development), and nothing else reads them. predictions:
+    (variant, fit) ->
     risk per test row (binary) or rows x horizons CIF (survival), NaN outside the fit's rows; fit is "pooled"
     or "logo:<axis>:<group>". A LOGO row is the pooled cell of its held-out group, with stratum "overall".
     truth (simulator only): rows aligned with test carrying p_ever (binary) or cif_<h>y, uncensored_event and
@@ -976,7 +1022,9 @@ def evaluate(kind, test, predictions, horizons, config, train=None, truth=None, 
     truth by sd_pooled / z_sd and each fit's slope by sd_pooled / sd_fit).
 
     At a survival horizon only rows whose potential follow-up reaches it are evaluated, and the censoring model
-    is fitted on exactly those rows, separately for each LOGO group (SPEC section 8), so `train` is not used.
+    is fitted on exactly those rows, separately for each LOGO group (SPEC section 8). A cell's metrics are
+    released only when its development counts pass the release rule and its test counts the floor; otherwise it
+    carries its test counts and insufficient_support, whichever side failed.
     config["evaluate"] may set "censoring" ("cox", "km" or "strata") and "censoring_covariates";
     config["report"]["small_cell_max"] is the largest count withheld."""
     settings = config.get("evaluate", {})
@@ -995,6 +1043,9 @@ def evaluate(kind, test, predictions, horizons, config, train=None, truth=None, 
         else:
             mask_all, strata = _held_out(test, fit, predictions, have), ()
         sub = test.loc[mask_all].reset_index(drop=True)
+        # The development rows of the same cells: all of them for the pooled fit, the held-out group's for LOGO.
+        dev = train if fit == "pooled" else train.loc[
+            stratum_labels(train[fit.split(":", 2)[1]]) == fit.split(":", 2)[2]].reset_index(drop=True)
         sub_truth = None if truth is None else truth.loc[mask_all].reset_index(drop=True)
         take = lambda variant, fit_name: np.asarray(predictions[(variant, fit_name)], float)[mask_all]
         pooled = None
@@ -1014,8 +1065,10 @@ def evaluate(kind, test, predictions, horizons, config, train=None, truth=None, 
             slope_all = None
             if S_fit is not None and "slope" in sub_truth:
                 slope_all = (np.vstack(S_fit), sub_truth.slope.to_numpy(float))
+            dev_cells = development_counts(kind, dev, strata, config)
             for stratum, mask in cells(sub, strata):
-                rows += binary_cell(y[mask], P_all[:, mask], have, fit, stratum, minimum,
+                released = release_by_development(dev_cells.get(stratum, (0, 0, 0)), int(mask.sum()), minimum)
+                rows += binary_cell(y[mask], P_all[:, mask], have, fit, stratum, minimum, released=released,
                                     pooled=None if Q_all is None else Q_all[:, mask],
                                     true_risk=None if true_all is None else true_all[mask],
                                     slopes=None if slope_all is None else (slope_all[0][:, mask], slope_all[1][mask]))
@@ -1067,9 +1120,11 @@ def evaluate(kind, test, predictions, horizons, config, train=None, truth=None, 
                 if S_fit is not None and f"slope_cif_{horizon:g}y" in known:
                     slope_all = (np.vstack([s.reshape(len(sub), -1)[eligible, j] for s in S_fit]),
                                  known[f"slope_cif_{horizon:g}y"].to_numpy(float))
+            dev_cells = development_counts(kind, dev, strata, config, horizon)
             for stratum, mask in cells(frame, strata):
+                released = release_by_development(dev_cells.get(stratum, (0, 0, 0)), int(mask.sum()), minimum)
                 rows += survival_cell(t[mask], code[mask], w[mask], model, np.flatnonzero(mask), P_all[:, mask],
-                                      have, fit, stratum, horizon, minimum,
+                                      have, fit, stratum, horizon, minimum, released=released,
                                       pooled=None if Q_all is None else Q_all[:, mask],
                                       truth=None if truth_all is None else tuple(v[mask] for v in truth_all),
                                       slopes=None if slope_all is None
