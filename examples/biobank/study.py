@@ -26,9 +26,7 @@ import argparse
 import collections
 import hashlib
 import importlib.metadata
-import inspect
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -146,7 +144,8 @@ def load_config(path, source=None):
     if not diseases:
         raise ValueError("the disease list is empty")
     phenotypes.CohortConfig.from_json(config["cohort"])
-    # SPEC section 8 (N2b): the primary survival censoring, chosen before the claim run.
+    # SPEC section 8 (N2b): the primary survival censoring, chosen before the claim run
+    # (its reason is required by check_reasons).
     if config.get("primary_censoring_rule") not in CENSORING:
         raise ValueError(f"primary_censoring_rule must be one of {sorted(CENSORING)}")
     return config, diseases
@@ -185,9 +184,12 @@ def check_reasons(config):
     settings += list(leaf_settings(config.get("compute", {}).get("threads", {}), "compute.threads"))
     if "memory_headroom_fraction" in config.get("compute", {}):
         settings.append("compute.memory_headroom_fraction")
+    # The primary survival censoring rule is a decision with its evidence (SPEC section 8, N2b).
+    if "primary_censoring_rule" in config:
+        settings.append("primary_censoring_rule")
     for path in settings:
         parts = path.split(".")
-        covering = [".".join(parts[:end]) for end in range(len(parts), 1, -1)]
+        covering = [path, *(".".join(parts[:end]) for end in range(len(parts) - 1, 1, -1))]
         if not any(isinstance(reasons.get(key), str) and reasons[key].strip() for key in covering):
             raise ValueError(f"study.json sets {path} without a reason in its reasons block")
     stale = [key for key in reasons if not any(path == key or path.startswith(key + ".") for path in settings)]
@@ -206,8 +208,10 @@ def check_claims(config, claim_run=False):
     the two-start convergence rule (R1), the same threshold the pipeline's
     convergence gate applies; runs at production n. A claim run also needs its
     replicate counts (R4): every planned (scenario, metric) cell sized from the
-    paired dev-seed spread of converged fits, R >= max(minimum, ceil((2 t sd/delta)^2)),
-    with the job that measured it. There is no fallback count."""
+    paired dev-seed spread of converged fits by the classifier's own rule
+    (study.claims.replicates_for: the smallest R >= minimum with
+    R >= (2 t_{R-1} sd/delta)^2), with the job that measured it. There is no
+    fallback count and no fixed t."""
     claims = config.get("claims") or {}
     margins = claims.get("margins") or {}
     replicates = claims.get("replicates") or {}
@@ -225,11 +229,12 @@ def check_claims(config, claim_run=False):
             or rule.get("on_fail") != "inconclusive_not_converged" or not str(rule.get("reason", "")).strip()):
         raise ValueError("claims.convergence needs 2 starts, the convergence gate's max_delta_sd, "
                          "on_fail inconclusive_not_converged and a reason (SPEC section 8, R1)")
-    minimum, t = replicates.get("minimum", 0), replicates.get("t", 0)
-    if not isinstance(minimum, int) or minimum < 5 or not isinstance(t, (int, float)) or not t > 0:
-        raise ValueError("claims replicates need a minimum of at least 5 and a positive t")
+    minimum = replicates.get("minimum", 0)
+    if not isinstance(minimum, int) or minimum < 5 or "t" in replicates:
+        raise ValueError("claims replicates need a minimum of at least 5 and no fixed t (R is sized with t_{R-1})")
     if not claim_run:
         return
+    from study.claims import replicates_for
     cells = [f"{scenario}.{metric}" for scenario in claims.get("scenarios") or [] for metric in CLAIM_MARGINS]
     if not cells:
         raise ValueError("a claim run needs its planned scenarios in study.json claims.scenarios")
@@ -241,22 +246,10 @@ def check_claims(config, claim_run=False):
         sd, delta = entry.get("sd_dev"), entry.get("delta")
         if not (isinstance(sd, (int, float)) and sd >= 0 and isinstance(delta, (int, float)) and delta > 0):
             raise ValueError(f"claim cell {cell} needs its dev-seed paired spread sd_dev and the margin delta used")
-        needed = max(minimum, math.ceil((2 * t * sd / delta) ** 2))
+        needed = replicates_for(sd, delta, minimum)
         if (entry.get("converged_starts") is not True or not str(entry.get("source_job", "")).strip()
                 or not isinstance(entry.get("R"), int) or entry["R"] < needed):
             raise ValueError(f"claim cell {cell} needs R >= {needed} from converged dev-seed fits and its source job")
-
-
-def frame_options(config, build_frames):
-    """build_frames' censoring argument for the config's primary rule. A
-    build_frames without the argument censors at ehr_end, so any other rule is
-    refused rather than silently ignored."""
-    censor = CENSORING[config["primary_censoring_rule"]]
-    if "censor" in inspect.signature(build_frames).parameters:
-        return {"censor": censor}
-    if censor != "ehr_end":
-        raise ValueError("this phenotypes.build_frames cannot censor other than at ehr_end")
-    return {}
 
 
 def check_frozen(config):
@@ -712,7 +705,7 @@ class Study:
             return
         config = phenotypes.CohortConfig.from_json(self.config["cohort"])
         base, frames = phenotypes.build_frames(self.source(), self.diseases, config,
-                                               **frame_options(self.config, phenotypes.build_frames))
+                                               censor=CENSORING[self.config["primary_censoring_rule"]])
         sites = self.site_labels(base.frame.ehr_site)
         if not self.checkpoint.done("features/base"):
             directory = self.checkpoint.begin("features/base")
@@ -835,7 +828,7 @@ class Study:
         A fit below the bar is sealed as insufficient_events: a result, never a
         failure. The count stays in the workspace record."""
         minimum = self.config["fit_gate"]["min_events"]
-        train = frame.loc[training_rows(frame, fit)]
+        train = frame.loc[training_rows(frame, fit, kind)]
         if kind == "binary":
             events = int(min((train.y == 1).sum(), (train.y == 0).sum()))
         else:
@@ -1064,6 +1057,8 @@ class Study:
         manifest = read_json(self.path("cohort") / "manifest.json")
         study = {"scope": "study", "item": "run", "config_sha256_12": config_hash(self.config)[:12],
                  "label": self.config["label"], "run_kind": self.run_kind,
+                 # The survival table's censoring caveat keys on this (tabulate_study.py).
+                 "censoring": self.config["primary_censoring_rule"],
                  "gam_commit_12": "g" + str(self.signature["engine"].get("gam_commit") or "none")[:12],
                  "scope_kinds": "_".join(self.kinds), "scope_diseases": len(self.diseases),
                  "unexpected_errors": len(unexpected_failures(self.step_records())),
@@ -1323,9 +1318,22 @@ def held_out(frame, fit):
     return frame[axis].astype(str).to_numpy() == group
 
 
-def training_rows(frame, fit):
-    """A fit's training rows: development rows outside its held-out group."""
-    return ~frame.test.to_numpy() & ~held_out(frame, fit)
+def zero_length(frame, kind):
+    """A survival frame's rows censored at entry (exit == entry, event 0). The
+    frame keeps them for evaluation and the censoring model G, but no fit trains
+    on them, so the z standardization and gam's empirical z law see one row set."""
+    if kind != "survival":
+        return np.zeros(len(frame), dtype=bool)
+    zero = frame.exit_age.to_numpy() == frame.entry_age.to_numpy()
+    if (frame.event.to_numpy()[zero] != 0).any():
+        raise ValueError("a zero-length survival row carries an event")
+    return zero
+
+
+def training_rows(frame, fit, kind):
+    """A fit's training rows: development rows outside its held-out group, less
+    a survival frame's zero-length rows."""
+    return ~frame.test.to_numpy() & ~held_out(frame, fit) & ~zero_length(frame, kind)
 
 
 def standardize(pgs):
@@ -1353,7 +1361,9 @@ def run_fit(spec, config, models):
     out = root / spec["step"]
     kind, fit = spec["kind"], spec["fit"]
     frame = load_frame(root / spec["frame"])
-    train = frame.loc[training_rows(frame, fit)]
+    train = frame.loc[training_rows(frame, fit, kind)]
+    # The driver alone drops zero-length survival rows (survival.fit refuses them); the record counts them.
+    dropped = int((~frame.test.to_numpy() & ~held_out(frame, fit)).sum()) - len(train)
     standardization = standardize(train.pgs)
     if not standardization["sd"] > 0:
         raise ValueError("the training score has no spread")
@@ -1377,15 +1387,16 @@ def run_fit(spec, config, models):
     write_json(out / "fit.json", {
         "status": "ok", "fit_seconds": round(seconds, 3), "standardization": standardization,
         "train_rows": int(len(train)), "train_sha256": person_set_hash(train.person_id),
+        **({"dropped_zero_length": dropped} if kind == "survival" else {}),
         "held_out_in_train": int(held_out(train, fit).sum()), "warm_reference": reference is not None,
         "restart": restart["start"] if restart else None,
         "info": json.loads(json.dumps(info or {}, default=str))})
 
 
-def verify_provenance(frame, fit, record):
+def verify_provenance(frame, fit, kind, record):
     """Refuse a fit whose recorded person set or standardization is not its own
     training set: a planted pooled standardization in a LOGO fit fires here."""
-    train = frame.loc[training_rows(frame, fit)]
+    train = frame.loc[training_rows(frame, fit, kind)]
     expected = standardize(train.pgs)
     if (record["train_rows"] != len(train) or record["train_sha256"] != person_set_hash(train.person_id)
             or record["held_out_in_train"] != 0
@@ -1407,7 +1418,7 @@ def run_predict(spec, config, models):
     frame = load_frame(root / spec["frame"])
     test = frame.loc[frame.test].reset_index(drop=True)
     horizons = spec["horizons"]
-    standardizations = [verify_provenance(frame, fit, read_json(root / step / "fit.json"))
+    standardizations = [verify_provenance(frame, fit, kind, read_json(root / step / "fit.json"))
                         for step in spec["models"].values()]
     index = np.flatnonzero(held_out(test, fit) if fit != "pooled" else np.ones(len(test), dtype=bool))
     data = model_frame(test.iloc[index], kind, standardizations[0], predict=True)
@@ -1432,8 +1443,9 @@ def run_evaluate(spec, config, models):
     kind = spec["kind"]
     frame = load_frame(root / spec["frame"])
     test = frame.loc[frame.test].reset_index(drop=True)
+    # Evaluation and G keep every development row; slopes are per the pooled fit's own z.
     train = frame.loc[~frame.test].reset_index(drop=True)
-    pooled_sd = standardize(train.pgs)["sd"]
+    pooled_sd = standardize(frame.loc[training_rows(frame, "pooled", kind)].pgs)["sd"]
     truth_path = root / f"features/{spec['disease']}/truth.parquet"
     truth = None
     if truth_path.is_file():
@@ -1456,9 +1468,8 @@ def run_evaluate(spec, config, models):
             if "slope" in saved:
                 slopes[(variant, fit)] = np.full(shape, np.nan)
                 slopes[(variant, fit)][saved["index"]] = to_pooled_z(saved["slope"], float(saved["z_sd"]), pooled_sd)
-    # Per-person slopes (d probit risk / dz) feed slope recovery where evaluate takes them.
-    extra = {"slopes": slopes} if slopes and "slopes" in inspect.signature(evaluate.evaluate).parameters else {}
-    rows = evaluate.evaluate(kind, test, predictions, horizons, config, train=train, truth=truth, **extra)
+    # Per-person slopes (d probit risk / dz) feed slope recovery.
+    rows = evaluate.evaluate(kind, test, predictions, horizons, config, train=train, truth=truth, slopes=slopes)
     for row in rows:
         row.setdefault("disease", spec["disease"])
         row.setdefault("model", kind)

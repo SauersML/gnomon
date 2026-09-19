@@ -19,6 +19,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from study import digest  # noqa: E402
 
 KEY_FIELDS = set(digest.KEYS)
+# SPEC section 8 N2b (decided 2026-09-19 17:45Z): what each survival censoring rule does to the
+# table's absolute risks in the simulator, printed with every survival table of a run under it.
+CENSORING_CAVEATS = {
+    "ehr_end": "CAVEAT survival (censored at last EHR contact, SPEC 8 N2b): in the simulator this overstates "
+               "absolute risk (observed risk and O/E) by about +3 to +6% at 1-5 y (pooled +4.5%); the direction "
+               "is structural and its size in AoU is unknown. Discrimination (AUC) is unaffected.",
+    "min_death_cutoff": "CAVEAT survival (censored at min(death, CDR cutoff), SPEC 8 N2b): in the simulator this "
+                        "understates absolute risk (observed risk and O/E) by about 14-26% at 1-5 y (pooled -19.8%); "
+                        "it is a sensitivity rule, never the primary.",
+}
 
 
 def cell(value):
@@ -60,6 +70,15 @@ def exclusion_caveats(results):
     return lines
 
 
+def censoring_caveat(run):
+    """The caveat a survival table prints with, from the censoring rule the run row
+    records. A run with no known rule gets no survival table."""
+    rule = run.get("censoring")
+    if rule not in CENSORING_CAVEATS:
+        raise ValueError(f"the run records survival censoring {rule!r}: no survival table without its caveat")
+    return CENSORING_CAVEATS[rule]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("tokens", type=Path)
@@ -98,14 +117,19 @@ def main():
     for model in ("binary", "survival"):
         chosen = [r for r in model_rows if r["model"] == model and r["fit"] == "pooled"
                   and r["stratum"] == args.stratum]
+        logo = [r for r in model_rows if r["model"] == model and r["fit"].startswith("logo_")]
+        caveat = censoring_caveat(run) if model == "survival" and (chosen or logo) else None
         rows = [[r["disease"], r["variant"], r["horizon"], *(r.get(m) for m in metrics)]
                 for r in sorted(chosen, key=lambda r: (r["disease"], r["horizon"], r["variant"]))]
         print_table(f"{model}: pooled fits, stratum {args.stratum}", ["disease", "variant", "horizon", *metrics], rows)
-        logo = [r for r in model_rows if r["model"] == model and r["fit"].startswith("logo_")]
+        if caveat and rows:
+            print(caveat)
         rows = [[r["disease"], r["variant"], r["fit"][len("logo_"):], r["horizon"], *(r.get(m) for m in metrics)]
                 for r in sorted(logo, key=lambda r: (r["disease"], r["fit"], r["horizon"], r["variant"]))]
         print_table(f"{model}: leave-one-group-out refits, scored on the held-out group's test rows",
                     ["disease", "variant", "held_out", "horizon", *metrics], rows)
+        if caveat and rows:
+            print(caveat)
 
     fit_fields = ["fits", "ok", "failed", "median_seconds", "max_seconds", "cpu_seconds", "threads", "max_rss_mb"]
     print_table("fits (disease_model_variant_component)", ["fit", *fit_fields],

@@ -333,6 +333,59 @@ def test_exclusion_exits_release_as_a_subgroup_and_flag_over_one_percent():
     assert "exclusion_exits_count" not in parsed[0] and "withheld" in tabulate.exclusion_caveats(parsed)[0]
 
 
+def test_every_survival_table_prints_its_censoring_caveat(tmp_path):
+    import contextlib
+    import importlib.util
+    import io
+    spec = importlib.util.spec_from_file_location("tabulate_study", HERE / "tabulate_study.py")
+    tabulate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tabulate)
+
+    def table(rows, run):
+        tokens = tmp_path / "tokens.txt"
+        tokens.write_text("\n".join(digest.names(digest.suppress(rows, 20, REGISTRY), 20, REGISTRY)
+                                    + digest.operation_names([{"scope": "study", "item": "run", **run}])))
+        out, argv = io.StringIO(), sys.argv
+        sys.argv = ["tabulate_study.py", str(tokens)]
+        try:
+            with contextlib.redirect_stdout(out):
+                tabulate.main()
+        finally:
+            sys.argv = argv
+        return out.getvalue()
+    binary = [cell("overall", 1000, 100)]
+    survival = [cell("overall", 1000, 100, model="survival", horizon=1.0),
+                cell("overall", 400, 40, model="survival", fit="logo:ancestry:afr", horizon=1.0)]
+    last_contact = tabulate.CENSORING_CAVEATS["ehr_end"]
+    # The pooled and the leave-one-group-out survival tables each carry it; a binary table does not.
+    assert table(binary + survival, {"censoring": "ehr_end"}).count(last_contact) == 2
+    assert "CAVEAT survival" not in table(binary, {"label": "production"})
+    # A survival table from a run with no recorded rule, or a rule without a caveat, is refused.
+    raises(ValueError, table, survival, {"label": "production"})
+    raises(ValueError, table, survival, {"censoring": "obs_end"})
+
+
+def test_the_primary_censoring_rule_is_required_known_and_reasoned(tmp_path):
+    study = driver()
+    config = json.loads((HERE / "study.json").read_text())
+    config["diseases"] = json.loads((HERE / config["diseases_file"]).read_text())
+
+    def load(value):
+        path = tmp_path / "study.json"
+        path.write_text(json.dumps(value))
+        return study.load_config(path)[0]
+
+    def edited(change):
+        value = json.loads(json.dumps(config))
+        change(value)
+        return value
+    assert load(config)["primary_censoring_rule"] == "ehr_end"   # SPEC section 8 N2b, 2026-09-19 17:45Z
+    raises(ValueError, load, edited(lambda c: c.update(primary_censoring_rule="obs_end")))
+    raises(ValueError, load, edited(lambda c: c["reasons"].pop("primary_censoring_rule")))
+    raises(ValueError, load, edited(lambda c: c.pop("primary_censoring_rule")))   # its reason is then stale
+    raises(ValueError, load, edited(lambda c: (c.pop("primary_censoring_rule"), c["reasons"].pop("primary_censoring_rule"))))
+
+
 def test_cohort_counts_by_ancestry_are_partitioned_and_nested():
     by_ancestry = {"afr": {"binary_n": 400, "binary_cases": 60, "survival_n": 390, "survival_disease": 30,
                            "survival_death": 25},
@@ -552,12 +605,19 @@ def test_claims_need_the_convergence_rule_and_sized_replicates():
     raises(ValueError, check, planned, claim_run=True)                 # unsized cells: no fallback to 5
     metrics = list(planned["claims"]["margins"])
     cell = {"sd_dev": 0.001, "delta": 0.002, "source_job": "1330000", "converged_starts": True}
-    # R = max(5, ceil((2 * 1.96 * 0.001 / 0.002)^2)) = max(5, ceil(3.84)) = 5.
-    planned["claims"]["replicates"]["by_scenario_metric"] = {f"realistic.{m}": {**cell, "R": 5} for m in metrics}
+    # The smallest R >= 5 with R >= (2 t_{R-1} 0.001 / 0.002)^2 is 7 (t_6 = 2.447 needs 5.99);
+    # a fixed t = 1.96 would have passed R = 5, and t_5 = 2.571 needs 6.61 > 6.
+    planned["claims"]["replicates"]["by_scenario_metric"] = {f"realistic.{m}": {**cell, "R": 7} for m in metrics}
     check(planned, claim_run=True)
+    short = json.loads(json.dumps(planned))
+    short["claims"]["replicates"]["by_scenario_metric"]["realistic.rmse_true"]["R"] = 6
+    raises(ValueError, check, short, claim_run=True)
     wide = json.loads(json.dumps(planned))
-    wide["claims"]["replicates"]["by_scenario_metric"]["realistic.auc_true"]["sd_dev"] = 0.004   # needs R = 62
+    wide["claims"]["replicates"]["by_scenario_metric"]["realistic.auc_true"]["sd_dev"] = 0.004   # needs R = 64
     raises(ValueError, check, wide, claim_run=True)
+    fixed_t = json.loads(json.dumps(config))
+    fixed_t["claims"]["replicates"]["t"] = 1.96                        # the sizing takes t_{R-1}, never a fixed t
+    raises(ValueError, check, fixed_t)
     unconverged = json.loads(json.dumps(planned))
     unconverged["claims"]["replicates"]["by_scenario_metric"]["realistic.oe_true"]["converged_starts"] = False
     raises(ValueError, check, unconverged, claim_run=True)
@@ -593,14 +653,69 @@ def test_a_planted_pooled_standardization_fires_the_logo_gate():
                           "test": rng.random(1000) < 0.2,
                           "ancestry": rng.choice(["afr", "eur"], 1000, p=[0.3, 0.7])})
     fit = "logo:ancestry:afr"
-    train = frame.loc[driver.training_rows(frame, fit)]
+    train = frame.loc[driver.training_rows(frame, fit, "binary")]
     record = {"train_rows": len(train), "train_sha256": driver.person_set_hash(train.person_id),
               "held_out_in_train": 0, "standardization": driver.standardize(train.pgs)}
-    assert driver.verify_provenance(frame, fit, record) == record["standardization"]
-    pooled = frame.loc[driver.training_rows(frame, "pooled")]
+    assert driver.verify_provenance(frame, fit, "binary", record) == record["standardization"]
+    pooled = frame.loc[driver.training_rows(frame, "pooled", "binary")]
     planted = dict(record, standardization=driver.standardize(pooled.pgs))
-    raises(ValueError, driver.verify_provenance, frame, fit, planted)
-    raises(ValueError, driver.verify_provenance, frame, fit, dict(record, train_rows=len(pooled)))
+    raises(ValueError, driver.verify_provenance, frame, fit, "binary", planted)
+    raises(ValueError, driver.verify_provenance, frame, fit, "binary", dict(record, train_rows=len(pooled)))
+
+
+class CaptureFit:
+    """A models module whose fit keeps the inputs it was given."""
+    def fit(self, kind, variant, component, data, settings, out, reference, disease=None):
+        self.data = data.copy()
+        return {}
+
+
+def test_zero_length_survival_rows_leave_every_fit_and_nothing_else(tmp_path):
+    study = driver()
+    rng = np.random.default_rng(5)
+
+    def rows(n, zero):
+        entry = rng.uniform(40, 70, n)
+        followup = np.zeros(n) if zero else rng.uniform(0.1, 8, n)
+        return pd.DataFrame({"pgs": rng.normal(0, 1, n), "test": rng.random(n) < 0.2,
+                             "ancestry": rng.choice(["afr", "eur"], n, p=[0.3, 0.7]), "entry_age": entry,
+                             "exit_age": entry + followup, "followup": followup,
+                             "event": np.zeros(n, np.int8) if zero else rng.choice([0, 1, 2], n).astype(np.int8),
+                             "n_dates": rng.integers(0, 3, n)})
+    clean, zero = rows(400, False), rows(40, True)
+    zero.loc[zero.index[:30], "test"] = False              # most of the planted rows are development rows
+    # The planted rows interleaved; the clean rows keep their order.
+    planted = pd.concat([clean.iloc[:150], zero.iloc[:20], clean.iloc[150:], zero.iloc[20:]], ignore_index=True)
+    clean["person_id"] = np.arange(len(clean), dtype=np.int64)
+    planted["person_id"] = np.concatenate([np.arange(150), 1000 + np.arange(20), np.arange(150, 400),
+                                           1020 + np.arange(20)]).astype(np.int64)
+    config = {"models": {}}
+    for fit in ("pooled", "logo:ancestry:afr"):
+        records, inputs = {}, {}
+        for name, frame in (("clean", clean), ("planted", planted)):
+            frame.to_parquet(tmp_path / f"{name}.parquet")
+            step = f"fits/{name}/{fit.replace(':', '__')}"
+            (tmp_path / step).mkdir(parents=True)
+            capture = CaptureFit()
+            study.run_fit({"root": str(tmp_path), "step": step, "kind": "survival", "fit": fit, "variant": "ours",
+                           "component": "disease", "frame": f"{name}.parquet", "reference": None,
+                           "disease_definition": {}}, config, capture)
+            records[name], inputs[name] = study.read_json(tmp_path / step / "fit.json"), capture.data
+            # The provenance gate at predict rebuilds the same rows from the unchanged frame.
+            assert study.verify_provenance(frame, fit, "survival", records[name]) == records[name]["standardization"]
+        pd.testing.assert_frame_equal(inputs["planted"], inputs["clean"])
+        assert records["planted"]["standardization"] == records["clean"]["standardization"]
+        assert records["planted"]["train_sha256"] == records["clean"]["train_sha256"]
+        held = study.held_out(zero, fit)
+        assert records["clean"]["dropped_zero_length"] == 0
+        assert records["planted"]["dropped_zero_length"] == int((~zero.test & ~held).sum()) > 0
+    # Evaluation and G keep them: the frame's own rows are unchanged.
+    assert len(study.load_frame(tmp_path / "planted.parquet")) == 440
+    # A binary frame has no zero-length rows, and a zero-length row with an event is a frame defect.
+    assert not study.zero_length(clean, "binary").any()
+    broken = planted.copy()
+    broken.loc[160, "event"] = 1
+    raises(ValueError, study.training_rows, broken, "pooled", "survival")
 
 
 if __name__ == "__main__":

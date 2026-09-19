@@ -69,6 +69,7 @@
     "calibrate_sha": "1692eab7"
   },
   "reasons": {
+    "primary_censoring_rule": "SPEC sections 3 and 8 N2b, decided 2026-09-19 17:45Z on study-eval's 5 worlds x 12 diseases: censoring at last EHR contact on the landmark-only frame overstates absolute risk against the truth by +3 to +6% at 1-5 y (pooled +4.5%), with AUC unaffected; min(death, CDR cutoff) understates it by 14-26% (pooled -19.8%) and is a sensitivity row only; the results table carries the caveat",
     "shipped.calibrate_sha": "replicates gnomon calibrate as shipped at gnomon 1692eab7 (one joint Duchon over the PCs on gam's default kernel; Gaussian terms from gam's own term builder, #2393; no Weibull baseline target); not a tuning choice (update at the #2370 cutover pin)",
     "fit_gate.min_events": "SPEC section 8 (23:45Z): a model with fewer training events than about its coefficients is not estimable by any solver; 100, the bar shared competing fits already use",
     "data.maximum_bytes_billed": "SPEC section 7a 01:00Z: the six-domain EHR end is estimated at about 70 GB (66-95), see SCHEMA.md Byte estimate; plan() dry-run gates",
@@ -94,7 +95,7 @@
     "scenarios": [],
     "convergence": {"starts": 2, "max_dRisk_over_SD": 0.01, "on_fail": "inconclusive_not_converged",
                     "reason": "SPEC section 8 R1: non-convergence is numerical error, not sampling noise; a cell whose fit fails the 2-start test is never classified and is filed as a gam bug"},
-    "replicates": {"minimum": 5, "t": 1.96, "by_scenario_metric": {}},
+    "replicates": {"minimum": 5, "by_scenario_metric": {}},
     "margins": {
       "rmse_true": {"delta": 0.02, "scale": "relative", "floor": 0.0005, "reason": "risk RMSE within max(2% of the competitor's, 0.0005): below a seed-to-seed change"},
       "oe_true": {"delta": 0.02, "scale": "absolute", "measure": "expected abs(O/E_true - 1)", "reason": "calibration-in-the-large within 2 points of O/E = 1 against the true risk"},
