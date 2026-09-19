@@ -450,7 +450,16 @@ def test_tables_follow_schema_and_latent_world():
         num = truth.select_dtypes("number")
         assert np.isfinite(num.to_numpy(float)[~num.isna().to_numpy()]).all()
         assert (truth.cif_1y.notna() == truth.in_survival).all()
-        assert (truth.uncensored_event.notna() == truth.in_survival).all()
+        # Only a frame row whose EHR ended by the landmark lacks the uncensored outcome, and only when the latent
+        # world has a code of it by the landmark (so the no-exit world would not admit the row).
+        unknown = truth.in_survival & truth.uncensored_event.isna()
+        assert (truth.uncensored_event.notna() <= truth.in_survival).all() and unknown.any()
+        assert (truth.cutoff_event.isna() == truth.uncensored_event.isna()).all()
+        lost = truth[unknown].merge(person, on="person_id")
+        landmark = lost.baseline_date.to_numpy("datetime64[D]").astype(np.int64) + sim.LANDMARK_DAYS
+        assert (lost.ehr_end.to_numpy("datetime64[D]").astype(np.int64) <= landmark).all()
+        birth_day = lost.birth_date.to_numpy("datetime64[D]").astype(np.int64)
+        assert (lost.t1_age.to_numpy(float) < (landmark + 1 - birth_day) / sim.DAYS).all()  # by the landmark's end
 
         # The observed survival outcome must be the latent one wherever observation did not end first.
         dis = sim.load_diseases(sim.DEFAULT_DISEASES)[0]
@@ -481,6 +490,7 @@ def test_truth_frames_match_study_phenotypes():
     the fixtures' mode, whose truth is computed only on those rows, so a missed row shows up as a null."""
     from study import cohort, phenotypes
     world, s = world_and_sample(20000, 3, "realistic", False)
+    kept = {}
     with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as d:
         for censoring in sim.CENSORING:
             out = Path(d) / censoring
@@ -499,6 +509,11 @@ def test_truth_frames_match_study_phenotypes():
                 assert set(binary.person_id) <= set(rows.person_id), (censoring, disease.slug)
                 assert (surv.event != 3).all(), (censoring, disease.slug)   # exclusions censor (below 1%)
                 assert rows.p_ever.notna().all() and rows.cif_1y[rows.in_survival].notna().all()
+                kept[censoring, disease.slug] = set(surv.person_id)
+    # Survival eligibility reads only what is known at the landmark, and the two censoring rules share one latent
+    # world, so they keep the same rows; they differ only in where follow-up ends.
+    for disease in diseases:
+        assert kept["independent", disease.slug] == kept["lastcontact", disease.slug], disease.slug
 
 
 def main():

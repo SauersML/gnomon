@@ -75,9 +75,10 @@ known at baseline and p_ever = P2(X). ``p_ever_noexit`` is the same with r_X = 0
 cutoff).
 
 cif_{h}y (survival). Entry is at tau0, the end of the landmark day, which gives entry age aL = (landmark + 1 - b) /
-365.25. The frame keeps people with no record dated on or before the landmark who are alive past it; the event is
-the SECOND qualifying date. There is no exit and no cutoff (both are censoring). In the equations below, tau = t -
-aL and P0 = exp(-mu0 (aL - E0)).
+365.25. The frame keeps people with no record dated on or before the landmark who are alive past it, whose EHR began
+by it, while the cutoff is after it: only what is known at the landmark. An EHR with no record after the landmark is
+censored at entry. The event is the SECOND qualifying date. There is no exit and no cutoff (both are censoring). In
+the equations below, tau = t - aL and P0 = exp(-mu0 (aL - E0)).
     A    = F(E0) e^{-mu1 (aL - E0)} + int_E0^aL f(s) e^{-mu0 (s - E0) - mu1 (aL - s)} ds     onset < aL, no code yet
     Den  = A + P0 (1 - F(aL))                                                               = P(entry | alive)
     Q(t) = A q(mu1 tau) + P0 [(1 - F(t)) q(mu0 tau) + int_aL^t f(s) q(mu0 (s - aL) + mu1 (t - s)) ds]
@@ -1387,8 +1388,9 @@ def build_frames(sim, censoring):
         for other in sim["diseases"]:
             if other["dp"].spec.exclusion_of == spec.slug:
                 excluded |= met[other["dp"].spec.root] <= landmark
+        # Only what is known at the landmark: an EHR with no record after it is censored at entry, not removed.
         surv = (pop & ~excluded & (rec["first_day"] > landmark) & ~(death_rec & (death_day <= landmark))
-                & ehr & (np.minimum(ehr_end, day(CDR_CUTOFF)) > landmark))
+                & ehr & (ehr_start <= landmark) & (day(CDR_CUTOFF) > landmark))
         frames[spec.slug] = (pop, surv)
     periods = dict(ehr_start=ehr_start, ehr_end=ehr_end, obs_start=obs_start, obs_end=obs_end, covering=covering)
     return base_mask, frames, periods
@@ -1450,6 +1452,9 @@ def truth_table(sim, frames, censoring):
         ev_u, age_u = _outcome(rec, p, admin_end)
         ev_c, age_c = _outcome(rec, p, cutoff_end)
         sj = surv[j]
+        # A frame row whose EHR exit came by the landmark can hold latent codes after that exit and by the landmark,
+        # never recorded. The no-exit world would not admit it, so it has no uncensored or cutoff outcome.
+        known = sj & (~np.isfinite(rec["t1"][j]) | (rec["first_day_latent"][j] > landmark[j]))
         row = {"disease": spec.slug, "person_id": p["person_id"][j], "p_ever": t["p_ever"][j],
                "p_ever_noexit": t["p_ever_noexit"][j],
                "slope": probit_slope(t["p_ever"][j], t["dp_ever"][j], ds_dz),
@@ -1459,9 +1464,10 @@ def truth_table(sim, frames, censoring):
                "index_scale": rec["terms"]["scale"][j],
                "onset_age": rec["t_d"][j], "t1_age": rec["t1"][j], "t2_age": rec["t2"][j],
                "p_entry": t["den"][j], "in_survival": sj,
-               "uncensored_event": np.where(sj, ev_u[j], np.nan),
-               "uncensored_exit_age": np.where(sj, age_u[j], np.nan),
-               "cutoff_event": np.where(sj, ev_c[j], np.nan), "cutoff_exit_age": np.where(sj, age_c[j], np.nan)}
+               "uncensored_event": np.where(known, ev_u[j], np.nan),
+               "uncensored_exit_age": np.where(known, age_u[j], np.nan),
+               "cutoff_event": np.where(known, ev_c[j], np.nan),
+               "cutoff_exit_age": np.where(known, age_c[j], np.nan)}
         for i, h in enumerate(horizons):
             row[f"cif_{h}y"] = np.where(sj, t["cif"][j, i], np.nan)
             row[f"slope_cif_{h}y"] = np.where(sj, probit_slope(t["cif"][j, i], t["dcif"][j, i], ds_dz), np.nan)

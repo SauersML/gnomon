@@ -376,6 +376,7 @@ def base_cohort(source, config):
     frame["test"], frame["fold"] = split(base_id, config)
     frame["_birth"], frame["_baseline"] = birth[rows], baseline[rows]
     frame["_obs_end"], frame["_death"] = obs_end[rows], days(person.column("death_date"))[rows]
+    frame["_ehr_start"] = days(person.column("ehr_start"))[rows]
     frame["_ehr_end"] = days(person.column("ehr_end"))[rows]
     return Base(frame, flow.steps, {"ses_quartile": ses_cuts, "lookback_tertile": lookback_cuts},
                 cutoff, config, pd.Index(base_id))
@@ -470,7 +471,13 @@ def survival_frame(rows, base, config, *, onset="second", censor="ehr_end"):
     censors at the last EHR-sourced record (SPEC section 3, 21:22Z: AoU's
     observation period also counts survey and physical-measurement dates),
     capped at the CDR cutoff because no record exists after it; "cutoff"
-    censors at min(death, cutoff) alone. Follow-up needs ehr_end past the landmark.
+    censors at min(death, cutoff) alone.
+
+    Eligibility reads only what is known at the landmark: no record, exclusion
+    match or death by it, an EHR begun by it, and the cutoff after it. An EHR
+    with no record after the landmark is censored at entry (follow-up 0), not
+    removed: requiring a later record would condition on the future, and under
+    last-contact censoring that record depends on the outcome.
 
     Exclusion roots (SPEC section 2, audit C3) remove only people who meet their
     case rule by the landmark; meeting it later CENSORS at that date. The
@@ -501,15 +508,16 @@ def survival_frame(rows, base, config, *, onset="second", censor="ehr_end"):
     flow.step("no_record_by_landmark", keep)
     keep &= ~(death <= landmark)
     flow.step("alive_at_landmark", keep)
-    keep &= observed_to > landmark
-    flow.step("ehr_past_landmark", keep)
-    if censor == "cutoff":
-        keep &= cutoff > landmark
-        flow.step("cutoff_past_landmark", keep)
+    keep &= frame._ehr_start.to_numpy() <= landmark  # NaN (no EHR) fails
+    flow.step("ehr_by_landmark", keep)
+    keep &= cutoff > landmark
+    flow.step("cutoff_past_landmark", keep)
 
     confirmed = frame.n_dates.to_numpy() >= 2
     event_day = np.where(confirmed, frame._second.to_numpy() if onset == "second" else first, np.nan)
-    exit_day = np.fmin(np.fmin(np.fmin(event_day, death), end), excluded)
+    # Every event, death and exclusion match of a kept row falls after the
+    # landmark, so only an end of observation by it is lifted to the entry.
+    exit_day = np.fmax(np.fmin(np.fmin(np.fmin(event_day, death), end), excluded), landmark)
     event = np.where(event_day == exit_day, 1, np.where(death == exit_day, 2, 0)).astype(np.int8)
     exits = int(((excluded == exit_day) & (event == 0))[keep].sum())  # censored by an exclusion match
     birth = frame._birth.to_numpy()
@@ -520,13 +528,15 @@ def survival_frame(rows, base, config, *, onset="second", censor="ehr_end"):
     out["exit_age"] = ((exit_day - birth) / YEAR)[keep]
     out["event"] = event[keep]
     out["followup"] = out.exit_age.to_numpy() - out.entry_age.to_numpy()
-    if not (out.followup.to_numpy() > 0).all():
-        raise AssertionError("a survival row exits at or before its entry")
+    at_entry = out.followup.to_numpy() == 0
+    if not (out.followup.to_numpy() >= 0).all() or (out.event.to_numpy()[at_entry] != 0).any():
+        raise AssertionError("a survival row exits before its entry, or has an event at it")
     out = out.reset_index(drop=True)
     counts = {"steps": flow.steps,
               "events": {"censored": int((out.event == 0).sum()), "disease": int((out.event == 1).sum()),
                          "death": int((out.event == 2).sum())},
               "exclusion_exits": exits,
+              "censored_at_entry": int(at_entry.sum()),
               "single_record_at_risk": int((out.n_dates == 1).sum())}
     return out, counts
 
@@ -594,24 +604,25 @@ def _summary(years, horizons):
 def followup_distribution(base, config):
     """Outcome-blind follow-up from the landmark, used to fix the horizons (audit S6, N4).
 
-    The population is base participants alive at the landmark whose EHR runs
-    past it (the survival frame's rules without any disease record). The
-    horizon basis is ADMINISTRATIVE follow-up, cutoff - landmark, because a
-    case's own records extend the EHR. Observed follow-up (ehr_end capped at
-    the cutoff) is reported beside it, and administrative follow-up is broken
-    down by entry year. `ehr` describes, over the whole base cohort, how the
-    EHR end relates to AoU's observation-period end, which also counts survey
-    and physical-measurement dates (SPEC section 3, 21:22Z).
+    The population is base participants alive at the landmark whose EHR began
+    by it, with the cutoff after it (the survival frame's rules without any
+    disease record). The horizon basis is ADMINISTRATIVE follow-up, cutoff -
+    landmark, because a case's own records extend the EHR. Observed follow-up
+    (ehr_end capped at the cutoff, and 0 for an EHR silent after the landmark)
+    is reported beside it, and administrative follow-up is broken down by entry
+    year. `ehr` describes, over the whole base cohort, how the EHR end relates
+    to AoU's observation-period end, which also counts survey and
+    physical-measurement dates (SPEC section 3, 21:22Z).
     """
     frame = base.frame
     landmark = frame._baseline.to_numpy() + config.landmark_days
     ehr_end, obs_end, death = frame._ehr_end.to_numpy(), frame._obs_end.to_numpy(), frame._death.to_numpy()
     observed_to = np.minimum(ehr_end, base.cdr_cutoff_day)
-    eligible = ~(death <= landmark) & (observed_to > landmark)
+    eligible = ~(death <= landmark) & (frame._ehr_start.to_numpy() <= landmark) & (base.cdr_cutoff_day > landmark)
     if not eligible.any():
-        raise ValueError("no base participant is alive with EHR past the landmark")
+        raise ValueError("no base participant is alive at the landmark with an EHR begun by it before the cutoff")
     administrative = (base.cdr_cutoff_day - landmark)[eligible] / YEAR
-    observed = (observed_to - landmark)[eligible] / YEAR
+    observed = np.maximum(observed_to - landmark, 0.0)[eligible] / YEAR
     entry_year = _year(landmark[eligible])
     horizons = sorted(set(HORIZON_CANDIDATES) | set(config.horizon_candidates))
     both = ~np.isnan(ehr_end)

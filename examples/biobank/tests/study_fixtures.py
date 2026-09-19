@@ -39,8 +39,12 @@ def manifest(roots=ROOTS, scores=SCORES, num_pcs=8, ses_available=True, cutoff=C
             "cdr_cutoff_source": "simulator"}
 
 
-def synthetic_tables(n, seed=0, roots=ROOTS, scores=SCORES, num_pcs=8, grid_days=None, record_rate=0.2):
-    """Every contract table for n people: a mix of eligible and ineligible, cases and single records."""
+def synthetic_tables(n, seed=0, roots=ROOTS, scores=SCORES, num_pcs=8, grid_days=None, record_rate=0.2,
+                     late_ehr=0.0):
+    """Every contract table for n people: a mix of eligible and ineligible, cases and single records.
+
+    late_ehr is the fraction of EHRs that begin inside the observation period after baseline, some of them
+    after the landmark."""
     rng = np.random.default_rng(seed)
     cutoff = day(CUTOFF)
     snap = (lambda d: np.floor(d / grid_days) * grid_days) if grid_days else (lambda d: np.floor(d))
@@ -56,6 +60,9 @@ def synthetic_tables(n, seed=0, roots=ROOTS, scores=SCORES, num_pcs=8, grid_days
     # The EHR ends at or before the observation period, which also counts surveys and measurements.
     has_ehr = covered & (rng.random(n) < 0.97)
     ehr_start = np.where(has_ehr, obs_start, np.nan)
+    if late_ehr:
+        late = has_ehr & (rng.random(n) < late_ehr)
+        ehr_start = np.where(late, np.floor(baseline + rng.random(n) * (obs_end - baseline)), ehr_start)
     ehr_end = np.where(rng.random(n) < 0.6, obs_end, snap(obs_end - rng.exponential(200, n)))
     ehr_end = np.where(has_ehr, np.maximum(ehr_end, ehr_start), np.nan)
     death = np.where(rng.random(n) < 0.08, snap(np.nan_to_num(baseline, nan=cutoff - 400)
