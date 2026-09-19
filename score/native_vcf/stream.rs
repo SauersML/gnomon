@@ -28,10 +28,9 @@ use std::simd::prelude::*;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
-/// Blocks inflated per rayon worker in one batch.
+/// Blocks inflated per rayon worker in one batch; a batch of plain text or gzip members reads as
+/// many blocks' worth of bytes.
 const BGZF_BLOCKS_PER_WORKER: usize = 64;
-/// Bytes read per rayon worker in one batch of plain text or gzip members.
-const TEXT_BYTES_PER_WORKER: usize = BGZF_BLOCKS_PER_WORKER * BGZF_MAX_DATA_LEN;
 /// Parts a batch is cut into per rayon worker, so one slow part leaves few workers idle.
 const PARTS_PER_WORKER: usize = 4;
 /// Compressed bytes requested from the source per read.
@@ -50,6 +49,11 @@ pub(super) fn score_source(
     let mut stream = InflatedStream::new(source);
     let mut bytes = Bytes::default();
     let mut at_end = false;
+    let batch_blocks = threads * BGZF_BLOCKS_PER_WORKER;
+    // The header is read a block at first and twice as many each time after, so past its end it
+    // reads less than its own length and a block, and its scans total less than twice what it
+    // reads. Reading a whole batch each time put two batches of text in the first batch.
+    let mut header_blocks = 1usize;
     let header_len = loop {
         let len = match format {
             VariantFormat::Vcf => vcf_header_len(bytes.filled(), at_end),
@@ -58,7 +62,8 @@ pub(super) fn score_source(
         if let Some(len) = len {
             break len;
         }
-        at_end = !stream.fill(&mut bytes, threads)?;
+        at_end = !stream.fill(&mut bytes, header_blocks)?;
+        header_blocks = (2 * header_blocks).min(batch_blocks);
     };
     let header_bytes = &bytes.filled()[..header_len];
     let header = match format {
@@ -95,7 +100,7 @@ pub(super) fn score_source(
     loop {
         let mut source_error = None;
         if !at_end {
-            match stream.fill(&mut bytes, threads) {
+            match stream.fill(&mut bytes, batch_blocks) {
                 Ok(more) => at_end = !more,
                 Err(err) => source_error = Some(err),
             }
@@ -447,16 +452,16 @@ impl InflatedStream {
         }
     }
 
-    /// Appends the next batch of inflated bytes to `out`, returning `false` once
-    /// the stream is exhausted.
-    fn fill(&mut self, out: &mut Bytes, threads: usize) -> io::Result<bool> {
+    /// Appends at most `blocks` BGZF blocks of inflated bytes to `out`, or as many
+    /// blocks' worth of other bytes, returning `false` once the stream is exhausted.
+    fn fill(&mut self, out: &mut Bytes, blocks: usize) -> io::Result<bool> {
         if let Input::Text(reader) = &mut self.input {
-            return read_text(reader.as_mut(), out, threads * TEXT_BYTES_PER_WORKER);
+            return read_text(reader.as_mut(), out, blocks * BGZF_MAX_DATA_LEN);
         }
         if matches!(self.input, Input::Done) {
             return Ok(false);
         }
-        self.fill_bgzf(out, threads * BGZF_BLOCKS_PER_WORKER)
+        self.fill_bgzf(out, blocks)
     }
 
     fn fill_bgzf(&mut self, out: &mut Bytes, batch_blocks: usize) -> io::Result<bool> {
@@ -593,7 +598,7 @@ fn read_text(reader: &mut dyn Read, out: &mut Bytes, len: usize) -> io::Result<b
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use super::{BoxError, for_each_line};
+    use super::{BoxError, Bytes, InflatedStream, for_each_line};
     use flate2::Crc;
     use std::io::Write as _;
 
@@ -915,6 +920,28 @@ mod tests {
             bytes.extend_from_slice(&u32::try_from(chunk.len()).expect("ISIZE").to_le_bytes());
         }
         bytes
+    }
+
+    /// A fill appends at most its count of BGZF blocks, or as many blocks' worth of plain text: the
+    /// unit a batch, and each of the header's reads, is sized in.
+    #[test]
+    fn a_fill_appends_at_most_its_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let text: Vec<u8> = (0..400_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let plain = dir.path().join("text.vcf");
+        let bgzf = dir.path().join("text.vcf.gz");
+        std::fs::write(&plain, &text).expect("write text");
+        std::fs::write(&bgzf, bgzf_bytes(&text, 1000)).expect("write bgzf");
+        for (path, block) in [(plain, BGZF_MAX_DATA_LEN), (bgzf, 1000)] {
+            let mut stream = InflatedStream::new(open_variant_source(&path).expect("open"));
+            let mut bytes = Bytes::default();
+            let mut read = 0;
+            for blocks in [1, 2, 3] {
+                assert!(stream.fill(&mut bytes, blocks).expect("fill"), "{path:?}");
+                read += blocks;
+                assert_eq!(bytes.filled(), &text[..read * block], "{path:?}");
+            }
+        }
     }
 
     /// A random cohort for the batched reader: hard calls of several ploidies,
