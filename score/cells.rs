@@ -849,11 +849,16 @@ impl ExactPlan {
             return Err(invalid("bands no score holds"));
         }
         // A weight past i64 comes back from its f64 as the plan compiled it: its shortest decimal
-        // at its band's scale. One that i64 holds was never saved this way.
-        let rebuilt = (0..entries)
-            .into_par_iter()
-            .with_min_len(PLAN_CHUNK)
-            .filter(|&i| flags[i] & SAVED_WIDE != 0)
+        // at its band's scale. One that i64 holds was never saved this way. Only a chunk whose flags
+        // OR to SAVED_WIDE holds one, and that OR reads the flags a vector at a time: testing each
+        // entry's flag instead cost a plan with none, rare N 1,000 K 512, 6.6% more instructions.
+        let rebuilt = flags
+            .par_chunks(PLAN_CHUNK)
+            .enumerate()
+            .filter(|(_, chunk)| chunk.iter().fold(0u8, |any, &flag| any | flag) & SAVED_WIDE != 0)
+            .flat_map_iter(|(c, chunk)| {
+                (c * PLAN_CHUNK..).zip(chunk).filter(|&(_, &flag)| flag & SAVED_WIDE != 0).map(|(i, _)| i)
+            })
             .map(|i| -> Result<(usize, i128), PlanError> {
                 let weight = f64::from_bits(weights[i] as u64);
                 let (multiple, specs) = scores.get(columns[i] as usize).ok_or_else(|| invalid("a wide weight's score"))?;
