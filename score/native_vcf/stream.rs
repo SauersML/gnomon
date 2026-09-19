@@ -426,8 +426,8 @@ pub(super) fn score_source(
                 BcfReader::from(&filled[complete..])
                     .read_record(&mut noodles_bcf::Record::default())?;
             }
-            let totals = accumulator.finish()?;
-            return native_result(totals, person_iids, score_names, input_path);
+            let (totals, report) = accumulator.finish()?;
+            return Ok(native_result(totals, report, person_iids, score_names));
         }
         bytes.consume(taken);
     }
@@ -1017,7 +1017,7 @@ mod tests {
             "variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.5\n1:100\tT\tA\t1\n1:200\tC\t.\t2\n",
         )
         .expect("write score");
-        let (_, rules) = load_score_rules(std::slice::from_ref(&score_path), None).expect("rules");
+        let (_, rules) = load_score_rules(std::slice::from_ref(&score_path), None, false).expect("rules");
         let (samples, held, threads) = (10, 4096, 2);
         let charge = |max| {
             super::MemoryCharge::new(MemoryBudget::of(max, held), Layout::Vcf, true, samples, samples, 1, &rules, threads)
@@ -1086,7 +1086,7 @@ mod tests {
             let score_path = dir.path().join("score.gnomon.tsv");
             std::fs::write(&score_path, format!("variant_id\teffect_allele\tother_allele\tS\n{rows}"))
                 .expect("write score");
-            let (_, rules) = load_score_rules(std::slice::from_ref(&score_path), None).expect("rules");
+            let (_, rules) = load_score_rules(std::slice::from_ref(&score_path), None, false).expect("rules");
             let &(start, end) = rules.ranges.values().next().expect("one position");
             let score_rules = &rules.rules[start..end];
             let need = scored_record_need(
@@ -1149,9 +1149,14 @@ mod tests {
 
     /// Scores `path` with the rules of `score_path` within a budget of `budget` bytes, read while
     /// this process holds nothing it counts, and gives what the run added to the heap at most.
-    fn counted_run(path: &Path, score_path: &Path, budget: usize) -> (Result<NativeVcfScoreResult, BoxError>, usize) {
+    fn counted_run(
+        path: &Path,
+        score_path: &Path,
+        budget: usize,
+        report: bool,
+    ) -> (Result<NativeVcfScoreResult, BoxError>, usize) {
         use std::sync::atomic::Ordering::Relaxed;
-        let scored = load_score_rules(std::slice::from_ref(&score_path.to_path_buf()), None)
+        let scored = load_score_rules(std::slice::from_ref(&score_path.to_path_buf()), None, report)
             .and_then(|(names, rules)| Ok((names, rules, open_variant_source(path)?)));
         let (names, rules, source) = match scored {
             Ok(scored) => scored,
@@ -1173,8 +1178,9 @@ mod tests {
     /// The memory budget bounds the heap a native run allocates (#2396), over cohorts whose
     /// decoded records dwarf their text: one sample at a time, dosages of forty, multiallelic
     /// records at a position where a rule names no single other allele, split multiallelic records,
-    /// some repeated, whose sites build columns for a REF-effect row and a repeated ALT, and 500
-    /// scores at every position; each as plain VCF, BGZF VCF and BCF. For each, the least budget that runs
+    /// some repeated, whose sites build columns for a REF-effect row and a repeated ALT, the same
+    /// reporting the rows it does not score (--unmatched-report), and 500 scores at every
+    /// position; each as plain VCF, BGZF VCF and BCF. For each, the least budget that runs
     /// it is found: one byte less refuses by name, and at it and above it the run scores what an
     /// unbounded run scores, adding no more to the heap than its budget. A budget too small for
     /// the sums refuses before allocating anything, and a record no budget below its own need
@@ -1275,12 +1281,21 @@ mod tests {
         let split_rows: String = (1..=300)
             .map(|position| format!("1:{position}\tA\tG\t1\t\n1:{position}\tG\tA\t0.5\t2\n1:{position}\tT\tA\t0.25\t\n"))
             .collect();
-        for (name, samples, body, names, rows) in [
-            ("one sample", 1, one_sample, "\tS".to_string(), one_sample_rows),
-            ("dosages", 40, dosages, "\tS".to_string(), dosage_rows),
-            ("multiallelic", 20, multiallelic, "\tS".to_string(), multiallelic_rows),
-            ("split", 20, split, "\tS1\tS2".to_string(), split_rows),
-            ("wide panel", 10, wide_panel, wide_panel_names, wide_panel_rows),
+        // The split cohort again with --unmatched-report, and rows it does not score: an allele no
+        // variant carries at each site, and positions where no record sits.
+        let reported_rows = format!(
+            "{split_rows}{}",
+            (1..=300)
+                .map(|position| format!("1:{position}\tC\tA\t1\t2\n1:{}\tA\tG\t\t1\n", position + 1000))
+                .collect::<String>()
+        );
+        for (name, samples, body, names, rows, reported) in [
+            ("one sample", 1, one_sample, "\tS".to_string(), one_sample_rows, false),
+            ("dosages", 40, dosages, "\tS".to_string(), dosage_rows, false),
+            ("multiallelic", 20, multiallelic, "\tS".to_string(), multiallelic_rows, false),
+            ("split", 20, split.clone(), "\tS1\tS2".to_string(), split_rows, false),
+            ("split reported", 20, split, "\tS1\tS2".to_string(), reported_rows, true),
+            ("wide panel", 10, wide_panel, wide_panel_names, wide_panel_rows, false),
         ] {
             let case = dir.path().join(name.replace(' ', "_"));
             std::fs::create_dir_all(&case).expect("case dir");
@@ -1288,9 +1303,12 @@ mod tests {
             std::fs::write(&score_path, format!("variant_id\teffect_allele\tother_allele{names}\n{rows}"))
                 .expect("write score");
             for path in cohort_files(&case, &format!("{}{body}", header(samples))) {
-                let (unbounded, unbounded_added) = counted_run(&path, &score_path, usize::MAX / 2);
+                let (unbounded, unbounded_added) = counted_run(&path, &score_path, usize::MAX / 2, reported);
                 let unbounded = unbounded.unwrap_or_else(|err| panic!("{name} {path:?}: {err}"));
-                let (refused, added) = counted_run(&path, &score_path, 1 << 10);
+                // Each C/A row's two weights, and the one weight at each position without a record.
+                let expected_lines = reported.then_some(300 * 2 + 300);
+                assert_eq!(unbounded.report.as_ref().map(|report| report.lines.len()), expected_lines, "{name} {path:?}");
+                let (refused, added) = counted_run(&path, &score_path, 1 << 10, reported);
                 let refused = refused.expect_err("a budget below the sums");
                 assert!(refused.to_string().starts_with("Scoring requires at least"), "{name} {path:?}: {refused}");
                 assert!(added < 1 << 10, "{name} {path:?}: {added} bytes allocated before refusing");
@@ -1298,9 +1316,9 @@ mod tests {
                 let (mut low, mut high) = (1usize << 10, 1usize << 40);
                 while high - low > 1 {
                     let mid = low + (high - low) / 2;
-                    if counted_run(&path, &score_path, mid).0.is_ok() { high = mid } else { low = mid }
+                    if counted_run(&path, &score_path, mid, reported).0.is_ok() { high = mid } else { low = mid }
                 }
-                let (below, _) = counted_run(&path, &score_path, high - 1);
+                let (below, _) = counted_run(&path, &score_path, high - 1, reported);
                 let below = below.expect_err("one byte below the least budget");
                 let message = below.to_string();
                 assert!(
@@ -1311,7 +1329,7 @@ mod tests {
                 );
                 let mut report = Vec::new();
                 for budget in [high, high + high / 2, 3 * high] {
-                    let (bounded, added) = counted_run(&path, &score_path, budget);
+                    let (bounded, added) = counted_run(&path, &score_path, budget, reported);
                     let bounded = bounded.unwrap_or_else(|err| panic!("{name} {path:?} at {budget}: {err}"));
                     // The budget charges the workers' stacks too, which are not on the heap.
                     let heap = budget - stacks;
@@ -1319,6 +1337,8 @@ mod tests {
                     assert_eq!(bounded.sums(), unbounded.sums(), "{name} {path:?} at {budget}");
                     assert_eq!(bounded.missing_counts, unbounded.missing_counts, "{name} {path:?}");
                     assert_eq!(bounded.score_variant_counts, unbounded.score_variant_counts, "{name} {path:?}");
+                    let lines = |result: &NativeVcfScoreResult| result.report.as_ref().map(|report| report.lines.len());
+                    assert_eq!(lines(&bounded), lines(&unbounded), "{name} {path:?}");
                     report.push(format!("{added} of {heap}"));
                 }
                 eprintln!(
@@ -1846,7 +1866,7 @@ mod tests {
         keep: Option<&Path>,
     ) -> Result<NativeVcfScoreResult, BoxError> {
         let (score_names, rules_by_key) =
-            load_score_rules(std::slice::from_ref(&score_path.to_path_buf()), None)?;
+            load_score_rules(std::slice::from_ref(&score_path.to_path_buf()), None, false)?;
         let mut reader = VcfReader::new(BufReader::new(File::open(vcf_path)?));
         let header = crate::variant_header::read_vcf_header(&mut reader)?.header;
         let all_samples: Vec<String> = header.sample_names().iter().cloned().collect();
@@ -1872,8 +1892,8 @@ mod tests {
             accumulator.take(&mut decoded)?;
             accumulator.apply();
         }
-        let totals = accumulator.finish()?;
-        native_result(totals, person_iids, score_names, vcf_path)
+        let (totals, report) = accumulator.finish()?;
+        require_overlap(native_result(totals, report, person_iids, score_names), vcf_path)
     }
 
     /// Batched scoring of plain and BGZF input, at any block size, thread count

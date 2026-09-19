@@ -88,6 +88,13 @@ struct ScoreArgs {
     /// The most blocks --blocks may name; required above 500.
     #[arg(long, value_name = "N", requires = "blocks")]
     blocks_max: Option<usize>,
+
+    /// Write each weight of a score row that adds to no score to PATH, one line a weight, with
+    /// why (no variant at the position, no allele pair there, several alleles, outside the
+    /// score's region) and the alleles the genotypes hold there. Every genotype format gives the
+    /// same file where it declares, or its alleles read as, the same REF.
+    #[arg(long, value_name = "PATH")]
+    unmatched_report: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -659,6 +666,7 @@ fn run_score(args: ScoreArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.out,
         args.blocks,
         args.blocks_max,
+        args.unmatched_report,
     )
     .map_err(|err| err as Box<dyn std::error::Error>)
 }

@@ -1041,6 +1041,7 @@ mod tests {
             None,
             None,
             super::super::BimRowOrder::Streamed,
+            None,
         )
         .unwrap()
         .0

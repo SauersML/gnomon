@@ -6,6 +6,7 @@ use crate::score::pipeline::MemoryBudget;
 use crate::score::prepare::EffectOnlyMatches;
 use crate::score::site::{RowMatch, Site, SiteAllele, names_no_single_other_allele, row_side};
 use crate::score::types::{GenomicRegion, parse_chromosome_label};
+use crate::score::unmatched::{Line, Unmatched, alleles_seen, write_report};
 use crate::shared::files::open_variant_source;
 use ahash::{AHashMap, AHashSet};
 use flate2::read::MultiGzDecoder;
@@ -25,6 +26,7 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::simd::cmp::{SimdOrd, SimdPartialEq, SimdPartialOrd};
 use std::simd::num::{SimdInt, SimdUint};
 use std::simd::{Mask, Select, i64x8, simd_swizzle, u8x8, u8x16, u8x32, u8x64, u32x8, u64x8};
@@ -47,6 +49,8 @@ pub struct NativeVcfScoreResult {
     places: Vec<u32>,
     /// The wide parts of the cells whose value left i128.
     spills: AHashMap<usize, Wide>,
+    /// With `--unmatched-report`, the weights not scored, until the report is written.
+    report: Option<NativeReport>,
 }
 
 impl NativeVcfScoreResult {
@@ -144,6 +148,18 @@ struct ScoreRules {
     most_runs: usize,
     most_per_score: usize,
     most_weights: usize,
+    /// With `--unmatched-report`, the weights a score's region leaves out; `None` without it.
+    unmatched: Option<Vec<RegionDrop>>,
+}
+
+/// A weight a score's region leaves out: its row's position and alleles, as spans of
+/// `ScoreRules::alleles`, and its score.
+#[derive(Debug, Clone, Copy)]
+struct RegionDrop {
+    key: VariantKey,
+    effect_allele: (usize, usize),
+    other_allele: (usize, usize),
+    score_index: usize,
 }
 
 impl ScoreRules {
@@ -177,6 +193,7 @@ struct ScoreRulesBuilder {
     rows: Vec<(VariantKey, ScoreRule, (usize, usize))>,
     alleles: String,
     applications: Vec<ScoreApplication>,
+    unmatched: Option<Vec<RegionDrop>>,
 }
 
 impl ScoreRulesBuilder {
@@ -212,11 +229,30 @@ impl ScoreRulesBuilder {
         (start, self.alleles.len())
     }
 
+    /// Records, for `--unmatched-report`, a weight of the row at `key` that the region of score
+    /// `score_index` leaves out.
+    fn push_region_drop(&mut self, key: VariantKey, effect_allele: &str, other_allele: &str, score_index: usize) {
+        if self.unmatched.is_none() {
+            return;
+        }
+        let effect_allele = self.push_allele(effect_allele);
+        let other_allele = self.push_allele(other_allele);
+        if let Some(drops) = self.unmatched.as_mut() {
+            drops.push(RegionDrop {
+                key,
+                effect_allele,
+                other_allele,
+                score_index,
+            });
+        }
+    }
+
     fn finish(mut self) -> ScoreRules {
         // A stable sort groups each position's rules and keeps their file order.
         self.rows.sort_by_key(|(key, _, _)| *key);
         let alleles = self.alleles;
         let applications = self.applications;
+        let unmatched = self.unmatched;
         let allele = |span: (usize, usize)| &alleles[span.0..span.1];
         // Rules match a record's alleles alike when they name one allele pair, in either order,
         // or one effect allele with the same other-allele text.
@@ -282,6 +318,7 @@ impl ScoreRulesBuilder {
             most_runs,
             most_per_score,
             most_weights,
+            unmatched,
         }
     }
 }
@@ -303,9 +340,31 @@ pub fn score_vcf_streaming(
     keep: Option<&Path>,
     score_regions: Option<&std::collections::HashMap<String, GenomicRegion>>,
 ) -> Result<NativeVcfScoreResult, Box<dyn Error + Send + Sync>> {
-    let (score_names, rules_by_key) = load_score_rules(native_score_files, score_regions)?;
+    score_vcf_streaming_reporting(input_path, native_score_files, keep, score_regions, None)
+}
+
+/// [`score_vcf_streaming`], writing the report of the score rows' weights it does not score to
+/// `unmatched_report` when one is given (`--unmatched-report`), before a run that matched no
+/// variant refuses.
+pub fn score_vcf_streaming_reporting(
+    input_path: &Path,
+    native_score_files: &[PathBuf],
+    keep: Option<&Path>,
+    score_regions: Option<&std::collections::HashMap<String, GenomicRegion>>,
+    unmatched_report: Option<&Path>,
+) -> Result<NativeVcfScoreResult, Box<dyn Error + Send + Sync>> {
+    let (score_names, rules_by_key) =
+        load_score_rules(native_score_files, score_regions, unmatched_report.is_some())?;
     let source = open_variant_source(input_path)?;
-    stream::score_source(source, input_path, keep, score_names, &rules_by_key, MemoryBudget::default)
+    let mut result =
+        stream::score_source(source, input_path, keep, score_names, &rules_by_key, MemoryBudget::default)?;
+    if let (Some(path), Some(report)) = (unmatched_report, result.report.take()) {
+        report
+            .write(path, &rules_by_key, &result.score_names)
+            .map_err(|err| format!("Could not write the unmatched report '{}': {err}", path.display()))?;
+        eprintln!("> Unmatched score rows written to {}", path.display());
+    }
+    require_overlap(result, input_path)
 }
 
 /// What decoding a record needs besides the record.
@@ -326,6 +385,8 @@ struct RecordAccumulator<'a> {
     pending: PendingPosition,
     effect_only_matches: EffectOnlyMatches,
     conflicts: MeasurementConflicts,
+    /// With `--unmatched-report`, the weights not scored so far.
+    report: Option<NativeReport>,
 }
 
 impl<'a> RecordAccumulator<'a> {
@@ -337,6 +398,7 @@ impl<'a> RecordAccumulator<'a> {
             pending: PendingPosition::default(),
             effect_only_matches: EffectOnlyMatches::default(),
             conflicts: MeasurementConflicts::default(),
+            report: rules_by_key.unmatched.as_ref().map(|_| NativeReport::new()),
         }
     }
 
@@ -366,6 +428,7 @@ impl<'a> RecordAccumulator<'a> {
             &mut self.effect_only_matches,
             &mut self.conflicts,
             &mut self.totals,
+            self.report.as_mut(),
         )
     }
 
@@ -375,8 +438,8 @@ impl<'a> RecordAccumulator<'a> {
     }
 
     /// What the accumulator holds between batches besides [`RecordAccumulator::bytes`]: the
-    /// records taken at a position not yet decided, and the buffers of its queues, which keep
-    /// their size once emptied.
+    /// records taken at a position not yet decided, the buffers of its queues, which keep their
+    /// size once emptied, and with `--unmatched-report`, the alleles seen kept so far.
     fn held_bytes(&self) -> usize {
         let pending = &self.pending;
         let totals = &self.totals;
@@ -395,6 +458,11 @@ impl<'a> RecordAccumulator<'a> {
         ]
         .into_iter()
         .fold(pending.held, usize::saturating_add)
+        .saturating_add(self.report.as_ref().map_or(0, |report| {
+            report
+                .seen_bytes
+                .saturating_add(report.seen.capacity() * std::mem::size_of::<Arc<str>>())
+        }))
     }
 
     /// What an accumulator for `people` and `scores` over `rules_by_key` allocates besides the
@@ -404,8 +472,9 @@ impl<'a> RecordAccumulator<'a> {
     /// an allele grows or flushes; each rule's decision; each range of people's wide cell parts
     /// and, as it adds, a cursor a run and one score's weights of an allele; the same once more to
     /// take alleles; the smallest buffers of its queues; and the one column a position builds at a
-    /// time, with its queue slots at the position with the most runs and weights. Its rules and
-    /// weights are the plan's, held before the budget was read.
+    /// time, with its queue slots at the position with the most runs and weights; and with
+    /// `--unmatched-report`, a line for every weight and the first buffer of the alleles seen. Its
+    /// rules and weights are the plan's, held before the budget was read.
     fn bytes(people: usize, scores: usize, rules_by_key: &ScoreRules) -> usize {
         let cells = people.saturating_mul(scores);
         let rules = rules_by_key.rules.len();
@@ -440,25 +509,34 @@ impl<'a> RecordAccumulator<'a> {
         .saturating_add(vec_base(std::mem::size_of::<(usize, String)>()))
         .saturating_add(vec_base(std::mem::size_of::<(usize, DecodedAllele)>()))
         .saturating_add(allele_need(people, rules_by_key.most_runs, rules_by_key.most_weights))
+        .saturating_add(rules_by_key.unmatched.as_ref().map_or(0, |_| {
+            grown_bytes(rules_by_key.merged.len(), std::mem::size_of::<NativeLine>())
+                .saturating_add(vec_base(std::mem::size_of::<Arc<str>>()))
+                .saturating_add(allocation_bytes(16))
+        }))
     }
 
-    /// Accumulates the records at the last open position and returns the totals.
-    fn finish(mut self) -> Result<ScoreTotals, Box<dyn Error + Send + Sync>> {
+    /// Accumulates the records at the last open position and returns the totals, with the report
+    /// of the weights not scored when it was asked for.
+    fn finish(mut self) -> Result<(ScoreTotals, Option<NativeReport>), Box<dyn Error + Send + Sync>> {
         self.resolve_pending()?;
         self.totals.finish(self.rules_by_key);
         self.effect_only_matches.report();
         self.conflicts.report();
-        Ok(self.totals)
+        if let Some(report) = self.report.as_mut() {
+            report.add_unreached(self.rules_by_key, &self.pending.resolved);
+        }
+        Ok((self.totals, self.report))
     }
 }
 
-/// The scores `totals` holds, or the error for a run that matched no variant.
+/// The scores `totals` holds, with the report of the weights not scored when it was asked for.
 fn native_result(
     totals: ScoreTotals,
+    report: Option<NativeReport>,
     person_iids: Vec<String>,
     score_names: Vec<String>,
-    input_path: &Path,
-) -> Result<NativeVcfScoreResult, Box<dyn Error + Send + Sync>> {
+) -> NativeVcfScoreResult {
     let ScoreTotals {
         cells,
         missing_counts,
@@ -476,15 +554,8 @@ fn native_result(
         .iter()
         .map(|&count| count as usize)
         .sum();
-    if matched_variants == 0 {
-        return Err(format!(
-            "No overlapping variants were found between '{}' and the score file(s).",
-            input_path.display()
-        )
-        .into());
-    }
 
-    Ok(NativeVcfScoreResult {
+    NativeVcfScoreResult {
         person_iids,
         score_names,
         score_variant_counts,
@@ -497,7 +568,23 @@ fn native_result(
             .map(|(&weight, &dosage)| weight as u32 + u32::from(dosage))
             .collect(),
         spills: spills.into_iter().flatten().collect(),
-    })
+        report,
+    }
+}
+
+/// `result`, or the error for a run that matched no variant of `input_path`.
+fn require_overlap(
+    result: NativeVcfScoreResult,
+    input_path: &Path,
+) -> Result<NativeVcfScoreResult, Box<dyn Error + Send + Sync>> {
+    if result.matched_variants == 0 {
+        return Err(format!(
+            "No overlapping variants were found between '{}' and the score file(s).",
+            input_path.display()
+        )
+        .into());
+    }
+    Ok(result)
 }
 
 /// The fewest people in one range when the sums are split across the rayon pool.
@@ -641,21 +728,27 @@ fn allele_need(people: usize, runs: usize, weights: usize) -> usize {
 /// What a scored record adds besides its record and allele needs, until its position is decided
 /// and as it is: its REF once and its ALT alleles, and their slots among the position's REFs and
 /// rows; each of its `columns` alleles' slot among the position's alleles; the position's copy of
-/// the chromosome; and what deciding the position over its `runs` of rules allocates for the
-/// record ([`site_need`]).
+/// the chromosome; what deciding the position over its `runs` of rules allocates for the record
+/// ([`site_need`]); and with `seen`, for `--unmatched-report`, its rows' part of the alleles seen
+/// there ([`seen_need`]).
 fn pending_need(
     chromosome: usize,
     ref_allele: usize,
     alt_alleles: impl Iterator<Item = usize>,
     columns: usize,
     runs: usize,
+    seen: bool,
 ) -> usize {
     let mut alts = 0usize;
     let mut strings = allocation_bytes(ref_allele.max(8));
+    let (mut alt_text, mut seen_rows) = (0usize, 0usize);
     for alt_allele in alt_alleles {
         alts += 1;
         strings = strings.saturating_add(allocation_bytes(alt_allele));
+        alt_text = alt_text.saturating_add(alt_allele);
+        seen_rows = seen_rows.saturating_add(grown_bytes(ref_allele.saturating_add(alt_allele).saturating_add(1), 1));
     }
+    let text = ref_allele.saturating_add(2).saturating_mul(alts).saturating_add(alt_text);
     allocation_bytes(alts.saturating_mul(std::mem::size_of::<String>()))
         .saturating_add(strings)
         .saturating_add(slots(1, std::mem::size_of::<String>()))
@@ -663,6 +756,19 @@ fn pending_need(
         .saturating_add(slots(columns, std::mem::size_of::<(usize, DecodedAllele)>()))
         .saturating_add(allocation_bytes(chromosome))
         .saturating_add(site_need(alts, runs))
+        .saturating_add(if seen { seen_need(alts, text, seen_rows) } else { 0 })
+}
+
+/// What the alleles seen at a position take for one of its records, with `rows` ALT alleles,
+/// `text` bytes of them at most and `grown` for each row's text as it is written: the rows' pairs
+/// and their texts, the texts joined and kept, and a slot among the positions' texts.
+fn seen_need(rows: usize, text: usize, grown: usize) -> usize {
+    allocation_bytes(rows.saturating_mul(std::mem::size_of::<(&str, &str)>()))
+        .saturating_add(allocation_bytes(rows.saturating_mul(std::mem::size_of::<String>())))
+        .saturating_add(grown)
+        .saturating_add(allocation_bytes(text))
+        .saturating_add(allocation_bytes(text.saturating_add(16)))
+        .saturating_add(slots(1, std::mem::size_of::<Arc<str>>()))
 }
 
 /// What deciding a position allocates for one of its records, with `rows` ALT alleles, as the
@@ -738,6 +844,7 @@ fn scored_record_need<'a, I: Iterator<Item = &'a str>>(
         alt_alleles().map(str::len),
         columns,
         position_runs(rules_by_key, rules_start, score_rules),
+        rules_by_key.unmatched.is_some(),
     );
     record_need(chromosome.len(), alts, columns).saturating_add(alleles).saturating_add(pending)
 }
@@ -770,7 +877,7 @@ fn position_needs(rules_by_key: &ScoreRules, people: usize) -> (usize, usize) {
                 }
             })
             .fold(0usize, usize::saturating_add);
-        let pending = pending_need(1, 1, std::iter::repeat_n(1, runs), runs, runs);
+        let pending = pending_need(1, 1, std::iter::repeat_n(1, runs), runs, runs, rules_by_key.unmatched.is_some());
         let need = record_need(1, runs, runs).saturating_add(alleles).saturating_add(pending);
         most = most.max(need);
         least = least.min(need);
@@ -1924,11 +2031,12 @@ impl PendingPosition {
         effect_only_matches: &mut EffectOnlyMatches,
         conflicts: &mut MeasurementConflicts,
         totals: &mut ScoreTotals,
+        report: Option<&mut NativeReport>,
     ) -> Result<(), String> {
         let Some(key) = self.key.take() else {
             return Ok(());
         };
-        let scored = self.score(key, rules_by_key, score_names, effect_only_matches, conflicts, totals);
+        let scored = self.score(key, rules_by_key, score_names, effect_only_matches, conflicts, totals, report);
         self.refs.clear();
         self.rows.clear();
         self.alleles.clear();
@@ -1938,6 +2046,7 @@ impl PendingPosition {
 
     /// Adds what every rule at `key` scores to `totals`: each score's copies of its effect allele,
     /// an ALT's from the rows measuring it and the REF's the ploidy less every ALT's.
+    #[allow(clippy::too_many_arguments)]
     fn score(
         &mut self,
         key: VariantKey,
@@ -1946,6 +2055,7 @@ impl PendingPosition {
         effect_only_matches: &mut EffectOnlyMatches,
         conflicts: &mut MeasurementConflicts,
         totals: &mut ScoreTotals,
+        mut report: Option<&mut NativeReport>,
     ) -> Result<(), String> {
         let Self {
             chromosome,
@@ -1968,11 +2078,20 @@ impl PendingPosition {
         // rule does.
         let (start, end) = rules_by_key.ranges.get(&key).copied().unwrap_or_default();
         let mut named: Vec<(usize, (usize, bool))> = Vec::new();
+        let mut seen = None;
         for run in rules_by_key.runs(start, end) {
             let rule = &rules_by_key.rules[run];
             let effect_allele = rules_by_key.allele(rule.effect_allele);
             let other_allele = rules_by_key.allele(rule.other_allele);
             let decision = site.match_row(effect_allele, other_allele);
+            if let Some(report) = report.as_deref_mut()
+                && let Some(reason) = Unmatched::of(decision, other_allele)
+            {
+                let seen = *seen.get_or_insert_with(|| {
+                    report.add_seen(alleles_seen(site_rows.iter().map(|&(_, reference, alternate)| (reference, alternate))))
+                });
+                report.add_run(rules_by_key, run, key, reason, seen);
+            }
             let effect_only = names_no_single_other_allele(other_allele);
             if effect_only {
                 for _ in rules_by_key.merged(run) {
@@ -2359,6 +2478,110 @@ impl MeasurementConflicts {
     }
 }
 
+/// The weights a native run does not score, for `--unmatched-report`.
+#[derive(Debug)]
+struct NativeReport {
+    /// Each unscored weight of a run of rules.
+    lines: Vec<NativeLine>,
+    /// The alleles seen at each position with an unscored weight, after none at all.
+    seen: Vec<Arc<str>>,
+    /// What the texts of `seen` hold.
+    seen_bytes: usize,
+}
+
+/// An unscored weight: the first rule of its run, its index in `ScoreRules::merged`, its
+/// position, why, and the alleles seen there, by index into `NativeReport::seen`.
+#[derive(Clone, Copy, Debug)]
+struct NativeLine {
+    run: usize,
+    weight: usize,
+    key: VariantKey,
+    reason: Unmatched,
+    seen: u32,
+}
+
+impl NativeReport {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            seen: vec![Arc::from("")],
+            seen_bytes: 0,
+        }
+    }
+
+    /// Records every weight of the run starting at rule `run`, at `key`, as unscored for `reason`.
+    fn add_run(&mut self, rules_by_key: &ScoreRules, run: usize, key: VariantKey, reason: Unmatched, seen: u32) {
+        let (start, end) = rules_by_key.rules[run].merged;
+        self.lines.extend((start..end).map(|weight| NativeLine {
+            run,
+            weight,
+            key,
+            reason,
+            seen,
+        }));
+    }
+
+    /// Keeps the alleles seen at a position, and gives their index.
+    fn add_seen(&mut self, seen: Arc<str>) -> u32 {
+        self.seen_bytes = self.seen_bytes.saturating_add(allocation_bytes(seen.len().saturating_add(16)));
+        self.seen.push(seen);
+        (self.seen.len() - 1) as u32
+    }
+
+    /// Records every weight at each position no record reached.
+    fn add_unreached(&mut self, rules_by_key: &ScoreRules, resolved: &[bool]) {
+        for (&key, &(start, end)) in &rules_by_key.ranges {
+            if resolved.get(start).copied().unwrap_or(false) {
+                continue;
+            }
+            for run in rules_by_key.runs(start, end) {
+                self.add_run(rules_by_key, run, key, Unmatched::NoVariant, 0);
+            }
+        }
+    }
+
+    /// Writes the report of these weights and of the weights the regions of `rules_by_key` leave
+    /// out to `path`.
+    fn write(mut self, path: &Path, rules_by_key: &ScoreRules, score_names: &[String]) -> io::Result<()> {
+        let seen = std::mem::take(&mut self.seen);
+        let line_of = |line: &NativeLine| {
+            let weight = rules_by_key.merged[line.weight];
+            let rule = &rules_by_key.rules[line.run];
+            let (first, second) = (rules_by_key.allele(rule.effect_allele), rules_by_key.allele(rule.other_allele));
+            // A weight of its run's other orientation is a row naming the run's pair the other way.
+            let (effect_allele, other_allele) = if weight.same_effect { (first, second) } else { (second, first) };
+            Line {
+                score: &score_names[weight.score_index],
+                key: line.key,
+                effect_allele,
+                other_allele,
+                reason: line.reason,
+                seen: &seen[line.seen as usize],
+            }
+        };
+        let drop_of = |drop: &RegionDrop| Line {
+            score: &score_names[drop.score_index],
+            key: drop.key,
+            effect_allele: rules_by_key.allele(drop.effect_allele),
+            other_allele: rules_by_key.allele(drop.other_allele),
+            reason: Unmatched::OutsideRegion,
+            seen: "",
+        };
+        self.lines.sort_unstable_by(|a, b| line_of(a).cmp(&line_of(b)));
+        let mut drops = rules_by_key.unmatched.clone().unwrap_or_default();
+        drops.sort_unstable_by(|a, b| drop_of(a).cmp(&drop_of(b)));
+        let (mut lines, mut drops) = (self.lines.iter().map(line_of).peekable(), drops.iter().map(drop_of).peekable());
+        write_report(
+            path,
+            std::iter::from_fn(|| match (lines.peek(), drops.peek()) {
+                (Some(line), Some(drop)) if drop < line => drops.next(),
+                (Some(_), _) => lines.next(),
+                (None, _) => drops.next(),
+            }),
+        )
+    }
+}
+
 /// The fields of a VCF record that scoring reads, as noodles' `Record` returns them.
 struct VcfFields<'r> {
     chromosome: &'r str,
@@ -2687,9 +2910,12 @@ fn ref_effect_error(score_name: &str, chromosome: &str, position: u32) -> String
     )
 }
 
+/// The rules of `native_score_files` within `score_regions`, and with `unmatched`, a record of the
+/// weights the regions leave out, for `--unmatched-report`.
 fn load_score_rules(
     native_score_files: &[PathBuf],
     score_regions: Option<&std::collections::HashMap<String, GenomicRegion>>,
+    unmatched: bool,
 ) -> Result<(Vec<String>, ScoreRules), Box<dyn Error + Send + Sync>> {
     let headers = read_score_headers(native_score_files)?;
     let mut score_names: Vec<String> = headers
@@ -2703,6 +2929,9 @@ fn load_score_rules(
         .map(|(idx, name)| (name.clone(), idx))
         .collect();
     let mut rules = ScoreRulesBuilder::default();
+    if unmatched {
+        rules.unmatched = Some(Vec::new());
+    }
     let mut skipped_contigs = SkippedContigs::default();
     let mut rejected = RejectedRows::default();
 
@@ -2805,6 +3034,7 @@ fn load_score_rules(
                 if let Some(Some(region)) = column_regions.get(column)
                     && !region.contains(key)
                 {
+                    rules.push_region_drop(key, effect_allele, other_allele, score_index);
                     continue;
                 }
 

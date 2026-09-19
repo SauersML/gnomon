@@ -121,6 +121,7 @@ pub fn run(opts: AllOptions) -> Result<(), Box<dyn std::error::Error>> {
                 emit_components: false,
                 blocks: None,
                 blocks_max: None,
+                unmatched_report: None,
             })
         })
     };

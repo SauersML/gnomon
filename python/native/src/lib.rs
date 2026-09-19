@@ -90,6 +90,7 @@ fn score(
             None,
             None,
             None,
+            None,
         )
     })
     .map_err(|err| PyRuntimeError::new_err(format!("gnomon score failed: {err}")))?;

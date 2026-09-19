@@ -114,6 +114,11 @@ struct Args {
     /// The most blocks --blocks may name; required above 500.
     #[clap(long, value_name = "N", requires = "blocks")]
     blocks_max: Option<usize>,
+
+    /// Write each weight of a score row that adds to no score to PATH, with why and the alleles
+    /// the genotypes hold at its position.
+    #[clap(long, value_name = "PATH")]
+    unmatched_report: Option<PathBuf>,
 }
 
 // ========================================================================================
@@ -127,7 +132,8 @@ struct Args {
 /// pre-computed sex to skip the internal VCF-scan sex inference. Pass `None`
 /// for `inferred_sex` to preserve the original full-scan behavior. `out` is
 /// `--out PREFIX`; `None` writes beside the inputs as before. `blocks` and
-/// `blocks_max` are `--blocks` and `--blocks-max`.
+/// `blocks_max` are `--blocks` and `--blocks-max`, and `unmatched_report` is
+/// `--unmatched-report PATH`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_gnomon_with_args(
     input_path: PathBuf,
@@ -141,6 +147,7 @@ pub fn run_gnomon_with_args(
     out: Option<PathBuf>,
     blocks: Option<String>,
     blocks_max: Option<usize>,
+    unmatched_report: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args {
         score,
@@ -154,6 +161,7 @@ pub fn run_gnomon_with_args(
         out,
         blocks,
         blocks_max,
+        unmatched_report,
     };
     run_gnomon_impl(args)
 }
@@ -207,6 +215,9 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     if let Some(prefix) = args.out.as_deref() {
         gnomon::output::validate_out_prefix(prefix)?;
+    }
+    if let Some(report) = args.unmatched_report.as_deref() {
+        ensure_output_absent(report)?;
     }
     let blocks = match args.blocks.as_deref() {
         Some(arg) => Some(BlockPartition::parse_arg(arg).map_err(|e| format!("--blocks: {e}"))?),
@@ -282,7 +293,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         );
         let prep_start = Instant::now();
         let native_score_files = normalize_score_files(&resolved_score_files, cache_dir.as_deref())?;
-        let native_result = native_vcf::score_vcf_streaming(
+        let native_result = native_vcf::score_vcf_streaming_reporting(
             &args.input_path,
             &native_score_files,
             args.keep.as_deref(),
@@ -291,6 +302,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
             } else {
                 Some(&score_regions_map)
             },
+            args.unmatched_report.as_deref(),
         )?;
         eprintln!(
             "> Native VCF scoring complete in {:.2?}. Found {} individuals to score and {} overlapping score variants across {} score(s).",
@@ -394,6 +406,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         cache_dir.as_deref(),
         blocks.as_ref(),
         args.blocks_max,
+        args.unmatched_report.as_deref(),
     )?;
     let memory_budget = MemoryBudget::default();
     pipeline::preflight_memory(&prep_result, memory_budget)?;
@@ -1050,6 +1063,7 @@ fn normalize_score_files(
 /// format, and then calls the main preparation logic to produce a "computation
 // blueprint" (`PreparationResult`). All user-facing console output for this phase
 // is handled here.
+#[allow(clippy::too_many_arguments)]
 fn run_preparation_phase(
     fileset_prefixes: &[PathBuf],
     score_files: &[PathBuf],
@@ -1058,6 +1072,7 @@ fn run_preparation_phase(
     cache_dir: Option<&Path>,
     blocks: Option<&BlockPartition>,
     blocks_max: Option<usize>,
+    unmatched_report: Option<&Path>,
 ) -> Result<Arc<PreparationResult>, Box<dyn Error + Send + Sync>> {
     if fileset_prefixes.len() > 1 {
         eprintln!(
@@ -1084,6 +1099,7 @@ fn run_preparation_phase(
         score_regions,
         blocks,
         blocks_max,
+        unmatched_report,
     )
     .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 

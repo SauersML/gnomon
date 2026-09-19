@@ -898,3 +898,113 @@ fn a_repeated_variant_scores_the_dose_its_records_agree_on_from_vcf_and_plink() 
     assert_eq!(answers[0], answers[1]);
     Ok(())
 }
+
+/// The unmatched report of one cohort and one score file is the same file from a `.bed` fileset
+/// and a VCF, through the command line and through each path's library entry with a region (#2383).
+#[test]
+fn the_unmatched_report_is_the_same_file_from_plink_and_vcf() -> TestResult {
+    // 1:100 holds A/G and A/T, split as a .bim writes them; 1:200 holds C/T; 1:300 nothing.
+    let dir = tempfile::tempdir()?;
+    let calls: [[u8; 4]; 3] = [[2, 0, 3, 2], [0, 2, 0, 0], [3, 2, 0, 2]];
+    let fam: String = (0..4)
+        .map(|person| format!("F I{person} 0 0 0 -9\n"))
+        .collect();
+    fs::write(dir.path().join("cohort.fam"), fam)?;
+    fs::write(
+        dir.path().join("cohort.bim"),
+        "1 a 0 100 G A\n1 b 0 100 T A\n1 c 0 200 T C\n",
+    )?;
+    let mut bed = vec![0x6c, 0x1b, 0x01];
+    for row in &calls {
+        bed.push(
+            row.iter()
+                .enumerate()
+                .fold(0u8, |byte, (i, &call)| byte | (call << (2 * i))),
+        );
+    }
+    fs::write(dir.path().join("cohort.bed"), bed)?;
+    // PLINK code 00 is two A1 (the ALT here), 10 one of each, 11 two A2.
+    let gt = |call: u8| ["1/1", "./.", "0/1", "0/0"][usize::from(call)];
+    let mut vcf = String::from(
+        "##fileformat=VCFv4.2\n##contig=<ID=1>\n\
+         ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+         #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tI0\tI1\tI2\tI3\n",
+    );
+    for (row, (id, pos, reference, alternate)) in calls
+        .iter()
+        .zip([("a", 100, "A", "G"), ("b", 100, "A", "T"), ("c", 200, "C", "T")])
+    {
+        let samples: Vec<&str> = row.iter().map(|&call| gt(call)).collect();
+        let samples = samples.join("\t");
+        vcf.push_str(&format!(
+            "1\t{pos}\t{id}\t{reference}\t{alternate}\t.\tPASS\t.\tGT\t{samples}\n"
+        ));
+    }
+    fs::write(dir.path().join("cohort.vcf"), vcf)?;
+    // Scored: 1:100 G/A, the site's REF A and 1:200 T/C. Not: C at 1:100 and G at 1:200, which
+    // no variant carries, and 1:300, where none sits.
+    let score = dir.path().join("weights.tsv");
+    fs::write(
+        &score,
+        "variant_id\teffect_allele\tother_allele\tS1\tS2\n\
+         1:100\tG\tA\t0.5\t1\n1:100\tC\tA\t1\t\n1:100\tA\t.\t2\t\n\
+         1:200\tT\tC\t\t1\n1:200\tG\t.\t1\t1\n1:300\tA\tG\t1\t2\n",
+    )?;
+    let header = "#score\tvariant_id\teffect_allele\tother_allele\treason\talleles_seen\n";
+    let unscored = "S1\t1:100\tC\tA\tno_allele_pair\tA/G,A/T\n\
+                    S1\t1:200\tG\t.\tno_allele_pair\tC/T\n\
+                    S1\t1:300\tA\tG\tno_variant_at_position\t.\n\
+                    S2\t1:200\tG\t.\tno_allele_pair\tC/T\n";
+    for input in ["cohort", "cohort.vcf"] {
+        let report = dir.path().join(format!("{}.unmatched.tsv", input.replace('.', "_")));
+        let output = Command::new(SCORE_BIN)
+            .current_dir(dir.path())
+            .env("GNOMON_CACHE_DIR", dir.path().join("cache"))
+            .arg("--out")
+            .arg(dir.path().join(input.replace('.', "_")))
+            .arg("--unmatched-report")
+            .arg(&report)
+            .arg(&score)
+            .arg(dir.path().join(input))
+            .output()?;
+        assert_success(&output);
+        assert_eq!(
+            fs::read_to_string(&report)?,
+            format!("{header}{unscored}S2\t1:300\tA\tG\tno_variant_at_position\t.\n"),
+            "{input}"
+        );
+    }
+
+    // With S2 restricted to 1:100-250, its 1:300 row is outside the region instead.
+    let regions = std::collections::HashMap::from([(
+        "S2".to_string(),
+        gnomon::types::GenomicRegion {
+            chromosome: 1,
+            start: 100,
+            end: 250,
+        },
+    )]);
+    let expected = format!("{header}{unscored}S2\t1:300\tA\tG\toutside_region\t.\n");
+    let plink_report = dir.path().join("plink_region.tsv");
+    gnomon::prepare::prepare_for_computation_with_blocks(
+        &[dir.path().join("cohort")],
+        std::slice::from_ref(&score),
+        None,
+        Some(&regions),
+        None,
+        None,
+        Some(&plink_report),
+    )?;
+    assert_eq!(fs::read_to_string(&plink_report)?, expected, "PLINK");
+    let vcf_report = dir.path().join("vcf_region.tsv");
+    gnomon::score::native_vcf::score_vcf_streaming_reporting(
+        &dir.path().join("cohort.vcf"),
+        std::slice::from_ref(&score),
+        None,
+        Some(&regions),
+        Some(&vcf_report),
+    )
+    .map_err(|error| error as Box<dyn Error>)?;
+    assert_eq!(fs::read_to_string(&vcf_report)?, expected, "VCF");
+    Ok(())
+}
