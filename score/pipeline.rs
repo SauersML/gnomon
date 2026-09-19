@@ -954,65 +954,30 @@ fn run_single_file_pipeline(
             let spool_file_path = spool_path
                 .clone()
                 .expect("spool path missing despite spooling enabled");
-            let (offsets, spool_bytes_per_variant) = {
+            let offsets = {
                 let mut state = spool_state
                     .take()
                     .expect("spool state missing despite spooling enabled");
                 state.writer.flush().map_err(|e| {
                     PipelineError::Io(format!("Failed to flush complex variant spool: {e}"))
                 })?;
-                (state.offsets, prep_result.spool_bytes_per_variant())
+                state.offsets
             };
-            let mmap = if spool_bytes_per_variant == 0 {
-                let mut anon = MmapOptions::new().len(1).map_anon().map_err(|e| {
-                    PipelineError::Io(format!(
-                        "Failed to allocate anonymous mapping for empty complex spool: {e}"
-                    ))
-                })?;
-                anon.copy_from_slice(&[0u8]);
-                anon.make_read_only().map_err(|e| {
-                    PipelineError::Io(format!(
-                        "Failed to convert anonymous mapping to read-only: {e}"
-                    ))
-                })?
-            } else {
-                let spool_file = File::open(&spool_file_path).map_err(|e| {
-                    PipelineError::Io(format!(
-                        "Failed to open complex variant spool {}: {e}",
-                        spool_file_path.display()
-                    ))
-                })?;
-                unsafe { Mmap::map(&spool_file) }.map_err(|e| {
-                    PipelineError::Io(format!(
-                        "Failed to memory-map complex variant spool {}: {e}",
-                        spool_file_path.display()
-                    ))
-                })?
-            };
-            let dense_map = Arc::new(prep_result.spool_dense_map().to_vec());
-            let resolver = ComplexVariantResolver::from_spool(
-                Arc::new(mmap),
-                offsets,
+            let spool_bytes_per_variant = prep_result.spool_bytes_per_variant();
+            with_spool(
+                &spool_file_path,
                 spool_bytes_per_variant,
-                dense_map,
-            );
-            if let Err(e) = resolve_complex_variants(
-                &resolver,
-                prep_result,
-                &mut final_scores,
-                &mut final_counts,
-            ) {
-                // Cleanup spool before propagating error
-                let _ = fs::remove_file(&spool_file_path);
-                return Err(e);
-            }
-            if let Err(e) = fs::remove_file(&spool_file_path) {
-                eprintln!(
-                    "> Warning: Failed to delete complex spool {}: {}",
-                    spool_file_path.display(),
-                    e
-                );
-            }
+                |mmap| {
+                    let resolver = ComplexVariantResolver::from_spool(
+                        Arc::new(mmap),
+                        offsets,
+                        spool_bytes_per_variant,
+                        Arc::new(prep_result.spool_dense_map().to_vec()),
+                    );
+                    resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)
+                },
+                |path| fs::remove_file(path),
+            )?;
         } else {
             let resolver = ComplexVariantResolver::from_single_source(bed_source.clone());
             resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
@@ -1020,6 +985,59 @@ fn run_single_file_pipeline(
     }
 
     Ok((final_scores, final_counts))
+}
+
+/// Maps the complex-variant spool at `path` read-only (one zero byte when no spooled row has
+/// bytes), hands the mapping to `resolve`, and removes the spool with `remove` once `resolve` has
+/// returned, whether or not it succeeded. `resolve` owns the mapping, so the mapping has ended when
+/// the spool is unlinked: on NFS a file unlinked while it is still mapped is silly-renamed to a
+/// `.nfsXXXX` file, which stayed in the output directory until the mapping ended, or for good if
+/// the process died first (#2395).
+fn with_spool<T>(
+    path: &Path,
+    spool_bytes_per_variant: u64,
+    resolve: impl FnOnce(Mmap) -> Result<T, PipelineError>,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<T, PipelineError> {
+    let resolved = map_spool(path, spool_bytes_per_variant).and_then(resolve);
+    let removed = remove(path);
+    let value = resolved?;
+    if let Err(e) = removed {
+        eprintln!(
+            "> Warning: Failed to delete complex spool {}: {}",
+            path.display(),
+            e
+        );
+    }
+    Ok(value)
+}
+
+fn map_spool(path: &Path, spool_bytes_per_variant: u64) -> Result<Mmap, PipelineError> {
+    if spool_bytes_per_variant == 0 {
+        let mut anon = MmapOptions::new().len(1).map_anon().map_err(|e| {
+            PipelineError::Io(format!(
+                "Failed to allocate anonymous mapping for empty complex spool: {e}"
+            ))
+        })?;
+        anon.copy_from_slice(&[0u8]);
+        return anon.make_read_only().map_err(|e| {
+            PipelineError::Io(format!(
+                "Failed to convert anonymous mapping to read-only: {e}"
+            ))
+        });
+    }
+    let spool_file = File::open(path).map_err(|e| {
+        PipelineError::Io(format!(
+            "Failed to open complex variant spool {}: {e}",
+            path.display()
+        ))
+    })?;
+    unsafe { Mmap::map(&spool_file) }.map_err(|e| {
+        PipelineError::Io(format!(
+            "Failed to memory-map complex variant spool {}: {e}",
+            path.display()
+        ))
+    })
 }
 
 /// The pipeline implementation for the multi-fileset case.
@@ -1313,65 +1331,30 @@ fn run_multi_file_pipeline(
             let spool_file_path = spool_path
                 .clone()
                 .expect("spool path missing despite spooling enabled");
-            let (offsets, spool_bytes_per_variant) = {
+            let offsets = {
                 let mut state = spool_state
                     .take()
                     .expect("spool state missing despite spooling enabled");
                 state.writer.flush().map_err(|e| {
                     PipelineError::Io(format!("Failed to flush complex variant spool: {e}"))
                 })?;
-                (state.offsets, prep_result.spool_bytes_per_variant())
+                state.offsets
             };
-            let mmap = if spool_bytes_per_variant == 0 {
-                let mut anon = MmapOptions::new().len(1).map_anon().map_err(|e| {
-                    PipelineError::Io(format!(
-                        "Failed to allocate anonymous mapping for empty complex spool: {e}"
-                    ))
-                })?;
-                anon.copy_from_slice(&[0u8]);
-                anon.make_read_only().map_err(|e| {
-                    PipelineError::Io(format!(
-                        "Failed to convert anonymous mapping to read-only: {e}"
-                    ))
-                })?
-            } else {
-                let spool_file = File::open(&spool_file_path).map_err(|e| {
-                    PipelineError::Io(format!(
-                        "Failed to open complex variant spool {}: {e}",
-                        spool_file_path.display()
-                    ))
-                })?;
-                unsafe { Mmap::map(&spool_file) }.map_err(|e| {
-                    PipelineError::Io(format!(
-                        "Failed to memory-map complex variant spool {}: {e}",
-                        spool_file_path.display()
-                    ))
-                })?
-            };
-            let dense_map = Arc::new(prep_result.spool_dense_map().to_vec());
-            let resolver = ComplexVariantResolver::from_spool(
-                Arc::new(mmap),
-                offsets,
+            let spool_bytes_per_variant = prep_result.spool_bytes_per_variant();
+            with_spool(
+                &spool_file_path,
                 spool_bytes_per_variant,
-                dense_map,
-            );
-            if let Err(e) = resolve_complex_variants(
-                &resolver,
-                prep_result,
-                &mut final_scores,
-                &mut final_counts,
-            ) {
-                // Cleanup spool before propagating error
-                let _ = fs::remove_file(&spool_file_path);
-                return Err(e);
-            }
-            if let Err(e) = fs::remove_file(&spool_file_path) {
-                eprintln!(
-                    "> Warning: Failed to delete complex spool {}: {}",
-                    spool_file_path.display(),
-                    e
-                );
-            }
+                |mmap| {
+                    let resolver = ComplexVariantResolver::from_spool(
+                        Arc::new(mmap),
+                        offsets,
+                        spool_bytes_per_variant,
+                        Arc::new(prep_result.spool_dense_map().to_vec()),
+                    );
+                    resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)
+                },
+                |path| fs::remove_file(path),
+            )?;
         } else {
             let resolver = ComplexVariantResolver::from_multi_sources(
                 shared_sources.as_ref().clone(),
@@ -1634,6 +1617,35 @@ fn create_spool_plan<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spool is unlinked once no mapping of it is left, whether its rows resolved or not, and
+    /// it is unlinked either way (#2395).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_spool_is_unmapped_before_it_is_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cohort.1.2.3.complex_spool.bin");
+        for fails in [false, true] {
+            std::fs::write(&path, [1u8, 2, 3, 4]).unwrap();
+            let shown = std::fs::canonicalize(&path).unwrap();
+            let mapped = || std::fs::read_to_string("/proc/self/maps").unwrap().contains(shown.to_str().unwrap());
+            let result = with_spool(
+                &path,
+                4,
+                |mmap| {
+                    assert_eq!(&mmap[..], [1, 2, 3, 4]);
+                    assert!(mapped(), "the resolver reads the spool through its mapping");
+                    if fails { Err(PipelineError::Compute("resolution failed".into())) } else { Ok(()) }
+                },
+                |spool| {
+                    assert!(!mapped(), "the spool is still mapped when it is unlinked");
+                    std::fs::remove_file(spool)
+                },
+            );
+            assert_eq!(result.is_ok(), !fails);
+            assert!(!path.exists());
+        }
+    }
 
     fn memory_test_prep(people: usize, scores: usize) -> PreparationResult {
         let names: Vec<String> = (0..scores).map(|i| format!("S{i}")).collect();
