@@ -123,7 +123,36 @@ def requirements(path):
     return lines
 
 
-def download_dependencies(lines, deps):
+def resolver(root):
+    """The pip every resolution runs: the interpreter's own ensurepip pip, in a venv of it under ``root``.
+
+    ``sys.executable -m pip`` imports whatever pip the interpreter can find, and on a build host whose Python ships
+    none that is a user-site pip nothing here creates or records: a PYTHONUSERBASE elsewhere hides it and the build
+    fails at the resolution, after the compile (gnomon#2404). ensurepip's pip comes with the interpreter, so this
+    venv resolves the same under any user site, and its version is recorded with the build.
+    """
+    venv = root / f".resolver-{PYTHON}"
+    python = venv / "bin" / "python"
+    try:
+        if not python.exists():
+            # Assembled beside its final path and renamed, so two builds sharing ``root`` never see half a venv.
+            root.mkdir(parents=True, exist_ok=True)
+            partial = root / f".resolver-{PYTHON}.partial-{os.getpid()}"
+            subprocess.run([sys.executable, "-m", "venv", "--clear", partial], check=True)
+            try:
+                partial.rename(venv)
+            except OSError:
+                shutil.rmtree(partial)
+                if not python.exists():
+                    raise
+        pip = run([python, "-m", "pip", "--version"]).split()
+        version = run([python, "-c", "import platform; print(platform.python_version())"]).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise SystemExit(f"the resolver venv {venv} cannot run pip ({error}); refusing before the build") from error
+    return python, {"python": version, "pip": pip[1]}
+
+
+def download_dependencies(lines, deps, pip_python):
     """Fetch the non-gamfit wheels for the runtime platform once; a re-pin reuses them."""
     wanted = sorted(line for line in lines if requirement_name(line) != "gamfit")
     stamp = hashlib.sha256("\n".join(wanted + TARGET).encode()).hexdigest()
@@ -135,7 +164,7 @@ def download_dependencies(lines, deps):
     deps.mkdir(parents=True)
     listing = deps / "requirements.txt"
     listing.write_text("\n".join(wanted) + "\n")
-    subprocess.run([sys.executable, "-m", "pip", "download", "--disable-pip-version-check",
+    subprocess.run([pip_python, "-m", "pip", "download", "--disable-pip-version-check",
                     "--no-cache-dir", *TARGET, "--dest", deps, "-r", listing], check=True)
     listing.unlink()
     marker.write_text(stamp + "\n")
@@ -291,7 +320,7 @@ def unstripped_twin(gam, target, out, maturin, jobs, timeout, wheel, cpu):
     return report
 
 
-def resolve(wheel, deps, lines, out, provenance, archive):
+def resolve(wheel, deps, lines, out, provenance, archive, pip_python):
     """Prove the wheels resolve for the runtime platform with no index; optionally write the tar."""
     house = out / "wheelhouse"
     if house.exists():
@@ -303,7 +332,7 @@ def resolve(wheel, deps, lines, out, provenance, archive):
     listing.write_text("\n".join(lines) + "\n")
     report = out / "resolution.json"
     with tempfile.TemporaryDirectory(dir=out) as scratch:
-        subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--dry-run",
+        subprocess.run([pip_python, "-m", "pip", "install", "--disable-pip-version-check", "--dry-run",
                         "--ignore-installed", "--no-index", "--find-links", house, *TARGET, "--target",
                         scratch, "--report", report, "-q", "-r", listing], check=True)
     installed = {normalized(item["metadata"]["name"]): item["metadata"]["version"]
@@ -594,7 +623,7 @@ def fma_instructions(wheel, work):
     return int(counted.stdout.strip() or 0)
 
 
-def verified_build(args, sha, stamp, lines, out):
+def verified_build(args, sha, stamp, lines, out, pip_python, pip_info):
     required = cpu_features(args.cpu) if args.cpu else None
     wheel, compiled = build(args.gam, args.target_dir, out, args.maturin, args.jobs, args.build_timeout, args.profile,
                             args.cpu)
@@ -613,8 +642,10 @@ def verified_build(args, sha, stamp, lines, out):
     provenance = {"gam_commit": sha, "profile": args.profile, "policy": POLICY, "python": PYTHON,
                   "wheel": str(wheel), "wheel_sha256": sha256(wheel), "engine_sha256": extension["engine_sha256"],
                   "rustc": run(["rustc", "--version"]).strip(), "maturin": run([args.maturin, "--version"]).strip(),
-                  "build": compiled, "extension": extension, "dependencies": stamp, "cpu_guard": guard}
-    tar = resolve(wheel, args.deps, lines, out, provenance, archive=args.profile == "release-pypi")
+                  "build": compiled, "extension": extension, "dependencies": stamp, "cpu_guard": guard,
+                  "resolver": pip_info}
+    tar = resolve(wheel, args.deps, lines, out, provenance, archive=args.profile == "release-pypi",
+                  pip_python=pip_python)
     if tar:
         provenance["wheelhouse"] = {"path": str(tar), "sha256": sha256(tar)}
     return wheel, provenance
@@ -649,9 +680,12 @@ def main():
     if args.unstripped and args.profile != "release-pypi":
         raise SystemExit("--unstripped relinks release-pypi; quick builds keep their symbols already")
     lines = requirements(args.requirements)
+    # Before any checkout or cargo work, so a host whose resolver cannot run pip refuses in seconds.
+    pip_python, pip_info = resolver(args.out)
+    print(f"RESOLVER {json.dumps(pip_info)}", flush=True)
     sha = checkout(args.gam, args.ref)
     print(f"PIN gam {sha} profile {args.profile}", flush=True)
-    stamp = download_dependencies(lines, args.deps)
+    stamp = download_dependencies(lines, args.deps, pip_python)
     variant = f"-{args.cpu.removeprefix('x86-64-')}" if args.cpu else ""
     out = args.out / (sha[:10] + ("" if args.profile == "release-pypi" else f"-{args.profile}") + variant)
     record = out / "PROVENANCE.json"
@@ -664,7 +698,7 @@ def main():
             raise SystemExit(f"{record} does not describe this pin, profile and dependency set")
         print(f"REUSED {wheel} (engine {provenance['engine_sha256']})", flush=True)
     else:
-        wheel, provenance = verified_build(args, sha, stamp, lines, out)
+        wheel, provenance = verified_build(args, sha, stamp, lines, out, pip_python, pip_info)
         write_json(record, provenance)
     if args.note:
         provenance["note"] = args.note
