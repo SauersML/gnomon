@@ -371,6 +371,12 @@ def test_an_undeclared_fit_error_fails_the_run_and_a_declared_refusal_does_not()
                 {"kind": "binary", "variant": "shipped", "phrase": "x", "issue": "gam#1", "reason": "r"},
                 {"kind": "binary", "variant": "calpred", "phrase": "Dense", "issue": "gam#1", "reason": "r"}):
         raises(ValueError, study.check_declared_refusals, {**config, "declared_refusals": [bad]})
+    # Our own model can never be declared: its failure always fails the run (lead ruling).
+    primary = {**config, "variants": ["ours", "shipped", "calpred"]}
+    for variant in ("ours", "shipped", "shared"):
+        raises(ValueError, study.check_declared_refusals, {**primary, "declared_refusals": [
+            {"kind": "survival", "variant": variant, "phrase": "fitendedwithoutcertifiedinnermode",
+             "issue": "gam#3003", "reason": "a planted primary-arm declaration"}]})
     refused = b"gamfit._rust.GamError: dense Hessian shape mismatch 11x11 vs 10x10\n"
     planted = b"gamfit._rust.GamError: fit_table panicked inside Rust boundary: libcublas unavailable\n"
     assert study.declared_refusal(config, {"kind": "binary", "variant": "calpred"}, refused) == "gam#3015"

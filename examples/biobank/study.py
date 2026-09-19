@@ -65,6 +65,8 @@ UNKNOWN = "unknown"
 RESTART = "restart"
 # SPEC section 8, minimum events: a fit below the bar is this result, not a failure.
 INSUFFICIENT_EVENTS = "insufficient_events"
+# Our own model, in both arms: its failures can never be declared refusals (lead, 09-19).
+PRIMARY = ("ours", "shipped")
 # The event code each survival component models.
 SURVIVAL_CAUSES = {"disease": 1, "death": 2}
 # A config's label: "production" for the shipped study.json, a named dev variant otherwise.
@@ -1238,8 +1240,15 @@ def check_declared_refusals(config):
     """study.json declared_refusals: the only failures a run may end with and
     still succeed. Each names the kind and variant it applies to, a phrase of
     the engine's refusal message, the gam issue that owns it and a reason; any
-    other failed step makes the run exit non-zero (no masking, SPEC section 5)."""
+    other failed step makes the run exit non-zero (no masking, SPEC section 5).
+    Only a competitor may be declared (lead ruling 09-19): a failure of our own
+    model, ours or shipped, always fails the run until gam is fixed. The shared
+    components every method uses are not a configured variant, so they cannot be
+    declared either."""
     for entry in config.get("declared_refusals", []):
+        if entry.get("variant") in PRIMARY:
+            raise ValueError(f"a declared refusal may name a competitor only, never {entry['variant']}: "
+                             "a primary-model failure fails the run")
         if (set(entry) != {"kind", "variant", "phrase", "issue", "reason"} or entry["kind"] not in KINDS
                 or entry["variant"] not in config["variants"] or not str(entry["phrase"]).strip()
                 or entry["phrase"] != entry["phrase"].lower() or not re.fullmatch(r"gam#\d+", str(entry["issue"]))
