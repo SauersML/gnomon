@@ -18,6 +18,73 @@ use sysinfo::System;
 /// container or scheduler into a refusal to score any input. Only a known limit
 /// whose usage cannot be read plans against no free memory.
 pub fn memory_bytes() -> (u64, u64) {
+    bounds_and_scope().0
+}
+
+/// [`memory_bytes`], and how many processes whose name starts with `name`, this one included,
+/// plan against that same memory.
+///
+/// Those are the processes that the limit bounding this one's memory also bounds. Under a cgroup
+/// limit they are the members of the cgroup that holds it, and of the cgroups below: the
+/// ancestor of this process's memory cgroup with the smallest limit, the highest of them when
+/// several share it, since a limit equal to its parent's separates nothing. Processes in other
+/// cgroups, such as other Slurm jobs on the node, draw on other limits, and counting them shrank
+/// this process's share of its own. Without a limit, or when this process cannot be matched to
+/// its cgroups, the memory is the machine's and so are the siblings: every such process on it.
+/// A narrower scope there, such as this process's own cgroup, would miss a gnomon that another
+/// session or another unlimited job starts at the same moment, before it holds the memory the
+/// available figure would show, and the fair share divides the machine's whole memory among
+/// every gnomon that plans against it, running or starting.
+///
+/// The census reads each candidate's comm with one open and one read: on a node of 1,554
+/// processes, reading every process's with a statx and two reads was 16 ms of kernel time a run
+/// (#2392).
+#[cfg(target_os = "linux")]
+pub fn memory_share(name: &str) -> (u64, u64, u64) {
+    let ((total, available), scope) = bounds_and_scope();
+    let named = |pid: &str| comm_starts_with(pid, name);
+    let siblings = match scope {
+        Some(scope) => processes_named_in(
+            &scope,
+            |path| std::fs::read_to_string(path),
+            |directory| {
+                std::fs::read_dir(directory)?
+                    .map(|entry| -> std::io::Result<Option<std::path::PathBuf>> {
+                        let entry = entry?;
+                        Ok(entry.file_type()?.is_dir().then(|| entry.path()))
+                    })
+                    .filter_map(Result::transpose)
+                    .collect()
+            },
+            named,
+        ),
+        None => processes_named_on_machine(named),
+    };
+    (total, available, siblings)
+}
+
+/// [`memory_bytes`], and how many processes on the machine have a name starting with `name`.
+#[cfg(not(target_os = "linux"))]
+pub fn memory_share(name: &str) -> (u64, u64, u64) {
+    let ((total, available), _) = bounds_and_scope();
+    (total, available, processes_named_on_machine(name))
+}
+
+/// Whether process `pid`'s name starts with `name`. A comm holds at most 15 bytes and a newline,
+/// so one read takes it whole.
+#[cfg(target_os = "linux")]
+fn comm_starts_with(pid: &str, name: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut comm) = std::fs::File::open(std::path::Path::new("/proc").join(pid).join("comm")) else {
+        return false;
+    };
+    let mut bytes = [0u8; 64];
+    comm.read(&mut bytes).is_ok_and(|read| bytes[..read].starts_with(name.as_bytes()))
+}
+
+/// `(total, available)` bytes and the cgroup directory whose members share them, `None` for the
+/// machine.
+fn bounds_and_scope() -> ((u64, u64), Option<std::path::PathBuf>) {
     let mut system = System::new();
     system.refresh_memory();
     let host = (system.total_memory(), system.available_memory());
@@ -37,7 +104,56 @@ pub fn memory_bytes() -> (u64, u64) {
         within_cgroup_bounds(host, bounds)
     }
     #[cfg(not(target_os = "linux"))]
-    host
+    (host, None)
+}
+
+/// Processes `named` accepts among the members of the cgroup `scope` and of every cgroup below
+/// it, at least one: this process. `members` reads a cgroup file and `children` lists a
+/// directory's subdirectories. A member that exits during the census does not count.
+#[cfg(target_os = "linux")]
+fn processes_named_in(
+    scope: &std::path::Path,
+    members: impl Fn(&std::path::Path) -> std::io::Result<String>,
+    children: impl Fn(&std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>>,
+    named: impl Fn(&str) -> bool,
+) -> u64 {
+    let mut count = 0u64;
+    let mut pending = vec![scope.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        if let Ok(pids) = members(&directory.join("cgroup.procs")) {
+            count += pids.lines().filter(|pid| named(pid.trim())).count() as u64;
+        }
+        if let Ok(below) = children(&directory) {
+            pending.extend(below);
+        }
+    }
+    count.max(1)
+}
+
+/// Processes on the machine `named` accepts, at least one: this process.
+#[cfg(target_os = "linux")]
+fn processes_named_on_machine(named: impl Fn(&str) -> bool) -> u64 {
+    // /proc enumerates process leaders. sysinfo 0.30 also enumerates their tasks, charging each
+    // worker thread another process's memory share.
+    let processes =
+        std::fs::read_dir("/proc").expect("Cannot inspect /proc to determine the scoring memory share");
+    let count = processes
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let pid = entry.file_name();
+            pid.as_encoded_bytes().iter().all(u8::is_ascii_digit) && pid.to_str().is_some_and(&named)
+        })
+        .count();
+    (count as u64).max(1)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn processes_named_on_machine(name: &str) -> u64 {
+    let mut system = System::new();
+    system.refresh_processes_specifics(sysinfo::ProcessRefreshKind::new());
+    // sysinfo 0.30 reports the executable name as `&str`.
+    let count = system.processes().values().filter(|process| process.name().starts_with(name)).count();
+    (count as u64).max(1)
 }
 
 /// This process's resident memory in bytes, or 0 when it cannot be read.
@@ -82,21 +198,50 @@ enum CgroupError {
     UsageUnreadable { limit: u64, error: String },
 }
 
+/// What [`cgroup_bounds`] finds: the smallest limit over this process's memory cgroups and their
+/// ancestors, the least headroom under any of them, and every limit it read with its cgroup, from
+/// this process's own cgroup up, hierarchy by hierarchy.
 #[cfg(target_os = "linux")]
-fn within_cgroup_bounds(host: (u64, u64), bounds: Result<(u64, u64), CgroupError>) -> (u64, u64) {
+#[derive(Debug, PartialEq, Eq)]
+struct Bounds {
+    total: u64,
+    available: u64,
+    limits: Vec<(std::path::PathBuf, u64)>,
+}
+
+#[cfg(target_os = "linux")]
+impl Bounds {
+    /// The cgroup whose members share this process's memory (see [`memory_share`]): the highest
+    /// cgroup whose limit is the smallest, when that limit is below `host` bytes. Otherwise no
+    /// cgroup limit binds (a v1 hierarchy reports "no limit" as a limit above any machine's
+    /// memory), and the scope is the machine.
+    fn scope(&self, host: u64) -> Option<std::path::PathBuf> {
+        let smallest = self.limits.iter().map(|&(_, limit)| limit).min().filter(|&limit| limit < host)?;
+        self.limits.iter().rev().find(|&&(_, limit)| limit == smallest).map(|(cgroup, _)| cgroup.clone())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn within_cgroup_bounds(
+    host: (u64, u64),
+    bounds: Result<Bounds, CgroupError>,
+) -> ((u64, u64), Option<std::path::PathBuf>) {
     match bounds {
-        Ok((total, available)) => (host.0.min(total), host.1.min(available)),
+        Ok(bounds) => (
+            (host.0.min(bounds.total), host.1.min(bounds.available)),
+            bounds.scope(host.0),
+        ),
         Err(CgroupError::Unmatched(reason)) => {
             eprintln!(
                 "> Cannot match this process to its memory cgroup limits ({reason}); planning against host memory."
             );
-            host
+            (host, None)
         }
         Err(CgroupError::UsageUnreadable { limit, error }) => {
             eprintln!(
                 "> A memory cgroup limit of {limit} bytes applies, but its usage cannot be read ({error}); planning against no free memory."
             );
-            (host.0.min(limit), 0)
+            ((host.0.min(limit), 0), None)
         }
     }
 }
@@ -106,10 +251,12 @@ fn cgroup_bounds(
     groups: &str,
     mounts: &str,
     mut read: impl FnMut(&std::path::Path) -> std::io::Result<String>,
-) -> Result<(u64, u64), CgroupError> {
+) -> Result<Bounds, CgroupError> {
     use std::io::ErrorKind;
     use std::path::{Component, Path};
     let mut bounds = (u64::MAX, u64::MAX);
+    // Every limit read, with its cgroup.
+    let mut limits = Vec::new();
     let mut matched = false;
     // Why a unified-hierarchy line could not be matched, when one could not.
     let mut unmatched_v2 = None;
@@ -177,6 +324,7 @@ fn cgroup_bounds(
                                 limit_path.display()
                             ))
                         })?;
+                        limits.push((directory.clone(), limit));
                         let usage_path = directory.join(if v2 {
                             "memory.current"
                         } else {
@@ -248,7 +396,11 @@ fn cgroup_bounds(
     }
     match unmatched_v2 {
         Some(reason) if !matched => Err(CgroupError::Unmatched(reason)),
-        _ => Ok(bounds),
+        _ => Ok(Bounds {
+            total: bounds.0,
+            available: bounds.1,
+            limits,
+        }),
     }
 }
 
@@ -286,18 +438,27 @@ fn unescape_mount_path(value: &str) -> std::io::Result<std::path::PathBuf> {
 mod tests {
     use super::*;
 
-    fn fixture(
-        groups: &str,
-        mounts: &str,
-        files: &[(&str, &str)],
-    ) -> Result<(u64, u64), CgroupError> {
-        cgroup_bounds(groups, mounts, |path| {
+    /// A reader of `files`, each a path and its contents.
+    fn files_of<'a>(files: &'a [(&str, &str)]) -> impl Fn(&std::path::Path) -> std::io::Result<String> + 'a {
+        |path| {
             files
                 .iter()
                 .find(|(name, _)| path == std::path::Path::new(name))
                 .map(|(_, contents)| contents.to_string())
                 .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
-        })
+        }
+    }
+
+    fn bounds_of(groups: &str, mounts: &str, files: &[(&str, &str)]) -> Result<Bounds, CgroupError> {
+        cgroup_bounds(groups, mounts, files_of(files))
+    }
+
+    fn fixture(
+        groups: &str,
+        mounts: &str,
+        files: &[(&str, &str)],
+    ) -> Result<(u64, u64), CgroupError> {
+        bounds_of(groups, mounts, files).map(|bounds| (bounds.total, bounds.available))
     }
 
     fn unmatched(result: Result<(u64, u64), CgroupError>) -> bool {
@@ -460,14 +621,14 @@ mod tests {
     #[test]
     fn unmatched_metadata_plans_against_the_host_and_unreadable_usage_fails_closed() {
         let host = (64_000, 32_000);
-        assert_eq!(
-            within_cgroup_bounds(host, Ok((16_000, 4_000))),
-            (16_000, 4_000)
-        );
-        assert_eq!(within_cgroup_bounds(host, Ok((u64::MAX, u64::MAX))), host);
+        let bounds = |total, available| -> Result<Bounds, CgroupError> {
+            Ok(Bounds { total, available, limits: Vec::new() })
+        };
+        assert_eq!(within_cgroup_bounds(host, bounds(16_000, 4_000)).0, (16_000, 4_000));
+        assert_eq!(within_cgroup_bounds(host, bounds(u64::MAX, u64::MAX)).0, host);
         assert_eq!(
             within_cgroup_bounds(host, Err(CgroupError::Unmatched("test".into()))),
-            host
+            (host, None)
         );
         assert_eq!(
             within_cgroup_bounds(
@@ -477,7 +638,93 @@ mod tests {
                     error: "test".into(),
                 })
             ),
-            (16_000, 0)
+            ((16_000, 0), None)
         );
+    }
+
+    #[test]
+    fn siblings_share_the_highest_cgroup_of_the_smallest_limit() {
+        let cgroup2 = "1 0 0:1 / /cg rw - cgroup2 cgroup rw\n";
+        let host = 1 << 40;
+        // A Slurm job and its step both hold 4,000 bytes: the job's limit holds every step.
+        let equal = bounds_of(
+            "0::/job/step/task\n",
+            cgroup2,
+            &[
+                ("/cg/job/step/task/memory.max", "max"),
+                ("/cg/job/step/memory.max", "4000"),
+                ("/cg/job/step/memory.current", "10"),
+                ("/cg/job/memory.max", "4000"),
+                ("/cg/job/memory.current", "10"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(equal.scope(host), Some("/cg/job".into()));
+        // A step held below its job's limit plans against its own.
+        let tighter = bounds_of(
+            "0::/job/step\n",
+            cgroup2,
+            &[
+                ("/cg/job/step/memory.max", "1000"),
+                ("/cg/job/step/memory.current", "10"),
+                ("/cg/job/memory.max", "4000"),
+                ("/cg/job/memory.current", "10"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(tighter.scope(host), Some("/cg/job/step".into()));
+        // No limit anywhere: the machine's memory, shared with every gnomon on it.
+        let free = bounds_of(
+            "0::/user.slice/session-1.scope\n",
+            cgroup2,
+            &[("/cg/user.slice/session-1.scope/memory.max", "max"), ("/cg/user.slice/memory.max", "max")],
+        )
+        .unwrap();
+        assert_eq!(free.scope(host), None);
+        // A limit the machine's memory is below binds nothing: a v1 hierarchy reports no limit so.
+        let v1 = bounds_of(
+            "10:memory:/system.slice/sshd.service\n",
+            "1 0 0:1 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
+            &[
+                ("/sys/fs/cgroup/memory/system.slice/sshd.service/memory.limit_in_bytes", "9223372036854771712"),
+                ("/sys/fs/cgroup/memory/system.slice/sshd.service/memory.usage_in_bytes", "10"),
+                ("/sys/fs/cgroup/memory/system.slice/memory.limit_in_bytes", "9223372036854771712"),
+                ("/sys/fs/cgroup/memory/system.slice/memory.usage_in_bytes", "10"),
+                ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "9223372036854771712"),
+                ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "10"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(v1.scope(host), None);
+        // The same limits on a machine with less memory than they hold bind nothing either; on
+        // one with more, the highest cgroup holding the smallest limit is the scope.
+        assert_eq!(equal.scope(4000), None);
+        assert_eq!(equal.scope(4001), Some("/cg/job".into()));
+    }
+
+    #[test]
+    fn the_census_counts_the_named_processes_below_the_scope_only() {
+        let files = [
+            ("/cg/job/cgroup.procs", "10\n11\n"),
+            ("/cg/job/step/cgroup.procs", "12\n14\n"),
+            ("/cg/other/cgroup.procs", "13\n"),
+            ("/proc/10/comm", "gnomon-score\n"),
+            ("/proc/11/comm", "bash\n"),
+            ("/proc/12/comm", "gnomon-score\n"),
+            ("/proc/13/comm", "gnomon-score\n"),
+        ];
+        let children = |directory: &std::path::Path| -> std::io::Result<Vec<std::path::PathBuf>> {
+            Ok(match directory.to_str() {
+                Some("/cg/job") => vec!["/cg/job/step".into()],
+                _ => Vec::new(),
+            })
+        };
+        let named = |pid: &str| {
+            files.iter().any(|(path, contents)| *path == format!("/proc/{pid}/comm") && contents.starts_with("gnomon"))
+        };
+        // Process 14 exited between the listing and its comm; process 13 is another job's.
+        assert_eq!(processes_named_in("/cg/job".as_ref(), files_of(&files), children, named), 2);
+        assert_eq!(processes_named_in("/cg/job/step".as_ref(), files_of(&files), children, named), 1);
+        assert_eq!(processes_named_in("/cg/empty".as_ref(), files_of(&files), children, named), 1);
     }
 }

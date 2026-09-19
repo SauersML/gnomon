@@ -21,10 +21,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-#[cfg(not(target_os = "linux"))]
-use sysinfo::ProcessRefreshKind;
-#[cfg(not(target_os = "linux"))]
-use sysinfo::System;
 
 // --- Pipeline Tuning Parameters ---
 
@@ -238,57 +234,18 @@ impl Default for MemoryBudget {
     }
 }
 
-/// How many gnomon processes are sharing this machine right now, including this one.
+/// The budget: a fraction of this process's memory, and of its fair share.
 ///
 /// Sizing a budget from free memory alone is a claim about the future -- that nothing
 /// else will allocate -- and that claim is false whenever a caller scores several
 /// chromosomes at once. Each sibling observes the same free memory, each takes its
-/// fraction of the whole, and together they commit a multiple of what exists.
-///
-/// The contention is observable, so observe it rather than requiring the caller to
-/// describe it. Matching is on the executable name, so every gnomon on the box counts
-/// regardless of who launched it.
-#[cfg(target_os = "linux")]
-fn concurrent_gnomon_processes() -> u64 {
-    // /proc enumerates process leaders. sysinfo 0.30 also enumerates their
-    // tasks, charging each worker thread another process's memory share and
-    // spending most of a tiny scoring run inspecting unrelated task state.
-    let processes =
-        fs::read_dir("/proc").expect("Cannot inspect /proc to determine the scoring memory share");
-    let count = processes
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .as_encoded_bytes()
-                .iter()
-                .all(u8::is_ascii_digit)
-        })
-        .filter(|entry| {
-            fs::read_to_string(entry.path().join("comm"))
-                .is_ok_and(|name| name.starts_with("gnomon"))
-        })
-        .count();
-    (count as u64).max(1)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn concurrent_gnomon_processes() -> u64 {
-    let mut system = System::new();
-    system.refresh_processes_specifics(ProcessRefreshKind::new());
-    let count = system
-        .processes()
-        .values()
-        // sysinfo 0.30 reports the executable name as `&str`.
-        .filter(|process| process.name().starts_with("gnomon"))
-        .count();
-    // At least one: this process is a gnomon even if the process table cannot be read.
-    u64::try_from(count).unwrap_or(1).max(1)
-}
-
+/// fraction of the whole, and together they commit a multiple of what exists. The
+/// contention is observable, so it is observed rather than described by the caller: the
+/// siblings are the gnomon processes that plan against the same memory limit
+/// ([`crate::memory::memory_share`]).
 fn default_max_ram_bytes() -> usize {
-    let (total, available) = crate::memory::memory_bytes();
-    memory_budget_from_system(available, total, concurrent_gnomon_processes())
+    let (total, available, siblings) = crate::memory::memory_share("gnomon");
+    memory_budget_from_system(available, total, siblings)
 }
 
 fn memory_budget_from_system(available: u64, total: u64, siblings: u64) -> usize {
