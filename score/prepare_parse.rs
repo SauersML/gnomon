@@ -195,11 +195,14 @@ pub(super) fn parse_bim_row(
     if found < fields.len() {
         return None;
     }
+    // The virtual `.bim` rows of a `.pgen` carry each `.pvar` record's REF as allele 2.
+    let reference_declared = path.extension().is_some_and(|extension| extension == "pvar");
     Some(parse_key(fields[0], fields[3]).map(|key| KeyedBimRecord {
         key,
         bim_row_index: row,
         allele1: Allele::new(fields[4]),
         allele2: Allele::new(fields[5]),
+        reference_declared,
     }))
 }
 

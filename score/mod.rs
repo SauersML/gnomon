@@ -11,4 +11,5 @@ pub mod native_vcf;
 pub mod pipeline;
 pub mod prepare;
 pub mod reformat;
+pub(crate) mod site;
 pub mod types;

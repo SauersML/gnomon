@@ -2,10 +2,9 @@ use crate::score::cells::{
     add_limbs, compare_limbs, limbs_of, round_decimal, round_long, shift_decimal, subtract_limbs,
 };
 use crate::score::exact::{FixedPoint, shortest_decimal_hinted};
-use crate::score::prepare::{
-    EffectOnlyMatches, OtherAlleleMatch, names_no_single_other_allele, resolve_other_allele,
-};
 use crate::score::pipeline::MemoryBudget;
+use crate::score::prepare::EffectOnlyMatches;
+use crate::score::site::{RowMatch, Site, SiteAllele, names_no_single_other_allele, row_side};
 use crate::score::types::{GenomicRegion, parse_chromosome_label};
 use crate::shared::files::open_variant_source;
 use ahash::{AHashMap, AHashSet};
@@ -318,19 +317,15 @@ struct DecodeContext<'a> {
 
 /// Accumulates decoded records taken in input order.
 ///
-/// The records at a position holding a rule that names no single other allele
-/// are accumulated together, when the next scored position or the end of input
-/// shows every one of them has been read.
+/// The records at a scored position are accumulated together, when the next scored position or
+/// the end of input shows every one of them has been read.
 struct RecordAccumulator<'a> {
     rules_by_key: &'a ScoreRules,
     score_names: &'a [String],
     totals: ScoreTotals,
     pending: PendingPosition,
     effect_only_matches: EffectOnlyMatches,
-    /// Per rule, whether an allele taken so far matched it first among its position's rules, and
-    /// if so whether the rule's effect allele was that record's REF: a second such allele is a
-    /// second record of the same allele pair.
-    claimed: Vec<Option<bool>>,
+    conflicts: MeasurementConflicts,
 }
 
 impl<'a> RecordAccumulator<'a> {
@@ -341,7 +336,7 @@ impl<'a> RecordAccumulator<'a> {
             totals: ScoreTotals::new(num_people, score_names.len(), rules_by_key),
             pending: PendingPosition::default(),
             effect_only_matches: EffectOnlyMatches::default(),
-            claimed: vec![None; rules_by_key.rules.len()],
+            conflicts: MeasurementConflicts::default(),
         }
     }
 
@@ -350,56 +345,28 @@ impl<'a> RecordAccumulator<'a> {
         if let Some(err) = decoded.error.take() {
             return Err(err);
         }
-        let rules_by_key = self.rules_by_key;
-        let score_names = self.score_names;
-        if let Some(key) = decoded.key {
-            if self.pending.key.is_some_and(|open| open != key) {
-                self.pending.resolve(
-                    rules_by_key,
-                    score_names,
-                    &mut self.effect_only_matches,
-                    &mut self.totals,
-                )?;
-            }
-            if decoded.effect_only {
-                if self.pending.key.is_none() {
-                    self.pending
-                        .open(key, decoded.chromosome.clone(), rules_by_key)?;
-                }
-                self.pending.push(decoded);
-                return Ok(());
-            }
+        let Some(key) = decoded.key else {
+            return Ok(());
+        };
+        if self.pending.key.is_some_and(|open| open != key) {
+            self.resolve_pending()?;
         }
-        for allele in &mut decoded.alleles[..decoded.allele_count] {
-            if let Some(earlier_effect_is_ref) =
-                self.claimed[allele.first_rule].replace(allele.first_rule_effect_is_ref)
-            {
-                let rule = &rules_by_key.rules[allele.first_rule];
-                return Err(repeated_pair_error(
-                    &decoded.chromosome,
-                    decoded.position,
-                    rules_by_key.allele(rule.effect_allele),
-                    rules_by_key.allele(rule.other_allele),
-                    earlier_effect_is_ref,
-                    allele.first_rule_effect_is_ref,
-                )
-                .into());
-            }
-            self.totals.add_allele(
-                rules_by_key,
-                &[(allele.first_rule, allele.first_rule_effect_is_ref)],
-                std::mem::take(&mut allele.column),
-                allele.scale.take(),
-                |score_index| {
-                    ref_effect_error(
-                        &score_names[score_index],
-                        &decoded.chromosome,
-                        decoded.position,
-                    )
-                },
-            )?;
+        if self.pending.key.is_none() {
+            self.pending
+                .open(key, decoded.chromosome.clone(), self.rules_by_key)?;
         }
+        self.pending.push(decoded);
         Ok(())
+    }
+
+    fn resolve_pending(&mut self) -> Result<(), String> {
+        self.pending.resolve(
+            self.rules_by_key,
+            self.score_names,
+            &mut self.effect_only_matches,
+            &mut self.conflicts,
+            &mut self.totals,
+        )
     }
 
     /// Adds the terms of every allele taken so far to the sums.
@@ -417,7 +384,6 @@ impl<'a> RecordAccumulator<'a> {
             pending.refs.capacity() * std::mem::size_of::<String>(),
             pending.rows.capacity() * std::mem::size_of::<(usize, String)>(),
             pending.alleles.capacity() * std::mem::size_of::<(usize, DecodedAllele)>(),
-            pending.matched.capacity() * std::mem::size_of::<(usize, bool)>(),
             totals.unapplied.capacity() * std::mem::size_of::<ScoredAllele>(),
             totals.unapplied_runs.capacity() * std::mem::size_of::<(usize, bool)>(),
             totals.unapplied_weights.capacity() * std::mem::size_of::<i64>(),
@@ -435,10 +401,11 @@ impl<'a> RecordAccumulator<'a> {
     /// records it takes: each person-score's i128 cell, i64 lane and u32 missing count (the lanes
     /// are freed before [`ScoreTotals::finish`] puts the missing counts in person order); each
     /// score's headroom, matched count, weight and dosage places and output places, and the scores
-    /// an allele grows or flushes; each rule's claim and decision; each range of people's wide cell
-    /// parts and, as it adds, a cursor a run and one score's weights of an allele; the same once
-    /// more to take alleles; and the smallest buffers of its queues. Its rules and weights are the
-    /// plan's, held before the budget was read.
+    /// an allele grows or flushes; each rule's decision; each range of people's wide cell parts
+    /// and, as it adds, a cursor a run and one score's weights of an allele; the same once more to
+    /// take alleles; the smallest buffers of its queues; and the one column a position builds at a
+    /// time, with its queue slots at the position with the most runs and weights. Its rules and
+    /// weights are the plan's, held before the budget was read.
     fn bytes(people: usize, scores: usize, rules_by_key: &ScoreRules) -> usize {
         let cells = people.saturating_mul(scores);
         let rules = rules_by_key.rules.len();
@@ -456,7 +423,6 @@ impl<'a> RecordAccumulator<'a> {
             scores * std::mem::size_of::<i32>(),
             scores * std::mem::size_of::<u8>(),
             scores * std::mem::size_of::<u32>(),
-            rules.saturating_mul(std::mem::size_of::<Option<bool>>()),
             rules.saturating_mul(std::mem::size_of::<bool>()),
             ranges * std::mem::size_of::<AHashMap<usize, Wide>>(),
         ]
@@ -473,19 +439,15 @@ impl<'a> RecordAccumulator<'a> {
         .saturating_add(vec_base(std::mem::size_of::<String>()))
         .saturating_add(vec_base(std::mem::size_of::<(usize, String)>()))
         .saturating_add(vec_base(std::mem::size_of::<(usize, DecodedAllele)>()))
-        .saturating_add(vec_base(std::mem::size_of::<(usize, bool)>()))
+        .saturating_add(allele_need(people, rules_by_key.most_runs, rules_by_key.most_weights))
     }
 
     /// Accumulates the records at the last open position and returns the totals.
     fn finish(mut self) -> Result<ScoreTotals, Box<dyn Error + Send + Sync>> {
-        self.pending.resolve(
-            self.rules_by_key,
-            self.score_names,
-            &mut self.effect_only_matches,
-            &mut self.totals,
-        )?;
+        self.resolve_pending()?;
         self.totals.finish(self.rules_by_key);
         self.effect_only_matches.report();
+        self.conflicts.report();
         Ok(self.totals)
     }
 }
@@ -551,14 +513,11 @@ struct DecodedRecord {
     key: Option<VariantKey>,
     /// The record's chromosome as written, for messages about a scored record.
     chromosome: String,
-    /// Whether a rule at the position names no single other allele. Which
-    /// alleles such a rule scores is decided by `PendingPosition`, so this
-    /// record's alleles carry no matched rules yet.
-    effect_only: bool,
-    /// An `effect_only` record's REF, and its ALT alleles in order: its (REF, ALT) rows.
+    /// The record's REF, and its ALT alleles in order: its (REF, ALT) rows. Which alleles the
+    /// rules at the position score is decided by `PendingPosition` over every record there.
     ref_allele: String,
     rows: Vec<String>,
-    /// Alleles with at least one matched rule, in ALT order. Only the first
+    /// Alleles some rule at the position may read, in ALT order. Only the first
     /// `allele_count` belong to this record; the rest keep their buffers.
     alleles: Vec<DecodedAllele>,
     allele_count: usize,
@@ -679,11 +638,11 @@ fn allele_need(people: usize, runs: usize, weights: usize) -> usize {
         .saturating_add(slots(weights, std::mem::size_of::<i64>()))
 }
 
-/// What a record at a position where a rule names no single other allele adds besides its
-/// record and allele needs, until the position is decided: its REF once and its ALT alleles, and
-/// their slots among the position's REFs and rows; each of its `columns` alleles' slot among the
-/// position's alleles; the runs an allele matches as the position is decided; and the position's
-/// copy of the chromosome and its decisions over its `runs`, with which row took each.
+/// What a scored record adds besides its record and allele needs, until its position is decided
+/// and as it is: its REF once and its ALT alleles, and their slots among the position's REFs and
+/// rows; each of its `columns` alleles' slot among the position's alleles; the position's copy of
+/// the chromosome; and what deciding the position over its `runs` of rules allocates for the
+/// record ([`site_need`]).
 fn pending_need(
     chromosome: usize,
     ref_allele: usize,
@@ -702,10 +661,43 @@ fn pending_need(
         .saturating_add(slots(1, std::mem::size_of::<String>()))
         .saturating_add(slots(alts, std::mem::size_of::<(usize, String)>()))
         .saturating_add(slots(columns, std::mem::size_of::<(usize, DecodedAllele)>()))
-        .saturating_add(grown_bytes(runs, std::mem::size_of::<(usize, bool)>()))
         .saturating_add(allocation_bytes(chromosome))
-        .saturating_add(allocation_bytes(runs.saturating_mul(std::mem::size_of::<(usize, OtherAlleleMatch)>())))
-        .saturating_add(allocation_bytes(runs.saturating_mul(std::mem::size_of::<Option<bool>>())))
+        .saturating_add(site_need(alts, runs))
+}
+
+/// What deciding a position allocates for one of its records, with `rows` ALT alleles, as the
+/// position's `runs` of rules are matched to its variants and scored: the rows as its [`Site`]
+/// reads them, with the site's variants, readings and per-row reading; the runs naming each
+/// variant, as they are found and in variant order; each variant's conflicts and each person's
+/// measured copies of it; the record's measured ploidy and first row; and the columns measuring a
+/// variant. Counted per record as if its rows were the position's, each allocation is at least
+/// the record's share of the position's, with a chunk of its own. The one column a position
+/// builds at a time is counted once, in [`RecordAccumulator::bytes`].
+fn site_need(rows: usize, runs: usize) -> usize {
+    use std::mem::size_of;
+    let each = |size: usize| allocation_bytes(rows.saturating_mul(size));
+    let grown = |count: usize, size: usize| vec_base(size).saturating_add(slots(count, size));
+    [
+        each(size_of::<(usize, &str, &str)>()),
+        grown(rows, size_of::<Vec<usize>>()),
+        rows.saturating_mul(grown(1, size_of::<usize>())),
+        grown(rows, size_of::<(&str, &str)>()),
+        each(size_of::<usize>()),
+        // Per variant, whether it is indistinct, the reading searched and the one found, the
+        // reading chosen and whether it is settled; per row, whether its first allele is its REF.
+        each(size_of::<bool>()).saturating_mul(6),
+        grown(1, size_of::<Vec<bool>>()),
+        each(size_of::<crate::score::site::Variant<'static>>()),
+        grown(runs, size_of::<(usize, (usize, bool))>()),
+        allocation_bytes(runs.saturating_mul(size_of::<(usize, bool)>())),
+        each(size_of::<u64>()),
+        each(size_of::<Measure<Decimal>>()),
+        allocation_bytes(size_of::<Option<Decimal>>()),
+        allocation_bytes(size_of::<usize>()),
+        grown(rows, size_of::<&DosageColumn>()),
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add)
 }
 
 /// The runs of the rules at a position, from rule `rules_start` on.
@@ -713,102 +705,72 @@ fn position_runs(rules_by_key: &ScoreRules, rules_start: usize, score_rules: &[S
     rules_by_key.runs(rules_start, rules_start + score_rules.len()).count()
 }
 
-/// The weights of every run of the rules at a position, from rule `rules_start` on.
-fn position_weights(rules_by_key: &ScoreRules, rules_start: usize, score_rules: &[ScoreRule]) -> usize {
-    rules_by_key.runs(rules_start, rules_start + score_rules.len()).map(|run| rules_by_key.merged(run).len()).sum()
-}
-
-/// How many runs of rules, and how many of their weights, score an allele `(ref_allele,
-/// alt_allele)` of a record at a position, at most, when the record decodes a column for it: the
-/// run naming its pair, or at an `effect_only` position, decided with the position, any of the
-/// position's runs.
-fn allele_runs(
-    rules_by_key: &ScoreRules,
-    rules_start: usize,
-    score_rules: &[ScoreRule],
-    effect_only: bool,
-    ref_allele: &str,
-    alt_allele: &str,
-) -> Option<(usize, usize)> {
-    if effect_only {
-        return may_score_at_effect_only_position(rules_by_key, score_rules, ref_allele, alt_allele).then(|| {
-            (
-                position_runs(rules_by_key, rules_start, score_rules),
-                position_weights(rules_by_key, rules_start, score_rules),
-            )
-        });
-    }
-    rules_for_allele(rules_by_key, rules_start, score_rules, false, ref_allele, alt_allele)
-        .map(|(run, _)| (1, rules_by_key.merged(run).len()))
-}
-
 /// What decoding and adding a scored record needs, from its chromosome, REF and ALT alleles and
 /// the rules at its position (`score_rules`, from rule `rules_start` on), counted before any of it
-/// is allocated: [`record_need`], an [`allele_need`] for each allele it decodes a column for, and
-/// at an `effect_only` position, [`pending_need`]. It does not depend on how many scores the
-/// rules weigh.
-#[allow(clippy::too_many_arguments)]
+/// is allocated: [`record_need`], an [`allele_need`] for each allele it decodes a column for
+/// ([`allele_reading`]), and [`pending_need`]. It does not depend on how many scores the rules
+/// weigh.
 fn scored_record_need<'a, I: Iterator<Item = &'a str>>(
     rules_by_key: &ScoreRules,
     rules_start: usize,
     score_rules: &[ScoreRule],
-    effect_only: bool,
     people: usize,
     chromosome: &str,
     ref_allele: &str,
     alt_alleles: impl Fn() -> I,
 ) -> usize {
+    let every_alt = may_name_reference(rules_by_key, score_rules, ref_allele);
     let mut alts = 0usize;
     let mut columns = 0usize;
     let mut alleles = 0usize;
     for alt_allele in alt_alleles() {
         alts += 1;
-        if let Some((runs, weights)) =
-            allele_runs(rules_by_key, rules_start, score_rules, effect_only, ref_allele, alt_allele)
+        if let Some(reading) =
+            allele_reading(rules_by_key, rules_start, score_rules, ref_allele, alt_allele, every_alt)
         {
             columns += 1;
-            alleles = alleles.saturating_add(allele_need(people, runs, weights));
+            alleles = alleles.saturating_add(allele_need(people, reading.runs, reading.weights));
         }
     }
-    let pending = if effect_only {
-        pending_need(
-            chromosome.len(),
-            ref_allele.len(),
-            alt_alleles().map(str::len),
-            columns,
-            position_runs(rules_by_key, rules_start, score_rules),
-        )
-    } else {
-        0
-    };
+    let pending = pending_need(
+        chromosome.len(),
+        ref_allele.len(),
+        alt_alleles().map(str::len),
+        columns,
+        position_runs(rules_by_key, rules_start, score_rules),
+    );
     record_need(chromosome.len(), alts, columns).saturating_add(alleles).saturating_add(pending)
 }
 
 /// What a record at the neediest and at the least needy scored position needs to decode and add,
 /// were it to carry an allele for each of its position's runs of rules, with a one-byte
 /// chromosome, REF and ALT alleles: each longer byte adds at most itself and a thirty-second to
-/// its allocation.
+/// its allocation. Such an allele is read by the run naming its pair, if any, and by each run
+/// naming an effect allele beside other-allele text, which may name every ALT there.
 fn position_needs(rules_by_key: &ScoreRules, people: usize) -> (usize, usize) {
     let mut most = 0usize;
     let mut least = usize::MAX;
     for &(start, end) in rules_by_key.ranges.values() {
-        let score_rules = &rules_by_key.rules[start..end];
-        let effect_only = is_effect_only_position(rules_by_key, score_rules);
-        let runs = position_runs(rules_by_key, start, score_rules);
-        let alleles = if effect_only {
-            let weights = position_weights(rules_by_key, start, score_rules);
-            runs.saturating_mul(allele_need(people, runs, weights))
-        } else {
-            rules_by_key
-                .runs(start, end)
-                .map(|run| allele_need(people, 1, rules_by_key.merged(run).len()))
-                .fold(0usize, usize::saturating_add)
-        };
-        let pending = if effect_only {
-            pending_need(1, 1, std::iter::repeat_n(1, runs), runs, runs)
-        } else {
-            0
-        };
+        let effect_only = |run: usize| names_no_single_other_allele(rules_by_key.allele(rules_by_key.rules[run].other_allele));
+        let runs = rules_by_key.runs(start, end).count();
+        let (effect_only_runs, effect_only_weights) = rules_by_key
+            .runs(start, end)
+            .filter(|&run| effect_only(run))
+            .fold((0usize, 0usize), |(count, weights), run| {
+                (count + 1, weights.saturating_add(rules_by_key.merged(run).len()))
+            });
+        let alleles = rules_by_key
+            .runs(start, end)
+            .map(|run| {
+                if effect_only(run) {
+                    allele_need(people, effect_only_runs, effect_only_weights)
+                } else {
+                    let weights = rules_by_key.merged(run).len().saturating_add(effect_only_weights);
+                    allele_need(people, 1 + effect_only_runs, weights)
+                }
+            })
+            .fold(0usize, usize::saturating_add);
+        let pending = pending_need(1, 1, std::iter::repeat_n(1, runs), runs, runs);
         let need = record_need(1, runs, runs).saturating_add(alleles).saturating_add(pending);
         most = most.max(need);
         least = least.min(need);
@@ -825,12 +787,6 @@ fn alt_alleles_of(bases: &str) -> impl Iterator<Item = &str> {
 struct DecodedAllele {
     /// The allele's ALT ordinal, from 0.
     alt_offset: usize,
-    /// The first rule of the run naming the allele's pair, as an index into every position's
-    /// rules: the pair it names is the allele's, and the run's weights score it. Unused at an
-    /// `effect_only` position.
-    first_rule: usize,
-    /// Whether that rule's effect allele is this record's REF.
-    first_rule_effect_is_ref: bool,
     /// One dosage per kept person, in output order.
     column: DosageColumn,
     /// The column's scale, once it has been normalized where it was decoded.
@@ -971,6 +927,38 @@ impl Doses {
 }
 
 impl DosageColumn {
+    /// How many people the column holds.
+    fn people(&self) -> usize {
+        match self {
+            Self::Calls(codes) => codes.len(),
+            Self::Dosages(doses) => doses.digits.len(),
+        }
+    }
+
+    /// One person's doses of the ALT and of the REF, each `None` where missing.
+    fn dose(&self, person: usize) -> [Option<Decimal>; 2] {
+        match self {
+            Self::Calls(codes) => match codes[person] {
+                MISSING_CALL => [None, None],
+                code => [code & 0x0f, code >> 4].map(|copies| {
+                    Some(Decimal {
+                        digits: i128::from(copies),
+                        places: 0,
+                    })
+                }),
+            },
+            Self::Dosages(doses) => {
+                let (digits, places) = (doses.digits[person], doses.places[person]);
+                [0, 1].map(|side| {
+                    (places[side] != u8::MAX).then_some(Decimal {
+                        digits: i128::from(digits[side]),
+                        places: places[side],
+                    })
+                })
+            }
+        }
+    }
+
     /// The column, emptied, as hard calls.
     fn calls(&mut self) -> &mut Vec<u8> {
         if let Self::Dosages(_) = self {
@@ -1115,11 +1103,13 @@ impl Wide {
     }
 }
 
-/// One scored allele: the runs of rules it is scored by, in `ScoreTotals::unapplied_runs`; each of
-/// their weights' lane weight at its score's scale, in `ScoreTotals::unapplied_weights`, in the
-/// order a [`ScoreWalk`] walks them; every kept person's dosage of it; and its column's scale.
+/// One scored allele: the runs of rules it is scored by, in `ScoreTotals::unapplied_runs`, and the
+/// ways of reading it of the scores it adds; each of their weights' lane weight at its score's
+/// scale, in `ScoreTotals::unapplied_weights`, in the order a [`ScoreWalk`] walks them; every kept
+/// person's dosage of it; and its column's scale.
 struct ScoredAllele {
     runs: (usize, usize),
+    reads: Reads,
     weights: (usize, usize),
     column: DosageColumn,
     scale: ColumnScale,
@@ -1130,50 +1120,109 @@ struct ScoredAllele {
 /// exactly, as any weight may.
 const IN_CELLS: i64 = i64::MIN;
 
-/// The weights `runs` give each score, score by score in increasing order. A run is its first rule
-/// and whether that rule's effect allele is the allele's REF; each run's weights are by score
-/// already, so they are walked together with a cursor each.
+/// Ways a score reads a variant, by the sides its weights there name: its ALT only, its REF only,
+/// or both. A column scores the scores reading it in the ways it holds, since a score's dose is
+/// missing where a side it reads is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Reads(u8);
+
+impl Reads {
+    const NONE: Self = Self(0);
+    const ALT: Self = Self(1);
+    const REF: Self = Self(2);
+    const BOTH: Self = Self(4);
+    /// Every way: every score.
+    const ANY: Self = Self(7);
+    /// The ways that read the REF.
+    const WITH_REF: Self = Self(6);
+
+    /// How one score's `weights` read their variant.
+    fn of(weights: &[MatchedRule]) -> Self {
+        let alt = weights.iter().any(|weight| !weight.effect_is_ref);
+        let reference = weights.iter().any(|weight| weight.effect_is_ref);
+        match (alt, reference) {
+            (true, false) => Self::ALT,
+            (false, true) => Self::REF,
+            (true, true) => Self::BOTH,
+            (false, false) => Self::NONE,
+        }
+    }
+
+    fn admits(self, weights: &[MatchedRule]) -> bool {
+        self.0 & Self::of(weights).0 != 0
+    }
+
+    /// The sides, (ALT, REF), a single way reads.
+    fn sides(self) -> [bool; 2] {
+        [
+            self.0 & (Self::ALT.0 | Self::BOTH.0) != 0,
+            self.0 & (Self::REF.0 | Self::BOTH.0) != 0,
+        ]
+    }
+
+    /// Each single way among these.
+    fn each(self) -> impl Iterator<Item = Self> {
+        [Self::ALT, Self::REF, Self::BOTH]
+            .into_iter()
+            .filter(move |way| self.0 & way.0 != 0)
+    }
+}
+
+/// The weights `runs` give each score that reads their allele in one of the ways `reads` holds,
+/// score by score in increasing order. A run is its first rule and whether that rule's effect
+/// allele is the allele's REF; each run's weights are by score already, so they are walked
+/// together with a cursor each.
 struct ScoreWalk<'w> {
     plan: &'w ScoreRules,
     runs: &'w [(usize, bool)],
+    reads: Reads,
     cursors: &'w mut Vec<usize>,
 }
 
 impl<'w> ScoreWalk<'w> {
-    fn new(plan: &'w ScoreRules, runs: &'w [(usize, bool)], cursors: &'w mut Vec<usize>) -> Self {
+    fn new(plan: &'w ScoreRules, runs: &'w [(usize, bool)], reads: Reads, cursors: &'w mut Vec<usize>) -> Self {
         cursors.clear();
         cursors.extend(runs.iter().map(|&(rule, _)| plan.rules[rule].merged.0));
-        Self { plan, runs, cursors }
+        Self {
+            plan,
+            runs,
+            reads,
+            cursors,
+        }
     }
 
     /// Puts the next score's weights in `weights`, giving `false` once every weight is walked.
     fn next_score(&mut self, weights: &mut Vec<MatchedRule>) -> bool {
         let plan = self.plan;
-        let next = self
-            .runs
-            .iter()
-            .zip(self.cursors.iter())
-            .filter(|&(&(rule, _), &cursor)| cursor < plan.rules[rule].merged.1)
-            .map(|(_, &cursor)| plan.merged[cursor].score_index)
-            .min();
-        let Some(score) = next else {
-            return false;
-        };
-        weights.clear();
-        for (&(rule, first_is_ref), cursor) in self.runs.iter().zip(self.cursors.iter_mut()) {
-            let end = plan.rules[rule].merged.1;
-            while *cursor < end && plan.merged[*cursor].score_index == score {
-                let weight = plan.merged[*cursor];
-                weights.push(MatchedRule {
-                    score_index: score,
-                    digits: weight.digits,
-                    exponent: weight.exponent,
-                    effect_is_ref: weight.same_effect == first_is_ref,
-                });
-                *cursor += 1;
+        loop {
+            let next = self
+                .runs
+                .iter()
+                .zip(self.cursors.iter())
+                .filter(|&(&(rule, _), &cursor)| cursor < plan.rules[rule].merged.1)
+                .map(|(_, &cursor)| plan.merged[cursor].score_index)
+                .min();
+            let Some(score) = next else {
+                return false;
+            };
+            weights.clear();
+            for (&(rule, first_is_ref), cursor) in self.runs.iter().zip(self.cursors.iter_mut()) {
+                let end = plan.rules[rule].merged.1;
+                while *cursor < end && plan.merged[*cursor].score_index == score {
+                    let weight = plan.merged[*cursor];
+                    weights.push(MatchedRule {
+                        score_index: score,
+                        digits: weight.digits,
+                        exponent: weight.exponent,
+                        effect_is_ref: weight.same_effect == first_is_ref,
+                    });
+                    *cursor += 1;
+                }
+            }
+            if self.reads == Reads::ANY || self.reads.admits(weights) {
+                return true;
             }
         }
-        true
     }
 }
 
@@ -1356,6 +1405,7 @@ impl ScoreTotals {
         &mut self,
         plan: &ScoreRules,
         runs: &[(usize, bool)],
+        reads: Reads,
         mut column: DosageColumn,
         scale: Option<ColumnScale>,
         ref_effect_error: impl Fn(usize) -> String,
@@ -1378,7 +1428,7 @@ impl ScoreTotals {
             &mut self.lane_weights,
         );
         let Walk { cursors, weights, rules } = &mut self.walk;
-        let mut walk = ScoreWalk::new(plan, runs, cursors);
+        let mut walk = ScoreWalk::new(plan, runs, reads, cursors);
         while walk.next_score(weights) {
             let score = weights[0].score_index;
             scored = true;
@@ -1419,7 +1469,7 @@ impl ScoreTotals {
                 dosage: &self.dosage_places,
             };
             let Walk { cursors, weights, rules } = &mut self.walk;
-            let mut walk = ScoreWalk::new(plan, runs, cursors);
+            let mut walk = ScoreWalk::new(plan, runs, reads, cursors);
             while walk.next_score(weights) {
                 queue_score(weights, at, &scale, rules, &mut self.groups, &mut self.lane_weights);
             }
@@ -1448,11 +1498,43 @@ impl ScoreTotals {
         self.unapplied_runs.extend_from_slice(runs);
         self.unapplied.push(ScoredAllele {
             runs: (first_run, self.unapplied_runs.len()),
+            reads,
             weights: (first_weight, self.unapplied_weights.len()),
             column,
             scale,
         });
         Ok(())
+    }
+
+    /// [`ScoreTotals::add_allele`] for a column built as a position is decided, whose terms are
+    /// added into the sums at once, so that the run holds one such column at a time.
+    fn add_built(
+        &mut self,
+        plan: &ScoreRules,
+        runs: &[(usize, bool)],
+        reads: Reads,
+        column: DosageColumn,
+        ref_effect_error: impl Fn(usize) -> String,
+    ) -> Result<(), String> {
+        self.add_allele(plan, runs, reads, column, None, ref_effect_error)?;
+        self.apply(plan);
+        Ok(())
+    }
+
+    /// The ways among `reads` in which the scores `runs` weigh read their allele, and the first of
+    /// those scores reading its REF.
+    fn reads(&mut self, plan: &ScoreRules, runs: &[(usize, bool)], reads: Reads) -> (Reads, Option<usize>) {
+        let Walk { cursors, weights, .. } = &mut self.walk;
+        let mut walk = ScoreWalk::new(plan, runs, reads, cursors);
+        let (mut found, mut ref_score) = (Reads::NONE, None);
+        while walk.next_score(weights) {
+            let way = Reads::of(weights);
+            found = Reads(found.0 | way.0);
+            if ref_score.is_none() && way.sides()[1] {
+                ref_score = Some(weights[0].score_index);
+            }
+        }
+        (found, ref_score)
     }
 
     /// Moves the lanes of `scores` into their cells.
@@ -1703,7 +1785,7 @@ impl ScoredAllele {
             DosageColumn::Calls(codes) => {
                 let codes = &codes[people];
                 let missing_call = u8x8::splat(MISSING_CALL);
-                let mut walk = ScoreWalk::new(plan, runs, cursors);
+                let mut walk = ScoreWalk::new(plan, runs, self.reads, cursors);
                 while walk.next_score(weights) {
                     let score = weights[0].score_index;
                     for (weight, lane_weight) in weights.iter().zip(&mut lane_weights) {
@@ -1738,7 +1820,7 @@ impl ScoredAllele {
             DosageColumn::Dosages(doses) => {
                 let digits = &doses.digits[people.clone()];
                 let dose_places = &doses.places[people];
-                let mut walk = ScoreWalk::new(plan, runs, cursors);
+                let mut walk = ScoreWalk::new(plan, runs, self.reads, cursors);
                 while walk.next_score(weights) {
                     let score = weights[0].score_index;
                     for (weight, lane_weight) in weights.iter().zip(&mut lane_weights) {
@@ -1777,10 +1859,9 @@ impl ScoredAllele {
     }
 }
 
-/// The records read so far at one position holding a rule that names no single
-/// other allele. Such a rule scores the one variant at the position carrying its
-/// effect allele with a listed other allele, so nothing there is scored until
-/// every record at the position has been read.
+/// The records read so far at one scored position. What a score row there scores is decided over
+/// every record at the position, by the site rule of [`crate::score::site`], so nothing there is
+/// scored until the next scored position or the end of input shows every one of them has been read.
 #[derive(Default)]
 struct PendingPosition {
     key: Option<VariantKey>,
@@ -1790,13 +1871,10 @@ struct PendingPosition {
     /// Every ALT allele read at the position, in input order, with its record's index in `refs`:
     /// the position's (REF, ALT) rows.
     rows: Vec<(usize, String)>,
-    /// Alleles some rule may score, each with its index in `rows`.
+    /// Decoded alleles, each with its index in `rows`, in row order.
     alleles: Vec<(usize, DecodedAllele)>,
     /// Which positions have been resolved, by the index of their first rule.
     resolved: Vec<bool>,
-    /// The runs of rules an allele matches as the position is decided, each as its first rule
-    /// and whether that rule's effect allele is the allele's REF.
-    matched: Vec<(usize, bool)>,
     /// What the records taken at the open position were counted to need.
     held: usize,
 }
@@ -1815,7 +1893,7 @@ impl PendingPosition {
         let first_rule = rules_by_key.ranges[&key].0;
         if std::mem::replace(&mut self.resolved[first_rule], true) {
             return Err(format!(
-                "Records at {chromosome}:{} are not adjacent in the input, and a score row there names no single other allele, so the variant it scores cannot be decided while streaming. Sort the input, for example with bcftools sort.",
+                "Records at {chromosome}:{} are not adjacent in the input, so the variants a score row there may name cannot be read together while streaming. Sort the input, for example with bcftools sort.",
                 key.1
             ));
         }
@@ -1828,101 +1906,456 @@ impl PendingPosition {
     fn push(&mut self, decoded: &mut DecodedRecord) {
         self.held = self.held.saturating_add(decoded.need);
         let first_row = self.rows.len();
-        let reference = self.refs.len();
+        let record = self.refs.len();
         self.refs.push(std::mem::take(&mut decoded.ref_allele));
-        self.rows.extend(decoded.rows.drain(..).map(|alt_allele| (reference, alt_allele)));
+        self.rows.extend(decoded.rows.drain(..).map(|alt_allele| (record, alt_allele)));
         for allele in &mut decoded.alleles[..decoded.allele_count] {
             self.alleles
                 .push((first_row + allele.alt_offset, std::mem::take(allele)));
         }
     }
 
-    /// Decides every rule at the open position over all of its rows, as Stage 3
-    /// does over `.bim` rows, and adds the alleles they score to `totals`. The
-    /// rules of a run name one pair, or one effect allele and other-allele text,
-    /// so a run is decided as its first rule is.
+    /// Decides every rule at the open position over all of its rows, as Stage 3 does over `.bim`
+    /// rows, and adds what they score to `totals`.
     fn resolve(
         &mut self,
         rules_by_key: &ScoreRules,
         score_names: &[String],
         effect_only_matches: &mut EffectOnlyMatches,
+        conflicts: &mut MeasurementConflicts,
         totals: &mut ScoreTotals,
     ) -> Result<(), String> {
         let Some(key) = self.key.take() else {
             return Ok(());
         };
-        let (start, end) = rules_by_key.ranges.get(&key).copied().unwrap_or_default();
-        let rows = || {
-            self.rows
-                .iter()
-                .map(|(reference, alt_allele)| (self.refs[*reference].as_str(), alt_allele.as_str()))
-        };
-        let decisions: Vec<(usize, OtherAlleleMatch)> = rules_by_key
-            .runs(start, end)
-            .map(|run| {
-                let rule = &rules_by_key.rules[run];
-                let decision = resolve_other_allele(
-                    rules_by_key.allele(rule.effect_allele),
-                    rules_by_key.allele(rule.other_allele),
-                    rows(),
-                );
-                for _ in rules_by_key.merged(run) {
-                    effect_only_matches.record(decision, key);
-                }
-                (run, decision)
-            })
-            .collect();
-
-        // A run's allele pair scores one row; a second row carrying it repeats the variant.
-        // Per run, whether a row has taken it, and if so whether its first rule's effect allele was
-        // that row's REF.
-        let mut taken: Vec<Option<bool>> = vec![None; decisions.len()];
-        for (row, allele) in &mut self.alleles {
-            let (reference, alt_allele) = &self.rows[*row];
-            let ref_allele = self.refs[*reference].as_str();
-            self.matched.clear();
-            for (index, &(run, decision)) in decisions.iter().enumerate() {
-                let rule = &rules_by_key.rules[run];
-                let effect_allele = rules_by_key.allele(rule.effect_allele);
-                let effect_is_ref = match decision {
-                    OtherAlleleMatch::Pair => pair_orientation(
-                        effect_allele,
-                        rules_by_key.allele(rule.other_allele),
-                        ref_allele,
-                        alt_allele,
-                    ),
-                    OtherAlleleMatch::EffectOnly(chosen) if chosen == *row => {
-                        Some(effect_allele == ref_allele)
-                    }
-                    _ => None,
-                };
-                if let Some(effect_is_ref) = effect_is_ref {
-                    if let Some(earlier_effect_is_ref) = taken[index].replace(effect_is_ref) {
-                        return Err(repeated_pair_error(
-                            &self.chromosome,
-                            key.1,
-                            effect_allele,
-                            rules_by_key.allele(rule.other_allele),
-                            earlier_effect_is_ref,
-                            effect_is_ref,
-                        ));
-                    }
-                    self.matched.push((run, effect_is_ref));
-                }
-            }
-            totals.add_allele(
-                rules_by_key,
-                &self.matched,
-                std::mem::take(&mut allele.column),
-                allele.scale.take(),
-                |score_index| ref_effect_error(&score_names[score_index], &self.chromosome, key.1),
-            )?;
-        }
+        let scored = self.score(key, rules_by_key, score_names, effect_only_matches, conflicts, totals);
         self.refs.clear();
         self.rows.clear();
         self.alleles.clear();
         self.held = 0;
+        scored
+    }
+
+    /// Adds what every rule at `key` scores to `totals`: each score's copies of its effect allele,
+    /// an ALT's from the rows measuring it and the REF's the ploidy less every ALT's.
+    fn score(
+        &mut self,
+        key: VariantKey,
+        rules_by_key: &ScoreRules,
+        score_names: &[String],
+        effect_only_matches: &mut EffectOnlyMatches,
+        conflicts: &mut MeasurementConflicts,
+        totals: &mut ScoreTotals,
+    ) -> Result<(), String> {
+        let Self {
+            chromosome,
+            refs,
+            rows,
+            alleles,
+            ..
+        } = self;
+        let (chromosome, position) = (chromosome.as_str(), key.1);
+        let site_rows: Vec<(usize, &str, &str)> = rows
+            .iter()
+            .map(|(record, alternate)| (*record, refs[*record].as_str(), alternate.as_str()))
+            .collect();
+        // A record writes its REF.
+        let site = Site::new(&site_rows, true);
+        // Every run of rules at the position that scores an allele of the site: the variant it
+        // names, its first rule, and whether that rule's effect allele is the variant's REF. A
+        // declared site is read one way or none, so the rules of a run, which name one allele pair
+        // in either order or one effect allele beside one other-allele text, meet it as its first
+        // rule does.
+        let (start, end) = rules_by_key.ranges.get(&key).copied().unwrap_or_default();
+        let mut named: Vec<(usize, (usize, bool))> = Vec::new();
+        for run in rules_by_key.runs(start, end) {
+            let rule = &rules_by_key.rules[run];
+            let effect_allele = rules_by_key.allele(rule.effect_allele);
+            let other_allele = rules_by_key.allele(rule.other_allele);
+            let decision = site.match_row(effect_allele, other_allele);
+            let effect_only = names_no_single_other_allele(other_allele);
+            if effect_only {
+                for _ in rules_by_key.merged(run) {
+                    effect_only_matches.record(decision, key);
+                }
+            }
+            let allele = match decision {
+                RowMatch::NoVariant => continue,
+                RowMatch::Several(..) if effect_only => continue,
+                RowMatch::Several(first, second) => {
+                    // Unsplit, a filter on REF and ALT drops a whole multiallelic record with every
+                    // ALT it carries, so the example splits first.
+                    let second_variant = site.variants()[second];
+                    let (reference, alternate) = (second_variant.reference, second_variant.alternate);
+                    return Err(format!(
+                        "{}, for example splitting multiallelic records and dropping the one with REF {reference} and ALT {alternate}: bcftools norm -m -any INPUT | bcftools view -e 'CHROM==\"{chromosome}\" && POS=={position} && REF==\"{reference}\" && ALT==\"{alternate}\"'.",
+                        site.several_error(chromosome, position, effect_allele, other_allele, (first, second), "record")
+                    ));
+                }
+                RowMatch::Unread(_) => {
+                    return Err(site.unread_error(chromosome, position, effect_allele, other_allele, "records"));
+                }
+                RowMatch::Scores(allele) => allele,
+            };
+            let run = (run, matches!(allele, SiteAllele::Reference(_)));
+            if let Some(twice) = site.listed_twice()
+                && (twice == allele.variant() || run_names_reference(rules_by_key, run))
+            {
+                let (reference, alternate) = site.variants()[twice].written;
+                return Err(format!(
+                    "A record at {chromosome}:{position} lists the ALT {alternate} of REF {reference} twice, so the copies of {alternate} that a score row there needs are unknown. List each ALT of a record once."
+                ));
+            }
+            named.push((allele.variant(), run));
+        }
+        if named.is_empty() {
+            return Ok(());
+        }
+
+        // Each (variant, score) is one matched variant of the score, weighed by every run naming the
+        // variant. It scores the variant's own rows, unless the score names the site's REF through
+        // it: then it waits on every variant of the site.
+        named.sort_unstable_by_key(|&(variant, (run, _))| (variant, run));
+        let runs: Vec<(usize, bool)> = named.iter().map(|&(_, run)| run).collect();
+        let variants = || {
+            named.chunk_by(|a, b| a.0 == b.0).scan(0, |start, group| {
+                let range = *start..*start + group.len();
+                *start = range.end;
+                Some((group[0].0, range))
+            })
+        };
+        let error = |score_index: usize| ref_effect_error(&score_names[score_index], chromosome, position);
+        let row_variants = site.row_variants();
+        let mut site_conflicts = vec![0u64; site.variants().len()];
+        // A single record listing each ALT once holds the site as a joined record does: its REF
+        // copies are the ploidy less every ALT's, so each variant's own decoded column serves the
+        // variant's ALT and the REF alike.
+        let one_record = refs.len() == 1 && site.variants().len() == row_variants.len();
+        let waits_on_site = |variant: usize| !one_record && site.reads_whole_site(SiteAllele::Reference(variant));
+        // The REF's doses read every row, so they are built before any column is taken.
+        for (variant, range) in variants() {
+            let runs = &runs[range];
+            if !waits_on_site(variant) {
+                continue;
+            }
+            let (reads, ref_score) = totals.reads(rules_by_key, runs, Reads::WITH_REF);
+            if reads == Reads::NONE {
+                continue;
+            }
+            let (column, conflicting) = site_column(
+                &site,
+                variant,
+                (refs.len(), &rows[..]),
+                &alleles[..],
+                || error(ref_score.unwrap_or(0)),
+                (chromosome, position),
+            )?;
+            site_conflicts[variant] += conflicting;
+            totals.add_built(rules_by_key, runs, Reads::WITH_REF, column, error)?;
+        }
+        for (variant, range) in variants() {
+            let runs = &runs[range];
+            // The scores of the variant that do not wait on the whole site.
+            let own = if waits_on_site(variant) { Reads::ALT } else { Reads::ANY };
+            let mut measured = (0..row_variants.len()).filter(|&row| row_variants[row] == variant);
+            let decoded = |row: usize| alleles.binary_search_by_key(&row, |&(decoded, _)| decoded).ok();
+            match (measured.next(), measured.next()) {
+                (Some(row), None) => {
+                    let index = decoded(row).ok_or_else(|| undecoded_error(chromosome, position))?;
+                    let allele = &mut alleles[index].1;
+                    let column = std::mem::take(&mut allele.column);
+                    totals.add_allele(rules_by_key, runs, own, column, allele.scale.take(), error)?;
+                }
+                _ => {
+                    let measurements = (0..row_variants.len())
+                        .filter(|&row| row_variants[row] == variant)
+                        .map(|row| decoded(row).map(|index| &alleles[index].1.column))
+                        .collect::<Option<Vec<&DosageColumn>>>()
+                        .ok_or_else(|| undecoded_error(chromosome, position))?;
+                    // Each score's dose waits on the sides its own rules read, so scores reading
+                    // different sides take different columns.
+                    let (reads, _) = totals.reads(rules_by_key, runs, own);
+                    for way in reads.each() {
+                        let (column, conflicting) = consensus_column(&measurements, way.sides())
+                            .ok_or_else(|| inexact_error(chromosome, position))?;
+                        site_conflicts[variant] += conflicting;
+                        totals.add_built(rules_by_key, runs, way, column, error)?;
+                    }
+                }
+            }
+        }
+        for (variant, &doses) in site_conflicts.iter().enumerate() {
+            conflicts.record(chromosome, position, &site, variant, doses);
+        }
         Ok(())
+    }
+}
+
+/// Whether a weight of the run starting at rule `first_rule` names its variant's REF, when that
+/// rule's effect allele is the REF as `first_is_ref` says.
+fn run_names_reference(rules_by_key: &ScoreRules, (first_rule, first_is_ref): (usize, bool)) -> bool {
+    rules_by_key
+        .merged(first_rule)
+        .iter()
+        .any(|weight| weight.same_effect == first_is_ref)
+}
+
+/// The column of `variant` beside the site's REF, over a position's `records` and its `rows`
+/// (each ALT with its record) with their decoded `alleles`: each person's copies of the variant's
+/// ALT, the one value its rows agree on, and of the REF, the ploidy the records agree on less the
+/// copies of every variant at the site. A person whose measurements disagree, or whose ALTs'
+/// copies pass the ploidy, has no dose, and is counted in the conflicts returned. A record with an
+/// ALT dose and no REF dose gives `ref_error`.
+fn site_column(
+    site: &Site<'_>,
+    variant: usize,
+    (records, rows): (usize, &[(usize, String)]),
+    alleles: &[(usize, DecodedAllele)],
+    ref_error: impl Fn() -> String,
+    (chromosome, position): (&str, u32),
+) -> Result<(DosageColumn, u64), String> {
+    let row_variants = site.row_variants();
+    // A REF dose reads every ALT at the site, and every one was decoded for it: the alleles are
+    // in row order, one a row.
+    if alleles.len() != rows.len() {
+        return Err(undecoded_error(chromosome, position));
+    }
+    let people = alleles.first().map_or(0, |(_, allele)| allele.column.people());
+    let mut built = Doses::default();
+    built.reserve(people);
+    let mut conflicting = 0u64;
+    let mut copies = vec![Measure::Uncalled; site.variants().len()];
+    let mut record_ploidy = vec![None; records];
+    let mut first_row_of_record = vec![usize::MAX; records];
+    for (row, (record, _)) in rows.iter().enumerate() {
+        first_row_of_record[*record] = first_row_of_record[*record].min(row);
+    }
+    for person in 0..people {
+        copies.fill(Measure::Uncalled);
+        // Each record's ploidy: its REF's copies, which each of its rows carries, and its ALTs'.
+        record_ploidy.fill(Some(Decimal::ZERO));
+        for (row, (_, allele)) in alleles.iter().enumerate() {
+            let [alternate, reference] = allele.column.dose(person);
+            copies[row_variants[row]].measure(alternate);
+            let record = rows[row].0;
+            let reference = if first_row_of_record[record] == row {
+                if alternate.is_some() && reference.is_none() {
+                    return Err(ref_error());
+                }
+                reference
+            } else {
+                Some(Decimal::ZERO)
+            };
+            record_ploidy[record] = match (record_ploidy[record], alternate, reference) {
+                (Some(sum), Some(alternate), Some(reference)) => Some(
+                    sum.add(alternate)
+                        .and_then(|sum| sum.add(reference))
+                        .ok_or_else(|| inexact_error(chromosome, position))?,
+                ),
+                _ => None,
+            };
+        }
+        let mut ploidy = Measure::Uncalled;
+        for measured in record_ploidy.iter().copied() {
+            ploidy.measure(measured);
+        }
+        let dose = site_dose(&copies, variant, ploidy).ok_or_else(|| inexact_error(chromosome, position))?;
+        match dose {
+            Measure::Copies([alternate, reference]) => built.push([
+                alternate.dose().ok_or_else(|| inexact_error(chromosome, position))?,
+                reference.dose().ok_or_else(|| inexact_error(chromosome, position))?,
+            ]),
+            Measure::Uncalled => built.push([Dose::MISSING; 2]),
+            Measure::Disagreeing => {
+                conflicting += 1;
+                built.push([Dose::MISSING; 2]);
+            }
+        }
+    }
+    Ok((DosageColumn::Dosages(built), conflicting))
+}
+
+/// A person's doses of `variant`'s ALT and of the site's REF, from every variant's measured
+/// copies and the measured ploidy, or `None` when the arithmetic leaves i128.
+fn site_dose(copies: &[Measure<Decimal>], variant: usize, ploidy: Measure<Decimal>) -> Option<Measure<[Decimal; 2]>> {
+    if ploidy == Measure::Disagreeing || copies.contains(&Measure::Disagreeing) {
+        return Some(Measure::Disagreeing);
+    }
+    let Measure::Copies(ploidy) = ploidy else {
+        return Some(Measure::Uncalled);
+    };
+    let mut alternates = Decimal::ZERO;
+    for measured in copies {
+        let Measure::Copies(copies) = measured else {
+            return Some(Measure::Uncalled);
+        };
+        alternates = alternates.add(*copies)?;
+    }
+    let reference = ploidy.sub(alternates)?;
+    let Measure::Copies(alternate) = copies[variant] else {
+        return Some(Measure::Uncalled);
+    };
+    Some(if reference.digits < 0 {
+        Measure::Disagreeing
+    } else {
+        Measure::Copies([alternate, reference])
+    })
+}
+
+/// The column of one variant measured by several rows, for rules reading the `sides` it names
+/// (ALT, REF): each person's copies of each side read, the one value the rows that have it agree
+/// on, and the people whose rows disagree on a side read, who have no dose. A side no rule reads is
+/// a present zero on the ALT side and missing on the REF side, which no rule then asks for. `None`
+/// when a dose leaves i64.
+fn consensus_column(measurements: &[&DosageColumn], sides: [bool; 2]) -> Option<(DosageColumn, u64)> {
+    let people = measurements.first().map_or(0, |column| column.people());
+    let mut built = Doses::default();
+    built.reserve(people);
+    let mut conflicting = 0u64;
+    for person in 0..people {
+        let mut copies = [Measure::Uncalled; 2];
+        for column in measurements {
+            let doses = column.dose(person);
+            for side in 0..2 {
+                copies[side].measure(doses[side]);
+            }
+        }
+        let read = |side: usize| sides[side].then_some(copies[side]);
+        if [read(0), read(1)].contains(&Some(Measure::Disagreeing)) {
+            conflicting += 1;
+            built.push([Dose::MISSING; 2]);
+            continue;
+        }
+        match (read(0), read(1)) {
+            (Some(Measure::Uncalled), _) | (_, Some(Measure::Uncalled)) => built.push([Dose::MISSING; 2]),
+            (alternate, reference) => {
+                let dose = |measured: Option<Measure<Decimal>>, unread: Dose| match measured {
+                    Some(Measure::Copies(copies)) => copies.dose(),
+                    _ => Some(unread),
+                };
+                built.push([dose(alternate, Dose::copies(0))?, dose(reference, Dose::MISSING)?]);
+            }
+        }
+    }
+    Some((DosageColumn::Dosages(built), conflicting))
+}
+
+fn undecoded_error(chromosome: &str, position: u32) -> String {
+    format!("A record at {chromosome}:{position} was read without an ALT a score row there needs.")
+}
+
+fn inexact_error(chromosome: &str, position: u32) -> String {
+    format!("The doses at {chromosome}:{position} have too many decimal places to combine exactly.")
+}
+
+/// An exact decimal: `digits × 10^-places`.
+#[derive(Clone, Copy, Debug)]
+struct Decimal {
+    digits: i128,
+    places: u8,
+}
+
+impl PartialEq for Decimal {
+    /// The same number, whatever places each is written at.
+    fn eq(&self, other: &Self) -> bool {
+        self.aligned(*other).is_some_and(|(a, b, _)| a == b)
+    }
+}
+
+impl Decimal {
+    const ZERO: Self = Self { digits: 0, places: 0 };
+
+    /// Both numbers' digits at the more places of the two, and those places.
+    fn aligned(self, other: Self) -> Option<(i128, i128, u8)> {
+        let places = self.places.max(other.places);
+        let at = |value: Self| value.digits.checked_mul(10i128.checked_pow(u32::from(places - value.places))?);
+        Some((at(self)?, at(other)?, places))
+    }
+
+    fn add(self, other: Self) -> Option<Self> {
+        let (a, b, places) = self.aligned(other)?;
+        Some(Self {
+            digits: a.checked_add(b)?,
+            places,
+        })
+    }
+
+    fn sub(self, other: Self) -> Option<Self> {
+        let (a, b, places) = self.aligned(other)?;
+        Some(Self {
+            digits: a.checked_sub(b)?,
+            places,
+        })
+    }
+
+    /// The decimal as a column's dose, when its digits fit i64.
+    fn dose(self) -> Option<Dose> {
+        Some(Dose {
+            digits: i64::try_from(self.digits).ok()?,
+            places: self.places,
+        })
+    }
+}
+
+/// A quantity measured by several rows: the one value every row that has one agrees on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Measure<T> {
+    /// No row has a value yet.
+    Uncalled,
+    /// Every row with a value has this one.
+    Copies(T),
+    /// Rows have different values: none is the quantity's.
+    Disagreeing,
+}
+
+impl<T: PartialEq + Copy> Measure<T> {
+    /// Takes one row's value: a missing value is no measurement.
+    fn measure(&mut self, value: Option<T>) {
+        let Some(value) = value else {
+            return;
+        };
+        *self = match *self {
+            Measure::Uncalled => Measure::Copies(value),
+            Measure::Copies(earlier) if earlier == value => Measure::Copies(earlier),
+            _ => Measure::Disagreeing,
+        };
+    }
+}
+
+/// Doses left missing because the measurements they need disagree, and the first variants.
+#[derive(Default)]
+struct MeasurementConflicts {
+    doses: u64,
+    variants: u64,
+    examples: Vec<String>,
+}
+
+impl MeasurementConflicts {
+    const EXAMPLES: usize = 5;
+
+    fn record(&mut self, chromosome: &str, position: u32, site: &Site<'_>, variant: usize, doses: u64) {
+        if doses == 0 {
+            return;
+        }
+        self.doses += doses;
+        self.variants += 1;
+        if self.examples.len() < Self::EXAMPLES {
+            let (reference, alternate) = site.variants()[variant].written;
+            self.examples
+                .push(format!("{chromosome}:{position} {reference}>{alternate} ({doses})"));
+        }
+    }
+
+    fn report(&self) {
+        if self.doses == 0 {
+            return;
+        }
+        eprintln!(
+            "> Warning: {} dose(s) at {} variant(s) are missing because the records measuring them disagree, or the ALTs' copies at their position pass the ploidy. Examples: {}",
+            self.doses,
+            self.variants,
+            self.examples.join(", ")
+        );
     }
 }
 
@@ -2054,7 +2487,6 @@ fn decode_scored_fields(
         rules_by_key,
         rules_start,
         score_rules,
-        is_effect_only_position(rules_by_key, score_rules),
         context.kept_indices.len(),
         fields.chromosome,
         fields.reference_bases,
@@ -2073,26 +2505,19 @@ fn decode_scored_fields(
     decoded.chromosome.push_str(fields.chromosome);
 
     let alt_alleles: Vec<&str> = alt_alleles_of(fields.alternate_bases).collect();
-    decode_rows(
-        rules_by_key,
-        score_rules,
-        fields.reference_bases,
-        &alt_alleles,
-        decoded,
-    );
+    decode_rows(fields.reference_bases, &alt_alleles, decoded);
+    let every_alt = may_name_reference(rules_by_key, score_rules, fields.reference_bases);
     for (alt_offset, alt_allele) in alt_alleles.iter().enumerate() {
-        let Some((first_rule, first_rule_effect_is_ref)) = rules_for_allele(
+        let Some(reading) = allele_reading(
             rules_by_key,
             rules_start,
             score_rules,
-            decoded.effect_only,
             fields.reference_bases,
             alt_allele,
+            every_alt,
         ) else {
             continue;
         };
-        let ref_effect_rule =
-            ref_effect_score(rules_by_key, decoded.effect_only, first_rule, first_rule_effect_is_ref);
         let allele = decoded.next_allele(alt_offset);
         decode_vcf_column(
             fields.samples,
@@ -2101,114 +2526,80 @@ fn decode_scored_fields(
             context.kept_indices,
             &mut allele.column,
             || {
-                ref_effect_rule.map(|score_index| {
+                reading.ref_effect.map(|score_index| {
                     ref_effect_error(&context.score_names[score_index], fields.chromosome, pos)
                 })
             },
         )?;
         allele.scale = Some(allele.column.normalize());
-        allele.first_rule = first_rule;
-        allele.first_rule_effect_is_ref = first_rule_effect_is_ref;
         decoded.allele_count += 1;
     }
     Ok(Fit::Decoded)
 }
 
-/// Marks `decoded` as `effect_only` when a rule at its position names no single
-/// other allele, and keeps the record's (REF, ALT) pairs for `PendingPosition`.
-fn decode_rows(
-    rules_by_key: &ScoreRules,
-    score_rules: &[ScoreRule],
-    ref_allele: &str,
-    alt_alleles: &[&str],
-    decoded: &mut DecodedRecord,
-) {
-    decoded.effect_only = is_effect_only_position(rules_by_key, score_rules);
-    if decoded.effect_only {
-        decoded.ref_allele.clear();
-        decoded.ref_allele.push_str(ref_allele);
-        decoded.rows.clear();
-        decoded.rows.extend(alt_alleles.iter().map(|alt_allele| alt_allele.to_string()));
-    }
+/// Keeps the record's REF and ALT alleles, its (REF, ALT) rows, for `PendingPosition`.
+fn decode_rows(ref_allele: &str, alt_alleles: &[&str], decoded: &mut DecodedRecord) {
+    decoded.ref_allele.clear();
+    decoded.ref_allele.push_str(ref_allele);
+    decoded.rows.clear();
+    decoded.rows.extend(alt_alleles.iter().map(|alt_allele| alt_allele.to_string()));
 }
 
-/// Whether a rule at a position with `score_rules` names no single other allele.
-fn is_effect_only_position(rules_by_key: &ScoreRules, score_rules: &[ScoreRule]) -> bool {
-    score_rules
-        .iter()
-        .any(|rule| names_no_single_other_allele(rules_by_key.allele(rule.other_allele)))
+/// Whether a rule at a position may name the REF the records there share: its effect allele
+/// begins with the first REF base of a record with `ref_allele`, as every REF the records hold
+/// begins. A REF's dose there is the ploidy less every ALT's copies, which reads every ALT.
+fn may_name_reference(rules_by_key: &ScoreRules, score_rules: &[ScoreRule], ref_allele: &str) -> bool {
+    score_rules.iter().any(|rule| {
+        rules_by_key.allele(rule.effect_allele).as_bytes().first() == ref_allele.as_bytes().first()
+    })
 }
 
-/// The run of the rules at a position, `score_rules` from rule `rules_start` on, naming the pair
-/// `(ref_allele, alt_allele)`: its first rule, and whether that rule's effect allele is REF; or
-/// `None` when no rule may score it. At an `effect_only` position the rules are matched once every
-/// record there has been read, so an allele some rule may score is `Some` with no run yet.
-fn rules_for_allele(
+/// How a record's ALT is read: by the runs of rules at its position naming one of its alleles,
+/// which may score its column as it was decoded, with their weights; and the first score whose
+/// weight among them names its REF, whose error a person without a complete REF dose raises.
+struct AlleleReading {
+    runs: usize,
+    weights: usize,
+    ref_effect: Option<usize>,
+}
+
+/// How ALT `alt_allele` of a record with REF `ref_allele` is read by the rules at its position,
+/// `score_rules` from rule `rules_start` on, or `None` when it is not read: it is read when a run
+/// names one of its alleles ([`row_side`]), or when `every_alt` holds.
+fn allele_reading(
     rules_by_key: &ScoreRules,
     rules_start: usize,
     score_rules: &[ScoreRule],
-    effect_only: bool,
     ref_allele: &str,
     alt_allele: &str,
-) -> Option<(usize, bool)> {
-    if effect_only {
-        return may_score_at_effect_only_position(rules_by_key, score_rules, ref_allele, alt_allele)
-            .then_some((rules_start, false));
-    }
-    rules_by_key.runs(rules_start, rules_start + score_rules.len()).find_map(|run| {
+    every_alt: bool,
+) -> Option<AlleleReading> {
+    let mut reading = AlleleReading {
+        runs: 0,
+        weights: 0,
+        ref_effect: None,
+    };
+    for run in rules_by_key.runs(rules_start, rules_start + score_rules.len()) {
         let rule = &rules_by_key.rules[run];
-        pair_orientation(
+        let Some(first_is_ref) = row_side(
             rules_by_key.allele(rule.effect_allele),
             rules_by_key.allele(rule.other_allele),
             ref_allele,
             alt_allele,
-        )
-        .map(|effect_is_ref| (run, effect_is_ref))
-    })
-}
-
-/// The first score a REF-effect weight of the run `first_rule` starts scores, for an allele whose
-/// orientation to that rule is `first_rule_effect_is_ref`: the one whose incomplete REF dosages
-/// are refused. None at an `effect_only` position, whose runs are matched later.
-fn ref_effect_score(
-    rules_by_key: &ScoreRules,
-    effect_only: bool,
-    first_rule: usize,
-    first_rule_effect_is_ref: bool,
-) -> Option<usize> {
-    if effect_only {
-        return None;
-    }
-    rules_by_key
-        .merged(first_rule)
-        .iter()
-        .find(|weight| weight.same_effect == first_rule_effect_is_ref)
-        .map(|weight| weight.score_index)
-}
-
-/// Whether some rule at a position where a rule names no single other allele may score
-/// `(ref_allele, alt_allele)`, once every record there has been read.
-fn may_score_at_effect_only_position(
-    rules_by_key: &ScoreRules,
-    score_rules: &[ScoreRule],
-    ref_allele: &str,
-    alt_allele: &str,
-) -> bool {
-    score_rules.iter().any(|rule| {
-        let effect_allele = rules_by_key.allele(rule.effect_allele);
-        let other_allele = rules_by_key.allele(rule.other_allele);
-        match resolve_other_allele(
-            effect_allele,
-            other_allele,
-            std::iter::once((ref_allele, alt_allele)),
-        ) {
-            OtherAlleleMatch::Pair => {
-                pair_orientation(effect_allele, other_allele, ref_allele, alt_allele).is_some()
-            }
-            OtherAlleleMatch::EffectOnly(_) => true,
-            OtherAlleleMatch::SeveralRows | OtherAlleleMatch::NoRow => false,
+        ) else {
+            continue;
+        };
+        let weights = rules_by_key.merged(run);
+        reading.runs += 1;
+        reading.weights += weights.len();
+        if reading.ref_effect.is_none() {
+            reading.ref_effect = weights
+                .iter()
+                .find(|weight| weight.same_effect == first_is_ref)
+                .map(|weight| weight.score_index);
         }
-    })
+    }
+    (every_alt || reading.runs > 0).then_some(reading)
 }
 
 /// Decodes the dosages a BCF `record` contributes to its matched rules into
@@ -2243,7 +2634,6 @@ fn decode_scored_bcf_record(
         rules_by_key,
         rules_start,
         score_rules,
-        is_effect_only_position(rules_by_key, score_rules),
         context.kept_indices.len(),
         chromosome,
         ref_allele,
@@ -2262,20 +2652,14 @@ fn decode_scored_bcf_record(
     decoded.chromosome.push_str(chromosome);
 
     let alt_alleles = alternate_bases.iter().collect::<Result<Vec<_>, _>>()?;
-    decode_rows(rules_by_key, score_rules, ref_allele, &alt_alleles, decoded);
+    decode_rows(ref_allele, &alt_alleles, decoded);
+    let every_alt = may_name_reference(rules_by_key, score_rules, ref_allele);
     for (alt_offset, alt_allele) in alt_alleles.iter().enumerate() {
-        let Some((first_rule, first_rule_effect_is_ref)) = rules_for_allele(
-            rules_by_key,
-            rules_start,
-            score_rules,
-            decoded.effect_only,
-            ref_allele,
-            alt_allele,
-        ) else {
+        let Some(reading) =
+            allele_reading(rules_by_key, rules_start, score_rules, ref_allele, alt_allele, every_alt)
+        else {
             continue;
         };
-        let ref_effect_rule =
-            ref_effect_score(rules_by_key, decoded.effect_only, first_rule, first_rule_effect_is_ref);
         let allele = decoded.next_allele(alt_offset);
         decode_bcf_column(
             record,
@@ -2285,14 +2669,12 @@ fn decode_scored_bcf_record(
             context.kept_indices,
             &mut allele.column,
             || {
-                ref_effect_rule.map(|score_index| {
+                reading.ref_effect.map(|score_index| {
                     ref_effect_error(&context.score_names[score_index], chromosome, pos)
                 })
             },
         )?;
         allele.scale = Some(allele.column.normalize());
-        allele.first_rule = first_rule;
-        allele.first_rule_effect_is_ref = first_rule_effect_is_ref;
         decoded.allele_count += 1;
     }
     Ok(Fit::Decoded)
@@ -2302,39 +2684,6 @@ fn ref_effect_error(score_name: &str, chromosome: &str, position: u32) -> String
     format!(
         "Cannot score REF-effect rule for score '{}' at {}:{} without a complete REF dosage (DS requires genotype ploidy and all ALT dosages).",
         score_name, chromosome, position,
-    )
-}
-
-/// The error for a second record carrying an allele pair that score rows name: which record a
-/// row scores is unknown, and scoring both would count the variant twice. `earlier_effect_is_ref`
-/// and `effect_is_ref` say whether `allele` was the REF of the record that first carried the pair
-/// and of this one, which decides the remedy. Records with the same REF and ALT are repeats, which
-/// bcftools removes once multiallelic records are split (bcftools norm --rm-dup exact alone keeps a
-/// record that lists one ALT twice). Records with REF and ALT swapped are different variants that
-/// share their allele strings, such as an insertion and a deletion of one base at a homopolymer:
-/// no deduplication removes either, so only the user can keep the one the row means. The example
-/// drops this record by its REF and ALT once multiallelic records are split: unsplit, a filter on
-/// REF and ALT drops a whole multiallelic record with every ALT it carries.
-fn repeated_pair_error(
-    chromosome: &str,
-    position: u32,
-    allele: &str,
-    other_allele: &str,
-    earlier_effect_is_ref: bool,
-    effect_is_ref: bool,
-) -> String {
-    let (reference, alternate) = if effect_is_ref { (allele, other_allele) } else { (other_allele, allele) };
-    let remedy = if earlier_effect_is_ref == effect_is_ref {
-        format!(
-            "They repeat REF {reference} and ALT {alternate}: remove the repeats, for example with bcftools norm -m -any --rm-dup exact INPUT."
-        )
-    } else {
-        format!(
-            "One has REF {alternate} and ALT {reference}, another REF {reference} and ALT {alternate}, so they are different variants: keep the one the row means, for example splitting multiallelic records and dropping the one with REF {reference} and ALT {alternate}: bcftools norm -m -any INPUT | bcftools view -e 'CHROM==\"{chromosome}\" && POS=={position} && REF==\"{reference}\" && ALT==\"{alternate}\"'."
-        )
-    };
-    format!(
-        "More than one record at {chromosome}:{position} carries the alleles {other_allele} and {allele}, which a score row names, so which record the row scores is unknown. {remedy}"
     )
 }
 
@@ -2638,23 +2987,6 @@ fn read_score_headers(
         });
     }
     Ok(headers)
-}
-
-/// Whether the effect allele is the REF, when a rule's allele pair is `(ref_allele,
-/// alt_allele)` in either order.
-fn pair_orientation(
-    effect_allele: &str,
-    other_allele: &str,
-    ref_allele: &str,
-    alt_allele: &str,
-) -> Option<bool> {
-    if effect_allele == alt_allele && other_allele == ref_allele {
-        Some(false)
-    } else if effect_allele == ref_allele && other_allele == alt_allele {
-        Some(true)
-    } else {
-        None
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4289,14 +4621,16 @@ mod tests {
             vcf
         };
 
+        // 1:300 A is the REF both records there carry, so its copies are the ploidy less the
+        // copies of C and of T, named through either pair.
         let pairs = score(
             "pairs.tsv",
-            "1:100\tA\tG\t0.5\n1:200\tT\tC\t-0.25\n1:400\tT\tC\t2\n1:500\tA\tG\t0.125\n",
+            "1:100\tA\tG\t0.5\n1:200\tT\tC\t-0.25\n1:300\tA\tC\t9\n1:400\tT\tC\t2\n1:500\tA\tG\t0.125\n",
         );
-        assert_eq!(pairs.sums(), [2.25, 2.125]);
-        assert_eq!(pairs.score_variant_counts, [4]);
-        // The same weights with the other allele unknown or listed as candidates, plus an
-        // ambiguous locus and one the genotypes lack.
+        assert_eq!(pairs.sums(), [11.25, 11.125]);
+        assert_eq!(pairs.score_variant_counts, [5]);
+        // The same weights with the other allele unknown or listed as candidates, plus a locus
+        // the genotypes lack.
         let effect_only = score(
             "effect_only.tsv",
             "1:100\tA\t.\t0.5\n1:200\tT\t.\t-0.25\n1:300\tA\t.\t9\n1:400\tT\tC/G\t2\n1:500\tA\tG/T\t0.125\n1:600\tA\t.\t7\n",
@@ -4305,14 +4639,14 @@ mod tests {
         assert_eq!(effect_only.score_variant_counts, pairs.score_variant_counts);
         assert_eq!(effect_only.missing_counts, pairs.missing_counts);
 
-        // No variant carries C at 1:100, two carry A at 1:300, and at 1:400 the only ALT
-        // that is T pairs it with an unlisted allele: all dropped; the explicit pair stays.
+        // No variant carries C at 1:100, and at 1:400 the only ALT that is T pairs it with an
+        // unlisted allele: both dropped. The REF at 1:300 and the explicit pair stay.
         let skipped = score(
             "skipped.tsv",
             "1:100\tC\t.\t1\n1:300\tA\t.\t1\n1:400\tT\tA/G\t1\n1:500\tA\tG\t1\n",
         );
-        assert_eq!(skipped.sums(), [2.0, 1.0]);
-        assert_eq!(skipped.score_variant_counts, [1]);
+        assert_eq!(skipped.sums(), [3.0, 2.0]);
+        assert_eq!(skipped.score_variant_counts, [2]);
     }
 
     #[test]
@@ -4359,7 +4693,7 @@ mod tests {
     }
 
     #[test]
-    fn effect_only_rules_refuse_records_at_their_position_that_are_not_adjacent() {
+    fn records_at_a_scored_position_that_are_not_adjacent_are_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
         let vcf_path = dir.path().join("unsorted.vcf");
         let score_path = dir.path().join("score.gnomon.tsv");
@@ -4371,17 +4705,17 @@ mod tests {
              1\t100\t.\tA\tT\t.\tPASS\t.\tGT\t0/1\n",
         )
         .expect("write vcf");
-        std::fs::write(
-            &score_path,
-            "variant_id\teffect_allele\tother_allele\tS\n1:100\tA\t.\t1\n1:200\tT\tC\t1\n",
-        )
-        .expect("write score");
-        let error = score_vcf_streaming(&vcf_path, &[score_path], None, None)
-            .expect_err("records at 1:100 are split by 1:200");
-        assert!(
-            error.to_string().contains("1:100 are not adjacent"),
-            "{error}"
-        );
+        // Whether the row at 1:100 names its other allele or not, its site is every record there.
+        for rows in ["1:100\tA\t.\t1\n1:200\tT\tC\t1\n", "1:100\tG\tA\t1\n1:200\tT\tC\t1\n"] {
+            std::fs::write(&score_path, format!("variant_id\teffect_allele\tother_allele\tS\n{rows}"))
+                .expect("write score");
+            let error = score_vcf_streaming(&vcf_path, std::slice::from_ref(&score_path), None, None)
+                .expect_err("records at 1:100 are split by 1:200");
+            assert!(
+                error.to_string().contains("1:100 are not adjacent"),
+                "{error}"
+            );
+        }
     }
 
     /// `text` as a plain VCF, a BGZF VCF in small blocks and a BCF, in `dir`.
@@ -4411,62 +4745,160 @@ mod tests {
         [vcf, bgzf, bcf]
     }
 
-    /// Records repeating an allele pair that a score row names are refused by name from plain
-    /// VCF, BGZF VCF and BCF: adjacent, apart, with REF and ALT swapped, and at a position where
-    /// another row names no single other allele. A repeated pair no row names still scores.
+    /// Records repeating REF and ALT are measurements of one variant, from plain VCF, BGZF VCF and
+    /// BCF: a person's dose is the one value the records with a dose agree on, and a person whose
+    /// records disagree has none. The variant counts once, and a REF dose waits on its agreeing
+    /// measurements as an ALT dose does.
     #[test]
-    fn records_repeating_a_scored_allele_pair_are_refused() {
+    fn records_repeating_a_variant_score_the_dose_they_agree_on() {
         let dir = tempfile::tempdir().expect("tempdir");
         let header = "##fileformat=VCFv4.2\n##contig=<ID=1>\n\
              ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
              ##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"ALT dosage\">\n\
              #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\n";
         let first = "1\t100\ta\tA\tG\t.\tPASS\t.\tGT:DS\t0|1:0.9\t0|0:0.1\n";
-        let second = "1\t100\tb\tA\tG\t.\tPASS\t.\tGT:DS\t1|1:1.8\t0|1:1.2\n";
+        let agreeing = "1\t100\tb\tA\tG\t.\tPASS\t.\tGT:DS\t0|1:0.90\t.|.:.\n";
+        let disagreeing = "1\t100\tb\tA\tG\t.\tPASS\t.\tGT:DS\t1|1:1.8\t0|0:0.1\n";
+        let other = "1\t200\tc\tC\tT\t.\tPASS\t.\tGT:DS\t0|1:1\t1|1:2\n";
+        let score_path = dir.path().join("score.gnomon.tsv");
+        for (case, body, scores, sums, missing) in [
+            (
+                "agreeing ALT",
+                [first, agreeing, other].concat(),
+                "variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.5\n1:200\tT\tC\t1\n",
+                [1.45, 2.05],
+                [0, 0],
+            ),
+            (
+                "agreeing REF",
+                [first, agreeing, other].concat(),
+                "variant_id\teffect_allele\tother_allele\tS\n1:100\tA\tG\t0.5\n1:200\tT\tC\t1\n",
+                [1.55, 2.95],
+                [0, 0],
+            ),
+            (
+                "disagreeing",
+                [first, disagreeing, other].concat(),
+                "variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.5\n1:100\tA\tG\t1\n1:200\tT\tC\t1\n",
+                [1.0, 2.0 + 0.5 * 0.1 + 1.9],
+                [1, 0],
+            ),
+        ] {
+            std::fs::write(&score_path, scores).expect("write score");
+            for path in cohort_files(dir.path(), &format!("{header}{body}")) {
+                let result = score_vcf_streaming(&path, std::slice::from_ref(&score_path), None, None)
+                    .unwrap_or_else(|err| panic!("{case}, {path:?}: {err}"));
+                for (actual, expected) in result.sums().iter().zip(sums) {
+                    assert!((actual - expected).abs() < 1e-12, "{case}, {path:?}: {actual} != {expected}");
+                }
+                assert_eq!(result.score_variant_counts, [2], "{case}, {path:?}");
+                assert_eq!(result.missing_counts, missing, "{case}, {path:?}");
+            }
+        }
+    }
+
+    /// Two variants whose alleles a score row names, a pair written with REF and ALT swapped
+    /// between records, are refused by name from plain VCF, BGZF VCF and BCF: which one the row
+    /// means is unknown. So is a record listing one ALT twice.
+    #[test]
+    fn records_swapping_a_scored_allele_pair_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let header = "##fileformat=VCFv4.2\n##contig=<ID=1>\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             ##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"ALT dosage\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\n";
+        let first = "1\t100\ta\tA\tG\t.\tPASS\t.\tGT:DS\t0|1:0.9\t0|0:0.1\n";
         let swapped = "1\t100\tb\tG\tA\t.\tPASS\t.\tGT:DS\t1|1:1.8\t0|1:1.2\n";
         let swapped_multiallelic = "1\t100\tb\tG\tA,T\t.\tPASS\t.\tGT:DS\t1|2:1,1\t0|1:1,0\n";
+        let repeated_alt = "1\t100\ta\tA\tG,G\t.\tPASS\t.\tGT:DS\t0|1:0.9,0\t0|0:0.1,0\n";
         let other = "1\t200\tc\tC\tT\t.\tPASS\t.\tGT:DS\t0|1:1\t1|1:2\n";
-        let unscored = "1\t300\td\tT\tC\t.\tPASS\t.\tGT:DS\t0|1:1\t1|1:2\n";
         let pairs = "variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.5\n1:200\tT\tC\t1\n";
         let with_effect_only = "variant_id\teffect_allele\tother_allele\tS\n\
              1:100\tG\tA\t0.5\n1:100\tT\t.\t2\n1:200\tT\tC\t1\n";
-        let repeated_alt = "1\t100\ta\tA\tG,G\t.\tPASS\t.\tGT:DS\t0|1:0.9,0\t0|0:0.1,0\n";
         let score_path = dir.path().join("score.gnomon.tsv");
-        // Records repeating REF and ALT are repeats, which splitting and deduplicating removes;
-        // records with REF and ALT swapped are different variants, of which the user keeps one.
-        let repeats =
-            "They repeat REF A and ALT G: remove the repeats, for example with bcftools norm -m -any --rm-dup exact INPUT.";
-        let different = "One has REF A and ALT G, another REF G and ALT A, so they are different variants: keep the one the \
-             row means, for example splitting multiallelic records and dropping the one with REF G and ALT A: bcftools \
-             norm -m -any INPUT | bcftools view -e 'CHROM==\"1\" && POS==100 && REF==\"G\" && ALT==\"A\"'.";
-        for (case, body, scores, remedy) in [
-            ("adjacent", [first, second, other].concat(), pairs, repeats),
-            ("apart", [first, other, second].concat(), pairs, repeats),
+        let different = "More than one record at 1:100 carries the alleles A and G, which a score row names, so which \
+             record the row scores is unknown. One has REF A and ALT G, another REF G and ALT A, so they are different \
+             variants: keep the one the row means, for example splitting multiallelic records and dropping the one with \
+             REF G and ALT A: bcftools norm -m -any INPUT | bcftools view -e 'CHROM==\"1\" && POS==100 && REF==\"G\" && \
+             ALT==\"A\"'.";
+        let twice = "A record at 1:100 lists the ALT G of REF A twice, so the copies of G that a score row there \
+             needs are unknown. List each ALT of a record once.";
+        for (case, body, scores, message) in [
             ("swapped", [first, swapped, other].concat(), pairs, different),
             ("swapped, the second multiallelic", [first, swapped_multiallelic, other].concat(), pairs, different),
-            ("one record repeating an ALT", [repeated_alt, other].concat(), pairs, repeats),
-            ("effect-only position", [first, second, other].concat(), with_effect_only, repeats),
             ("swapped at an effect-only position", [first, swapped, other].concat(), with_effect_only, different),
+            ("one record repeating an ALT", [repeated_alt, other].concat(), pairs, twice),
         ] {
             std::fs::write(&score_path, scores).expect("write score");
             for path in cohort_files(dir.path(), &format!("{header}{body}")) {
                 let error = score_vcf_streaming(&path, std::slice::from_ref(&score_path), None, None)
                     .expect_err(case)
                     .to_string();
-                assert!(
-                    error.starts_with(
-                        "More than one record at 1:100 carries the alleles A and G, which a score row names, so which \
-                         record the row scores is unknown. "
-                    ) && error.ends_with(remedy),
-                    "{case}, {path:?}: {error}"
-                );
+                assert_eq!(error, message, "{case}, {path:?}");
             }
         }
-        std::fs::write(&score_path, pairs).expect("write score");
-        for path in cohort_files(dir.path(), &format!("{header}{first}{other}{unscored}{unscored}")) {
-            let result = score_vcf_streaming(&path, std::slice::from_ref(&score_path), None, None)
-                .expect("a repeated pair no row names scores");
-            assert_eq!(result.sums(), [1.45, 2.05], "{path:?}");
+    }
+
+    /// A REF-effect row scores the ploidy less every ALT at its position, in a joined record and in
+    /// the records bcftools norm -m- splits it into alike, from hard calls and from dosages.
+    #[test]
+    fn a_ref_dose_is_the_same_from_joined_and_split_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let header = "##fileformat=VCFv4.2\n##contig=<ID=1>\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             ##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"ALT dosage\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\ts3\ts4\ts5\n";
+        // s1 A/G, s2 A/T, s3 G/T, s4 T/T, s5 missing.
+        let joined = "1\t100\t.\tA\tG,T\t.\tPASS\t.\tGT:DS\t0/1:1,0\t0/2:0,1\t1/2:0.9,1.1\t2/2:0,2\t./.:.,.\n";
+        let split = "1\t100\t.\tA\tG\t.\tPASS\t.\tGT:DS\t0/1:1\t0/0:0\t1/0:0.9\t0/0:0\t./.:.\n\
+             1\t100\t.\tA\tT\t.\tPASS\t.\tGT:DS\t0/0:0\t0/1:1\t0/1:1.1\t1/1:2\t./.:.\n";
+        let score_path = dir.path().join("score.gnomon.tsv");
+        std::fs::write(
+            &score_path,
+            "variant_id\teffect_allele\tother_allele\tRefA\tAltG\n1:100\tA\tG\t1\t\n1:100\tG\tA\t\t1\n",
+        )
+        .expect("write score");
+        for format in ["GT", "GT:DS"] {
+            let keep = |text: &str| -> String {
+                if format == "GT:DS" {
+                    return text.to_string();
+                }
+                text.lines()
+                    .map(|line| {
+                        if line.starts_with('#') {
+                            return format!("{line}\n");
+                        }
+                        let mut fields: Vec<String> = line.split('\t').map(str::to_string).collect();
+                        fields[8] = "GT".to_string();
+                        for sample in &mut fields[9..] {
+                            *sample = sample.split(':').next().unwrap_or(".").to_string();
+                        }
+                        format!("{}\n", fields.join("\t"))
+                    })
+                    .collect()
+            };
+            let mut answers = Vec::new();
+            for body in [joined, split] {
+                for path in cohort_files(dir.path(), &keep(&format!("{header}{body}"))) {
+                    let result = score_vcf_streaming(&path, std::slice::from_ref(&score_path), None, None)
+                        .unwrap_or_else(|err| panic!("{format}, {path:?}: {err}"));
+                    answers.push((result.sums(), result.missing_counts.clone(), result.score_variant_counts.clone()));
+                }
+            }
+            let (ref_a, alt_g) = if format == "GT" {
+                ([1.0, 1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 1.0, 0.0, 0.0])
+            } else {
+                ([1.0, 1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.9, 0.0, 0.0])
+            };
+            for (sums, missing, counts) in &answers {
+                for person in 0..5 {
+                    // Scores in name order: AltG, then RefA.
+                    assert!((sums[2 * person] - alt_g[person]).abs() < 1e-12, "{format}: {sums:?}");
+                    assert!((sums[2 * person + 1] - ref_a[person]).abs() < 1e-12, "{format}: {sums:?}");
+                }
+                assert_eq!(missing, &[0, 0, 0, 0, 0, 0, 0, 0, 1, 1], "{format}");
+                assert_eq!(counts, &[1, 1], "{format}");
+            }
         }
     }
 

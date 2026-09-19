@@ -28,7 +28,7 @@ use std::{
 /// weight past i64 at its band's scale as its f64, flagged in its slot (format 5 stored its
 /// integer's entry and limbs beside the slot, 24 bytes more): a header holding the key and one
 /// BLAKE3 digest per section, then little-endian arrays padded to multiples of 8 bytes.
-const MAGIC: [u8; 8] = *b"GNPLAN06";
+const MAGIC: [u8; 8] = *b"GNPLAN07";
 /// Inputs are hashed in leaves of this many bytes, so a key depends only on the
 /// bytes, never on thread count, read sizes or available memory.
 const LEAF_BYTES: u64 = 4 << 20;
@@ -135,7 +135,7 @@ fn plan_directory() -> Option<PathBuf> {
 /// Every source whose code decides what a saved plan holds, so that changing one invalidates
 /// plans even when the build timestamp does not change: the join and its row and score parsing,
 /// the block expansion, the text sources the join reads, the plan types and this format, the exact
-/// plan's places, multiples, bands, flags and entry bands, and the shortest round-trip decimals
+/// plan's places, bands, flags and entry bands, and the shortest round-trip decimals
 /// they scale, which the pinned `ryu` and toolchain decide.
 const SOURCES: [&[u8]; 11] = [
     include_bytes!("prepare.rs"),
@@ -595,12 +595,13 @@ struct Sections<'a> {
     string_bytes: Cow<'a, [u8]>,
     rule_positions: Cow<'a, [u32]>,
     rule_context_ends: Cow<'a, [u64]>,
+    /// Per rule, whether its rows write their REF.
+    rule_declared: Cow<'a, [u8]>,
     context_rows: Cow<'a, [u64]>,
     rule_application_ends: Cow<'a, [u64]>,
     application_weights: Cow<'a, [f64]>,
     application_columns: Cow<'a, [u64]>,
     /// The exact plan's scores, as [`ExactTables`] holds them.
-    multiples: Cow<'a, [u64]>,
     band_ends: Cow<'a, [u64]>,
     bands: Cow<'a, [u64]>,
 }
@@ -622,11 +623,11 @@ impl Sections<'_> {
             Column::U8(&self.string_bytes),
             Column::U32(&self.rule_positions),
             Column::U64(&self.rule_context_ends),
+            Column::U8(&self.rule_declared),
             Column::U64(&self.context_rows),
             Column::U64(&self.rule_application_ends),
             Column::F64(&self.application_weights),
             Column::U64(&self.application_columns),
-            Column::U64(&self.multiples),
             Column::U64(&self.band_ends),
             Column::U64(&self.bands),
         ]
@@ -662,11 +663,11 @@ impl Sections<'_> {
             string_bytes: Cow::Owned(reader.read()?),
             rule_positions: Cow::Owned(reader.read()?),
             rule_context_ends: Cow::Owned(reader.read()?),
+            rule_declared: Cow::Owned(reader.read()?),
             context_rows: Cow::Owned(reader.read()?),
             rule_application_ends: Cow::Owned(reader.read()?),
             application_weights: Cow::Owned(reader.read()?),
             application_columns: Cow::Owned(reader.read()?),
-            multiples: Cow::Owned(reader.read()?),
             band_ends: Cow::Owned(reader.read()?),
             bands: Cow::Owned(reader.read()?),
         })
@@ -689,6 +690,7 @@ impl<'a> Sections<'a> {
         let rules = prep.complex_rules.len();
         let mut rule_positions = Vec::with_capacity(rules);
         let mut rule_context_ends = Vec::with_capacity(rules);
+        let mut rule_declared = Vec::with_capacity(rules);
         let mut rule_application_ends = Vec::with_capacity(rules);
         let mut context_rows = Vec::new();
         let mut application_weights = Vec::new();
@@ -702,6 +704,7 @@ impl<'a> Sections<'a> {
                 strings.push(allele2);
             }
             rule_context_ends.push(context_rows.len() as u64);
+            rule_declared.push(u8::from(rule.reference_declared));
             for score in &rule.score_applications {
                 application_weights.push(score.weight);
                 application_columns.push(score.score_column_index.0 as u64);
@@ -713,11 +716,7 @@ impl<'a> Sections<'a> {
         // The exact plan is what a loaded plan scores with, so it is stored in place of the
         // parsed weights it was built from.
         let (exact_weights, exact_flags, entry_band) = prep.exact().entry_arrays();
-        let ExactTables {
-            multiples,
-            band_ends,
-            bands,
-        } = prep.exact().tables();
+        let ExactTables { band_ends, bands } = prep.exact().tables();
         Sections {
             scalars: Cow::Owned(vec![
                 prep.total_variants_in_bim,
@@ -737,11 +736,11 @@ impl<'a> Sections<'a> {
             string_bytes: Cow::Owned(strings.bytes),
             rule_positions: Cow::Owned(rule_positions),
             rule_context_ends: Cow::Owned(rule_context_ends),
+            rule_declared: Cow::Owned(rule_declared),
             context_rows: Cow::Owned(context_rows),
             rule_application_ends: Cow::Owned(rule_application_ends),
             application_weights: Cow::Owned(application_weights),
             application_columns: Cow::Owned(application_columns),
-            multiples: Cow::Owned(multiples),
             band_ends: Cow::Owned(band_ends),
             bands: Cow::Owned(bands),
         }
@@ -756,6 +755,8 @@ impl<'a> Sections<'a> {
             .filter(|&count| count <= self.string_ends.len())
             .ok_or_else(|| invalid("Invalid variant plan score count"))?;
         if self.rule_context_ends.len() != self.rule_positions.len()
+            || self.rule_declared.len() != self.rule_positions.len()
+            || self.rule_declared.iter().any(|&declared| declared > 1)
             || self.rule_application_ends.len() != self.rule_positions.len()
             || self.application_columns.len() != self.application_weights.len()
         {
@@ -775,11 +776,12 @@ impl<'a> Sections<'a> {
             .collect::<io::Result<Vec<_>>>()?;
         let mut complex = Vec::with_capacity(self.rule_positions.len());
         let (mut context, mut application) = (0, 0);
-        for ((&position, &context_end), &application_end) in self
+        for (((&position, &context_end), &application_end), &declared) in self
             .rule_positions
             .iter()
             .zip(self.rule_context_ends.iter())
             .zip(self.rule_application_ends.iter())
+            .zip(self.rule_declared.iter())
         {
             let chromosome = strings.next()?;
             let (context_end, application_end) = (context_end as usize, application_end as usize);
@@ -806,6 +808,7 @@ impl<'a> Sections<'a> {
                 locus_chr_pos: (chromosome, position),
                 possible_contexts,
                 score_applications,
+                reference_declared: declared == 1,
             });
             (context, application) = (context_end, application_end);
         }
@@ -813,11 +816,10 @@ impl<'a> Sections<'a> {
             return Err(invalid("Trailing variant plan strings"));
         }
 
-        if self.multiples.len() != score_count {
+        if self.band_ends.len() != score_count {
             return Err(invalid("Invalid variant plan exact score tables"));
         }
         let tables = ExactTables {
-            multiples: self.multiples.into_owned(),
             band_ends: self.band_ends.into_owned(),
             bands: self.bands.into_owned(),
         };
@@ -1023,6 +1025,7 @@ mod tests {
             "variant_id\teffect_allele\tother_allele\tS\tR\n\
              1:100\tG\tA\t0.25\t-0.0\n\
              1:100\tT\tA\t1e-40\t3\n\
+             1:100\tA\tG\t0.5\t1\n\
              1:200\tT\tC\t-2.5\t0.125\n",
         )
         .unwrap();
@@ -1344,7 +1347,7 @@ mod tests {
         };
         // This plan under the previous format's magic, in a header that checks.
         let mut previous = saved.clone();
-        previous[..MAGIC.len()].copy_from_slice(b"GNPLAN05");
+        previous[..MAGIC.len()].copy_from_slice(b"GNPLAN06");
         reseal(&mut previous);
         let truncated = saved[..HEADER_BYTES + (saved.len() - HEADER_BYTES) / 2].to_vec();
         // The first section's digest with one byte flipped, in a header that checks.
@@ -1418,7 +1421,6 @@ mod tests {
             counts: Cow::Borrowed(&[1]),
             string_ends: Cow::Borrowed(&[1]),
             string_bytes: Cow::Borrowed(b"S"),
-            multiples: Cow::Borrowed(&[1]),
             band_ends: Cow::Borrowed(&[1]),
             bands: Cow::Borrowed(&[1, 1, 0, 0, 0]),
             ..Sections::default()
@@ -1444,12 +1446,7 @@ mod tests {
                 ..valid()
             },
             Sections {
-                multiples: Cow::Borrowed(&[]),
                 band_ends: Cow::Borrowed(&[]),
-                ..valid()
-            },
-            Sections {
-                multiples: Cow::Borrowed(&[0]),
                 ..valid()
             },
             Sections {
@@ -1485,6 +1482,7 @@ mod tests {
             Sections {
                 rule_positions: Cow::Borrowed(&[100]),
                 rule_context_ends: Cow::Borrowed(&[1]),
+                rule_declared: Cow::Borrowed(&[0]),
                 rule_application_ends: Cow::Borrowed(&[0]),
                 ..valid()
             },

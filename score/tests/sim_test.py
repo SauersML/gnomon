@@ -422,12 +422,15 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
 
 def run_impossible_diploid_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     """
-    Test Goal: Exercise the "fatal data inconsistency" branch by giving one
-    individual two non-missing genotypes at the same locus.
+    Test Goal: give one individual calls at a split site that no diploid genotype
+    has: two copies of C on the A/C record and one G on the A/G record. The REF
+    A is the allele both records carry, so its dose is two less both ALTs'
+    copies, which here is negative: that dose is missing and reported, while
+    each ALT still scores its own record's copies.
     """
     prefix = workdir / "impossible_diploid_test"
     print("\n" + "="*80)
-    print("= Running Impossible Diploid Crash Test")
+    print("= Running Impossible Diploid Test")
     print("="*80)
     print(f"Test files will be prefixed: {prefix}")
 
@@ -439,16 +442,17 @@ def run_impossible_diploid_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     ])
     score_df = pd.DataFrame([
         {'variant_id': '1:50000', 'effect_allele': 'C', 'other_allele': 'A', 'crash_score': 1.0},
+        {'variant_id': '1:50000', 'effect_allele': 'A', 'other_allele': 'C', 'crash_score': 0.5},
         {'variant_id': '1:50000', 'effect_allele': 'G', 'other_allele': 'A', 'crash_score': 2.0},
     ])
     genotypes_df = pd.DataFrame(-1, index=bim_df['id'], columns=individuals)
-    # id_ok has one non-missing geno, should be fine.
+    # id_ok is heterozygous A/C and missing on the A/G record.
     genotypes_df.loc['1:50000:A:C', 'id_ok'] = 1
-    # id_bad has two non-missing genos for the same locus, this is the trigger.
+    # id_bad is C/C on one record and A/G on the other: three ALT copies.
     genotypes_df.loc['1:50000:A:C', 'id_bad'] = 2
     genotypes_df.loc['1:50000:A:G', 'id_bad'] = 1
-    # id_missing is missing both, should be fine.
-    
+    # id_missing is missing both.
+
     score_file = prefix.with_suffix(".score")
     _write_plink_files(prefix, bim_df, individuals, genotypes_df)
     _write_score_file(score_file, score_df)
@@ -459,35 +463,40 @@ def run_impossible_diploid_test(workdir: Path, gnomon_path: Path, run_cmd_func):
         "Impossible Diploid Test",
         workdir,
     )
-    
-    # 3. Validation  (require new ambiguity-resolution success path)
+
+    # 3. Validation
     if gnomon_res is None:
         print("❌ Test failed: Gnomon command could not be executed.")
         return False
-
     stderr = (gnomon_res.stderr or "").lower()
+    if gnomon_res.returncode != 0:
+        print("   > Expected exit code 0.")
+        print("\n❌ Impossible Diploid Test FAILED.")
+        return False
+    if "missing because the calls they need disagree" not in stderr:
+        print("   > Expected the dose the conflicting calls leave unknown to be reported.")
+        print("\n❌ Impossible Diploid Test FAILED.")
+        return False
 
-    # New behavior: non-fatal, explicit resolution signal(s)
-    resolved_signal = (
-        ("ambiguity resolved" in stderr) or
-        ("complex variant resolution complete" in stderr)
-    )
-
-    if gnomon_res.returncode == 0 and resolved_signal:
-        out_path = workdir / f"{prefix.name}_{score_file.stem}.sscore"
-        if out_path.exists():
-            print_file_header(out_path, "Gnomon")
-        print("\n✅ Verification successful: ambiguity detected and resolved (non-fatal).")
-        print("\n✅ Impossible Diploid Test SUCCEEDED.")
-        return True
-
-    # Otherwise fail with a clear hint
-    if "conflicting genotype data" in stderr:
-        print("   > Ambiguity remained fatal; resolution is required.")
-    else:
-        print("   > Expected explicit ambiguity resolution with exit code 0; conditions not met.")
-    print("\n❌ Impossible Diploid Test FAILED.")
-    return False
+    # The score has two matched variants: A/C, named through both its alleles, and A/G. A dose
+    # naming the REF reads both records, so id_ok's A/C variant waits on its missing A/G call.
+    out_path = workdir / f"{prefix.name}_{score_file.stem}.sscore"
+    print_file_header(out_path, "Gnomon")
+    result = pd.read_csv(out_path, sep='\t').set_index('#IID')
+    expected = {
+        'id_ok': (0.0, 100.0),
+        'id_bad': (2.0, 50.0),
+        'id_missing': (0.0, 100.0),
+    }
+    for iid, (average, missing_pct) in expected.items():
+        got = (result.loc[iid, 'crash_score_AVG'], result.loc[iid, 'crash_score_MISSING_PCT'])
+        if not np.allclose(got, (average, missing_pct)):
+            print(f"   > {iid}: expected AVG {average} and MISSING_PCT {missing_pct}, got {got}.")
+            print("\n❌ Impossible Diploid Test FAILED.")
+            return False
+    print("\n✅ Verification successful: the impossible REF dose is missing and reported.")
+    print("\n✅ Impossible Diploid Test SUCCEEDED.")
+    return True
 
 # --- TEST: MULTIPLE SCORE FILES ---
 

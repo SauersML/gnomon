@@ -1082,7 +1082,6 @@ mod tests {
                 &rules,
                 start,
                 score_rules,
-                is_effect_only_position(&rules, score_rules),
                 12,
                 "1",
                 reference,
@@ -1162,8 +1161,9 @@ mod tests {
 
     /// The memory budget bounds the heap a native run allocates (#2396), over cohorts whose
     /// decoded records dwarf their text: one sample at a time, dosages of forty, multiallelic
-    /// records at a position where a rule names no single other allele, and 500 scores at
-    /// every position; each as plain VCF, BGZF VCF and BCF. For each, the least budget that runs
+    /// records at a position where a rule names no single other allele, split multiallelic records,
+    /// some repeated, whose sites build columns for a REF-effect row and a repeated ALT, and 500
+    /// scores at every position; each as plain VCF, BGZF VCF and BCF. For each, the least budget that runs
     /// it is found: one byte less refuses by name, and at it and above it the run scores what an
     /// unbounded run scores, adding no more to the heap than its budget. A budget too small for
     /// the sums refuses before allocating anything, and a record no budget below its own need
@@ -1251,10 +1251,24 @@ mod tests {
             })
             .collect();
         let wide_panel_names: String = (0..500).map(|score| format!("\tS{score:03}")).collect();
+        // Split sites, every fifth with its first record repeated: S1 names the REF, so it waits on
+        // the whole site, and S2 names only the repeated ALT, whose measurements are combined.
+        let split: String = (1..=300)
+            .flat_map(|position| {
+                let first = format!("1\t{position}\t.\tA\tG\t.\t.\t.\tGT\t{}\n", calls(20, position, ["0|0", "0|1", "1|0"]));
+                let second = format!("1\t{position}\t.\tA\tT\t.\t.\t.\tGT\t{}\n", calls(20, position + 1, ["0|0", "1|0", "0|0"]));
+                let repeat = if position % 5 == 0 { first.clone() } else { String::new() };
+                [first, second, repeat]
+            })
+            .collect();
+        let split_rows: String = (1..=300)
+            .map(|position| format!("1:{position}\tA\tG\t1\t\n1:{position}\tG\tA\t0.5\t2\n1:{position}\tT\tA\t0.25\t\n"))
+            .collect();
         for (name, samples, body, names, rows) in [
             ("one sample", 1, one_sample, "\tS".to_string(), one_sample_rows),
             ("dosages", 40, dosages, "\tS".to_string(), dosage_rows),
             ("multiallelic", 20, multiallelic, "\tS".to_string(), multiallelic_rows),
+            ("split", 20, split, "\tS1\tS2".to_string(), split_rows),
             ("wide panel", 10, wide_panel, wide_panel_names, wide_panel_rows),
         ] {
             let case = dir.path().join(name.replace(' ', "_"));

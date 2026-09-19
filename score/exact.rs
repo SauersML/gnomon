@@ -1,10 +1,9 @@
 //! Exact score arithmetic.
 //!
-//! Every term a score receives is a weight times a small integer dosage (or, for the
-//! complex-variant averaging fallback, a small rational). A weight is held at its shortest
-//! round-trip decimal form, so per score one power of ten, times the least common multiple
-//! of its averaging denominators, turns every term into an integer. Sums of those integers
-//! cannot depend on the order, grouping, partition or thread count of the accumulation.
+//! Every term a score receives is a weight times a small integer dosage. A weight is held at its
+//! shortest round-trip decimal form, so per score one power of ten turns every term into an
+//! integer. Sums of those integers cannot depend on the order, grouping, partition or thread
+//! count of the accumulation.
 //! Floating point appears once, when a finished sum is rounded to f64 for output.
 
 use std::simd::{

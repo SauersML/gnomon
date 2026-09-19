@@ -160,6 +160,10 @@ pub struct GroupedComplexRule {
 
     /// A list of all scores that apply to this set of contexts.
     pub score_applications: Vec<ScoreInfo>,
+
+    /// Whether every context's allele 2 is its REF as the genotypes write it, as the rows of a
+    /// `.pvar` carry it. A `.bim` writes no REF, and the site rule reads one from the alleles.
+    pub reference_declared: bool,
 }
 /// Defines the subset of individuals to be processed by the engine.
 ///

@@ -487,6 +487,7 @@ pub(super) fn expand_plan(
             locus_chr_pos: rule.locus_chr_pos,
             possible_contexts: rule.possible_contexts,
             score_applications: applications,
+            reference_declared: rule.reference_declared,
         });
     }
     Ok(VariantPlan {
@@ -656,6 +657,7 @@ mod tests {
                     weight: 3.0,
                     score_column_index: ScoreColumnIndex(0),
                 }],
+                reference_declared: false,
             }],
             names: vec!["A".to_string(), "B".to_string()],
             counts: vec![2, 2],

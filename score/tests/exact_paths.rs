@@ -1,7 +1,7 @@
 //! Exact score arithmetic along every dispatch path. Random panels with missing calls, flipped
-//! alleles, duplicate score lines, present zero weights, multiallelic loci and all four PLINK
-//! codes are scored through the dense and sparse kernels, the bounded accumulator, small-keep
-//! direct scoring and split filesets. Every path must leave bit-identical cells and counts, and
+//! alleles, duplicate score lines, present zero weights, split multiallelic loci, variants measured
+//! by two rows and all four PLINK codes are scored through the dense and sparse kernels, the
+//! bounded accumulator, small-keep direct scoring and split filesets. Every path must leave bit-identical cells and counts, and
 //! every sum and average must be the correctly rounded exact rational, which this file derives
 //! from the written weights with its own integer arithmetic. The same holds for VCF and BCF
 //! input scored natively, from GT calls, DS dosages and GP probabilities, and a GT panel prints
@@ -59,9 +59,10 @@ struct Line {
 #[derive(Clone, Copy, PartialEq)]
 enum Locus {
     Simple,
+    /// A split site: rows G/A and C/A, allele 2 the REF A that both carry.
     Multiallelic,
-    /// Two identical contexts, resolved by the heuristic chain; only the last score scores it.
-    Heuristic,
+    /// One variant measured by two rows, as an array's duplicate probe.
+    Repeated,
 }
 
 struct Panel {
@@ -75,21 +76,19 @@ struct Panel {
 impl Panel {
     fn random(rng: &mut Rng, people: usize, scores: usize) -> Self {
         let (mut rows, mut lines, mut loci) = (Vec::new(), Vec::new(), Vec::new());
-        // The last score is kept for heuristic loci, so the oracle can leave it out.
-        let checked = scores - 1;
         for chrom in 1..=2u8 {
             for j in 0..24u32 {
                 let pos = 1000 + 10 * j;
                 let calls = |rng: &mut Rng| (0..people).map(|_| rng.below(4) as u8).collect();
                 let locus = match rng.below(12) {
                     0 | 1 => Locus::Multiallelic,
-                    2 if scores > 1 => Locus::Heuristic,
+                    2 => Locus::Repeated,
                     _ => Locus::Simple,
                 };
                 let contexts: Vec<(&str, &str)> = match locus {
                     Locus::Simple => vec![PAIRS[rng.below(PAIRS.len())]],
-                    Locus::Multiallelic => vec![("A", "G"), ("A", "C")],
-                    Locus::Heuristic => vec![("A", "G"), ("A", "G")],
+                    Locus::Multiallelic => vec![("G", "A"), ("C", "A")],
+                    Locus::Repeated => vec![("G", "A"), ("G", "A")],
                 };
                 for &(a1, a2) in &contexts {
                     rows.push(Row {
@@ -106,13 +105,8 @@ impl Panel {
                     let (a1, a2) = contexts[rng.below(contexts.len())];
                     let (effect, other) = if rng.below(2) == 0 { (a1, a2) } else { (a2, a1) };
                     let weights = (0..scores)
-                        .map(|score| {
-                            let scored = if locus == Locus::Heuristic {
-                                score == checked
-                            } else {
-                                score < checked || scores == 1
-                            };
-                            (scored && rng.below(3) != 0).then(|| match rng.below(10) {
+                        .map(|_| {
+                            (rng.below(3) != 0).then(|| match rng.below(10) {
                                 0 => 0,
                                 1 => (rng.below(9) as i64 + 1) * 1_000_000,
                                 _ => rng.below(4_000_001) as i64 - 2_000_000,
@@ -191,65 +185,78 @@ impl Panel {
         Ok(())
     }
 
-    /// Per kept person (in `kept` order) and checked score: the exact sum in millionths, the
-    /// score's variant count and the person's missing count.
+    /// Per kept person (in `kept` order) and score: the exact sum in millionths, the score's
+    /// variant count and the person's missing count, by the site rule written out plainly. Allele 2
+    /// of every row is its REF and allele 1 its ALT. A line scores its effect allele's copies: an
+    /// ALT's are the one value the rows measuring that variant agree on, and the REF's are two less
+    /// every ALT's at the locus. Each (variant, score) is one matched variant, missing when a copy
+    /// its lines need is unknown, and a score naming the REF through a variant needs every one.
     fn oracle(&self, kept: &[usize]) -> (Vec<i128>, Vec<u32>, Vec<u32>) {
-        let checked = if self.scores == 1 { 1 } else { self.scores - 1 };
-        let (mut sums, mut missing) = (vec![0i128; kept.len() * checked], vec![0u32; kept.len() * checked]);
-        let mut counts = vec![0u32; checked];
-        let dose = |call: u8, effect: &str, row: &Row| {
-            let a2 = [0, 0, 1, 2][call as usize];
-            if effect == row.a2 { a2 } else { 2 - a2 }
-        };
-        for &(chrom, pos, locus) in &self.loci {
-            if locus == Locus::Heuristic {
-                continue;
-            }
+        let scores = self.scores;
+        let (mut sums, mut missing) = (vec![0i128; kept.len() * scores], vec![0u32; kept.len() * scores]);
+        let mut counts = vec![0u32; scores];
+        // Copies of allele 1 per PLINK code; `None` for the missing call.
+        let alt_copies = |call: u8| [Some(2i64), None, Some(1), Some(0)][call as usize];
+        for &(chrom, pos, _) in &self.loci {
             let rows: Vec<&Row> = self.rows.iter().filter(|r| r.chrom == chrom && r.pos == pos).collect();
             let lines: Vec<&Line> = self.lines.iter().filter(|l| l.chrom == chrom && l.pos == pos).collect();
-            for score in 0..checked {
-                let scored: Vec<&Line> = lines.iter().copied().filter(|l| l.weights[score].is_some()).collect();
-                if scored.is_empty() {
-                    continue;
-                }
-                match locus {
-                    Locus::Simple => {
-                        // One entry per line, counted once per row.
-                        let row = rows[0];
-                        counts[score] += 1;
-                        for (k, &person) in kept.iter().enumerate() {
-                            let call = row.calls[person];
-                            if call == 1 {
-                                missing[k * checked + score] += 1;
-                                continue;
-                            }
-                            for line in &scored {
-                                sums[k * checked + score] +=
-                                    i128::from(line.weights[score].unwrap() * dose(call, line.effect, row));
-                            }
-                        }
+            // The locus's variants, each the ALT that its rows carry.
+            let mut variants: Vec<&str> = rows.iter().map(|row| row.a1).collect();
+            variants.dedup();
+            // A line's variant: the one whose ALT and REF are its two alleles.
+            let variant_of = |line: &Line| {
+                variants
+                    .iter()
+                    .position(|&alt| rows.iter().any(|row| {
+                        row.a1 == alt
+                            && ((row.a1 == line.effect && row.a2 == line.other)
+                                || (row.a2 == line.effect && row.a1 == line.other))
+                    }))
+                    .expect("every line names a variant")
+            };
+            for score in 0..scores {
+                for (variant, alt) in variants.iter().enumerate() {
+                    let scored: Vec<&Line> = lines
+                        .iter()
+                        .copied()
+                        .filter(|l| l.weights[score].is_some() && variant_of(l) == variant)
+                        .collect();
+                    if scored.is_empty() {
+                        continue;
                     }
-                    _ => {
-                        // Every line is its own application on the one context carrying its pair.
-                        for line in &scored {
-                            counts[score] += 1;
-                            let row = rows
+                    counts[score] += 1;
+                    let names_reference = scored.iter().any(|line| line.effect != *alt);
+                    for (k, &person) in kept.iter().enumerate() {
+                        // Each variant's copies of its ALT over its rows: `None` when no row has a
+                        // call, `Some(None)` when the calls disagree.
+                        let copies = |alt: &str| -> Option<Option<i64>> {
+                            let calls: Vec<i64> = rows
                                 .iter()
-                                .copied()
-                                .find(|r| {
-                                    (r.a1 == line.effect && r.a2 == line.other)
-                                        || (r.a2 == line.effect && r.a1 == line.other)
-                                })
-                                .expect("every line matches a context");
-                            for (k, &person) in kept.iter().enumerate() {
-                                let call = row.calls[person];
-                                if call == 1 {
-                                    missing[k * checked + score] += 1;
-                                } else {
-                                    sums[k * checked + score] +=
-                                        i128::from(line.weights[score].unwrap() * dose(call, line.effect, row));
+                                .filter(|row| row.a1 == alt)
+                                .filter_map(|row| alt_copies(row.calls[person]))
+                                .collect();
+                            let first = *calls.first()?;
+                            Some(calls.iter().all(|&c| c == first).then_some(first))
+                        };
+                        let needed: Vec<&str> = if names_reference { variants.clone() } else { vec![alt] };
+                        let known: Option<Vec<i64>> = needed.iter().map(|&alt| copies(alt).flatten()).collect();
+                        let dose = |line: &Line, known: &[i64]| -> Option<i64> {
+                            if line.effect == *alt {
+                                return Some(copies(alt).flatten().expect("a known variant"));
+                            }
+                            let reference = 2 - known.iter().sum::<i64>();
+                            (reference >= 0).then_some(reference)
+                        };
+                        let doses = known.and_then(|known| {
+                            scored.iter().map(|line| dose(line, &known)).collect::<Option<Vec<i64>>>()
+                        });
+                        match doses {
+                            Some(doses) => {
+                                for (line, dose) in scored.iter().zip(doses) {
+                                    sums[k * scores + score] += i128::from(line.weights[score].unwrap() * dose);
                                 }
                             }
+                            None => missing[k * scores + score] += 1,
                         }
                     }
                 }
@@ -333,10 +340,9 @@ fn every_dispatch_path_gives_the_correctly_rounded_exact_scores() -> TestResult 
                     // The oracle, once per keep: people in output order, scores by name.
                     let kept: Vec<usize> = prep.output_idx_to_fam_idx.iter().map(|f| f.0 as usize).collect();
                     let (sums, variant_counts, missing) = panel.oracle(&kept);
-                    let checked = if scores == 1 { 1 } else { scores - 1 };
                     let exact = prep.exact();
                     let stride = exact.stride();
-                    for score in 0..checked {
+                    for score in 0..scores {
                         let column = prep
                             .score_names
                             .iter()
@@ -345,7 +351,7 @@ fn every_dispatch_path_gives_the_correctly_rounded_exact_scores() -> TestResult 
                         assert_eq!(prep.score_variant_counts[column], variant_counts[score], "{label}");
                         for person in 0..kept.len() {
                             let lanes = &cells[person * stride..(person + 1) * stride];
-                            let cell = person * checked + score;
+                            let cell = person * scores + score;
                             assert_eq!(counts[person * scores + column], missing[cell], "{label} person {person}");
                             let want_sum: f64 = format!("{}e-6", sums[cell]).parse()?;
                             assert_eq!(
@@ -817,13 +823,13 @@ fn a_banded_score_of_one_band_prints_its_exact_scores() -> TestResult {
 }
 
 #[test]
-fn a_repeated_variant_is_refused_from_vcf_and_scored_once_from_plink() -> TestResult {
+fn a_repeated_variant_scores_the_dose_its_records_agree_on_from_vcf_and_plink() -> TestResult {
     // Two records of 1:100 A/G, then 1:200 C/T. Per record, each person's PLINK code: 00 two A1,
-    // 01 missing, 10 one of each, 11 two A2. The copies agree or one is missing, so PLINK input
-    // has one dose per person to score; VCF input cannot tell which record a row scores.
+    // 01 missing, 10 one of each, 11 two A2. The records are two measurements of one variant: a
+    // person's dose is the one their called copies agree on, and I3's disagree, so I3 has none.
     let dir = tempfile::tempdir()?;
-    let calls: [[u8; 3]; 3] = [[2, 1, 0], [2, 3, 0], [3, 3, 2]];
-    let fam: String = (0..3)
+    let calls: [[u8; 4]; 3] = [[2, 1, 0, 2], [2, 3, 0, 3], [3, 3, 2, 3]];
+    let fam: String = (0..4)
         .map(|person| format!("F I{person} 0 0 0 -9\n"))
         .collect();
     fs::write(dir.path().join("cohort.fam"), fam)?;
@@ -844,7 +850,7 @@ fn a_repeated_variant_is_refused_from_vcf_and_scored_once_from_plink() -> TestRe
     let mut vcf = String::from(
         "##fileformat=VCFv4.2\n##contig=<ID=1>\n\
          ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
-         #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tI0\tI1\tI2\n",
+         #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tI0\tI1\tI2\tI3\n",
     );
     let sites = [
         ("a", 100, "A", "G"),
@@ -875,23 +881,20 @@ fn a_repeated_variant_is_refused_from_vcf_and_scored_once_from_plink() -> TestRe
             .arg(dir.path().join(input))
             .output()
     };
-    let output = score_input("cohort")?;
-    assert_success(&output);
-    let rows = sscore_rows(&dir.path().join("cohort.sscore"))?;
-    // 1:100 once per person: one of each, the one called copy's two G, no G; then 1:200's T.
-    for (row, want) in rows.iter().zip([0.5 + 2.0, 1.0 + 2.0, 1.0]) {
-        assert_eq!(row[1].parse::<f64>()?, want, "PLINK: {row:?}");
+    let mut answers = Vec::new();
+    for input in ["cohort", "cohort.vcf"] {
+        let output = score_input(input)?;
+        assert_success(&output);
+        let rows = sscore_rows(&dir.path().join(format!("{}.sscore", input.replace('.', "_"))))?;
+        // 1:100 once per person: one of each, the one called copy's two G, no G, none; then
+        // 1:200's T.
+        for (row, (sum, missing)) in rows.iter().zip([(0.5 + 2.0, 0), (1.0 + 2.0, 0), (1.0, 0), (2.0, 1)]) {
+            assert_eq!(row[1].parse::<f64>()?, sum, "{input}: {row:?}");
+            assert_eq!(row[2].parse::<u32>()?, missing, "{input}: {row:?}");
+        }
+        assert_eq!(rows.len(), 4);
+        answers.push(rows);
     }
-    assert_eq!(rows.len(), 3);
-    let output = score_input("cohort.vcf")?;
-    assert!(
-        !output.status.success(),
-        "the repeated VCF record was scored"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("More than one record at 1:100 carries the alleles A and G"),
-        "{stderr}"
-    );
+    assert_eq!(answers[0], answers[1]);
     Ok(())
 }

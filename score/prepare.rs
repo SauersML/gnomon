@@ -11,6 +11,7 @@
 use crate::pipeline_error::PipelineError;
 use crate::score::cells::{ExactPlan, PlanError};
 use crate::score::io::{TextSource, open_plink_text_source, open_text_source};
+use crate::score::site::{RowMatch, Site, SiteAllele, names_no_single_other_allele, row_side};
 use crate::score::types::{
     BimRowIndex, FilesetBoundary, GenomicRegion, GroupedComplexRule, PersonSubset, PipelineKind,
     PreparationResult, ScoreColumnIndex, ScoreInfo, parse_chromosome_label,
@@ -19,7 +20,7 @@ use crate::score::types::{OriginalPersonIndex, OutputPersonIndex};
 use ahash::{AHashMap, AHashSet};
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
@@ -67,6 +68,9 @@ struct KeyedBimRecord {
     bim_row_index: BimRowIndex,
     allele1: Allele,
     allele2: Allele,
+    /// Whether allele 2 is the REF as the genotypes write it: a `.pvar` does, and the virtual
+    /// `.bim` rows of a `.pgen` carry it there; a `.bim` writes no REF.
+    reference_declared: bool,
 }
 
 /// A parsed record from a score file.
@@ -461,8 +465,9 @@ impl JoinOutputs {
         }
     }
 
-    /// Builds the plan rows of one locus from the `.bim` rows and score records
-    /// that share `key`, each group in input order.
+    /// Builds the plan rows of one locus from the `.bim` rows and score records that share `key`,
+    /// each group in input order, by the site rule of [`crate::score::site`]: a `.bim` row's
+    /// allele 2 is its REF and allele 1 its ALT, as plink2 reads a `.bim`.
     fn reconcile_locus(
         &mut self,
         key: VariantKey,
@@ -473,21 +478,17 @@ impl JoinOutputs {
         // sets, context vectors, or match lists. Emit their CSR row in
         // exactly the same arithmetic and record order as grouped loci.
         if let ([bim], [score]) = (bim_group, score_group) {
-            if allele_pair_matches(
+            if let Some(effect_is_ref) = row_side(
                 score.effect_allele.as_str(),
                 score.other_allele.as_str(),
-                bim.allele1.as_str(),
                 bim.allele2.as_str(),
+                bim.allele1.as_str(),
             ) {
                 let mut assignment = SimpleScoreAssignment {
                     dosage_weight: 0.0,
                     missing_correction: 0.0,
                 };
-                apply_simple_score_assignment(
-                    &mut assignment,
-                    score.weight,
-                    score.effect_allele.as_str() == bim.allele1.as_str(),
-                );
+                apply_simple_score_assignment(&mut assignment, score.weight, !effect_is_ref);
                 self.required_bim_indices.push(bim.bim_row_index);
                 self.required_is_complex.push(0);
                 self.push_row_key(key);
@@ -507,23 +508,19 @@ impl JoinOutputs {
         if let [bim] = bim_group {
             self.row_entries.clear();
             for score in score_group {
-                if !allele_pair_matches(
+                let Some(effect_is_ref) = row_side(
                     score.effect_allele.as_str(),
                     score.other_allele.as_str(),
-                    bim.allele1.as_str(),
                     bim.allele2.as_str(),
-                ) {
+                    bim.allele1.as_str(),
+                ) else {
                     continue;
-                }
+                };
                 let mut assignment = SimpleScoreAssignment {
                     dosage_weight: 0.0,
                     missing_correction: 0.0,
                 };
-                apply_simple_score_assignment(
-                    &mut assignment,
-                    score.weight,
-                    score.effect_allele.as_str() == bim.allele1.as_str(),
-                );
+                apply_simple_score_assignment(&mut assignment, score.weight, !effect_is_ref);
                 self.row_entries.push((score.score_column_index, assignment));
             }
             if !self.row_entries.is_empty() {
@@ -551,85 +548,101 @@ impl JoinOutputs {
             return Ok(());
         }
 
-        let mut complex_for_key: BTreeMap<
-            Vec<(BimRowIndex, String, String)>,
-            Vec<(ScoreColumnIndex, f64, String, String)>,
-        > = BTreeMap::new();
-
-        for score_record in score_group {
-            let possible_contexts: Vec<_> = bim_group
-                .iter()
-                .filter(|rec| {
-                    allele_pair_matches(
-                        score_record.effect_allele.as_str(),
-                        score_record.other_allele.as_str(),
-                        rec.allele1.as_str(),
-                        rec.allele2.as_str(),
-                    )
-                })
-                .map(|rec| {
-                    (
-                        rec.bim_row_index,
-                        rec.allele1.to_string(),
-                        rec.allele2.to_string(),
-                    )
-                })
-                .collect();
-            if possible_contexts.is_empty() {
-                continue;
+        let site = bim_site(bim_group);
+        let chromosome = chromosome_label(key.0);
+        // Every scored record with its site allele, in input order.
+        let mut scored: Vec<(SiteAllele, &KeyedScoreRecord)> = Vec::new();
+        for score in score_group {
+            let (effect, other) = (score.effect_allele.as_str(), score.other_allele.as_str());
+            match site.match_row(effect, other) {
+                RowMatch::NoVariant => {}
+                RowMatch::Several(first, second) => {
+                    return Err(PrepError::AmbiguousReconciliation(format!(
+                        "{}: remove the other's .bim row from the genotypes, or the row from the score file.",
+                        site.several_error(&chromosome, key.1, effect, other, (first, second), ".bim row")
+                    )));
+                }
+                RowMatch::Unread(_) => {
+                    return Err(PrepError::AmbiguousReconciliation(format!(
+                        "{} Score genotypes that declare their REF instead, a .pgen fileset or a VCF or BCF file, or remove the variant the row does not mean.",
+                        site.unread_error(&chromosome, key.1, effect, other, ".bim rows")
+                    )));
+                }
+                RowMatch::Scores(allele) => scored.push((allele, score)),
             }
-            let score_info = (
-                score_record.score_column_index,
-                score_record.weight,
-                score_record.effect_allele.to_string(),
-                score_record.other_allele.to_string(),
-            );
-            complex_for_key
-                .entry(possible_contexts)
-                .or_default()
-                .push(score_info);
+        }
+        if scored.is_empty() {
+            return Ok(());
         }
 
-        // Finalize complex rules for this key immediately.
-        let mut key_complex_indices: BTreeSet<BimRowIndex> = BTreeSet::new();
-        for (contexts, scores) in complex_for_key {
-            for (bim_idx, _, _) in &contexts {
-                key_complex_indices.insert(*bim_idx);
+        // A (variant, score) pair is one matched variant of the score. It adds from its variant's
+        // own row alone when one row measures the variant and the pair does not name the site's
+        // REF. Otherwise it is resolved per person from the site's rows: several rows of a variant
+        // are measurements that must agree, and the site's REF dose is the ploidy less every
+        // ALT's copies.
+        scored.sort_by_key(|(allele, score)| (allele.variant(), score.score_column_index));
+        let mut simple: Vec<Vec<(ScoreColumnIndex, SimpleScoreAssignment)>> =
+            vec![Vec::new(); bim_group.len()];
+        let mut complex = Vec::new();
+        for group in scored.chunk_by(|(a, x), (b, y)| {
+            (a.variant(), x.score_column_index) == (b.variant(), y.score_column_index)
+        }) {
+            let variant = group[0].0.variant();
+            self.score_variant_counts[group[0].1.score_column_index.0] += 1;
+            let whole_site = group.iter().any(|(allele, _)| site.reads_whole_site(*allele));
+            let mut rows = (0..bim_group.len()).filter(|&row| site.row_variants()[row] == variant);
+            match (rows.next(), rows.next()) {
+                (Some(row), None) if !whole_site => {
+                    for (allele, score) in group {
+                        let mut assignment = SimpleScoreAssignment {
+                            dosage_weight: 0.0,
+                            missing_correction: 0.0,
+                        };
+                        // The effect allele is allele 1 when it is the ALT of a row whose REF is
+                        // allele 2, or the REF of one whose REF is allele 1.
+                        let alternate = matches!(allele, SiteAllele::Alternate(_));
+                        let flipped = alternate == site.first_is_reference()[row];
+                        apply_simple_score_assignment(&mut assignment, score.weight, flipped);
+                        simple[row].push((score.score_column_index, assignment));
+                    }
+                }
+                _ => complex.extend(group.iter().map(|(_, score)| ScoreInfo {
+                    effect_allele: score.effect_allele.to_string(),
+                    other_allele: score.other_allele.to_string(),
+                    weight: score.weight,
+                    score_column_index: score.score_column_index,
+                })),
             }
-
-            for (score_col_idx, _, _, _) in &scores {
-                self.score_variant_counts[score_col_idx.0] += 1;
-            }
-
-            let chr_str = match key.0 {
-                23 => "X".to_string(),
-                24 => "Y".to_string(),
-                25 => "XY".to_string(),
-                26 => "MT".to_string(),
-                n => n.to_string(),
-            };
-
+        }
+        let has_complex = !complex.is_empty();
+        if has_complex {
             self.final_complex_rules.push(GroupedComplexRule {
-                locus_chr_pos: (chr_str, key.1),
-                possible_contexts: contexts,
-                score_applications: scores
-                    .into_iter()
-                    .map(|(sc_idx, weight, ea, oa)| ScoreInfo {
-                        effect_allele: ea,
-                        other_allele: oa,
-                        weight,
-                        score_column_index: sc_idx,
-                    })
+                locus_chr_pos: (chromosome, key.1),
+                possible_contexts: bim_group
+                    .iter()
+                    .map(|bim| (bim.bim_row_index, bim.allele1.to_string(), bim.allele2.to_string()))
                     .collect(),
+                score_applications: complex,
+                reference_declared: reference_declared(bim_group),
             });
         }
-
-        // Emit CSR rows and required variant metadata for this key in sorted order.
-        // This preserves global row ordering while avoiding a global index set.
-        for bim_row_index in key_complex_indices {
-            self.required_bim_indices.push(bim_row_index);
-            self.required_is_complex.push(1);
+        // Every row of a site resolved per person is spooled for the complex pass.
+        for (bim, mut entries) in bim_group.iter().zip(simple) {
+            if entries.is_empty() && !has_complex {
+                continue;
+            }
+            entries.sort_by_key(|&(column, _)| column);
+            self.required_bim_indices.push(bim.bim_row_index);
+            self.required_is_complex.push(u8::from(has_complex));
             self.push_row_key(key);
+            for &(column, assignment) in &entries {
+                self.csr_builder.push_contribution(column, assignment)?;
+                accumulate_baseline(
+                    &mut self.baseline_missing_sum_by_score[column.0],
+                    &mut self.baseline_errors[column.0],
+                    assignment.missing_correction,
+                );
+            }
             self.csr_builder.finish_variant()?;
         }
         Ok(())
@@ -839,37 +852,31 @@ fn join_sorted_slices(
     Ok(())
 }
 
-/// A record that names no single other allele becomes the pair of the one variant
-/// carrying its effect allele, or is counted and dropped. Records naming their other
-/// allele go on unchanged.
+/// A record that names no single other allele becomes the pair of the one allele of its site
+/// that its effect allele names, or is counted and dropped. Records naming their other allele go
+/// on unchanged.
 fn resolve_effect_only_records(
     key: VariantKey,
     bim_group: &[KeyedBimRecord],
     score_group: &mut Vec<KeyedScoreRecord>,
     effect_only_matches: &mut EffectOnlyMatches,
 ) {
+    let site = bim_site(bim_group);
     score_group.retain_mut(|record| {
-        let decision = resolve_other_allele(
-            record.effect_allele.as_str(),
-            record.other_allele.as_str(),
-            bim_group
-                .iter()
-                .map(|bim| (bim.allele1.as_str(), bim.allele2.as_str())),
-        );
-        effect_only_matches.record(decision, key);
-        match decision {
-            OtherAlleleMatch::Pair => true,
-            OtherAlleleMatch::EffectOnly(row) => {
-                let bim = &bim_group[row];
-                record.other_allele = if bim.allele1.as_str() == record.effect_allele.as_str() {
-                    bim.allele2.clone()
-                } else {
-                    bim.allele1.clone()
-                };
-                true
-            }
-            OtherAlleleMatch::SeveralRows | OtherAlleleMatch::NoRow => false,
+        if !names_no_single_other_allele(record.other_allele.as_str()) {
+            return true;
         }
+        let decision = site.match_row(record.effect_allele.as_str(), record.other_allele.as_str());
+        effect_only_matches.record(decision, key);
+        let RowMatch::Scores(allele) = decision else {
+            return false;
+        };
+        let variant = site.variants()[allele.variant()];
+        record.other_allele = Allele::new(match allele {
+            SiteAllele::Alternate(_) => variant.reference,
+            SiteAllele::Reference(_) => variant.alternate,
+        });
+        true
     });
 }
 
@@ -930,65 +937,32 @@ fn accumulate_baseline(sum: &mut f64, error: &mut f64, value: f64) {
     *sum = next;
 }
 
-#[inline(always)]
-fn allele_pair_matches(
-    effect_allele: &str,
-    other_allele: &str,
-    bim_a1: &str,
-    bim_a2: &str,
-) -> bool {
-    (effect_allele == bim_a1 && other_allele == bim_a2)
-        || (effect_allele == bim_a2 && other_allele == bim_a1)
+/// The site of the `.bim` rows at one locus. Allele 2 is the REF when every row declares it, as the
+/// rows of a `.pvar` do; otherwise the site reads its REF from the alleles, allele 2 first where
+/// they leave the choice free.
+fn bim_site(bim_group: &[KeyedBimRecord]) -> Site<'_> {
+    let rows: Vec<(usize, &str, &str)> = bim_group
+        .iter()
+        .enumerate()
+        .map(|(row, bim)| (row, bim.allele2.as_str(), bim.allele1.as_str()))
+        .collect();
+    Site::new(&rows, reference_declared(bim_group))
 }
 
-/// How a score record's other allele pins down which variant at its locus it scores.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OtherAlleleMatch {
-    /// The record names one other allele, so the allele pair decides, as always.
-    Pair,
-    /// The record names no other allele ("."), or several candidates ("A/G"), and only
-    /// this row carries its effect allele with a listed other allele.
-    EffectOnly(usize),
-    /// Several rows carry the effect allele, so which variant the score meant is unknown.
-    SeveralRows,
-    /// No row carries the effect allele with a listed other allele.
-    NoRow,
+/// Whether every row at a locus declares its REF.
+fn reference_declared(bim_group: &[KeyedBimRecord]) -> bool {
+    bim_group.iter().all(|bim| bim.reference_declared)
 }
 
-/// Other-allele text that names no single allele: "." where the score file gave none,
-/// or candidates separated by '/', as harmonized PGS Catalog files infer them.
-pub(crate) fn names_no_single_other_allele(other_allele: &str) -> bool {
-    other_allele == "." || other_allele.contains('/')
-}
-
-/// Decides how a score record matches the variant rows at its locus, `.bim` rows or a
-/// VCF record's REF and ALT, given as `(allele1, allele2)` pairs in row order.
-pub(crate) fn resolve_other_allele<'a>(
-    effect_allele: &str,
-    other_allele: &str,
-    rows: impl Iterator<Item = (&'a str, &'a str)>,
-) -> OtherAlleleMatch {
-    if !names_no_single_other_allele(other_allele) {
-        return OtherAlleleMatch::Pair;
+/// A chromosome code as gnomon writes it in messages.
+fn chromosome_label(code: u8) -> String {
+    match code {
+        23 => "X".to_string(),
+        24 => "Y".to_string(),
+        25 => "XY".to_string(),
+        26 => "MT".to_string(),
+        n => n.to_string(),
     }
-    let listed = |allele: &str| other_allele == "." || other_allele.split('/').any(|c| c == allele);
-    let mut found = None;
-    for (index, (allele1, allele2)) in rows.enumerate() {
-        let row_other = if allele1 == effect_allele {
-            allele2
-        } else if allele2 == effect_allele {
-            allele1
-        } else {
-            continue;
-        };
-        if !listed(row_other) {
-            continue;
-        }
-        if found.replace(index).is_some() {
-            return OtherAlleleMatch::SeveralRows;
-        }
-    }
-    found.map_or(OtherAlleleMatch::NoRow, OtherAlleleMatch::EffectOnly)
 }
 
 /// Weights from score rows that name no single other allele, by how they matched the
@@ -999,21 +973,20 @@ pub(crate) struct EffectOnlyMatches {
     several_rows: u64,
     no_row: u64,
     /// The first skipped loci, with why each was skipped.
-    examples: Vec<(VariantKey, OtherAlleleMatch)>,
+    examples: Vec<(VariantKey, RowMatch)>,
 }
 
 impl EffectOnlyMatches {
     const EXAMPLES: usize = 5;
 
-    pub(crate) fn record(&mut self, decision: OtherAlleleMatch, key: VariantKey) {
+    pub(crate) fn record(&mut self, decision: RowMatch, key: VariantKey) {
         match decision {
-            OtherAlleleMatch::Pair => return,
-            OtherAlleleMatch::EffectOnly(_) => {
+            RowMatch::Scores(_) => {
                 self.matched += 1;
                 return;
             }
-            OtherAlleleMatch::SeveralRows => self.several_rows += 1,
-            OtherAlleleMatch::NoRow => self.no_row += 1,
+            RowMatch::Several(..) | RowMatch::Unread(_) => self.several_rows += 1,
+            RowMatch::NoVariant => self.no_row += 1,
         }
         if self.examples.len() < Self::EXAMPLES {
             self.examples.push((key, decision));
@@ -1029,7 +1002,7 @@ impl EffectOnlyMatches {
     pub(crate) fn report(&self) {
         if self.matched > 0 {
             eprintln!(
-                "> Matched {} weight(s) from score rows that name no single other allele on their effect allele, at loci where one variant carries it.",
+                "> Matched {} weight(s) from score rows that name no single other allele on their effect allele, at loci where it names one allele of the variants there.",
                 self.matched
             );
         }
@@ -1038,24 +1011,17 @@ impl EffectOnlyMatches {
             return;
         }
         eprintln!(
-            "> Warning: Skipped {skipped} weight(s) from score rows that name no single other allele: {} at loci where several variants carry the effect allele, {} where no variant carries it with a listed other allele. They contribute nothing to any score.",
+            "> Warning: Skipped {skipped} weight(s) from score rows that name no single other allele: {} at loci where the effect allele may name more than one allele of the variants there, {} where no variant carries it with a listed other allele. They contribute nothing to any score.",
             self.several_rows, self.no_row
         );
         eprintln!("> Examples (first {}):", self.examples.len());
         for ((chr, pos), decision) in &self.examples {
-            let chr = match chr {
-                23 => "X".to_string(),
-                24 => "Y".to_string(),
-                25 => "XY".to_string(),
-                26 => "MT".to_string(),
-                n => n.to_string(),
-            };
-            let reason = if *decision == OtherAlleleMatch::SeveralRows {
-                "several variants carry the effect allele"
+            let reason = if matches!(decision, RowMatch::Several(..) | RowMatch::Unread(_)) {
+                "the effect allele may name more than one allele of the variants there"
             } else {
                 "no variant carries the effect allele"
             };
-            eprintln!(">   - {chr}:{pos}: {reason}");
+            eprintln!(">   - {}:{pos}: {reason}", chromosome_label(*chr));
         }
     }
 }
@@ -2300,49 +2266,51 @@ mod tests {
         }
     }
 
+    /// The site of `.bim` rows given as (allele 1, allele 2).
+    fn site_of<'a>(rows: &[(&'a str, &'a str)]) -> Site<'a> {
+        let rows: Vec<(usize, &str, &str)> = rows
+            .iter()
+            .enumerate()
+            .map(|(row, &(allele1, allele2))| (row, allele2, allele1))
+            .collect();
+        Site::new(&rows, false)
+    }
+
     #[test]
     fn explicit_other_alleles_are_left_to_the_pair_rule() {
-        let rows = [("A", "G")];
+        let site = site_of(&[("A", "G")]);
+        assert_eq!(site.match_row("A", "T"), RowMatch::NoVariant);
         assert_eq!(
-            resolve_other_allele("A", "T", rows.iter().copied()),
-            OtherAlleleMatch::Pair
-        );
-        assert_eq!(
-            resolve_other_allele("A", "G", rows.iter().copied()),
-            OtherAlleleMatch::Pair
+            site.match_row("A", "G"),
+            RowMatch::Scores(SiteAllele::Alternate(0))
         );
     }
 
     #[test]
-    fn a_missing_other_allele_resolves_to_the_one_row_carrying_the_effect_allele() {
+    fn a_missing_other_allele_resolves_to_the_one_allele_its_effect_allele_names() {
         // A split multiallelic locus where only the second row carries the effect allele.
-        let rows = [("C", "T"), ("G", "A")];
+        let site = site_of(&[("C", "T"), ("G", "A")]);
         assert_eq!(
-            resolve_other_allele("A", ".", rows.iter().copied()),
-            OtherAlleleMatch::EffectOnly(1)
+            site.match_row("A", "."),
+            RowMatch::Scores(SiteAllele::Reference(1))
         );
         assert_eq!(
-            resolve_other_allele("A", "G/T", rows.iter().copied()),
-            OtherAlleleMatch::EffectOnly(1)
+            site.match_row("A", "G/T"),
+            RowMatch::Scores(SiteAllele::Reference(1))
         );
-        assert_eq!(
-            resolve_other_allele("A", "C/T", rows.iter().copied()),
-            OtherAlleleMatch::NoRow
-        );
-        assert_eq!(
-            resolve_other_allele("G", ".", [("C", "T")].iter().copied()),
-            OtherAlleleMatch::NoRow
-        );
+        assert_eq!(site.match_row("A", "C/T"), RowMatch::NoVariant);
+        assert_eq!(site_of(&[("C", "T")]).match_row("G", "."), RowMatch::NoVariant);
 
-        // Two rows carry the effect allele: ambiguous, unless the candidates pick one.
-        let rows = [("A", "G"), ("A", "AT")];
+        // Two rows carry the effect allele: ambiguous. The candidates pick the second, whose REF a
+        // `.bim` does not write: A is its ALT if AT is its REF, and the site's REF otherwise.
+        let site = site_of(&[("A", "G"), ("A", "AT")]);
+        assert_eq!(site.match_row("A", "."), RowMatch::Several(0, 1));
+        assert_eq!(site.match_row("A", "AT/C"), RowMatch::Unread(1));
+        // Both carry it as the REF, the one REF of the site.
+        let site = site_of(&[("G", "A"), ("T", "A")]);
         assert_eq!(
-            resolve_other_allele("A", ".", rows.iter().copied()),
-            OtherAlleleMatch::SeveralRows
-        );
-        assert_eq!(
-            resolve_other_allele("A", "AT/C", rows.iter().copied()),
-            OtherAlleleMatch::EffectOnly(1)
+            site.match_row("A", "."),
+            RowMatch::Scores(SiteAllele::Reference(0))
         );
     }
 
@@ -2378,12 +2346,13 @@ mod tests {
             .unwrap()
         };
 
+        // 1:300 A is the REF both rows there carry, named through either pair.
         let pairs = prepare(
             "pairs.tsv",
-            "1:100\tA\tG\t0.5\n1:200\tT\tC\t-0.25\n1:400\tT\tC\t2\n1:500\tA\tG\t0.125\n",
+            "1:100\tA\tG\t0.5\n1:200\tT\tC\t-0.25\n1:300\tA\tC\t9\n1:400\tT\tC\t2\n1:500\tA\tG\t0.125\n",
         );
-        // The same weights with the other allele unknown or listed as candidates, plus an
-        // ambiguous locus and one the genotypes lack.
+        // The same weights with the other allele unknown or listed as candidates, plus a locus the
+        // genotypes lack.
         let effect_only = prepare(
             "effect_only.tsv",
             "1:100\tA\t.\t0.5\n1:200\tT\t.\t-0.25\n1:300\tA\t.\t9\n1:400\tT\tC/G\t2\n1:500\tA\tG/T\t0.125\n1:600\tA\t.\t7\n",
@@ -2394,11 +2363,11 @@ mod tests {
         );
         assert_eq!(effect_only.score_variant_counts, pairs.score_variant_counts);
 
-        // No variant carries C at 1:100, two carry A at 1:300, and at 1:400 the only row
-        // carrying T pairs it with an unlisted allele: all dropped; the explicit pair stays.
+        // No variant carries C at 1:100, and at 1:400 the only row carrying T pairs it with an
+        // unlisted allele: both dropped; the explicit pair stays.
         let skipped = prepare(
             "skipped.tsv",
-            "1:100\tC\t.\t1\n1:300\tA\t.\t1\n1:400\tT\tA/G\t1\n1:500\tA\tG\t1\n",
+            "1:100\tC\t.\t1\n1:400\tT\tA/G\t1\n1:500\tA\tG\t1\n",
         );
         let (matched, rules) = plan_by_row_text(&skipped, &rows);
         assert_eq!(
@@ -2840,18 +2809,23 @@ mod tests {
         let weights = dir.path().join("weights.tsv");
         std::fs::write(&weights, "variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.25\n1:150\tC\tT\t0.5\n1:200\tA\tAC\t-0.75\n1:250\tC\tA\t0.125\n1:300\t<DEL>\tA\t-0.125\n1:300\t<DEL>\tA\t0.375\n").unwrap();
         let prep = prepare_for_computation(&[prefix], &[weights], None, None).unwrap();
-        assert_eq!(prep.required_bim_indices, [0, 1, 2, 3, 5].map(BimRowIndex));
+        assert_eq!(prep.required_bim_indices, [0, 1, 2, 3, 4, 5].map(BimRowIndex));
         // The two 1:300 lines stay two entries, each one written weight, flipped.
-        assert_eq!(prep.sparse_row_offsets(), &[0, 1, 2, 3, 3, 5]);
+        assert_eq!(prep.sparse_row_offsets(), &[0, 1, 2, 3, 3, 3, 5]);
         assert_eq!(prep.sparse_weights(), &[0.25, -0.5, -0.75, 0.125, -0.375]);
         assert_eq!(prep.sparse_missing_corrections(), &[0.0, 1.0, 0.0, -0.25, 0.75]);
         assert_eq!(prep.baseline_missing_sum_by_score(), &[1.5]);
         assert_eq!(prep.score_variant_counts, [5]);
-        assert_eq!(prep.required_is_complex(), &[0, 0, 0, 1, 0]);
+        // 1:250 C is the REF of both rows there, so its dose is two less both ALTs' copies:
+        // the site's two rows are resolved per person, and both are spooled.
+        assert_eq!(prep.required_is_complex(), &[0, 0, 0, 1, 1, 0]);
         assert_eq!(prep.complex_rules.len(), 1);
         assert_eq!(
             prep.complex_rules[0].possible_contexts,
-            [(BimRowIndex(3), "A".into(), "C".into())]
+            [
+                (BimRowIndex(3), "A".into(), "C".into()),
+                (BimRowIndex(4), "G".into(), "C".into())
+            ]
         );
     }
 

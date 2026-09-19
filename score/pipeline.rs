@@ -2112,7 +2112,8 @@ mod tests {
             [0, 1, 2, 3, 3, 2, 0],
             [3, 2, 1, 0, 1, 0, 2],
             [2, 3, 0, 1, 2, 1, 3],
-            [0; 7],
+            // The split site's second ALT: no one carries more ALT copies at 1:200 than two.
+            [3, 2, 3, 0, 2, 1, 3],
         ];
         let weights = dir.path().join("weights.tsv");
         fs::write(&weights, "variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.25\n1:150\tC\tT\t0.5\n1:200\tC\tA\t0.125\n").unwrap();
@@ -2155,7 +2156,7 @@ mod tests {
                 for (out, fam) in prep.output_idx_to_fam_idx.iter().enumerate() {
                     let mut expected = 0.0;
                     let mut expected_missing = 0;
-                    for (row, weight) in [0.25, 0.5, 0.125].into_iter().enumerate() {
+                    for (row, weight) in [0.25, 0.5].into_iter().enumerate() {
                         let packed = calls[row][fam.0 as usize];
                         if packed == 1 {
                             expected_missing += 1;
@@ -2168,6 +2169,18 @@ mod tests {
                             };
                             expected += weight * if row == 1 { 2.0 - dosage } else { dosage };
                         }
+                    }
+                    // 1:200 C is the REF both rows there carry: two less both ALTs' copies, the
+                    // allele 1 of each row, and missing when either row is.
+                    let alternate = |packed: u8| match packed {
+                        0 => 2.0,
+                        2 => 1.0,
+                        3 => 0.0,
+                        _ => unreachable!(),
+                    };
+                    match (calls[2][fam.0 as usize], calls[3][fam.0 as usize]) {
+                        (1, _) | (_, 1) => expected_missing += 1,
+                        (a, g) => expected += 0.125 * (2.0 - alternate(a) - alternate(g)),
                     }
                     let stride = prep.exact().stride();
                     assert_eq!(

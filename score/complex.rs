@@ -1,18 +1,17 @@
 use crate::pipeline_error::PipelineError;
 use crate::score::cells::{ExactPlan, Target};
 use crate::score::io::BedSource;
+use crate::score::site::{RowMatch, Site, SiteAllele};
 use crate::score::types::{
     BimRowIndex, FilesetBoundary, GroupedComplexRule, OutputPersonIndex, PreparationResult,
     ScoreInfo,
 };
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use rayon::prelude::*;
-use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A read-only resolver for fetching complex variant genotypes.
 ///
@@ -298,72 +297,6 @@ fn decode_genotypes(row: &[u8], bytes: &[u32], shifts: &[u8], out: &mut [u8]) {
     }
 }
 
-// ========================================================================================
-//                            Complex Variant Resolution Types
-// ========================================================================================
-
-// A type alias for the final, merged collector.
-pub type FinalAggregatedCollector = HashMap<Heuristic, (u64, Vec<CriticalIntegrityWarningInfo>)>;
-
-/// An enum representing the complete, ordered set of resolution strategies.
-/// This approach uses static dispatch for zero-cost abstraction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Heuristic {
-    /// Tries to find one BIM entry that perfectly matches both score file alleles.
-    ExactScoreAlleleMatch,
-    /// Tries to find one interpretation composed ONLY of score file alleles.
-    PrioritizeUnambiguousGenotype,
-    /// Prefers an interpretation where allele lengths match the score file.
-    PreferMatchingAlleleStructure,
-    /// Checks if all conflicting interpretations result in the same dosage.
-    ConsistentDosage,
-    /// As a last resort, prefers a single heterozygous call over homozygous ones.
-    PreferHeterozygous,
-    /// Infers a heterozygous genotype if conflicting homozygous calls involve alleles
-    /// where one is a prefix of the other (e.g. C/C vs CAGA/CAGA -> C/CAGA).
-    IndelAnchorBase,
-    /// Final fallback: if both homozygous states conflict (00 and 11), infer a
-    /// heterozygous genotype from the observed homozygous alleles.
-    FallbackOpposingHomozygousAsHet,
-    /// Absolute last fallback: average dosage across all remaining conflicts.
-    FallbackAverageDosageAcrossConflicts,
-}
-
-/// Describes the specific heuristic used to resolve a critical data ambiguity,
-/// holding the data needed for transparent reporting.
-#[derive(Debug, Clone)]
-pub enum ResolutionMethod {
-    /// All conflicting sources yielded the same effect allele dosage.
-    ConsistentDosage {
-        dosage: f64,
-    },
-    /// Exactly one heterozygous call was found alongside one or more homozygous
-    /// calls, and the heterozygous call was chosen.
-    PreferHeterozygous {
-        chosen_dosage: f64,
-    },
-    /// A single BIM entry's alleles perfectly matched the score file alleles.
-    ExactScoreAlleleMatch {
-        chosen_dosage: f64,
-    },
-    /// A single interpretation was composed of standard alleles from the score file.
-    PrioritizeUnambiguousGenotype {
-        chosen_dosage: f64,
-    },
-    PreferMatchingAlleleStructure {
-        chosen_dosage: f64,
-    },
-    IndelAnchorBase {
-        chosen_dosage: f64,
-    },
-    FallbackOpposingHomozygousAsHet {
-        chosen_dosage: f64,
-    },
-    FallbackAverageDosageAcrossConflicts {
-        chosen_dosage: f64,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,54 +434,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn heuristic_table_is_indexed_by_discriminant() {
-        for (index, method) in HEURISTICS.iter().enumerate() {
-            assert_eq!(*method as usize, index);
-        }
-    }
-
-    #[test]
-    fn warning_report_follows_declaration_order_and_stays_silent_after_a_fatal_error() {
-        let info = || CriticalIntegrityWarningInfo {
-            iid: "IID1".to_string(),
-            locus_chr_pos: ("22".to_string(), 1000),
-            score_name: "S0".to_string(),
-            conflicts: Vec::new(),
-            resolution_method: ResolutionMethod::ConsistentDosage { dosage: 1.0 },
-            score_effect_allele: "A".to_string(),
-            score_other_allele: "G".to_string(),
-        };
-        let mut warnings = FinalAggregatedCollector::new();
-        // Inserted in reverse declaration order.
-        for method in HEURISTICS.iter().rev().step_by(3) {
-            warnings.insert(*method, (2, vec![info()]));
-        }
-        let mut report = ResolutionReport {
-            warnings,
-            unresolvable: None,
-        };
-        let text = warning_report(&report).expect("heuristic events are reported");
-        let positions: Vec<usize> = HEURISTICS
-            .iter()
-            .filter_map(|method| text.find(&format!("WARNING CATEGORY: {method:?} ")))
-            .collect();
-        assert_eq!(positions.len(), report.warnings.len(), "{text}");
-        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
-
-        report.unresolvable = Some(FatalAmbiguityData {
-            iid: "IID2".to_string(),
-            locus_chr_pos: ("22".to_string(), 1001),
-            score_name: "S0".to_string(),
-            conflicts: Vec::new(),
-        });
-        assert!(warning_report(&report).is_none());
-
-        report.unresolvable = None;
-        report.warnings.clear();
-        assert!(warning_report(&report).is_none());
-    }
-
     /// A small deterministic generator, so the scenarios need no seeding API.
     struct SplitMix64(u64);
 
@@ -598,9 +483,10 @@ mod tests {
         data
     }
 
-    /// Random packed genotypes (missing calls and padding bits included) and random
-    /// rules over a small allele vocabulary, so contexts collide, duplicate, swap and
-    /// share prefixes often enough to reach every heuristic.
+    /// Random packed genotypes (missing calls and padding bits included) and random sites: a REF
+    /// written in one of two frames, ALTs drawn from a small vocabulary so a variant is often
+    /// measured by several rows, and score rows naming an ALT or the REF of a variant. Rows are
+    /// often shared between sites, so the calls of one variant's rows agree only by chance.
     struct Scenario {
         total_people: usize,
         rows: Vec<Vec<u8>>,
@@ -611,48 +497,63 @@ mod tests {
 
     impl Scenario {
         fn random(seed: u64, total_people: usize, keep_all: bool) -> Self {
-            const ALLELES: [&str; 6] = ["A", "G", "C", "T", "CA", "CAGA"];
+            // Each ALT beside the REF C, and the same variant written in the frame of the REF CA.
+            const VARIANTS: [[(&str, &str); 2]; 3] = [
+                [("C", "T"), ("CA", "TA")],
+                [("C", "G"), ("CA", "GA")],
+                [("C", "A"), ("CA", "AA")],
+            ];
             let mut rng = SplitMix64(seed);
             let num_variants = 40;
-            let rows = (0..num_variants)
-                .map(|_| {
-                    (0..total_people.div_ceil(4))
-                        .map(|_| rng.next() as u8)
-                        .collect()
-                })
-                .collect();
+            // Rows that often agree: each row is a copy of an earlier one with a few calls changed.
+            let mut rows: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..num_variants {
+                let row = match rows.len() {
+                    0 => (0..total_people.div_ceil(4)).map(|_| rng.next() as u8).collect(),
+                    known => {
+                        let mut row = rows[rng.below(known)].clone();
+                        for byte in &mut row {
+                            if rng.below(4) == 0 {
+                                *byte ^= 1 << (2 * rng.below(4));
+                            }
+                        }
+                        row
+                    }
+                };
+                rows.push(row);
+            }
             let num_scores = 1 + rng.below(4);
             let mut rules = Vec::new();
             for rule_idx in 0..60 {
-                let num_contexts = 1 + rng.below(6);
+                let num_contexts = 2 + rng.below(5);
                 let possible_contexts: Vec<(BimRowIndex, String, String)> = (0..num_contexts)
                     .map(|_| {
+                        let (reference, alternate) = VARIANTS[rng.below(VARIANTS.len())][rng.below(2)];
+                        // A `.bim` writes its alleles in either order.
+                        let (allele1, allele2) = if rng.below(2) == 0 {
+                            (alternate, reference)
+                        } else {
+                            (reference, alternate)
+                        };
                         (
                             BimRowIndex(rng.below(num_variants) as u64),
-                            ALLELES[rng.below(ALLELES.len())].to_string(),
-                            ALLELES[rng.below(ALLELES.len())].to_string(),
+                            allele1.to_string(),
+                            allele2.to_string(),
                         )
                     })
                     .collect();
                 let score_applications = (0..1 + rng.below(4))
                     .map(|_| {
-                        let (effect_allele, other_allele) = if rng.below(4) != 0 {
-                            let (_, a1, a2) = &possible_contexts[rng.below(num_contexts)];
-                            if rng.below(2) == 0 {
-                                (a1.clone(), a2.clone())
-                            } else {
-                                (a2.clone(), a1.clone())
-                            }
+                        let (_, allele1, allele2) = &possible_contexts[rng.below(num_contexts)];
+                        let (effect_allele, other_allele) = if rng.below(2) == 0 {
+                            (allele1.clone(), allele2.clone())
                         } else {
-                            (
-                                ALLELES[rng.below(ALLELES.len())].to_string(),
-                                ALLELES[rng.below(ALLELES.len())].to_string(),
-                            )
+                            (allele2.clone(), allele1.clone())
                         };
                         ScoreInfo {
                             effect_allele,
                             other_allele,
-                            weight: (rng.unit() * 3.0 - 1.5) as f64,
+                            weight: rng.unit() * 3.0 - 1.5,
                             score_column_index: ScoreColumnIndex(rng.below(num_scores)),
                         }
                     })
@@ -661,20 +562,30 @@ mod tests {
                     locus_chr_pos: ("22".to_string(), 1000 + rule_idx),
                     possible_contexts,
                     score_applications,
+                    reference_declared: false,
                 });
             }
-            // A locus with more duplicate contexts than a table covers.
+            // A site with more rows than a table covers, one variant measured by all of them.
             rules.push(GroupedComplexRule {
                 locus_chr_pos: ("22".to_string(), 5000),
                 possible_contexts: (0..6)
-                    .map(|variant| (BimRowIndex(variant), "A".to_string(), "G".to_string()))
+                    .map(|variant| (BimRowIndex(variant), "G".to_string(), "A".to_string()))
                     .collect(),
-                score_applications: vec![ScoreInfo {
-                    effect_allele: "G".to_string(),
-                    other_allele: "A".to_string(),
-                    weight: 0.7,
-                    score_column_index: ScoreColumnIndex(0),
-                }],
+                score_applications: vec![
+                    ScoreInfo {
+                        effect_allele: "G".to_string(),
+                        other_allele: "A".to_string(),
+                        weight: 0.7,
+                        score_column_index: ScoreColumnIndex(0),
+                    },
+                    ScoreInfo {
+                        effect_allele: "A".to_string(),
+                        other_allele: "G".to_string(),
+                        weight: -0.3,
+                        score_column_index: ScoreColumnIndex(0),
+                    },
+                ],
+                reference_declared: false,
             });
 
             let mut kept: Vec<u32> = (0..total_people as u32)
@@ -783,132 +694,126 @@ mod tests {
         }
     }
 
-    /// The person-major resolver this module replaced, reduced to its arithmetic:
-    /// every person, every rule, every application, in that order. People whose
-    /// byte is `pruned_byte` have missing calls, as a spool that pruned it gives them.
+    /// The site rule person by person: every person, every rule, every application, in that
+    /// order, with each variant's copies taken from the list of its rows' called copies. People
+    /// whose byte is `pruned_byte` have missing calls, as a spool that pruned it gives them.
+    /// Returns the conflicts per (rule, application).
     fn reference_resolve(
         scenario: &Scenario,
         prep_result: &PreparationResult,
         pruned_byte: Option<usize>,
         scores: &mut [i64],
         counts: &mut [u32],
-    ) -> FinalAggregatedCollector {
-        let pipeline = ResolverPipeline::new();
+    ) -> Vec<((usize, usize), u64)> {
         let num_scores = prep_result.score_names.len();
         let exact = prep_result.exact();
         let stride = exact.stride();
-        let mut collector = FinalAggregatedCollector::new();
+        let mut conflicts: AHashMap<(usize, usize), u64> = AHashMap::new();
         for (person, fam_idx) in prep_result.output_idx_to_fam_idx.iter().enumerate() {
             let fam_idx = fam_idx.0 as usize;
-            for rule in &prep_result.complex_rules {
-                let valid: Vec<(u8, &(BimRowIndex, String, String))> = rule
+            for (rule_idx, rule) in prep_result.complex_rules.iter().enumerate() {
+                let rows: Vec<(usize, &str, &str)> = rule
                     .possible_contexts
                     .iter()
-                    .map(|context| {
-                        let bits = if pruned_byte == Some(fam_idx / 4) {
-                            0b01
-                        } else {
-                            scenario.genotype(context.0, fam_idx)
-                        };
-                        (bits, context)
-                    })
-                    .filter(|(bits, _)| *bits != 0b01)
+                    .enumerate()
+                    .map(|(context, (_, allele1, allele2))| (context, allele2.as_str(), allele1.as_str()))
                     .collect();
-                for score_info in &rule.score_applications {
-                    let column = score_info.score_column_index.0;
-                    let cell = person * num_scores + column;
-                    let lanes = &mut scores[person * stride..(person + 1) * stride];
-                    let matching: Vec<_> = valid
-                        .iter()
-                        .copied()
-                        .filter(|(_, context)| {
-                            score_allele_pair_matches(score_info, &context.1, &context.2)
-                        })
-                        .collect();
-                    if matching.is_empty() {
-                        counts[cell] += 1;
-                        continue;
-                    }
-                    if matching.len() == 1 {
-                        let (bits, (_, bim_a1, bim_a2)) = matching[0];
-                        match Heuristic::calculate_score_dosage(bits, bim_a1, bim_a2, score_info) {
-                            Some(dosage) => exact.add(
-                                exact.complex_target(column, score_info.weight),
-                                exact.complex_term(column, score_info.weight, dosage as u32, 1),
-                                lanes,
-                            ),
-                            None => counts[cell] += 1,
-                        }
-                        continue;
-                    }
-                    let context = ResolutionContext {
-                        score_info,
-                        conflicting_interpretations: &matching,
+                let site = Site::new(&rows, rule.reference_declared);
+                let variants = site.variants().len();
+                // Every variant's called copies of its ALT, over its rows.
+                let mut called: Vec<Vec<u32>> = vec![Vec::new(); variants];
+                for (context, (bim_row, _, _)) in rule.possible_contexts.iter().enumerate() {
+                    let bits = if pruned_byte == Some(fam_idx / 4) {
+                        0b01
+                    } else {
+                        scenario.genotype(*bim_row, fam_idx)
                     };
-                    let resolution = pipeline
-                        .resolve(&context)
-                        .expect("the average fallback resolves every conflict");
-                    exact.add(
-                        exact.complex_target(column, score_info.weight),
-                        exact.complex_term(
-                            column,
-                            score_info.weight,
-                            resolution.numerator,
-                            resolution.denominator,
+                    let allele1 = match bits {
+                        0b00 => 2,
+                        0b10 => 1,
+                        0b11 => 0,
+                        _ => continue,
+                    };
+                    // A row whose REF is allele 2 has allele 1 as its ALT.
+                    let copies = if site.first_is_reference()[context] { allele1 } else { 2 - allele1 };
+                    called[site.row_variants()[context]].push(copies);
+                }
+                // Each variant's copies: Some(Ok) when its calls agree, Some(Err) when they do not.
+                let copies: Vec<Option<Result<u32, ()>>> = called
+                    .iter()
+                    .map(|calls| {
+                        let first = *calls.first()?;
+                        Some(if calls.iter().all(|&c| c == first) { Ok(first) } else { Err(()) })
+                    })
+                    .collect();
+                let alleles: Vec<SiteAllele> = rule
+                    .score_applications
+                    .iter()
+                    .map(|info| match site.match_row(&info.effect_allele, &info.other_allele) {
+                        RowMatch::Scores(allele) => allele,
+                        other => panic!("scenario rule names no one allele: {other:?}"),
+                    })
+                    .collect();
+                let key = |index: usize| {
+                    (
+                        alleles[index].variant(),
+                        rule.score_applications[index].score_column_index.0,
+                    )
+                };
+                for (index, score_info) in rule.score_applications.iter().enumerate() {
+                    let column = score_info.score_column_index.0;
+                    let first_of_pair = (0..index).all(|earlier| key(earlier) != key(index));
+                    let whole_site = (0..alleles.len())
+                        .any(|other| key(other) == key(index) && site.reads_whole_site(alleles[other]));
+                    let dose: Result<u32, bool> = if whole_site {
+                        if copies.iter().any(|c| matches!(c, Some(Err(())))) {
+                            Err(true)
+                        } else if copies.iter().any(Option::is_none) {
+                            Err(false)
+                        } else {
+                            let alternates: u32 = copies.iter().map(|c| c.unwrap().unwrap()).sum();
+                            match (alleles[index], alternates) {
+                                (_, total) if total > 2 => Err(true),
+                                (SiteAllele::Reference(_), total) => Ok(2 - total),
+                                (SiteAllele::Alternate(variant), _) => Ok(copies[variant].unwrap().unwrap()),
+                            }
+                        }
+                    } else {
+                        // A variant's own REF copies are two less its ALT's.
+                        match (alleles[index], copies[alleles[index].variant()]) {
+                            (SiteAllele::Alternate(_), Some(Ok(copies))) => Ok(copies),
+                            (SiteAllele::Reference(_), Some(Ok(copies))) => Ok(2 - copies),
+                            (_, Some(Err(()))) => Err(true),
+                            (_, None) => Err(false),
+                        }
+                    };
+                    match dose {
+                        Ok(dose) => exact.add(
+                            exact.complex_target(column, score_info.weight),
+                            exact.complex_term(column, score_info.weight, dose),
+                            &mut scores[person * stride..(person + 1) * stride],
                         ),
-                        lanes,
-                    );
-                    let (count, samples) = collector
-                        .entry(resolution.method_used)
-                        .or_insert((0, Vec::new()));
-                    *count += 1;
-                    if samples.len() < MAX_WARNING_SAMPLES {
-                        samples.push(CriticalIntegrityWarningInfo {
-                            iid: prep_result.final_person_iids[person].clone(),
-                            locus_chr_pos: rule.locus_chr_pos.clone(),
-                            score_name: prep_result.score_names[score_info.score_column_index.0]
-                                .clone(),
-                            conflicts: matching
-                                .iter()
-                                .map(|(bits, context)| ConflictSource {
-                                    bim_row: context.0,
-                                    alleles: (context.1.clone(), context.2.clone()),
-                                    genotype_bits: *bits,
-                                })
-                                .collect(),
-                            resolution_method: resolution_method(
-                                resolution.method_used,
-                                resolution.chosen_dosage,
-                            ),
-                            score_effect_allele: score_info.effect_allele.clone(),
-                            score_other_allele: score_info.other_allele.clone(),
-                        });
+                        Err(conflict) => {
+                            if first_of_pair {
+                                counts[person * num_scores + column] += 1;
+                                if conflict {
+                                    *conflicts.entry((rule_idx, index)).or_default() += 1;
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        collector
-    }
-
-    fn rendered(collector: &FinalAggregatedCollector) -> Vec<String> {
-        let mut categories: Vec<String> = collector
-            .iter()
-            .map(|(method, (count, samples))| {
-                let samples: Vec<String> = samples
-                    .iter()
-                    .map(format_critical_integrity_warning)
-                    .collect();
-                format!("{method:?} {count}\n{}", samples.join("\n---\n"))
-            })
-            .collect();
-        categories.sort();
-        categories
+        let mut conflicts: Vec<((usize, usize), u64)> = conflicts.into_iter().collect();
+        conflicts.sort_unstable();
+        conflicts
     }
 
     #[test]
     fn row_major_resolver_matches_person_major_reference() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut methods_seen = AHashSet::new();
+        let (mut conflicting, mut reference_scored) = (0u64, false);
         for (seed, total_people, keep_all) in [
             (1, 1, true),
             (2, 3, true),
@@ -923,14 +828,26 @@ mod tests {
             let (initial_scores, initial_counts) = scenario.initial_accumulators(seed, prep_result.exact().stride());
             let mut expected_scores = initial_scores.clone();
             let mut expected_counts = initial_counts.clone();
-            let expected_warnings = reference_resolve(
+            let expected_conflicts = reference_resolve(
                 &scenario,
                 &prep_result,
                 None,
                 &mut expected_scores,
                 &mut expected_counts,
             );
-            methods_seen.extend(expected_warnings.keys().copied());
+            conflicting += expected_conflicts.iter().map(|(_, count)| count).sum::<u64>();
+            reference_scored |= prep_result.complex_rules.iter().any(|rule| {
+                let rows: Vec<(usize, &str, &str)> = rule
+                    .possible_contexts
+                    .iter()
+                    .enumerate()
+                    .map(|(context, (_, allele1, allele2))| (context, allele2.as_str(), allele1.as_str()))
+                    .collect();
+                let site = Site::new(&rows, false);
+                rule.score_applications.iter().any(|info| {
+                    matches!(site.match_row(&info.effect_allele, &info.other_allele), RowMatch::Scores(allele) if site.reads_whole_site(allele))
+                })
+            });
 
             let scenario_dir = dir.path().join(format!("seed{seed}"));
             std::fs::create_dir_all(&scenario_dir).expect("scenario dir");
@@ -968,19 +885,109 @@ mod tests {
                         "seed {seed}, {total_people} people, {label}, {} per block",
                         limits.block_people
                     );
-                    assert!(report.unresolvable.is_none(), "{context}");
                     assert_eq!(scores, expected_scores, "{context}");
                     assert_eq!(counts, expected_counts, "{context}");
-                    assert_eq!(
-                        rendered(&report.warnings),
-                        rendered(&expected_warnings),
-                        "{context}"
-                    );
+                    assert_eq!(report.conflicts, expected_conflicts, "{context}");
                 }
             }
         }
-        // The scenarios must reach the heuristic chain, not only single interpretations.
-        assert!(methods_seen.len() >= 3, "heuristics reached: {methods_seen:?}");
+        // The scenarios must reach disagreeing measurements and REF doses, not only lone ALTs.
+        assert!(conflicting > 0 && reference_scored);
+    }
+
+    /// The rule with `rows` at one site, given as (allele 1, allele 2) with the calls of four
+    /// people each, and `applications` as (effect, other, weight) of one score.
+    fn site_prep(rows: &[(&str, &str, [u8; 4])], applications: &[(&str, &str, f64)]) -> (PreparationResult, Vec<Vec<u8>>) {
+        let rule = GroupedComplexRule {
+            locus_chr_pos: ("1".to_string(), 100),
+            possible_contexts: rows
+                .iter()
+                .enumerate()
+                .map(|(row, (allele1, allele2, _))| (BimRowIndex(row as u64), allele1.to_string(), allele2.to_string()))
+                .collect(),
+            score_applications: applications
+                .iter()
+                .map(|&(effect, other, weight)| ScoreInfo {
+                    effect_allele: effect.to_string(),
+                    other_allele: other.to_string(),
+                    weight,
+                    score_column_index: ScoreColumnIndex(0),
+                })
+                .collect(),
+            reference_declared: false,
+        };
+        let bed_rows = rows
+            .iter()
+            .map(|(_, _, calls)| {
+                vec![calls.iter().enumerate().fold(0u8, |byte, (person, call)| byte | (call << (2 * person)))]
+            })
+            .collect();
+        (test_prep_result(vec![rule], 4, &[0, 1, 2, 3], 1, rows.len() as u64), bed_rows)
+    }
+
+    /// Each person's sum and missing count for the one score of `prep_result` over `bed_rows`.
+    fn resolved_site(prep_result: &PreparationResult, bed_rows: &[Vec<u8>]) -> (Vec<f64>, Vec<u32>, u64) {
+        let resolver = ComplexVariantResolver::from_single_source(BedSource::from_byte_source(Arc::new(
+            VecSource(bed_bytes(bed_rows)),
+        )));
+        let stride = prep_result.exact().stride();
+        let mut scores = vec![0i64; 4 * stride];
+        let mut counts = vec![0u32; 4];
+        let report = resolve_rows(
+            &resolver,
+            prep_result,
+            &mut scores,
+            &mut counts,
+            ResolveLimits::for_people(4),
+            &ProgressBar::hidden(),
+        )
+        .expect("resolution");
+        let sums = (0..4)
+            .map(|person| prep_result.exact().sum(0, &scores[person * stride..(person + 1) * stride]))
+            .collect();
+        (sums, counts, report.conflicts.iter().map(|(_, count)| count).sum())
+    }
+
+    // PLINK codes: 00 two copies of allele 1, 10 one, 11 none, 01 missing.
+    const HOM_ALT: u8 = 0b00;
+    const HET: u8 = 0b10;
+    const HOM_REF: u8 = 0b11;
+    const MISSING: u8 = 0b01;
+
+    #[test]
+    fn the_ref_of_a_split_site_is_the_ploidy_less_every_alt() {
+        // A>G and A>T split: people G/A, T/A, G/T and T/T.
+        let rows = [
+            ("G", "A", [HET, HOM_REF, HET, HOM_REF]),
+            ("T", "A", [HOM_REF, HET, HET, HOM_ALT]),
+        ];
+        let (prep_result, bed_rows) = site_prep(&rows, &[("A", "G", 1.0)]);
+        assert_eq!(resolved_site(&prep_result, &bed_rows), (vec![1.0, 1.0, 0.0, 0.0], vec![0; 4], 0));
+        // Named through the other ALT, it is the same allele.
+        let (prep_result, bed_rows) = site_prep(&rows, &[("A", "T", 1.0)]);
+        assert_eq!(resolved_site(&prep_result, &bed_rows).0, vec![1.0, 1.0, 0.0, 0.0]);
+        // A missing call on either row leaves the REF's dose unknown; ALTs past the ploidy conflict.
+        let rows = [
+            ("G", "A", [MISSING, HOM_ALT, HET, HOM_REF]),
+            ("T", "A", [HOM_REF, HET, MISSING, HOM_REF]),
+        ];
+        let (prep_result, bed_rows) = site_prep(&rows, &[("A", "G", 1.0), ("G", "A", 0.5)]);
+        assert_eq!(resolved_site(&prep_result, &bed_rows), (vec![0.0, 0.0, 0.0, 2.0], vec![1, 1, 1, 0], 1));
+    }
+
+    #[test]
+    fn repeated_rows_of_one_variant_score_the_dose_their_calls_agree_on() {
+        let rows = [
+            ("G", "A", [HET, HOM_ALT, MISSING, HET]),
+            ("G", "A", [HET, HET, HOM_REF, MISSING]),
+        ];
+        let (prep_result, bed_rows) = site_prep(&rows, &[("G", "A", 1.0)]);
+        // Agreeing calls give their dose, a missing call is no measurement, and calls that
+        // disagree leave the dose missing and are reported.
+        assert_eq!(resolved_site(&prep_result, &bed_rows), (vec![1.0, 0.0, 0.0, 1.0], vec![0, 1, 0, 0], 1));
+        // One missing dose per (variant, score), however many rows of the score name the variant.
+        let (prep_result, bed_rows) = site_prep(&rows, &[("G", "A", 1.0), ("A", "G", 0.25)]);
+        assert_eq!(resolved_site(&prep_result, &bed_rows), (vec![1.25, 0.0, 0.5, 1.25], vec![0, 1, 0, 0], 1));
     }
 
     #[test]
@@ -1011,7 +1018,7 @@ mod tests {
             let (initial_scores, initial_counts) = scenario.initial_accumulators(seed, prep_result.exact().stride());
             let mut expected_scores = initial_scores.clone();
             let mut expected_counts = initial_counts.clone();
-            let expected_warnings = reference_resolve(
+            let expected_conflicts = reference_resolve(
                 &scenario,
                 &prep_result,
                 Some(pruned_byte),
@@ -1035,14 +1042,9 @@ mod tests {
                     panic!("resolution failed for seed {seed}, {block_people} per block");
                 };
                 let context = format!("seed {seed}, {block_people} per block");
-                assert!(report.unresolvable.is_none(), "{context}");
                 assert_eq!(scores, expected_scores, "{context}");
                 assert_eq!(counts, expected_counts, "{context}");
-                assert_eq!(
-                    rendered(&report.warnings),
-                    rendered(&expected_warnings),
-                    "{context}"
-                );
+                assert_eq!(report.conflicts, expected_conflicts, "{context}");
             }
         }
     }
@@ -1102,6 +1104,7 @@ mod tests {
                 weight: 1.0,
                 score_column_index: ScoreColumnIndex(0),
             }],
+            reference_declared: false,
         }];
         let prep_result = test_prep_result(rules, 10, &scenario.kept, 1, last_variant + 1);
         let mut scores = vec![0i64; scenario.kept.len() * prep_result.exact().stride()];
@@ -1123,721 +1126,13 @@ mod tests {
             "{error}"
         );
     }
-
-    #[test]
-    fn resolver_pipeline_uses_heterozygous_fallback_last() {
-        let score_info = ScoreInfo {
-            effect_allele: "T".to_string(),
-            other_allele: "A".to_string(),
-            weight: 1.0,
-            score_column_index: ScoreColumnIndex(0),
-        };
-        let ctx_a = (BimRowIndex(10), "A".to_string(), "T".to_string());
-        let ctx_b = (BimRowIndex(11), "A".to_string(), "T".to_string());
-        let conflicting_interpretations = vec![(0b00, &ctx_a), (0b11, &ctx_b)];
-        let context = ResolutionContext {
-            score_info: &score_info,
-            conflicting_interpretations: &conflicting_interpretations,
-        };
-
-        let pipeline = ResolverPipeline::new();
-        let resolution = pipeline
-            .resolve(&context)
-            .expect("fallback heuristic should resolve remaining ambiguity");
-
-        assert_eq!(
-            resolution.method_used,
-            Heuristic::FallbackOpposingHomozygousAsHet
-        );
-        assert!((resolution.chosen_dosage - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn resolver_pipeline_preserves_existing_priority_over_fallback() {
-        let score_info = ScoreInfo {
-            effect_allele: "A".to_string(),
-            other_allele: "G".to_string(),
-            weight: 1.0,
-            score_column_index: ScoreColumnIndex(0),
-        };
-        let exact_ctx = (BimRowIndex(20), "A".to_string(), "G".to_string());
-        let non_exact_ctx = (BimRowIndex(21), "A".to_string(), "T".to_string());
-        let conflicting_interpretations = vec![(0b10, &exact_ctx), (0b11, &non_exact_ctx)];
-        let context = ResolutionContext {
-            score_info: &score_info,
-            conflicting_interpretations: &conflicting_interpretations,
-        };
-
-        let pipeline = ResolverPipeline::new();
-        let resolution = pipeline
-            .resolve(&context)
-            .expect("exact match heuristic should resolve ambiguity first");
-
-        assert_eq!(resolution.method_used, Heuristic::ExactScoreAlleleMatch);
-    }
-
-    #[test]
-    fn fallback_het_requires_both_homozygous_states() {
-        let score_info = ScoreInfo {
-            effect_allele: "A".to_string(),
-            other_allele: "G".to_string(),
-            weight: 1.0,
-            score_column_index: ScoreColumnIndex(0),
-        };
-        let ctx_a = (BimRowIndex(30), "A".to_string(), "C".to_string());
-        let ctx_b = (BimRowIndex(31), "A".to_string(), "T".to_string());
-        let conflicting_interpretations = vec![(0b00, &ctx_a), (0b10, &ctx_b)];
-        let context = ResolutionContext {
-            score_info: &score_info,
-            conflicting_interpretations: &conflicting_interpretations,
-        };
-
-        let resolution = Heuristic::FallbackOpposingHomozygousAsHet.try_resolve(&context);
-        assert!(resolution.is_none());
-    }
-
-    #[test]
-    fn fallback_het_dosage_matches_inferred_allele_pair() {
-        let ctx_a = (BimRowIndex(40), "C".to_string(), "T".to_string());
-        let ctx_b = (BimRowIndex(41), "C".to_string(), "T".to_string());
-        let conflicting_interpretations = vec![(0b00, &ctx_a), (0b11, &ctx_b)];
-
-        let incompatible_score_info = ScoreInfo {
-            effect_allele: "G".to_string(),
-            other_allele: "A".to_string(),
-            weight: 1.0,
-            score_column_index: ScoreColumnIndex(0),
-        };
-        let incompatible_context = ResolutionContext {
-            score_info: &incompatible_score_info,
-            conflicting_interpretations: &conflicting_interpretations,
-        };
-        assert!(
-            Heuristic::FallbackOpposingHomozygousAsHet
-                .try_resolve(&incompatible_context)
-                .is_none()
-        );
-
-        let score_info_one = ScoreInfo {
-            effect_allele: "C".to_string(),
-            other_allele: "T".to_string(),
-            weight: 1.0,
-            score_column_index: ScoreColumnIndex(0),
-        };
-        let context_one = ResolutionContext {
-            score_info: &score_info_one,
-            conflicting_interpretations: &conflicting_interpretations,
-        };
-        let res_one = Heuristic::FallbackOpposingHomozygousAsHet
-            .try_resolve(&context_one)
-            .expect("fallback should resolve");
-        assert!((res_one.chosen_dosage - 1.0).abs() < 1e-9);
-
-        let score_info_t = ScoreInfo {
-            effect_allele: "T".to_string(),
-            other_allele: "C".to_string(),
-            weight: 1.0,
-            score_column_index: ScoreColumnIndex(0),
-        };
-        let context_t = ResolutionContext {
-            score_info: &score_info_t,
-            conflicting_interpretations: &conflicting_interpretations,
-        };
-        let res_t = Heuristic::FallbackOpposingHomozygousAsHet
-            .try_resolve(&context_t)
-            .expect("fallback should resolve");
-        assert!((res_t.chosen_dosage - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn fallback_average_dosage_supports_three_plus_conflicts() {
-        let score_info = ScoreInfo {
-            effect_allele: "T".to_string(),
-            other_allele: "A".to_string(),
-            weight: 1.0,
-            score_column_index: ScoreColumnIndex(0),
-        };
-        let c1 = (BimRowIndex(50), "A".to_string(), "T".to_string()); // 00 => 0
-        let c2 = (BimRowIndex(51), "A".to_string(), "T".to_string()); // 10 => 1
-        let c3 = (BimRowIndex(52), "A".to_string(), "T".to_string()); // 11 => 2
-        let conflicting_interpretations = vec![(0b00, &c1), (0b10, &c2), (0b11, &c3)];
-        let context = ResolutionContext {
-            score_info: &score_info,
-            conflicting_interpretations: &conflicting_interpretations,
-        };
-
-        let resolution = Heuristic::FallbackAverageDosageAcrossConflicts
-            .try_resolve(&context)
-            .expect("average fallback should resolve");
-        assert!((resolution.chosen_dosage - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn resolver_pipeline_uses_average_only_as_absolute_last_resort() {
-        let score_info = ScoreInfo {
-            effect_allele: "T".to_string(),
-            other_allele: "A".to_string(),
-            weight: 1.0,
-            score_column_index: ScoreColumnIndex(0),
-        };
-        // 00 + 11 should be consumed by the earlier opposing-homozygous fallback,
-        // not by the average fallback.
-        let c1 = (BimRowIndex(60), "A".to_string(), "T".to_string());
-        let c2 = (BimRowIndex(61), "A".to_string(), "T".to_string());
-        let conflicting_interpretations = vec![(0b00, &c1), (0b11, &c2)];
-        let context = ResolutionContext {
-            score_info: &score_info,
-            conflicting_interpretations: &conflicting_interpretations,
-        };
-
-        let pipeline = ResolverPipeline::new();
-        let resolution = pipeline
-            .resolve(&context)
-            .expect("pipeline should resolve with prior fallback");
-        assert_eq!(
-            resolution.method_used,
-            Heuristic::FallbackOpposingHomozygousAsHet
-        );
-    }
-
-    #[test]
-    fn fallback_average_dosage_handles_two_conflicts() {
-        let score_info = ScoreInfo {
-            effect_allele: "T".to_string(),
-            other_allele: "A".to_string(),
-            weight: 1.0,
-            score_column_index: ScoreColumnIndex(0),
-        };
-        // Crafted to avoid all earlier heuristics:
-        // - no exact score allele match
-        // - no unambiguous genotype from score allele set
-        // - not a single heterozygous-vs-homozygous tie
-        // - not opposing 00/11 fallback
-        // Dosages are 0 (00 with A/T) and 2 (00 with T/A), average = 1.0.
-        let c1 = (BimRowIndex(70), "A".to_string(), "T".to_string());
-        let c2 = (BimRowIndex(71), "T".to_string(), "A".to_string());
-        let conflicting_interpretations = vec![(0b00, &c1), (0b00, &c2)];
-        let context = ResolutionContext {
-            score_info: &score_info,
-            conflicting_interpretations: &conflicting_interpretations,
-        };
-
-        let pipeline = ResolverPipeline::new();
-        let resolution = pipeline
-            .resolve(&context)
-            .expect("pipeline should resolve with average fallback");
-        assert_eq!(
-            resolution.method_used,
-            Heuristic::FallbackAverageDosageAcrossConflicts
-        );
-        assert!((resolution.chosen_dosage - 1.0).abs() < 1e-9);
-    }
 }
 
-/// A private struct holding the raw data for one conflicting source of evidence.
-/// This is used exclusively for building the final fatal error report.
-#[derive(Debug, Clone)]
-pub struct ConflictSource {
-    pub bim_row: BimRowIndex,
-    pub alleles: (String, String),
-    pub genotype_bits: u8,
-}
-
-/// A private struct holding the data for a critical but non-fatal integrity warning.
-/// This is used when multiple data sources conflict but lead to a consistent outcome.
-#[derive(Debug, Clone)]
-pub struct CriticalIntegrityWarningInfo {
-    pub iid: String,
-    pub locus_chr_pos: (String, u32),
-    pub score_name: String,
-    pub conflicts: Vec<ConflictSource>,
-    pub resolution_method: ResolutionMethod,
-    pub score_effect_allele: String,
-    pub score_other_allele: String,
-}
 //========================================================================================
 //
-//                      The Zero-Cost Heuristic Pipeline
+//                      The site rule, resolved per person
 //
 //========================================================================================
-
-/// The data required for any heuristic to make a decision.
-/// It is created once per conflict and passed down the chain.
-pub struct ResolutionContext<'a> {
-    pub score_info: &'a ScoreInfo,
-    pub conflicting_interpretations: &'a [(u8, &'a (BimRowIndex, String, String))],
-}
-
-/// The successful outcome of a resolution, specifying the dosage and the rule that won.
-pub struct Resolution {
-    pub chosen_dosage: f64,
-    /// The chosen dosage exactly, as numerator / denominator.
-    pub numerator: u32,
-    pub denominator: u32,
-    pub method_used: Heuristic,
-}
-
-#[inline(always)]
-fn score_allele_pair_matches(score_info: &ScoreInfo, bim_a1: &str, bim_a2: &str) -> bool {
-    (score_info.effect_allele == bim_a1 && score_info.other_allele == bim_a2)
-        || (score_info.effect_allele == bim_a2 && score_info.other_allele == bim_a1)
-}
-
-impl Heuristic {
-    /// The main dispatcher for the enum. It calls the appropriate private method
-    /// for the specific heuristic variant.
-    pub fn try_resolve(&self, context: &ResolutionContext) -> Option<Resolution> {
-        match self {
-            Heuristic::ExactScoreAlleleMatch => self.resolve_exact_match(context),
-            Heuristic::PrioritizeUnambiguousGenotype => self.resolve_unambiguous_genotype(context),
-            Heuristic::PreferMatchingAlleleStructure => {
-                self.resolve_prefer_matching_allele_structure(context)
-            }
-            Heuristic::ConsistentDosage => self.resolve_consistent_dosage(context),
-            Heuristic::PreferHeterozygous => self.resolve_prefer_het(context),
-            Heuristic::IndelAnchorBase => self.resolve_indel_anchor_base(context),
-            Heuristic::FallbackOpposingHomozygousAsHet => {
-                self.resolve_fallback_opposing_homozygous_as_het(context)
-            }
-            Heuristic::FallbackAverageDosageAcrossConflicts => {
-                self.resolve_fallback_average_dosage_across_conflicts(context)
-            }
-        }
-    }
-
-    /// Heuristic 1: The most stringent rule. Succeeds only if exactly one
-    /// BIM entry's alleles are identical to the score file's alleles.
-    fn resolve_exact_match(&self, context: &ResolutionContext) -> Option<Resolution> {
-        let score_eff_allele = &context.score_info.effect_allele;
-        let score_oth_allele = &context.score_info.other_allele;
-
-        let exact_matches: Vec<_> = context
-            .conflicting_interpretations
-            .iter()
-            .filter(|(_, (_, bim_a1, bim_a2))| {
-                (bim_a1 == score_eff_allele && bim_a2 == score_oth_allele)
-                    || (bim_a1 == score_oth_allele && bim_a2 == score_eff_allele)
-            })
-            .collect();
-
-        if exact_matches.len() == 1 {
-            let (packed_geno, (_, bim_a1, bim_a2)) = exact_matches[0];
-            let dosage =
-                Self::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, context.score_info)?;
-            Some(Resolution {
-                chosen_dosage: dosage,
-                numerator: dosage as u32,
-                denominator: 1,
-                method_used: *self,
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Heuristic 3: Solves conflicts by preferring an interpretation where the resulting
-    /// genotype's allele lengths match the allele lengths from the score file.
-    fn resolve_prefer_matching_allele_structure(
-        &self,
-        context: &ResolutionContext,
-    ) -> Option<Resolution> {
-        let score_a1_len = context.score_info.effect_allele.len();
-        let score_a2_len = context.score_info.other_allele.len();
-
-        let matching_structure_interpretations: Vec<_> = context
-            .conflicting_interpretations
-            .iter()
-            .filter(|(packed_geno, (_, bim_a1, bim_a2))| {
-                // Interpret the person's actual alleles first.
-                let (person_allele_1, person_allele_2) =
-                    Self::interpret_person_alleles(*packed_geno, bim_a1, bim_a2);
-
-                // Get the lengths of the person's alleles.
-                let person_a1_len = person_allele_1.len();
-                let person_a2_len = person_allele_2.len();
-
-                // If the genotype was invalid/missing, the lengths will be 0, so this will not match.
-                if person_a1_len == 0 {
-                    return false;
-                }
-
-                // Check for a match in either direction to handle swapped alleles.
-                (person_a1_len == score_a1_len && person_a2_len == score_a2_len)
-                    || (person_a1_len == score_a2_len && person_a2_len == score_a1_len)
-            })
-            .collect();
-
-        // If we found exactly one interpretation with a matching allele structure, it's our winner.
-        if matching_structure_interpretations.len() == 1 {
-            let (packed_geno, (_, bim_a1, bim_a2)) = matching_structure_interpretations[0];
-            let dosage =
-                Self::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, context.score_info)?;
-            Some(Resolution {
-                chosen_dosage: dosage,
-                numerator: dosage as u32,
-                denominator: 1,
-                method_used: *self,
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Heuristic 2: Solves the `A/A` vs `AGA/AGA` conflict. Succeeds if
-    /// exactly one interpretation is composed solely of standard alleles found
-    /// in the score file, while others use non-standard/complex alleles.
-    fn resolve_unambiguous_genotype(&self, context: &ResolutionContext) -> Option<Resolution> {
-        let score_eff_allele = &context.score_info.effect_allele;
-        let score_oth_allele = &context.score_info.other_allele;
-
-        let mut unambiguous_interpretations = Vec::new();
-        for &interpretation in context.conflicting_interpretations {
-            let (_, (_, bim_a1, bim_a2)) = interpretation;
-            let is_a1_valid = bim_a1 == score_eff_allele || bim_a1 == score_oth_allele;
-            let is_a2_valid = bim_a2 == score_eff_allele || bim_a2 == score_oth_allele;
-
-            if is_a1_valid && is_a2_valid {
-                unambiguous_interpretations.push(interpretation);
-            }
-        }
-
-        if unambiguous_interpretations.len() == 1 {
-            let (packed_geno, (_, bim_a1, bim_a2)) = unambiguous_interpretations[0];
-            let dosage =
-                Self::calculate_score_dosage(packed_geno, bim_a1, bim_a2, context.score_info)?;
-            Some(Resolution {
-                chosen_dosage: dosage,
-                numerator: dosage as u32,
-                denominator: 1,
-                method_used: *self,
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Heuristic 3: Succeeds if all conflicting interpretations, despite
-    /// having different allele definitions, coincidentally result in the same
-    /// final effect allele dosage.
-    fn resolve_consistent_dosage(&self, context: &ResolutionContext) -> Option<Resolution> {
-        let dosages: Vec<f64> = context
-            .conflicting_interpretations
-            .iter()
-            .map(|(packed_geno, (_, bim_a1, bim_a2))| {
-                Self::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, context.score_info)
-            })
-            .collect::<Option<Vec<_>>>()?;
-
-        let first_dosage = dosages[0];
-        if dosages.iter().all(|&d| (d - first_dosage).abs() < 1e-9) {
-            Some(Resolution {
-                chosen_dosage: first_dosage,
-                numerator: first_dosage as u32,
-                denominator: 1,
-                method_used: *self,
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Heuristic 4: A final tie-breaker that prefers a single heterozygous
-    /// call if it conflicts with one or more homozygous calls.
-    fn resolve_prefer_het(&self, context: &ResolutionContext) -> Option<Resolution> {
-        let heterozygous_calls: Vec<_> = context
-            .conflicting_interpretations
-            .iter()
-            .filter(|(packed_geno, _)| *packed_geno == 0b10)
-            .collect();
-
-        let homozygous_calls_exist = context
-            .conflicting_interpretations
-            .iter()
-            .any(|(packed_geno, _)| *packed_geno != 0b10);
-
-        if heterozygous_calls.len() == 1 && homozygous_calls_exist {
-            let (packed_geno, (_, bim_a1, bim_a2)) = heterozygous_calls[0];
-            let dosage =
-                Self::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, context.score_info)?;
-            Some(Resolution {
-                chosen_dosage: dosage,
-                numerator: dosage as u32,
-                denominator: 1,
-                method_used: *self,
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Heuristic 5: Resolves conflicts where one row says homozygous Ref and another
-    /// says homozygous Alt, but the alleles share an anchor base (one is a prefix of the other).
-    /// This implies the array detected both the short (Ref) and long (Alt) alleles,
-    /// so the true genotype is Heterozygous.
-    fn resolve_indel_anchor_base(&self, context: &ResolutionContext) -> Option<Resolution> {
-        let mut homozygous_alleles = Vec::new();
-
-        for (packed_geno, (_, bim_a1, bim_a2)) in context.conflicting_interpretations {
-            // Check for Homozygous calls (00 = Hom A1, 11 = Hom A2)
-            match packed_geno {
-                0b00 => homozygous_alleles.push(bim_a1.as_str()),
-                0b11 => homozygous_alleles.push(bim_a2.as_str()),
-                _ => {} // Ignore heterozygous or missing for this check
-            }
-        }
-
-        if homozygous_alleles.len() < 2 {
-            return None;
-        }
-
-        // Check if we have valid conflicting homozygous alleles
-        let first_allele = homozygous_alleles[0];
-        let has_conflict = homozygous_alleles.iter().any(|&a| a != first_allele);
-
-        if !has_conflict {
-            return None; // All homozygous calls agree, so this heuristic doesn't apply
-        }
-
-        // We have conflicting homozygous calls. Check if they form a prefix relationship.
-        // We require that ALL observed homozygous alleles can be explained by a single
-        // pair of (Short, Long) alleles where Short is a prefix of Long.
-
-        // Find the shortest and longest alleles
-        let shortest = homozygous_alleles.iter().min_by_key(|a| a.len()).unwrap();
-        let longest = homozygous_alleles.iter().max_by_key(|a| a.len()).unwrap();
-
-        // The prefix condition must hold
-        if !longest.starts_with(shortest) {
-            return None;
-        }
-
-        // Also strictly require that every homozygous allele found is EITHER the short or the long one.
-        // (No third unrelated allele allowed)
-        let clean_evidence = homozygous_alleles
-            .iter()
-            .all(|&a| a == *shortest || a == *longest);
-        if !clean_evidence {
-            return None;
-        }
-
-        // If we get here, we have evidence for both Short and Long alleles, and one is a prefix of the other.
-        // This strongly suggests a Heterozygous genotype (Short/Long).
-        // Since we are creating a synthetic Het call, the dosage of the effect allele is always 1.0,
-        // (assuming the effect allele is one of the two).
-
-        // Sanity check: is the effect allele even involved?
-        let effect = &context.score_info.effect_allele;
-        let other = &context.score_info.other_allele;
-        if !((effect == *shortest && other == *longest)
-            || (effect == *longest && other == *shortest))
-        {
-            return None;
-        }
-
-        // The inferred genotype is Short/Long.
-        // If Effect == Short or Effect == Long, dosage is 1.0.
-        // If Effect is neither (weird?), dosage is 0.0.
-        // Derived from logic: if we infer Het (Short/Long), and one of them is the effect allele, dosage is 1.
-
-        // Inferred Genotype: { *shortest, *longest }
-        // Dosage = count of Effect Allele in that set.
-        let mut final_dosage = 0.0;
-        if effect == *shortest {
-            final_dosage += 1.0;
-        }
-        if effect == *longest {
-            final_dosage += 1.0;
-        }
-
-        Some(Resolution {
-            chosen_dosage: final_dosage,
-            numerator: final_dosage as u32,
-            denominator: 1,
-            method_used: *self,
-        })
-    }
-
-    /// Heuristic 6: Final fallback for the specific opposing-homozygous pattern.
-    /// If both homozygous states (00 and 11) are observed among conflicting
-    /// interpretations, infer a heterozygous genotype from the observed alleles
-    /// and score dosage from that inferred pair.
-    fn resolve_fallback_opposing_homozygous_as_het(
-        &self,
-        context: &ResolutionContext,
-    ) -> Option<Resolution> {
-        let mut hom_a1_alleles = AHashSet::new();
-        let mut hom_a2_alleles = AHashSet::new();
-
-        for (packed_geno, (_, bim_a1, bim_a2)) in context.conflicting_interpretations {
-            match packed_geno {
-                0b00 => {
-                    hom_a1_alleles.insert(bim_a1.as_str());
-                }
-                0b11 => {
-                    hom_a2_alleles.insert(bim_a2.as_str());
-                }
-                _ => {}
-            }
-        }
-
-        // This fallback applies only when each side points to a single concrete
-        // allele and those alleles disagree (e.g., C/C vs T/T => infer C/T).
-        if hom_a1_alleles.len() != 1 || hom_a2_alleles.len() != 1 {
-            return None;
-        }
-        let allele_from_00 = *hom_a1_alleles.iter().next().unwrap();
-        let allele_from_11 = *hom_a2_alleles.iter().next().unwrap();
-        if allele_from_00 == allele_from_11 {
-            return None;
-        }
-
-        let effect = context.score_info.effect_allele.as_str();
-        let other = context.score_info.other_allele.as_str();
-        if !((effect == allele_from_00 && other == allele_from_11)
-            || (effect == allele_from_11 && other == allele_from_00))
-        {
-            return None;
-        }
-        let mut inferred_dosage = 0.0;
-        if effect == allele_from_00 {
-            inferred_dosage += 1.0;
-        }
-        if effect == allele_from_11 {
-            inferred_dosage += 1.0;
-        }
-
-        Some(Resolution {
-            chosen_dosage: inferred_dosage,
-            numerator: inferred_dosage as u32,
-            denominator: 1,
-            method_used: *self,
-        })
-    }
-
-    /// Heuristic 7: Absolute last resort. Compute dosage for each remaining
-    /// conflicting interpretation and use the arithmetic mean.
-    fn resolve_fallback_average_dosage_across_conflicts(
-        &self,
-        context: &ResolutionContext,
-    ) -> Option<Resolution> {
-        if context.conflicting_interpretations.is_empty() {
-            return None;
-        }
-        let sum: f64 = context
-            .conflicting_interpretations
-            .iter()
-            .map(|(packed_geno, (_, bim_a1, bim_a2))| {
-                Self::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, context.score_info)
-            })
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .sum();
-        let avg = sum / context.conflicting_interpretations.len() as f64;
-        Some(Resolution {
-            chosen_dosage: avg,
-            // Every interpretation's dosage is 0, 1 or 2, so the sum is an exact integer.
-            numerator: sum as u32,
-            denominator: context.conflicting_interpretations.len() as u32,
-            method_used: *self,
-        })
-    }
-
-    /// A private helper to compute dosage from raw PLINK bits.
-    /// This function is now fully safe and self-contained, returning 0.0 if the
-    /// effect allele is not one of the two alleles from the BIM entry.
-    #[inline(always)]
-    fn calculate_score_dosage(
-        packed_geno: u8,
-        bim_a1: &str,
-        bim_a2: &str,
-        score_info: &ScoreInfo,
-    ) -> Option<f64> {
-        if !score_allele_pair_matches(score_info, bim_a1, bim_a2) {
-            return None;
-        }
-        // Decodes the genotype with respect to the BIM alleles.
-        let dosage_wrt_a1 = match packed_geno {
-            0b00 => 2.0, // Homozygous for A1
-            0b10 => 1.0, // Heterozygous (one A1, one A2)
-            0b11 => 0.0, // Homozygous for A2
-            _ => 0.0,    // Missing or invalid
-        };
-
-        if bim_a1 == score_info.effect_allele {
-            // Case 1: The effect allele is A1. The dosage is the count of A1.
-            Some(dosage_wrt_a1)
-        } else if bim_a2 == score_info.effect_allele {
-            // Case 2: The effect allele is A2. The dosage is the count of A2,
-            // which is the inverse of the A1 count.
-            Some(2.0 - dosage_wrt_a1)
-        } else {
-            None
-        }
-    }
-
-    /// A private helper to determine a person's actual alleles from their genotype bits.
-    #[inline(always)]
-    fn interpret_person_alleles<'a>(
-        packed_geno: u8,
-        bim_a1: &'a str,
-        bim_a2: &'a str,
-    ) -> (&'a str, &'a str) {
-        match packed_geno {
-            0b00 => (bim_a1, bim_a1), // Homozygous for A1
-            0b10 => (bim_a1, bim_a2), // Heterozygous (one A1, one A2)
-            0b11 => (bim_a2, bim_a2), // Homozygous for A2
-            _ => ("", ""),            // Represents a missing or invalid genotype
-        }
-    }
-}
-
-/// The pipeline orchestrator that holds and runs the heuristic chain.
-pub struct ResolverPipeline {
-    heuristics: Vec<Heuristic>,
-}
-
-impl Default for ResolverPipeline {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ResolverPipeline {
-    /// Creates a new pipeline with the heuristics in their correct order of priority.
-    pub fn new() -> Self {
-        // The order is explicit
-        let heuristics = vec![
-            Heuristic::ExactScoreAlleleMatch,
-            Heuristic::PrioritizeUnambiguousGenotype,
-            Heuristic::PreferMatchingAlleleStructure,
-            Heuristic::ConsistentDosage,
-            Heuristic::IndelAnchorBase,
-            Heuristic::PreferHeterozygous,
-            Heuristic::FallbackOpposingHomozygousAsHet,
-            Heuristic::FallbackAverageDosageAcrossConflicts,
-        ];
-        Self { heuristics }
-    }
-
-    /// Executes the heuristic chain, returning the first successful resolution.
-    pub fn resolve(&self, context: &ResolutionContext) -> Option<Resolution> {
-        for heuristic in &self.heuristics {
-            if let Some(resolution) = heuristic.try_resolve(context) {
-                return Some(resolution); // Success! Stop the chain.
-            }
-        }
-        None // All heuristics failed.
-    }
-}
-
-/// A private struct holding the complete, raw payload for a fatal ambiguity error.
-/// Collecting this data first and formatting it once at the end is a key optimization.
-struct FatalAmbiguityData {
-    iid: String,
-    locus_chr_pos: (String, u32),
-    score_name: String,
-    conflicts: Vec<ConflictSource>,
-}
 
 /// Genotype fetch failures surface as the person-major resolver reported them:
 /// the fetch error's text, wrapped as an I/O error.
@@ -1845,26 +1140,12 @@ fn fetch_error(error: PipelineError) -> PipelineError {
     PipelineError::Io(error.to_string())
 }
 
-/// The most matching contexts a score application may have and still be
-/// tabulated (4^4 genotype combinations). Wider applications resolve per person.
+/// The most contexts an application may read and still be tabulated (4^4 genotype
+/// combinations). Wider applications resolve per person.
 const TABULATED_MAX_CONTEXTS: usize = 4;
 
-/// Sample warnings reported per heuristic.
-const MAX_WARNING_SAMPLES: usize = 5;
-
-const HEURISTIC_COUNT: usize = 8;
-
-/// Every heuristic, indexed by `Heuristic as usize`.
-const HEURISTICS: [Heuristic; HEURISTIC_COUNT] = [
-    Heuristic::ExactScoreAlleleMatch,
-    Heuristic::PrioritizeUnambiguousGenotype,
-    Heuristic::PreferMatchingAlleleStructure,
-    Heuristic::ConsistentDosage,
-    Heuristic::PreferHeterozygous,
-    Heuristic::IndelAnchorBase,
-    Heuristic::FallbackOpposingHomozygousAsHet,
-    Heuristic::FallbackAverageDosageAcrossConflicts,
-];
+/// Loci a warning names as examples.
+const MAX_CONFLICT_EXAMPLES: usize = 5;
 
 /// People per evaluation block: few enough that a block's decoded genotypes and
 /// score rows stay in cache, enough to amortize the per-block setup.
@@ -1874,21 +1155,20 @@ const MAX_BLOCK_PEOPLE: usize = 4096;
 /// Row bytes a resolver without memory maps reads for one group of rules.
 const STREAMED_GROUP_BYTES: usize = 64 << 20;
 
-/// What one combination of genotypes does to one score of one person.
-#[derive(Clone, Copy)]
+/// The copies of allele 1, a `.bim` row's ALT, in each PLINK code [00, 01, 10, 11]: `None` for the
+/// missing call.
+const ALT_COPIES: [Option<u32>; 4] = [Some(2), None, Some(1), Some(0)];
+
+/// What one combination of genotypes on an application's contexts does to one score of one person.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
-    /// No interpretation carries the score's alleles.
-    Missing,
-    /// Exactly one interpretation: its dosage times the weight, as an exact term.
+    /// The dose is known: its exact term.
     Add(i128),
-    /// Several interpretations, reconciled by a heuristic.
-    Resolved {
-        method: Heuristic,
-        dosage: f64,
-        value: i128,
-    },
-    /// Several interpretations and no heuristic applies.
-    Unresolvable,
+    /// A call the dose needs is missing.
+    Missing,
+    /// Calls the dose needs disagree: rows measuring one variant give different copies, or the
+    /// ALTs' copies at the site pass the ploidy. No genotype has these calls, so the dose is unknown.
+    Conflict,
 }
 
 /// The branch-free form of an `Outcome`, applied to every person.
@@ -1898,133 +1178,175 @@ struct TableEntry {
     value: i128,
     /// Added to the missing count.
     missing: u32,
-    /// Whether the outcome is a heuristic event to report.
-    reported: bool,
+    /// Whether the outcome is a conflict to report.
+    conflict: bool,
 }
 
-impl From<Outcome> for TableEntry {
-    fn from(outcome: Outcome) -> Self {
+impl TableEntry {
+    /// The entry of `outcome` for an application that does, or does not, count its variant's
+    /// missing dose. Each (variant, score) counts one missing dose however many rows name it.
+    fn new(outcome: Outcome, counts_missing: bool) -> Self {
         match outcome {
-            Outcome::Missing => Self {
-                value: 0,
-                missing: 1,
-                reported: false,
-            },
             Outcome::Add(value) => Self {
                 value,
                 missing: 0,
-                reported: false,
+                conflict: false,
             },
-            Outcome::Resolved { value, .. } => Self {
-                value,
-                missing: 0,
-                reported: true,
-            },
-            Outcome::Unresolvable => Self {
+            Outcome::Missing => Self {
                 value: 0,
-                missing: 0,
-                reported: true,
+                missing: u32::from(counts_missing),
+                conflict: false,
+            },
+            Outcome::Conflict => Self {
+                value: 0,
+                missing: u32::from(counts_missing),
+                conflict: counts_missing,
             },
         }
     }
 }
 
-/// Resolves one score application for one combination of genotypes on its
-/// matching contexts, by the person-major resolver's rules: drop missing calls,
-/// then take the single interpretation left or run the heuristic chain.
+/// How one application reads its site.
+#[derive(Clone, Copy, Debug)]
+struct SiteReading {
+    /// The allele it scores.
+    allele: SiteAllele,
+    /// Whether its dose waits on every variant of the site: its (variant, score) scores the REF.
+    whole_site: bool,
+    /// Whether it counts its (variant, score)'s missing dose: the first of them does.
+    counts_missing: bool,
+}
+
+/// One variant's copies of its ALT over the rows measuring it, so far.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Measured {
+    /// No row has a call yet.
+    Uncalled,
+    /// Every called row gave these copies.
+    Copies(u32),
+    /// Called rows gave different copies.
+    Disagreeing,
+}
+
+/// A site's contexts as the site rule reads them.
+struct SiteRows<'p> {
+    /// The variant each context measures.
+    variants: &'p [usize],
+    /// Whether each context's ALT is its allele 1: its REF is allele 2.
+    alternate_is_allele1: &'p [bool],
+}
+
+/// The outcome of one application for `genotypes` on its `matching` contexts. A variant's copies
+/// of its ALT is the one value its called rows agree on: its rows are measurements of one
+/// quantity, and a missing call is no measurement. The site's REF copies are the ploidy, two on a
+/// `.bed`, less every ALT's at the site; a variant's own REF copies are two less its ALT's.
 fn resolve_outcome(
-    pipeline: &ResolverPipeline,
     exact: &ExactPlan,
-    rule: &GroupedComplexRule,
     score_info: &ScoreInfo,
+    reading: SiteReading,
+    rows: &SiteRows<'_>,
     matching: &[usize],
     genotypes: &[u8],
+    measured: &mut Vec<Measured>,
 ) -> Outcome {
-    let called = || {
-        matching
-            .iter()
-            .zip(genotypes)
-            .filter(|&(_, &bits)| bits != 0b01)
-            .map(|(&context, &bits)| (bits, &rule.possible_contexts[context]))
-    };
-    let mut first_two = called();
-    match (first_two.next(), first_two.next()) {
-        (None, _) => Outcome::Missing,
-        (Some((packed_geno, (_, bim_a1, bim_a2))), None) => {
-            match Heuristic::calculate_score_dosage(packed_geno, bim_a1, bim_a2, score_info) {
-                Some(dosage) => Outcome::Add(exact.complex_term(
-                    score_info.score_column_index.0,
-                    score_info.weight,
-                    dosage as u32,
-                    1,
-                )),
-                None => Outcome::Missing,
-            }
-        }
-        _ => {
-            let interpretations: Vec<(u8, &(BimRowIndex, String, String))> = called().collect();
-            let context = ResolutionContext {
-                score_info,
-                conflicting_interpretations: &interpretations,
-            };
-            match pipeline.resolve(&context) {
-                Some(resolution) => Outcome::Resolved {
-                    method: resolution.method_used,
-                    dosage: resolution.chosen_dosage,
-                    value: exact.complex_term(
-                        score_info.score_column_index.0,
-                        score_info.weight,
-                        resolution.numerator,
-                        resolution.denominator,
-                    ),
-                },
-                None => Outcome::Unresolvable,
-            }
-        }
+    measured.clear();
+    measured.resize(rows.variants.iter().max().map_or(0, |&last| last + 1), Measured::Uncalled);
+    for (&context, &bits) in matching.iter().zip(genotypes) {
+        let Some(allele1) = ALT_COPIES[usize::from(bits & 0b11)] else {
+            continue;
+        };
+        let copies = if rows.alternate_is_allele1[context] { allele1 } else { 2 - allele1 };
+        let slot = &mut measured[rows.variants[context]];
+        *slot = match *slot {
+            Measured::Uncalled => Measured::Copies(copies),
+            Measured::Copies(earlier) if earlier == copies => Measured::Copies(copies),
+            _ => Measured::Disagreeing,
+        };
     }
+    let variant = reading.allele.variant();
+    let dose = if reading.whole_site {
+        // Every variant of the site is among the contexts read.
+        let mut alternates = 0u32;
+        let mut missing = false;
+        for &state in measured.iter() {
+            match state {
+                Measured::Disagreeing => return Outcome::Conflict,
+                Measured::Uncalled => missing = true,
+                Measured::Copies(copies) => alternates += copies,
+            }
+        }
+        if missing {
+            return Outcome::Missing;
+        }
+        let Some(reference) = 2u32.checked_sub(alternates) else {
+            return Outcome::Conflict;
+        };
+        match (reading.allele, measured[variant]) {
+            (SiteAllele::Reference(_), _) => reference,
+            (SiteAllele::Alternate(_), Measured::Copies(copies)) => copies,
+            (SiteAllele::Alternate(_), _) => return Outcome::Missing,
+        }
+    } else {
+        match (reading.allele, measured[variant]) {
+            (SiteAllele::Alternate(_), Measured::Copies(copies)) => copies,
+            (SiteAllele::Reference(_), Measured::Copies(copies)) => 2 - copies,
+            (_, Measured::Uncalled) => return Outcome::Missing,
+            (_, Measured::Disagreeing) => return Outcome::Conflict,
+        }
+    };
+    Outcome::Add(exact.complex_term(score_info.score_column_index.0, score_info.weight, dose))
 }
 
-/// One score's view of a rule: the contexts that can carry its allele pair and
-/// what every combination of genotypes on them does.
+/// One score row's view of its site: the contexts it reads and what every combination of
+/// genotypes on them does.
 struct ApplicationPlan {
     column: usize,
     /// Where the application's terms go in a person's lanes.
     target: Target,
-    /// The rule's contexts whose allele pair matches the score's, in context order.
+    reading: SiteReading,
+    /// The contexts it reads, in context order: its variant's rows, or every row of the site.
     matching: Vec<usize>,
     kind: ApplicationKind,
 }
 
 enum ApplicationKind {
-    /// One matching context and nothing to report: each person's genotype on that
-    /// context selects what is added, read straight from the row.
+    /// One context and nothing to report: each person's genotype on that context selects what
+    /// is added, read straight from the row.
     Direct { values: [i128; 4], missing: [u32; 4] },
-    /// Indexed by the packed genotype code over `matching`, two bits per context
-    /// with the first context lowest.
-    Table {
-        entries: Vec<TableEntry>,
-        outcomes: Vec<Outcome>,
-    },
-    /// Too many matching contexts to tabulate: resolved per person.
+    /// Indexed by the packed genotype code over `matching`, two bits per context with the first
+    /// context lowest.
+    Table { entries: Vec<TableEntry> },
+    /// Too many contexts to tabulate: resolved per person.
     PerPerson,
 }
 
 impl ApplicationKind {
     fn new(
-        pipeline: &ResolverPipeline,
         exact: &ExactPlan,
-        rule: &GroupedComplexRule,
         score_info: &ScoreInfo,
+        reading: SiteReading,
+        rows: &SiteRows<'_>,
         matching: &[usize],
     ) -> Self {
         if matching.len() > TABULATED_MAX_CONTEXTS {
             return Self::PerPerson;
         }
+        let mut measured = Vec::new();
+        let mut entry = |genotypes: &[u8]| {
+            let outcome = resolve_outcome(
+                exact,
+                score_info,
+                reading,
+                rows,
+                matching,
+                genotypes,
+                &mut measured,
+            );
+            TableEntry::new(outcome, reading.counts_missing)
+        };
         if matching.len() == 1 {
-            let entries: [TableEntry; 4] = std::array::from_fn(|code| {
-                resolve_outcome(pipeline, exact, rule, score_info, matching, &[code as u8]).into()
-            });
-            if !entries.iter().any(|entry| entry.reported) {
+            let entries: [TableEntry; 4] = std::array::from_fn(|code| entry(&[code as u8]));
+            if !entries.iter().any(|entry| entry.conflict) {
                 return Self::Direct {
                     values: entries.map(|entry| entry.value),
                     missing: entries.map(|entry| entry.missing),
@@ -2033,18 +1355,15 @@ impl ApplicationKind {
         }
         let mut genotypes = [0u8; TABULATED_MAX_CONTEXTS];
         let genotypes = &mut genotypes[..matching.len()];
-        let outcomes: Vec<Outcome> = (0..1usize << (2 * matching.len()))
+        let entries = (0..1usize << (2 * matching.len()))
             .map(|code| {
                 for (position, bits) in genotypes.iter_mut().enumerate() {
                     *bits = ((code >> (2 * position)) & 0b11) as u8;
                 }
-                resolve_outcome(pipeline, exact, rule, score_info, matching, genotypes)
+                entry(genotypes)
             })
             .collect();
-        Self::Table {
-            entries: outcomes.iter().map(|&outcome| outcome.into()).collect(),
-            outcomes,
-        }
+        Self::Table { entries }
     }
 }
 
@@ -2055,28 +1374,78 @@ struct RulePlan {
     /// How many of `decoded_contexts` tabulated and per-person applications read.
     /// The rest are decoded only when some person's calls are forced missing.
     table_contexts: usize,
+    /// The variant each context measures, by the site rule.
+    row_variants: Vec<usize>,
+    /// Whether each context's ALT is its allele 1.
+    alternate_is_allele1: Vec<bool>,
     applications: Vec<ApplicationPlan>,
 }
 
 impl RulePlan {
-    fn new(pipeline: &ResolverPipeline, exact: &ExactPlan, rule: &GroupedComplexRule) -> Self {
+    fn rows(&self) -> SiteRows<'_> {
+        SiteRows {
+            variants: &self.row_variants,
+            alternate_is_allele1: &self.alternate_is_allele1,
+        }
+    }
+}
+
+impl RulePlan {
+    /// The plan of `rule`, one site's rows and the score rows resolved per person there. The join
+    /// built it by the site rule, so every score row names one allele of the site.
+    fn new(exact: &ExactPlan, rule: &GroupedComplexRule) -> Result<Self, PipelineError> {
         let num_contexts = rule.possible_contexts.len();
+        let rows: Vec<(usize, &str, &str)> = rule
+            .possible_contexts
+            .iter()
+            .enumerate()
+            .map(|(context, (_, allele1, allele2))| (context, allele2.as_str(), allele1.as_str()))
+            .collect();
+        let site = Site::new(&rows, rule.reference_declared);
+        let alleles = rule
+            .score_applications
+            .iter()
+            .map(|score_info| match site.match_row(&score_info.effect_allele, &score_info.other_allele) {
+                RowMatch::Scores(allele) => Ok(allele),
+                RowMatch::NoVariant | RowMatch::Several(..) | RowMatch::Unread(_) => Err(PipelineError::Compute(format!(
+                    "A plan's complex rule at {}:{} holds a score row naming {} and {}, which name no one allele of its site.",
+                    rule.locus_chr_pos.0, rule.locus_chr_pos.1, score_info.effect_allele, score_info.other_allele
+                ))),
+            })
+            .collect::<Result<Vec<SiteAllele>, PipelineError>>()?;
+        let row_variants = site.row_variants().to_vec();
+        // A row whose first written allele, allele 2, is its REF has allele 1 as its ALT.
+        let alternate_is_allele1 = site.first_is_reference().to_vec();
+        let site_rows = SiteRows {
+            variants: &row_variants,
+            alternate_is_allele1: &alternate_is_allele1,
+        };
+        let group = |index: usize| {
+            (
+                alleles[index].variant(),
+                rule.score_applications[index].score_column_index,
+            )
+        };
         let mut tabulated = vec![false; num_contexts];
         let mut direct = vec![false; num_contexts];
         let applications = rule
             .score_applications
             .iter()
-            .map(|score_info| {
-                let matching: Vec<usize> = rule
-                    .possible_contexts
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (_, bim_a1, bim_a2))| {
-                        score_allele_pair_matches(score_info, bim_a1, bim_a2)
-                    })
-                    .map(|(context, _)| context)
+            .enumerate()
+            .map(|(index, score_info)| {
+                let allele = alleles[index];
+                let whole_site = (0..alleles.len()).any(|other| {
+                    group(other) == group(index) && site.reads_whole_site(alleles[other])
+                });
+                let reading = SiteReading {
+                    allele,
+                    whole_site,
+                    counts_missing: (0..index).all(|earlier| group(earlier) != group(index)),
+                };
+                let matching: Vec<usize> = (0..num_contexts)
+                    .filter(|&context| whole_site || row_variants[context] == allele.variant())
                     .collect();
-                let kind = ApplicationKind::new(pipeline, exact, rule, score_info, &matching);
+                let kind = ApplicationKind::new(exact, score_info, reading, &site_rows, &matching);
                 let used = match kind {
                     ApplicationKind::Direct { .. } => &mut direct,
                     _ => &mut tabulated,
@@ -2087,6 +1456,7 @@ impl RulePlan {
                 ApplicationPlan {
                     column: score_info.score_column_index.0,
                     target: exact.complex_target(score_info.score_column_index.0, score_info.weight),
+                    reading,
                     matching,
                     kind,
                 }
@@ -2098,72 +1468,21 @@ impl RulePlan {
         let table_contexts = decoded_contexts.len();
         decoded_contexts
             .extend((0..num_contexts).filter(|&context| direct[context] && !tabulated[context]));
-        Self {
+        Ok(Self {
             decoded_contexts,
             table_contexts,
+            row_variants,
+            alternate_is_allele1,
             applications,
-        }
+        })
     }
 }
 
-/// A reported heuristic event, kept compact until the report is built.
-struct Sample {
-    /// (person, rule, application): the order the person-major resolver met events in.
-    order: (usize, usize, usize),
-    /// Genotype bits on the application's matching contexts.
-    genotypes: Vec<u8>,
-    dosage: f64,
-}
-
-/// Heuristic events from one block of people.
+/// Conflicts from one block of people: per (rule, application) that counts its variant's missing
+/// dose, the people whose calls there disagree.
 #[derive(Default)]
 struct BlockReport {
-    counts: [u64; HEURISTIC_COUNT],
-    /// The earliest events per heuristic, sorted, at most `MAX_WARNING_SAMPLES` each.
-    samples: [Vec<Sample>; HEURISTIC_COUNT],
-    unresolvable: Option<Sample>,
-}
-
-impl BlockReport {
-    /// Records a reported outcome. Returns false when the outcome is unresolvable
-    /// and the pass must stop.
-    fn record(
-        &mut self,
-        outcome: Outcome,
-        order: (usize, usize, usize),
-        genotypes: impl FnOnce() -> Vec<u8>,
-    ) -> bool {
-        match outcome {
-            Outcome::Resolved { method, dosage, .. } => {
-                self.counts[method as usize] += 1;
-                let samples = &mut self.samples[method as usize];
-                if samples.len() < MAX_WARNING_SAMPLES
-                    || samples.last().is_some_and(|last| order < last.order)
-                {
-                    let position = samples.partition_point(|existing| existing.order < order);
-                    samples.insert(
-                        position,
-                        Sample {
-                            order,
-                            genotypes: genotypes(),
-                            dosage,
-                        },
-                    );
-                    samples.truncate(MAX_WARNING_SAMPLES);
-                }
-                true
-            }
-            Outcome::Unresolvable => {
-                self.unresolvable = Some(Sample {
-                    order,
-                    genotypes: genotypes(),
-                    dosage: 0.0,
-                });
-                false
-            }
-            Outcome::Missing | Outcome::Add(_) => true,
-        }
-    }
+    conflicts: AHashMap<(usize, usize), u64>,
 }
 
 /// Everything a block needs to apply one group of rules.
@@ -2177,11 +1496,9 @@ struct GroupPass<'a> {
     rows: &'a [&'a [u8]],
     max_contexts: usize,
     layout: &'a PersonLayout,
-    pipeline: &'a ResolverPipeline,
     exact: &'a ExactPlan,
     stride: usize,
     num_scores: usize,
-    stop: &'a AtomicBool,
 }
 
 /// What a direct application adds to one block of people.
@@ -2280,12 +1597,10 @@ fn evaluate_block(
     let mut genotypes = vec![0u8; pass.max_contexts * num_people];
     let mut code_buffer = vec![0u8; num_people];
     let mut tuple = Vec::new();
+    let mut measured = Vec::new();
     let mut report = BlockReport::default();
 
     for rule_idx in pass.group.clone() {
-        if pass.stop.load(Ordering::Relaxed) {
-            break;
-        }
         let rule = &pass.rules[rule_idx];
         let plan = &pass.plans[rule_idx];
         let rows = &pass.rows[pass.context_offsets[rule_idx] - first_context
@@ -2305,7 +1620,8 @@ fn evaluate_block(
 
         for (application_idx, application) in plan.applications.iter().enumerate() {
             let column = application.column;
-            let (entries, outcomes) = match &application.kind {
+            let mut conflicts = 0u64;
+            let entries = match &application.kind {
                 ApplicationKind::Direct { values, missing } => {
                     let context = application.matching[0];
                     let direct = DirectApplication {
@@ -2327,7 +1643,7 @@ fn evaluate_block(
                     }
                     continue;
                 }
-                ApplicationKind::Table { entries, outcomes } => (entries, outcomes),
+                ApplicationKind::Table { entries } => entries,
                 ApplicationKind::PerPerson => {
                     let score_info = &rule.score_applications[application_idx];
                     let people_rows = scores
@@ -2343,26 +1659,21 @@ fn evaluate_block(
                                 .map(|&context| genotypes[context * num_people + person]),
                         );
                         let outcome = resolve_outcome(
-                            pass.pipeline,
                             pass.exact,
-                            rule,
                             score_info,
+                            application.reading,
+                            &plan.rows(),
                             &application.matching,
                             &tuple,
+                            &mut measured,
                         );
-                        let entry = TableEntry::from(outcome);
+                        let entry = TableEntry::new(outcome, application.reading.counts_missing);
                         pass.exact.add(application.target, entry.value, person_scores);
                         person_counts[column] += entry.missing;
-                        if entry.reported
-                            && !report.record(
-                                outcome,
-                                (first_person + person, rule_idx, application_idx),
-                                || tuple.clone(),
-                            )
-                        {
-                            pass.stop.store(true, Ordering::Relaxed);
-                            return report;
-                        }
+                        conflicts += u64::from(entry.conflict);
+                    }
+                    if conflicts > 0 {
+                        *report.conflicts.entry((rule_idx, application_idx)).or_default() += conflicts;
                     }
                     continue;
                 }
@@ -2383,25 +1694,15 @@ fn evaluate_block(
             };
             let people_rows = scores
                 .chunks_exact_mut(pass.stride)
-                .zip(counts.chunks_exact_mut(num_scores))
-                .enumerate();
-            for ((person, (person_scores, person_counts)), &code) in people_rows.zip(codes) {
+                .zip(counts.chunks_exact_mut(num_scores));
+            for ((person_scores, person_counts), &code) in people_rows.zip(codes) {
                 let entry = entries[code as usize];
                 pass.exact.add(application.target, entry.value, person_scores);
                 person_counts[column] += entry.missing;
-                if entry.reported {
-                    let width = application.matching.len();
-                    let unpack = || {
-                        (0..width)
-                            .map(|position| (code >> (2 * position)) & 0b11)
-                            .collect()
-                    };
-                    let order = (first_person + person, rule_idx, application_idx);
-                    if !report.record(outcomes[code as usize], order, unpack) {
-                        pass.stop.store(true, Ordering::Relaxed);
-                        return report;
-                    }
-                }
+                conflicts += u64::from(entry.conflict);
+            }
+            if conflicts > 0 {
+                *report.conflicts.entry((rule_idx, application_idx)).or_default() += conflicts;
             }
         }
     }
@@ -2447,53 +1748,10 @@ fn streamed_groups(context_offsets: &[usize], span_len: usize, budget: usize) ->
     groups
 }
 
-fn conflict_sources(
-    rule: &GroupedComplexRule,
-    matching: &[usize],
-    genotypes: &[u8],
-) -> Vec<ConflictSource> {
-    matching
-        .iter()
-        .zip(genotypes)
-        .filter(|&(_, &bits)| bits != 0b01)
-        .map(|(&context, &bits)| {
-            let (bim_row, bim_a1, bim_a2) = &rule.possible_contexts[context];
-            ConflictSource {
-                bim_row: *bim_row,
-                alleles: (bim_a1.clone(), bim_a2.clone()),
-                genotype_bits: bits,
-            }
-        })
-        .collect()
-}
-
-fn resolution_method(method: Heuristic, chosen_dosage: f64) -> ResolutionMethod {
-    match method {
-        Heuristic::ExactScoreAlleleMatch => ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage },
-        Heuristic::PrioritizeUnambiguousGenotype => {
-            ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage }
-        }
-        Heuristic::PreferMatchingAlleleStructure => {
-            ResolutionMethod::PreferMatchingAlleleStructure { chosen_dosage }
-        }
-        Heuristic::ConsistentDosage => ResolutionMethod::ConsistentDosage {
-            dosage: chosen_dosage,
-        },
-        Heuristic::PreferHeterozygous => ResolutionMethod::PreferHeterozygous { chosen_dosage },
-        Heuristic::IndelAnchorBase => ResolutionMethod::IndelAnchorBase { chosen_dosage },
-        Heuristic::FallbackOpposingHomozygousAsHet => {
-            ResolutionMethod::FallbackOpposingHomozygousAsHet { chosen_dosage }
-        }
-        Heuristic::FallbackAverageDosageAcrossConflicts => {
-            ResolutionMethod::FallbackAverageDosageAcrossConflicts { chosen_dosage }
-        }
-    }
-}
-
-/// Heuristic warnings, and the unresolvable ambiguity that stopped resolution, if any.
+/// People whose calls disagreed, per (rule, application) that counts its variant's missing dose,
+/// in rule then application order.
 struct ResolutionReport {
-    warnings: FinalAggregatedCollector,
-    unresolvable: Option<FatalAmbiguityData>,
+    conflicts: Vec<((usize, usize), u64)>,
 }
 
 /// The row-major resolver. Each rule context's row is located once and its scored
@@ -2518,12 +1776,11 @@ fn resolve_rows(
         .checked_div(stride)
         .unwrap_or(0)
         .min(final_missing_counts.len().checked_div(num_scores).unwrap_or(0));
-    let mut report = ResolutionReport {
-        warnings: FinalAggregatedCollector::new(),
-        unresolvable: None,
-    };
+    let mut conflicts: AHashMap<(usize, usize), u64> = AHashMap::new();
     if num_people == 0 || rules.is_empty() {
-        return Ok(report);
+        return Ok(ResolutionReport {
+            conflicts: Vec::new(),
+        });
     }
 
     let layout = PersonLayout::new(resolver, prep_result, num_people)?;
@@ -2542,11 +1799,10 @@ fn resolve_rows(
         context_offsets.push(locations.len());
     }
 
-    let pipeline = ResolverPipeline::new();
     let plans: Vec<RulePlan> = rules
         .par_iter()
-        .map(|rule| RulePlan::new(&pipeline, exact, rule))
-        .collect();
+        .map(|rule| RulePlan::new(exact, rule))
+        .collect::<Result<_, _>>()?;
 
     let mapped = resolver.is_mapped();
     let groups = if mapped {
@@ -2560,10 +1816,6 @@ fn resolve_rows(
     };
     pb.set_length((num_people * groups.len()) as u64);
 
-    let stop = AtomicBool::new(false);
-    let mut counts = [0u64; HEURISTIC_COUNT];
-    let mut samples: [Vec<Sample>; HEURISTIC_COUNT] = Default::default();
-    let mut unresolvable: Option<Sample> = None;
     let mut storage = Vec::<u8>::new();
     let people_scores = &mut final_scores[..num_people * stride];
     let people_counts = &mut final_missing_counts[..num_people * num_scores];
@@ -2605,11 +1857,9 @@ fn resolve_rows(
             group,
             rows: &rows,
             layout: &layout,
-            pipeline: &pipeline,
             exact,
             stride,
             num_scores,
-            stop: &stop,
         };
         let block_reports: Vec<BlockReport> = people_scores
             .par_chunks_mut(block_lanes)
@@ -2622,87 +1872,25 @@ fn resolve_rows(
                 block_report
             })
             .collect();
-
         for block_report in block_reports {
-            let BlockReport {
-                counts: block_counts,
-                samples: block_samples,
-                unresolvable: block_unresolvable,
-            } = block_report;
-            for (method_idx, method_samples) in block_samples.into_iter().enumerate() {
-                counts[method_idx] += block_counts[method_idx];
-                samples[method_idx].extend(method_samples);
+            for (key, count) in block_report.conflicts {
+                *conflicts.entry(key).or_default() += count;
             }
-            unresolvable = match (unresolvable, block_unresolvable) {
-                (Some(current), Some(candidate)) if candidate.order < current.order => {
-                    Some(candidate)
-                }
-                (current, candidate) => current.or(candidate),
-            };
-        }
-        for method_samples in &mut samples {
-            method_samples.sort_by_key(|sample| sample.order);
-            method_samples.truncate(MAX_WARNING_SAMPLES);
-        }
-        if stop.load(Ordering::Relaxed) {
-            break;
         }
     }
 
-    for (method_idx, method_samples) in samples.iter().enumerate() {
-        if counts[method_idx] == 0 {
-            continue;
-        }
-        let method = HEURISTICS[method_idx];
-        let infos = method_samples
-            .iter()
-            .map(|sample| {
-                let (person, rule_idx, application_idx) = sample.order;
-                let rule = &rules[rule_idx];
-                let score_info = &rule.score_applications[application_idx];
-                CriticalIntegrityWarningInfo {
-                    iid: prep_result.final_person_iids[person].clone(),
-                    locus_chr_pos: rule.locus_chr_pos.clone(),
-                    score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
-                    conflicts: conflict_sources(
-                        rule,
-                        &plans[rule_idx].applications[application_idx].matching,
-                        &sample.genotypes,
-                    ),
-                    resolution_method: resolution_method(method, sample.dosage),
-                    score_effect_allele: score_info.effect_allele.clone(),
-                    score_other_allele: score_info.other_allele.clone(),
-                }
-            })
-            .collect();
-        report
-            .warnings
-            .insert(method, (counts[method_idx], infos));
-    }
-    report.unresolvable = unresolvable.map(|sample| {
-        let (person, rule_idx, application_idx) = sample.order;
-        let rule = &rules[rule_idx];
-        let score_info = &rule.score_applications[application_idx];
-        FatalAmbiguityData {
-            iid: prep_result.final_person_iids[person].clone(),
-            locus_chr_pos: rule.locus_chr_pos.clone(),
-            score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
-            conflicts: conflict_sources(
-                rule,
-                &plans[rule_idx].applications[application_idx].matching,
-                &sample.genotypes,
-            ),
-        }
-    });
-    Ok(report)
+    let mut conflicts: Vec<((usize, usize), u64)> = conflicts.into_iter().collect();
+    conflicts.sort_unstable();
+    Ok(ResolutionReport { conflicts })
 }
 
 // The "slow path" resolver for complex variants.
 ///
 /// This function runs *after* the main high-performance pipeline is complete and
-/// adds every person's score contributions for the small set of variants that
-/// could not be handled by the fast path. It is row-major (see `resolve_rows`),
-/// and the progress bar advances as blocks of people finish.
+/// adds every person's score contributions at the sites whose doses read several
+/// rows: a variant measured by more than one row, and the REF of a site with several
+/// variants. It is row-major (see `resolve_rows`), and the progress bar advances as
+/// blocks of people finish.
 pub fn resolve_complex_variants(
     resolver: &ComplexVariantResolver,
     prep_result: &Arc<PreparationResult>,
@@ -2714,7 +1902,7 @@ pub fn resolve_complex_variants(
         return Ok(());
     }
 
-    eprintln!("> Resolving {num_rules} complex variant rules...");
+    eprintln!("> Resolving {num_rules} sites whose doses read several rows...");
 
     let pb = ProgressBar::new(prep_result.num_people_to_score as u64);
     let progress_style = ProgressStyle::with_template(
@@ -2735,340 +1923,42 @@ pub fn resolve_complex_variants(
     pb.finish_with_message("Done.");
 
     let report = resolution?;
-    if let Some(text) = warning_report(&report) {
+    if let Some(text) = conflict_report(&report, prep_result) {
         eprint!("{text}");
     }
-
-    if let Some(data) = report.unresolvable {
-        return Err(PipelineError::Compute(format_fatal_ambiguity_report(&data)));
-    }
-
     eprintln!("> Complex variant resolution complete.");
     Ok(())
 }
 
-/// The data integrity warning report, with categories in the heuristics' declaration
-/// order rather than the hash map's. None when no heuristic resolved anything, or when an
-/// unresolvable ambiguity aborted resolution: blocks stop wherever they had reached, so
-/// the counts would describe a scheduling-dependent subset of people.
-fn warning_report(report: &ResolutionReport) -> Option<String> {
+/// The warning for doses left missing because calls disagreed, naming the first loci. None when
+/// every call agreed.
+fn conflict_report(report: &ResolutionReport, prep_result: &PreparationResult) -> Option<String> {
     use std::fmt::Write;
-    if report.unresolvable.is_some() || report.warnings.is_empty() {
+    if report.conflicts.is_empty() {
         return None;
     }
-    let mut text = String::with_capacity(4096);
+    let total: u64 = report.conflicts.iter().map(|(_, count)| count).sum();
+    let mut text = String::new();
     writeln!(
         text,
-        "\n\n========================= CRITICAL DATA INTEGRITY WARNINGS ========================="
+        "> Warning: {total} dose(s) at {} (variant, score) pair(s) are missing because the calls they need disagree: rows measuring one variant give different copies, or the ALTs' copies at a site pass the ploidy. Examples:",
+        report.conflicts.len()
     )
     .unwrap();
-    writeln!(
-        text,
-        "Gnomon detected loci with ambiguous data that were resolved via heuristics.\nWhile computation continued, the underlying data should be investigated."
-    )
-    .unwrap();
-    for heuristic in HEURISTICS {
-        let Some((total_count, samples)) = report.warnings.get(&heuristic) else {
-            continue;
-        };
+    for &((rule_idx, application_idx), count) in report.conflicts.iter().take(MAX_CONFLICT_EXAMPLES) {
+        let rule = &prep_result.complex_rules[rule_idx];
+        let score_info = &rule.score_applications[application_idx];
         writeln!(
             text,
-            "\n==================== WARNING CATEGORY: {:?} ====================",
-            heuristic
+            ">   - {}:{} effect allele {} (other {}) in score '{}': {count} people",
+            rule.locus_chr_pos.0,
+            rule.locus_chr_pos.1,
+            score_info.effect_allele,
+            score_info.other_allele,
+            prep_result.score_names[score_info.score_column_index.0]
         )
         .unwrap();
-        writeln!(text, "Total Occurrences: {}", total_count).unwrap();
-        writeln!(text, "Showing up to 5 samples:").unwrap();
-        if samples.is_empty() {
-            writeln!(text, "  (No samples collected)").unwrap();
-        } else {
-            for (i, info) in samples.iter().enumerate() {
-                if i > 0 {
-                    writeln!(
-                        text,
-                        "---------------------------------------------------------------------------------"
-                    )
-                    .unwrap();
-                }
-                writeln!(text, "{}", format_critical_integrity_warning(info)).unwrap();
-            }
-        }
     }
-    writeln!(
-        text,
-        "\n=================================================================================\n"
-    )
-    .unwrap();
     Some(text)
 }
 
-/// A private helper function to format the final, dense data report for a fatal ambiguity.
-/// This is called only once, on the main thread, after a fatal error is confirmed.
-fn format_fatal_ambiguity_report(data: &FatalAmbiguityData) -> String {
-    use std::fmt::Write;
-    let mut report = String::with_capacity(512);
-
-    // Helper to interpret genotype bits is still useful.
-    let interpret_genotype = |bits: u8, a1: &str, a2: &str| -> String {
-        match bits {
-            0b00 => format!("{a1}/{a1}"),
-            0b01 => "Missing".to_string(),
-            0b10 => format!("{a1}/{a2}"),
-            0b11 => format!("{a2}/{a2}"),
-            _ => "Invalid Bits".to_string(),
-        }
-    };
-
-    // Build the final report string.
-    writeln!(
-        report,
-        "Fatal: Unresolvable ambiguity for individual '{}'.\n",
-        data.iid
-    )
-    .unwrap();
-    writeln!(report, "Individual:   {}", data.iid).unwrap();
-    writeln!(
-        report,
-        "Locus:        {}:{}",
-        data.locus_chr_pos.0, data.locus_chr_pos.1
-    )
-    .unwrap();
-    writeln!(report, "Score:        {}\n", data.score_name).unwrap();
-    writeln!(report, "Conflicting Sources:").unwrap();
-
-    for conflict in &data.conflicts {
-        writeln!(report, "  - BIM Row: {}", conflict.bim_row.0).unwrap();
-        writeln!(
-            report,
-            "    Alleles (A1,A2): ({}, {})",
-            conflict.alleles.0, conflict.alleles.1
-        )
-        .unwrap();
-
-        let bits_str = match conflict.genotype_bits {
-            0b00 => "00",
-            0b01 => "01",
-            0b10 => "10",
-            0b11 => "11",
-            _ => "??",
-        };
-        let interpretation = interpret_genotype(
-            conflict.genotype_bits,
-            &conflict.alleles.0,
-            &conflict.alleles.1,
-        );
-        writeln!(
-            report,
-            "    Genotype Bits:   {bits_str} (Interpreted as {interpretation})"
-        )
-        .unwrap();
-    }
-
-    report
-}
-
-/// A private helper function to format a critical integrity warning.
-/// This is called only once, on the main thread, to report benign ambiguities.
-fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> String {
-    use std::fmt::Write;
-    let mut report = String::with_capacity(512);
-
-    // Helper to interpret genotype bits and alleles into a human-readable string.
-    let interpret_genotype = |bits: u8, a1: &str, a2: &str| -> String {
-        match bits {
-            0b00 => format!("{a1}/{a1}"),
-            0b01 => "Missing".to_string(),
-            0b10 => format!("{a1}/{a2}"),
-            0b11 => format!("{a2}/{a2}"),
-            _ => "Invalid Bits".to_string(),
-        }
-    };
-
-    // Update the `is_chosen` helper
-    let is_chosen = |method: &ResolutionMethod,
-                     conflict: &ConflictSource,
-                     score_ea: &str,
-                     score_oa: &str|
-     -> bool {
-        let bim_a1 = &conflict.alleles.0;
-        let bim_a2 = &conflict.alleles.1;
-        match method {
-            ResolutionMethod::ExactScoreAlleleMatch { .. } => {
-                (bim_a1 == score_ea && bim_a2 == score_oa)
-                    || (bim_a1 == score_oa && bim_a2 == score_ea)
-            }
-            ResolutionMethod::PrioritizeUnambiguousGenotype { .. } => {
-                (bim_a1 == score_ea || bim_a1 == score_oa)
-                    && (bim_a2 == score_ea || bim_a2 == score_oa)
-            }
-            ResolutionMethod::PreferMatchingAlleleStructure { .. } => {
-                let score_a1_len = score_ea.len();
-                let score_a2_len = score_oa.len();
-
-                // Re-create the logic from the actual heuristic
-                let (person_allele_1, person_allele_2) = Heuristic::interpret_person_alleles(
-                    conflict.genotype_bits,
-                    &conflict.alleles.0,
-                    &conflict.alleles.1,
-                );
-                let person_a1_len = person_allele_1.len();
-                let person_a2_len = person_allele_2.len();
-
-                if person_a1_len == 0 {
-                    return false;
-                }
-
-                (person_a1_len == score_a1_len && person_a2_len == score_a2_len)
-                    || (person_a1_len == score_a2_len && person_a2_len == score_a1_len)
-            }
-            ResolutionMethod::PreferHeterozygous { .. } => conflict.genotype_bits == 0b10,
-            ResolutionMethod::ConsistentDosage { .. } => true,
-            ResolutionMethod::IndelAnchorBase { .. } => {
-                // For indel anchor base, we "chose" the homozygous rows that contributed
-                // to the inference.
-                match conflict.genotype_bits {
-                    0b00 => true, // Contributed evidence if hom
-                    0b11 => true,
-                    _ => false,
-                }
-            }
-            ResolutionMethod::FallbackOpposingHomozygousAsHet { .. } => true,
-            ResolutionMethod::FallbackAverageDosageAcrossConflicts { .. } => true,
-        }
-    };
-
-    // Add the individual, locus, and score information to the report
-    writeln!(
-        report,
-        "Ambiguity resolved for Individual '{}' at Locus {}:{}",
-        data.iid, data.locus_chr_pos.0, data.locus_chr_pos.1
-    )
-    .unwrap();
-    writeln!(report, "  While calculating score: '{}'", data.score_name).unwrap();
-    writeln!(report).unwrap();
-
-    // Update the rationale generation
-    let method_name: &str;
-    let mut rationale = String::new();
-
-    match &data.resolution_method {
-        ResolutionMethod::ExactScoreAlleleMatch { .. } => {
-            method_name = "'Exact Score Allele Match' Heuristic";
-            if let Some(chosen) = data.conflicts.iter().find(|c| {
-                is_chosen(
-                    &data.resolution_method,
-                    c,
-                    &data.score_effect_allele,
-                    &data.score_other_allele,
-                )
-            }) {
-                write!(rationale, "The interpretation with alleles ({}, {}) was chosen because it perfectly matches the score file.", chosen.alleles.0, chosen.alleles.1).unwrap();
-            }
-        }
-        ResolutionMethod::PrioritizeUnambiguousGenotype { .. } => {
-            method_name = "'Prioritize Unambiguous Genotype' Heuristic";
-            if let Some(chosen) = data.conflicts.iter().find(|c| {
-                is_chosen(
-                    &data.resolution_method,
-                    c,
-                    &data.score_effect_allele,
-                    &data.score_other_allele,
-                )
-            }) {
-                write!(rationale, "The interpretation with alleles ({}, {}) was chosen because both alleles are present in the score file's required set.", chosen.alleles.0, chosen.alleles.1).unwrap();
-            }
-        }
-        ResolutionMethod::PreferMatchingAlleleStructure { .. } => {
-            method_name = "'Prefer Matching Allele Structure' Heuristic";
-            if let Some(c) = data.conflicts.iter().find(|c| {
-                is_chosen(
-                    &data.resolution_method,
-                    c,
-                    &data.score_effect_allele,
-                    &data.score_other_allele,
-                )
-            }) {
-                // Re-interpret the genotype to get the person's actual alleles for the rationale.
-                let (pa1, pa2) = Heuristic::interpret_person_alleles(
-                    c.genotype_bits,
-                    &c.alleles.0,
-                    &c.alleles.1,
-                );
-                let person_geno_str = format!("{}/{}", pa1, pa2);
-                write!(rationale, "The interpretation from BIM Row {} (resulting in genotype '{}') was chosen because its allele lengths ({}, {}) structurally match the score file.", c.bim_row.0, person_geno_str, pa1.len(), pa2.len()).unwrap();
-            }
-        }
-        ResolutionMethod::PreferHeterozygous { .. } => {
-            method_name = "'Prefer Heterozygous' Heuristic";
-            let chosen = data.conflicts.iter().find(|c| c.genotype_bits == 0b10);
-            let rejected = data.conflicts.iter().find(|c| c.genotype_bits != 0b10);
-            if let (Some(c), Some(r)) = (chosen, rejected) {
-                let chosen_geno = interpret_genotype(c.genotype_bits, &c.alleles.0, &c.alleles.1);
-                let rejected_geno = interpret_genotype(r.genotype_bits, &r.alleles.0, &r.alleles.1);
-                write!(rationale, "The heterozygous interpretation ({}) was chosen over a conflicting homozygous interpretation ({}).", chosen_geno, rejected_geno).unwrap();
-            }
-        }
-        ResolutionMethod::ConsistentDosage { dosage } => {
-            method_name = "'Consistent Dosage' Heuristic";
-
-            write!(rationale, "All conflicting sources yielded a consistent effect allele dosage of {}, so computation continued.", dosage).unwrap();
-        }
-        ResolutionMethod::IndelAnchorBase { .. } => {
-            method_name = "'Indel Anchor Base' Heuristic";
-            write!(rationale, "Conflicting homozygous calls were found for alleles sharing an anchor base (one is a prefix of the other). This implies the array detected both alleles, so a Heterozygous genotype was inferred.").unwrap();
-        }
-        ResolutionMethod::FallbackOpposingHomozygousAsHet { .. } => {
-            method_name = "'Fallback Opposing Homozygous As Het' Heuristic";
-            write!(rationale, "All higher-priority ambiguity rules failed, and conflicting sources contained opposing homozygous states (00 and 11). A synthetic heterozygous genotype was inferred from those alleles, and dosage was computed from that inferred pair.").unwrap();
-        }
-        ResolutionMethod::FallbackAverageDosageAcrossConflicts { chosen_dosage } => {
-            method_name = "'Fallback Average Dosage Across Conflicts' Heuristic";
-            write!(rationale, "All higher-priority ambiguity rules failed. Dosage was computed independently for each conflicting interpretation and averaged as a final fallback (mean dosage = {}).", chosen_dosage).unwrap();
-        }
-    };
-
-    writeln!(report, "  Method: {}", method_name).unwrap();
-    writeln!(
-        report,
-        "  Score File requires: Effect={}, Other={}",
-        data.score_effect_allele, data.score_other_allele
-    )
-    .unwrap();
-
-    writeln!(report, "\n  Conflicting Sources Considered:").unwrap();
-
-    for conflict in &data.conflicts {
-        let prefix = if is_chosen(
-            &data.resolution_method,
-            conflict,
-            &data.score_effect_allele,
-            &data.score_other_allele,
-        ) {
-            "-> Chosen:  "
-        } else {
-            "   Rejected:"
-        };
-        let interpretation = interpret_genotype(
-            conflict.genotype_bits,
-            &conflict.alleles.0,
-            &conflict.alleles.1,
-        );
-        writeln!(
-            report,
-            "{} BIM Row {}: Alleles=({}, {}), Genotype={} ({})",
-            prefix,
-            conflict.bim_row.0,
-            conflict.alleles.0,
-            conflict.alleles.1,
-            conflict.genotype_bits,
-            interpretation
-        )
-        .unwrap();
-    }
-
-    if !rationale.is_empty() {
-        writeln!(report, "\n  Rationale: {}", rationale).unwrap();
-    }
-
-    report.trim_end().to_string()
-}
