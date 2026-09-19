@@ -2447,23 +2447,13 @@ impl RemoteByteRangeSource {
     }
 
     fn ensure_block(&self, start: u64) -> Result<Arc<Vec<u8>>, PipelineError> {
-        {
-            let mut cache = self.cache.lock().unwrap();
-            if let Some(block) = cache.get(start) {
-                return Ok(block);
-            }
-        }
-
         let length = self.block_length(start);
         if length == 0 {
             return Err(PipelineError::Io(
                 "Requested block beyond end of object".to_string(),
             ));
         }
-        let data = self.fetch_block(start, length)?;
-        let mut cache = self.cache.lock().unwrap();
-        cache.insert(start, Arc::clone(&data));
-        Ok(data)
+        cached_block(&self.cache, start, || self.fetch_block(start, length))
     }
 
     fn fetch_block(&self, start: u64, length: usize) -> Result<Arc<Vec<u8>>, PipelineError> {
@@ -2786,13 +2776,6 @@ impl HttpByteRangeSource {
     }
 
     fn ensure_block(&self, start: u64) -> Result<Arc<Vec<u8>>, PipelineError> {
-        {
-            let mut cache = self.cache.lock().unwrap();
-            if let Some(block) = cache.get(start) {
-                return Ok(block);
-            }
-        }
-
         let length = self.block_length(start);
         if length == 0 {
             return Err(PipelineError::Io(format!(
@@ -2800,11 +2783,7 @@ impl HttpByteRangeSource {
                 url = self.fetcher.url
             )));
         }
-
-        let data = self.fetch_block(start, length)?;
-        let mut cache = self.cache.lock().unwrap();
-        cache.insert(start, Arc::clone(&data));
-        Ok(data)
+        cached_block(&self.cache, start, || self.fetch_block(start, length))
     }
 
     fn fetch_block(&self, start: u64, length: usize) -> Result<Arc<Vec<u8>>, PipelineError> {
@@ -3053,9 +3032,14 @@ fn detect_compression_from_prefix(
     Ok((wrapped, compression))
 }
 
+/// One block of a remote object, filled by the first reader that misses it. A reader
+/// that misses it while that fetch is on its way waits for it and takes its result, so
+/// readers of one block at the same time issue one request between them.
+type BlockSlot = Arc<OnceLock<Result<Arc<Vec<u8>>, PipelineError>>>;
+
 struct RemoteCache {
     capacity: usize,
-    blocks: HashMap<u64, Arc<Vec<u8>>>,
+    blocks: HashMap<u64, BlockSlot>,
     order: VecDeque<u64>,
 }
 
@@ -3068,34 +3052,52 @@ impl RemoteCache {
         }
     }
 
-    fn get(&mut self, key: u64) -> Option<Arc<Vec<u8>>> {
-        if let Some(value) = self.blocks.get(&key).cloned() {
+    /// The slot of the block at `key`, empty until a reader has fetched it.
+    fn slot(&mut self, key: u64) -> BlockSlot {
+        if let Some(slot) = self.blocks.get(&key).cloned() {
             self.touch(key);
-            Some(value)
-        } else {
-            None
-        }
-    }
-
-    fn insert(&mut self, key: u64, value: Arc<Vec<u8>>) {
-        if let std::collections::hash_map::Entry::Occupied(mut e) = self.blocks.entry(key) {
-            e.insert(value);
-            self.touch(key);
-            return;
+            return slot;
         }
         if self.order.len() == self.capacity
             && let Some(oldest) = self.order.pop_front()
         {
             self.blocks.remove(&oldest);
         }
+        let slot = BlockSlot::default();
         self.order.push_back(key);
-        self.blocks.insert(key, value);
+        self.blocks.insert(key, Arc::clone(&slot));
+        slot
+    }
+
+    /// Drops the block at `key` if `slot` still holds it, so the next read of a block
+    /// whose fetch failed fetches it again.
+    fn forget(&mut self, key: u64, slot: &BlockSlot) {
+        if self.blocks.get(&key).is_some_and(|held| Arc::ptr_eq(held, slot)) {
+            self.blocks.remove(&key);
+            self.order.retain(|&k| k != key);
+        }
     }
 
     fn touch(&mut self, key: u64) {
         self.order.retain(|&k| k != key);
         self.order.push_back(key);
     }
+}
+
+/// The block at `start`, from `cache` or else from `fetch`, called by one reader however
+/// many miss the block at once. A failed fetch is every waiting reader's error and is not
+/// kept.
+fn cached_block(
+    cache: &Mutex<RemoteCache>,
+    start: u64,
+    fetch: impl FnOnce() -> Result<Arc<Vec<u8>>, PipelineError>,
+) -> Result<Arc<Vec<u8>>, PipelineError> {
+    let slot = cache.lock().unwrap().slot(start);
+    let block = slot.get_or_init(fetch).clone();
+    if block.is_err() {
+        cache.lock().unwrap().forget(start, &slot);
+    }
+    block
 }
 
 #[cfg(test)]
@@ -3595,6 +3597,82 @@ mod tests {
         let source = HttpByteRangeSource::with_block_size(&url, 4).expect("source");
         assert!(source.read_at(0, &mut [0; 4]).is_err());
         server.join().expect("HTTP server");
+    }
+
+    /// Readers that miss one block at the same time share one fetch of it. The fetch
+    /// returns only once every reader holds the block's slot, so each of them missed it.
+    /// A failed fetch is every waiting reader's error, and the next read fetches afresh.
+    #[test]
+    fn readers_missing_one_block_at_once_share_one_fetch() {
+        use std::sync::atomic::AtomicUsize;
+        const READERS: usize = 8;
+        let cache = Mutex::new(RemoteCache::new(4));
+        let fetches = AtomicUsize::new(0);
+        let fetch = |key: u64, result: Result<Arc<Vec<u8>>, PipelineError>| {
+            fetches.fetch_add(1, Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while Arc::strong_count(&cache.lock().unwrap().blocks[&key]) < 1 + READERS {
+                assert!(std::time::Instant::now() < deadline, "readers never met");
+                thread::yield_now();
+            }
+            result
+        };
+        let read_all = |key: u64, result: Result<Arc<Vec<u8>>, PipelineError>| {
+            thread::scope(|scope| {
+                let readers: Vec<_> = (0..READERS)
+                    .map(|_| {
+                        let result = result.clone();
+                        scope.spawn(|| cached_block(&cache, key, || fetch(key, result)))
+                    })
+                    .collect();
+                readers
+                    .into_iter()
+                    .map(|reader| reader.join().expect("reader"))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        let block = Arc::new(b"block".to_vec());
+        for read in read_all(0, Ok(Arc::clone(&block))) {
+            assert_eq!(read.expect("fetched block").as_slice(), b"block");
+        }
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+        let refused = PipelineError::Io("range refused".to_string());
+        for read in read_all(1, Err(refused)) {
+            assert!(matches!(read, Err(PipelineError::Io(m)) if m == "range refused"));
+        }
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        let again = cached_block(&cache, 1, || {
+            fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::clone(&block))
+        });
+        assert_eq!(again.expect("fetched afresh").as_slice(), b"block");
+        assert_eq!(fetches.load(Ordering::SeqCst), 3);
+    }
+
+    /// Concurrent reads of one block of an HTTP object issue one range request: the
+    /// fixture serves the length probe and one range, then stops listening.
+    #[test]
+    fn concurrent_http_reads_of_one_block_request_it_once() {
+        let (url, server) = serve_http_responses(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n".to_string(),
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-7/8\r\nContent-Length: 8\r\nConnection: close\r\n\r\nabcdefgh".to_string(),
+        ]);
+        let source = HttpByteRangeSource::with_block_size(&url, 8).expect("source");
+        let start = std::sync::Barrier::new(8);
+        thread::scope(|scope| {
+            for offset in 0..8u64 {
+                let (source, start) = (&source, &start);
+                scope.spawn(move || {
+                    let mut byte = [0; 1];
+                    start.wait();
+                    source.read_at(offset, &mut byte).expect("byte of the block");
+                    assert_eq!(byte[0], b"abcdefgh"[offset as usize]);
+                });
+            }
+        });
+        server.join().expect("the probe and one range request");
     }
 
     #[test]
