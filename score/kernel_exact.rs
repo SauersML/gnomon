@@ -90,6 +90,50 @@ fn build_table(terms: &[i64], group: usize, stride: usize, table: &mut [i64]) {
     }
 }
 
+macro_rules! build_stripe_table {
+    ($name:ident, $lanes:literal) => {
+        /// [`build_table`] at a stride of one or two SIMD widths, the same sums entry by entry. The
+        /// group's term rows and its table are fixed arrays and each prefix a constant, so no entry
+        /// is bounds-checked and no lane loop runs: through `build_table`, with a slice check per
+        /// entry and a runtime lane count, building tables took a third of a common N 1,000 K 1
+        /// cell's kernel cycles.
+        #[inline(never)]
+        fn $name(terms: &[i64], group: usize, table: &mut [i64]) {
+            type Lanes = Simd<i64, $lanes>;
+            /// Entries `0..PREFIX` hold the sums of the variants before this one; entry
+            /// `code × PREFIX + e` gains this variant's code-`code` row on entry `e`'s sum.
+            #[inline(always)]
+            fn expand<const PREFIX: usize>(table: &mut [[i64; $lanes]; 256], add: [Lanes; 4]) {
+                for entry in 0..PREFIX {
+                    let sum = Lanes::from_array(table[entry]);
+                    table[PREFIX + entry] = (sum + add[1]).to_array();
+                    table[2 * PREFIX + entry] = (sum + add[2]).to_array();
+                    table[3 * PREFIX + entry] = (sum + add[3]).to_array();
+                    table[entry] = (sum + add[0]).to_array();
+                }
+            }
+            let first = group * VARIANTS_PER_TABLE * 4;
+            let rows: &[[i64; $lanes]; VARIANTS_PER_TABLE * 4] =
+                terms.as_chunks::<$lanes>().0[first..first + VARIANTS_PER_TABLE * 4].try_into().unwrap();
+            let table: &mut [[i64; $lanes]; 256] = (&mut table.as_chunks_mut::<$lanes>().0[..256]).try_into().unwrap();
+            let adds = |v: usize| {
+                [
+                    Lanes::from_array(rows[v * 4]),
+                    Lanes::from_array(rows[v * 4 + 1]),
+                    Lanes::from_array(rows[v * 4 + 2]),
+                    Lanes::from_array(rows[v * 4 + 3]),
+                ]
+            };
+            table[..4].copy_from_slice(&rows[..4]);
+            expand::<4>(table, adds(1));
+            expand::<16>(table, adds(2));
+            expand::<64>(table, adds(3));
+        }
+    };
+}
+build_stripe_table!(build_table_4, 4);
+build_stripe_table!(build_table_8, 8);
+
 /// Table keys for 32 people per step: the butterfly transpose of four row words on eight u32
 /// lanes. `rows[k]` are whole 8-byte chunks of the same byte range; `keys.len() == 4 * rows[k].len()`.
 #[inline(never)]
@@ -393,12 +437,12 @@ pub(crate) fn apply_table_rows(
     }
     for batch in scratch.tabled.chunks(GROUPS_PER_BATCH) {
         for (g, &group) in batch.iter().enumerate() {
-            build_table(
-                terms,
-                group,
-                stride,
-                &mut scratch.tables[g * 256 * stride..(g + 1) * 256 * stride],
-            );
+            let table = &mut scratch.tables[g * 256 * stride..(g + 1) * 256 * stride];
+            match stride {
+                4 => build_table_4(terms, group, table),
+                8 => build_table_8(terms, group, table),
+                _ => build_table(terms, group, stride, table),
+            }
             let source = group_rows(data, row_bytes, rows, &scratch.zero_row, group);
             if striped {
                 // A striped person reads each group's key where the transpose left it: gathering
@@ -714,6 +758,28 @@ mod tests {
                     }
                 }
                 assert_eq!(cells, want, "people {people} rows {rows} stride {stride} gathered {gathered}");
+            }
+        }
+    }
+
+    /// The fixed-stride builders give `build_table`'s entries, with code-00 rows that are not zero,
+    /// and leave a longer table's tail as it was.
+    #[test]
+    fn fixed_stride_tables_equal_the_general_build() {
+        let mut rng = Rng(0x5851_f42d_4c95_7f2d);
+        for stride in [4usize, 8] {
+            let groups = 3;
+            let terms: Vec<i64> = (0..groups * 16 * stride).map(|_| rng.next() as i64).collect();
+            for group in 0..groups {
+                let mut want = vec![0i64; 256 * stride];
+                build_table(&terms, group, stride, &mut want);
+                let mut got = vec![7i64; 257 * stride];
+                match stride {
+                    4 => build_table_4(&terms, group, &mut got),
+                    _ => build_table_8(&terms, group, &mut got),
+                }
+                assert_eq!(got[..256 * stride], want[..], "stride {stride} group {group}");
+                assert!(got[256 * stride..].iter().all(|&lane| lane == 7), "stride {stride} group {group}");
             }
         }
     }
