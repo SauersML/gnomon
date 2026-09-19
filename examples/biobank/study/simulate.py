@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """AoU-shaped truth simulator for the single study (SPEC section 6, amended by section 8).
 
-It writes the SCHEMA v1 tables (manifest.json, person, condition, root, ancestry, pcs, scores) exactly as the
-BigQuery cohort stage does, plus ``truth.parquet`` (key disease, person_id) and ``truth_person.parquet``. Every
-stage after the cohort reads the same files on MSI and in AoU, so the synthetic tables exercise the real
-pipeline, and the truth columns let every lane score predictions against the true risk.
+It writes the SCHEMA v2 tables (manifest.json, person, condition, root, ancestry, pcs, scores) exactly as the
+BigQuery cohort stage does, through study/cohort.py's write_tables, plus ``truth.parquet`` (key disease,
+person_id) and ``truth_person.parquet``. Every stage after the cohort reads the same files on MSI and in AoU, so
+the synthetic tables exercise the real pipeline, and the truth columns let every lane score predictions against
+the true risk.
 
 The generative model
 ====================
 Time is age in years (days / 365.25). A person has birth day b, consent (baseline) age aB, an EHR start E0 (the
-first encounter, ``obs_start``) and, per disease k, the following latent processes. They are independent given
+first EHR record, ``ehr_start``) and, per disease k, the following latent processes. They are independent given
 the person's covariates x, which include the latent standardized score S_k.
 
-Clinical onset. ``P(T_D <= a | x) = F(a) = G(u(a))`` with ``u(a) = alpha(a) + eta(x) + beta(x) S``.
+Ancestry. PCs are real 1KG samples projected through gnomon's HWE PCA model. Each person mixes source individuals
+of AoU-like ancestry groups with continuous admixture, plus a little noise; projection is linear in dosage.
+ancestry_pred is a linear discriminant on PC1-6 with the groups' shares as priors, as AoU's classifier is.
+
+Clinical onset. ``P(T_D <= a | x) = F(a) = G(u(a))`` with ``u(a) = scale(x) (alpha(a) + eta(x)) + beta(x) S``.
+The scale is 1 except in the CalPred-true worlds, where it is exp(-nu'PC).
   - ``alpha(a) = a_inf - delta exp(-kappa (a - 50))`` is increasing, and ``G(a_inf + ...)`` < 1 leaves a never-onset
-    fraction.  G is the Aranda-Ordaz asymmetric link ``G(u) = 1 - (1 + lam e^u)^(-1/lam)`` with lam = 0.5, which is
-    neither probit, logit nor cloglog (audit S3: data are generated outside the fitted families).
+    fraction. The competitor-true worlds use alpha linear in age (binary) or in log age (survival) instead.
+  - G is the Aranda-Ordaz asymmetric link ``G(u) = 1 - (1 + lam e^u)^(-1/lam)`` with lam = 0.5, which is neither
+    probit, logit nor cloglog (audit S3: data are generated outside the fitted families).
   - Onset runs from birth, and everybody enrolled is alive at consent, so the disease-free survivors who enter the
     survival frame are depleted of high-S people as entry age grows (audit M10).
   - eta(x) holds sex, genetic-ancestry components, Census region, EHR site, zip3 deprivation and a PC term.
@@ -54,7 +61,8 @@ The truth is the probability of the OBSERVABLE event under the phenotype rule (a
 people with at least the base cohort's 365 days of lookback. Every integral is one-dimensional in the onset age s
 or in the window end: Gauss-Legendre pieces clustered on the code-rate scale 1 / mu1 (and at most 2 years long),
 running recurrences over a time grid, and Boole's rule for the outer integrals. The refinement test doubles every
-node count and requires agreement to 1e-8. Write ``q(L) = 1 - e^-L (1 + L)`` for P(Poisson(L) >= 2), and
+node count and requires agreement to 1e-8. Every 1 - F below is the link's survival function, computed directly,
+so it keeps its precision where onset is nearly certain. Write ``q(L) = 1 - e^-L (1 + L)`` for P(Poisson(L) >= 2), and
 ``Lam(s, w) = mu0 (s - E0) + mu1 (w - s)`` for the code intensity over [E0, w) given onset s.
 
 p_ever (binary; SCHEMA truth.p_ever). Recorded codes run over [E0, W), with W = min(X, T_M, C), and
@@ -92,7 +100,7 @@ Usage
 =====
     simulate.py reference --projection data.projection_scores.bin --labels kg_pop.tsv --out reference_pcs.parquet
     simulate.py generate --out DIR --n 20000 --seed 1 [--scenario realistic] [--reference reference_pcs.parquet]
-    simulate.py publish --root /scratch.global/sauer354/aou-study/sim/v1 --reference ... --git-sha SHA
+    simulate.py publish --root /scratch.global/sauer354/aou-study/sim/vN --reference ... --git-sha SHA [--append]
 The scenarios are:
 - ``realistic`` (a);
 - ``null_slope`` (b): a constant slope;
@@ -405,7 +413,8 @@ def load_diseases(path: str | Path) -> list[DiseaseSpec]:
     for item in items:
         root = str(item.get("root") or item.get("snomed_code"))
         slug = item["slug"]
-        branches = tuple(sorted(str(b.get("root") or b.get("snomed_code")) for b in item.get("excluded_branches") or []))
+        branches = tuple(sorted(str(b.get("root") or b.get("snomed_code"))
+                                for b in item.get("excluded_branches") or []))
         spec = DiseaseSpec(slug=slug, root=root, sex=item.get("sex"), pgs=item.get("pgs") or item.get("pgs_id"),
                            branches=branches, **DISEASE_DEFAULTS.get(slug, GENERIC_DISEASE))
         out.append(spec)
@@ -781,8 +790,8 @@ def sample_people(world: World, n: int, rng: np.random.Generator) -> dict:
                 baseline=baseline, has_baseline=has_baseline, a_base=a_base, sex_code=sex_code, male=male,
                 ehr=ehr, site=site, state=state, state_null=state_null, region=region, zip3=zip3,
                 zip_known=zip_known, zip_post=zip_post, in_map=in_map, dep=dep, ses_z=ses_z, e0=e0, x_exit=x_exit,
-                rate_x=rate_x, omega=omega, t_m=t_m, race=race, eth=eth, in_ancestry=in_ancestry, related=related, genotyped=genotyped,
-                u_enc=rng.gamma(1.2, 1.0 / 1.2, n))
+                rate_x=rate_x, omega=omega, t_m=t_m, race=race, eth=eth, in_ancestry=in_ancestry, related=related,
+                genotyped=genotyped, u_enc=rng.gamma(1.2, 1.0 / 1.2, n))
 
 
 # --------------------------------------------------------------------------------------------------------------
