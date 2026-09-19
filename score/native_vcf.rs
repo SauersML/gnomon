@@ -27,7 +27,7 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::simd::cmp::{SimdOrd, SimdPartialEq, SimdPartialOrd};
 use std::simd::num::{SimdInt, SimdUint};
-use std::simd::{Mask, Select, i64x8, simd_swizzle, u8x8, u8x16, u8x32, u8x64, u64x8};
+use std::simd::{Mask, Select, i64x8, simd_swizzle, u8x8, u8x16, u8x32, u8x64, u32x8, u64x8};
 
 mod crc;
 mod dosage;
@@ -631,6 +631,10 @@ impl DosageColumn {
 /// score's weights need, plus the most any dosage the score has taken carried. A dosage with more
 /// places rescales the score's cells first, and a value that leaves i128 moves into a wide
 /// integer, so no term is rounded; a value is rounded once, at output.
+///
+/// The cells are person × score. Each range of people keeps its lanes and missing counts score ×
+/// person, so a rule adds to one contiguous run of its score's people whatever the number of
+/// scores; `finish` puts the missing counts back in person × score order.
 struct ScoreTotals {
     num_scores: usize,
     cells: Vec<i128>,
@@ -710,10 +714,9 @@ struct ExactRule {
     /// The largest term this rule adds for any person, when it is at most `LANE_LIMIT`: the rule
     /// then adds into the lanes, and otherwise into the cells.
     bound: Option<u128>,
-    /// The weight at the score's scale, times a dose at the column's decimal places, is a term.
+    /// The weight at the score's scale, times a dose at the column's decimal places or a count of
+    /// copies, is a term.
     weight: i64,
-    /// For hard calls, the term of each count of copies; fifteen, `MISSING_CALL`'s, adds zero.
-    call_terms: [i64; 16],
 }
 
 fn pow10(digits: u32) -> Option<i128> {
@@ -834,10 +837,9 @@ impl ScoreTotals {
                 self.rescale(score, places);
             }
         }
-        let calls = matches!(column, DosageColumn::Calls(_));
         let mut rules: Vec<ExactRule> = matched_rules
             .iter()
-            .map(|rule| self.exact_rule(rule, places, scale.largest, calls))
+            .map(|rule| self.exact_rule(rule, places, scale.largest))
             .collect();
         // A score whose lanes cannot take this allele's bounds is flushed first. The rules of a
         // score whose bounds alone pass the limit add into the cells.
@@ -877,7 +879,6 @@ impl ScoreTotals {
         rule: &MatchedRule,
         places: u8,
         largest: Option<[u128; 2]>,
-        calls: bool,
     ) -> ExactRule {
         let score = rule.score_index;
         // A score's weight places are at least any of its weights' own, so the shift is nonnegative.
@@ -892,13 +893,6 @@ impl ScoreTotals {
             .zip(largest)
             .and_then(|(weight, largest)| u128::from(weight.unsigned_abs()).checked_mul(largest[side]))
             .filter(|&bound| bound <= LANE_LIMIT);
-        let mut call_terms = [0i64; 16];
-        if let (true, Some(weight), Some(_)) = (calls, weight, bound) {
-            // No call holds more copies than `largest`, so the terms it can reach fit.
-            for (copies, term) in call_terms.iter_mut().enumerate().take(15) {
-                *term = weight.checked_mul(copies as i64).unwrap_or(0);
-            }
-        }
         ExactRule {
             score_index: score,
             effect_is_ref: rule.effect_is_ref,
@@ -907,7 +901,6 @@ impl ScoreTotals {
             scaled,
             bound,
             weight: weight.unwrap_or(0),
-            call_terms,
         }
     }
 
@@ -931,14 +924,13 @@ impl ScoreTotals {
             .zip(self.spills.par_iter_mut())
             .enumerate()
             .for_each(|(range, ((cells, lanes), spill))| {
-                let people = cells
-                    .chunks_exact_mut(num_scores)
-                    .zip(lanes.chunks_exact_mut(num_scores));
-                for (person, (cells, lanes)) in people.enumerate() {
-                    for &score in scores {
-                        let index = range * range_cells + person * num_scores + score;
-                        let lane = std::mem::take(&mut lanes[score]);
-                        add_term(&mut cells[score], index, spill, i128::from(lane));
+                let people = cells.len() / num_scores;
+                for &score in scores {
+                    let lanes = &mut lanes[score * people..(score + 1) * people];
+                    for (person, lane) in lanes.iter_mut().enumerate() {
+                        let index = person * num_scores + score;
+                        let lane = i128::from(std::mem::take(lane));
+                        add_term(&mut cells[index], range * range_cells + index, spill, lane);
                     }
                 }
             });
@@ -947,11 +939,25 @@ impl ScoreTotals {
         }
     }
 
-    /// Adds every queued allele and moves every lane into its cell.
+    /// Adds every queued allele, moves every lane into its cell, and puts the missing counts in
+    /// person × score order.
     fn finish(&mut self) {
         self.apply();
         let scores: Vec<usize> = (0..self.num_scores).collect();
         self.flush(&scores);
+        let num_scores = self.num_scores;
+        let range_cells = self.range_people * num_scores;
+        let mut by_person = vec![0u32; self.missing_counts.len()];
+        let ranges = self.missing_counts.chunks(range_cells).zip(by_person.chunks_mut(range_cells));
+        for (by_score, by_person) in ranges {
+            let people = by_score.len() / num_scores;
+            for (score, counts) in by_score.chunks_exact(people.max(1)).enumerate() {
+                for (person, &count) in counts.iter().enumerate() {
+                    by_person[person * num_scores + score] = count;
+                }
+            }
+        }
+        self.missing_counts = by_person;
     }
 
     /// Multiplies every cell of `score` by the powers of ten that bring it to `places` dosage places.
@@ -1021,33 +1027,69 @@ impl ScoreTotals {
     }
 }
 
-/// Adds one term per person to one score's lanes, and counts the people it gives as missing.
+/// Adds `weight` times each person's copies of the allele in `code >> SHIFT`, eight people a
+/// step, to one score's lanes. The rule's bound covers the column's most copies, so every term
+/// fits; a missing call adds nothing.
 #[inline(always)]
-fn add_one_score<T>(
-    values: impl Iterator<Item = T>,
-    score: usize,
-    num_scores: usize,
-    lanes: &mut [i64],
-    missing: &mut [u32],
-    term: impl Fn(T) -> (i64, bool),
-) {
-    if num_scores == 1 {
-        for ((value, lane), count) in values.zip(lanes.iter_mut()).zip(missing.iter_mut()) {
-            let (term, absent) = term(value);
-            *lane = lane.wrapping_add(term);
-            *count += u32::from(absent);
-        }
-    } else {
-        let slots = lanes.iter_mut().zip(missing.iter_mut()).skip(score).step_by(num_scores);
-        for (value, (lane, count)) in values.zip(slots) {
-            let (term, absent) = term(value);
-            *lane = lane.wrapping_add(term);
-            *count += u32::from(absent);
-        }
+fn add_call_terms<const SHIFT: u8>(codes: &[u8], weight: i64, lanes: &mut [i64]) {
+    let (code_steps, code_rest) = codes.as_chunks::<8>();
+    let (lane_steps, lane_rest) = lanes.as_chunks_mut::<8>();
+    let weights = i64x8::splat(weight);
+    for (codes, lanes) in code_steps.iter().zip(lane_steps) {
+        let codes = u8x8::from_array(*codes);
+        let copies = (codes >> u8x8::splat(SHIFT)) & u8x8::splat(0x0f);
+        let copies = codes.simd_eq(u8x8::splat(MISSING_CALL)).select(u8x8::splat(0), copies);
+        *lanes = (i64x8::from_array(*lanes) + weights * copies.cast::<i64>()).to_array();
+    }
+    for (&code, lane) in code_rest.iter().zip(lane_rest) {
+        let copies = if code == MISSING_CALL { 0 } else { i64::from((code >> SHIFT) & 0x0f) };
+        *lane = lane.wrapping_add(weight.wrapping_mul(copies));
     }
 }
 
-/// One range's cells, lanes, missing counts and wide cell parts, laid out person × score.
+/// Adds `weight` times each person's dose digits of side `SIDE` (ALT 0, REF 1), eight people a
+/// step, to one score's lanes. A missing dose's digits are zero.
+#[inline(always)]
+fn add_dose_terms<const SIDE: usize>(digits: &[[i64; 2]], weight: i64, lanes: &mut [i64]) {
+    let (digit_steps, digit_rest) = digits.as_chunks::<8>();
+    let (lane_steps, lane_rest) = lanes.as_chunks_mut::<8>();
+    let weights = i64x8::splat(weight);
+    for (digits, lanes) in digit_steps.iter().zip(lane_steps) {
+        let low = i64x8::from_slice(&digits.as_flattened()[..8]);
+        let high = i64x8::from_slice(&digits.as_flattened()[8..]);
+        let doses = if SIDE == 0 {
+            simd_swizzle!(low, high, [0, 2, 4, 6, 8, 10, 12, 14])
+        } else {
+            simd_swizzle!(low, high, [1, 3, 5, 7, 9, 11, 13, 15])
+        };
+        *lanes = (i64x8::from_array(*lanes) + weights * doses).to_array();
+    }
+    for (digits, lane) in digit_rest.iter().zip(lane_rest) {
+        *lane = lane.wrapping_add(weight.wrapping_mul(digits[SIDE]));
+    }
+}
+
+/// Counts each person whose `absent` holds, eight people a step, into one score's missing counts.
+#[inline(always)]
+fn count_missing<T: Copy>(
+    persons: &[T],
+    missing: &mut [u32],
+    absent: impl Fn(&[T; 8]) -> Mask<i32, 8>,
+    absent_one: impl Fn(T) -> bool,
+) {
+    let (person_steps, person_rest) = persons.as_chunks::<8>();
+    let (missing_steps, missing_rest) = missing.as_chunks_mut::<8>();
+    for (persons, missing) in person_steps.iter().zip(missing_steps) {
+        let counted = absent(persons).select(u32x8::splat(1), u32x8::splat(0));
+        *missing = (u32x8::from_array(*missing) + counted).to_array();
+    }
+    for (&person, count) in person_rest.iter().zip(missing_rest) {
+        *count += u32::from(absent_one(person));
+    }
+}
+
+/// One range's accumulators: cells and wide cell parts person × score, lanes and missing counts
+/// score × person.
 struct Accumulators<'a> {
     cells: &'a mut [i128],
     lanes: &'a mut [i64],
@@ -1057,7 +1099,9 @@ struct Accumulators<'a> {
 
 impl ScoredAllele {
     /// Adds this allele's terms for the people from `first_person` on, whose accumulators, from
-    /// global cell `first_cell`, `into` holds.
+    /// global cell `first_cell`, `into` holds. Each rule adds to its score's run of lanes, eight
+    /// people a step, and each score the allele scores counts its missing people once; a rule
+    /// whose terms can pass the lane bound adds into the cells, exactly, person by person.
     fn apply(
         &self,
         first_person: usize,
@@ -1072,70 +1116,75 @@ impl ScoredAllele {
             missing,
             spill,
         } = into;
-        let people = first_person..first_person + missing.len() / num_scores;
-        // One rule adding into lanes needs no branch: a missing call's copies are fifteen, whose
-        // term is zero, and a missing dose's digits are zero.
-        match (&self.column, &self.rules[..]) {
-            (DosageColumn::Calls(codes), [rule]) if rule.bound.is_some() => {
-                let shift = if rule.effect_is_ref { 4 } else { 0 };
-                let persons = codes[people].iter().copied();
-                add_one_score(persons, rule.score_index, num_scores, lanes, missing, |code| {
-                    let term = rule.call_terms[usize::from((code >> shift) & 0x0f)];
-                    (term, code == MISSING_CALL)
-                });
-            }
-            (DosageColumn::Dosages(doses), [rule]) if rule.bound.is_some() => {
-                let side = usize::from(rule.effect_is_ref);
-                let persons = doses.digits[people.clone()].iter().zip(&doses.places[people]);
-                add_one_score(persons, rule.score_index, num_scores, lanes, missing, |(digits, places)| {
-                    (rule.weight.wrapping_mul(digits[side]), places[0] == u8::MAX)
-                });
-            }
-            (DosageColumn::Calls(codes), rules) => {
-                for (offset, &code) in codes[people].iter().enumerate() {
-                    let base = offset * num_scores;
-                    if code == MISSING_CALL {
-                        for &score_index in &self.missing_scores {
-                            missing[base + score_index] += 1;
+        let range = missing.len() / num_scores;
+        let people = first_person..first_person + range;
+        let run = |score: usize| score * range..(score + 1) * range;
+        match &self.column {
+            DosageColumn::Calls(codes) => {
+                let codes = &codes[people];
+                for rule in &self.rules {
+                    if rule.bound.is_some() {
+                        let lanes = &mut lanes[run(rule.score_index)];
+                        match rule.effect_is_ref {
+                            false => add_call_terms::<0>(codes, rule.weight, lanes),
+                            true => add_call_terms::<4>(codes, rule.weight, lanes),
                         }
                         continue;
                     }
-                    for rule in rules {
-                        let copies = if rule.effect_is_ref { code >> 4 } else { code & 0x0f };
-                        let index = base + rule.score_index;
-                        if rule.bound.is_some() {
-                            let term = rule.call_terms[usize::from(copies)];
-                            lanes[index] = lanes[index].wrapping_add(term);
-                        } else {
-                            let shift = u32::from(dosage_places[rule.score_index]);
+                    let shift = if rule.effect_is_ref { 4 } else { 0 };
+                    let places = u32::from(dosage_places[rule.score_index]);
+                    for (offset, &code) in codes.iter().enumerate() {
+                        if code != MISSING_CALL {
+                            let copies = i64::from((code >> shift) & 0x0f);
+                            let index = offset * num_scores + rule.score_index;
                             let cell = &mut cells[index];
-                            add_exact(cell, first_cell + index, spill, rule, i64::from(copies), shift);
+                            add_exact(cell, first_cell + index, spill, rule, copies, places);
                         }
                     }
                 }
+                let missing_call = u8x8::splat(MISSING_CALL);
+                for &score in &self.missing_scores {
+                    count_missing(
+                        codes,
+                        &mut missing[run(score)],
+                        |codes| u8x8::from_array(*codes).simd_eq(missing_call).cast(),
+                        |code| code == MISSING_CALL,
+                    );
+                }
             }
-            (DosageColumn::Dosages(doses), rules) => {
-                let persons = doses.digits[people.clone()].iter().zip(&doses.places[people]);
-                for (offset, (digits, places)) in persons.enumerate() {
-                    let base = offset * num_scores;
-                    if places[0] == u8::MAX {
-                        for &score_index in &self.missing_scores {
-                            missing[base + score_index] += 1;
+            DosageColumn::Dosages(doses) => {
+                let digits = &doses.digits[people.clone()];
+                let places = &doses.places[people];
+                for rule in &self.rules {
+                    let side = usize::from(rule.effect_is_ref);
+                    if rule.bound.is_some() {
+                        let lanes = &mut lanes[run(rule.score_index)];
+                        match side {
+                            0 => add_dose_terms::<0>(digits, rule.weight, lanes),
+                            _ => add_dose_terms::<1>(digits, rule.weight, lanes),
                         }
                         continue;
                     }
-                    for rule in rules {
-                        let side = usize::from(rule.effect_is_ref);
-                        let index = base + rule.score_index;
-                        if rule.bound.is_some() {
-                            let term = rule.weight.wrapping_mul(digits[side]);
-                            lanes[index] = lanes[index].wrapping_add(term);
-                        } else {
+                    for (offset, (digits, places)) in digits.iter().zip(places).enumerate() {
+                        if places[0] != u8::MAX {
                             let shift = u32::from(dosage_places[rule.score_index] - places[side]);
+                            let index = offset * num_scores + rule.score_index;
                             let cell = &mut cells[index];
                             add_exact(cell, first_cell + index, spill, rule, digits[side], shift);
                         }
                     }
+                }
+                for &score in &self.missing_scores {
+                    count_missing(
+                        places,
+                        &mut missing[run(score)],
+                        |places| {
+                            let places = u8x16::from_slice(places.as_flattened());
+                            let alt: u8x8 = simd_swizzle!(places, [0, 2, 4, 6, 8, 10, 12, 14]);
+                            alt.simd_eq(u8x8::splat(u8::MAX)).cast()
+                        },
+                        |places| places[0] == u8::MAX,
+                    );
                 }
             }
         }
@@ -4303,6 +4352,105 @@ mod tests {
             z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
             ((z ^ (z >> 31)) % n as u64) as usize
+        }
+    }
+
+    /// Eight people a step add what a person-by-person loop adds: call terms of up to fourteen
+    /// copies of each allele and missing calls, doses of any size whose terms wrap as the lanes
+    /// do, missing counts, both sides, and runs of any length.
+    #[test]
+    fn lane_passes_add_what_one_person_at_a_time_adds() {
+        let mut draws = Draws(0x1a4e);
+        for round in 0..2000 {
+            let people = draws.below(40);
+            let weight = match round % 3 {
+                0 => i64::MIN + draws.below(1000) as i64,
+                _ => draws.below(1 << 40) as i64 - (1 << 39),
+            };
+            let codes: Vec<u8> = (0..people)
+                .map(|_| match draws.below(8) {
+                    0 => MISSING_CALL,
+                    1 => (draws.below(15) | draws.below(15) << 4) as u8,
+                    _ => [0x20, 0x11, 0x02][draws.below(3)],
+                })
+                .collect();
+            let (mut digits, mut places) = (Vec::new(), Vec::new());
+            for _ in 0..people {
+                if draws.below(6) == 0 {
+                    digits.push([0i64; 2]);
+                    places.push([u8::MAX; 2]);
+                } else {
+                    let dose = |draws: &mut Draws| match draws.below(4) {
+                        0 => i64::MAX - draws.below(1000) as i64,
+                        _ => draws.below(2_000_001) as i64,
+                    };
+                    digits.push([dose(&mut draws), dose(&mut draws)]);
+                    places.push([draws.below(7) as u8, draws.below(7) as u8]);
+                }
+            }
+            let start: Vec<i64> = (0..people).map(|_| draws.below(1 << 30) as i64 - (1 << 29)).collect();
+            let counts: Vec<u32> = (0..people).map(|_| draws.below(5) as u32).collect();
+            for shift in [0u8, 4] {
+                let mut lanes = start.clone();
+                if shift == 4 {
+                    add_call_terms::<4>(&codes, weight, &mut lanes);
+                } else {
+                    add_call_terms::<0>(&codes, weight, &mut lanes);
+                }
+                let want: Vec<i64> = start
+                    .iter()
+                    .zip(&codes)
+                    .map(|(&lane, &code)| {
+                        let copies = if code == MISSING_CALL { 0 } else { (code >> shift) & 0x0f };
+                        lane.wrapping_add(weight.wrapping_mul(i64::from(copies)))
+                    })
+                    .collect();
+                assert_eq!(lanes, want, "calls, shift {shift}");
+            }
+            for side in [0usize, 1] {
+                let mut lanes = start.clone();
+                if side == 1 {
+                    add_dose_terms::<1>(&digits, weight, &mut lanes);
+                } else {
+                    add_dose_terms::<0>(&digits, weight, &mut lanes);
+                }
+                let want: Vec<i64> = start
+                    .iter()
+                    .zip(&digits)
+                    .map(|(&lane, digits)| lane.wrapping_add(weight.wrapping_mul(digits[side])))
+                    .collect();
+                assert_eq!(lanes, want, "doses, side {side}");
+            }
+            let mut missing = counts.clone();
+            count_missing(
+                &codes,
+                &mut missing,
+                |codes| u8x8::from_array(*codes).simd_eq(u8x8::splat(MISSING_CALL)).cast(),
+                |code| code == MISSING_CALL,
+            );
+            let want: Vec<u32> = counts
+                .iter()
+                .zip(&codes)
+                .map(|(&count, &code)| count + u32::from(code == MISSING_CALL))
+                .collect();
+            assert_eq!(missing, want, "missing calls");
+            let mut missing = counts.clone();
+            count_missing(
+                &places,
+                &mut missing,
+                |places| {
+                    let places = u8x16::from_slice(places.as_flattened());
+                    let alt: u8x8 = simd_swizzle!(places, [0, 2, 4, 6, 8, 10, 12, 14]);
+                    alt.simd_eq(u8x8::splat(u8::MAX)).cast()
+                },
+                |places| places[0] == u8::MAX,
+            );
+            let want: Vec<u32> = counts
+                .iter()
+                .zip(&places)
+                .map(|(&count, places)| count + u32::from(places[0] == u8::MAX))
+                .collect();
+            assert_eq!(missing, want, "missing doses");
         }
     }
 
