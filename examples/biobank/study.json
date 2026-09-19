@@ -1,5 +1,6 @@
 {
   "study": "aou-single-study-v1",
+  "label": "production",
   "diseases_file": "study/diseases.json",
   "frozen_config_sha256": null,
   "primary_censoring_rule": "ehr_end",
@@ -24,6 +25,14 @@
     "horizon_candidates": [1, 2, 3, 4, 5],
     "horizon_min_reach": 0.5
   },
+  "fit_gate": {
+    "min_events": 100
+  },
+  "convergence": {
+    "variants": ["ours", "shipped"],
+    "start": "permuted_rows",
+    "max_delta_sd": 0.01
+  },
   "logo": {
     "axes": ["ancestry", "region", "ehr_site"],
     "max_sites": 10,
@@ -33,7 +42,44 @@
   },
   "models": {
     "binary": {},
-    "survival": {}
+    "survival": {
+      "num_pcs": 6,
+      "q_centers": 24,
+      "slope_centers": 20,
+      "windows": ["admin_years", "lookback_years"],
+      "latent_law": "global-empirical",
+      "death_model": "location-scale"
+    }
+  },
+  "shipped": {
+    "calibrate_sha": "de0bd1df"
+  },
+  "reasons": {
+    "shipped.calibrate_sha": "replicates gnomon calibrate as shipped at gnomon de0bd1df; not a tuning choice (update when gnomon-2370's joint-PC purge lands)",
+    "fit_gate.min_events": "SPEC section 8 (23:45Z): a model with fewer training events than about its coefficients is not estimable by any solver; 100, the bar shared competing fits already use",
+    "data.maximum_bytes_billed": "SPEC section 7a 01:00Z: the six-domain EHR end is estimated at about 70 GB (66-95), see SCHEMA.md Byte estimate; plan() dry-run gates",
+    "cohort.num_pcs": "user 23:40Z: 6 PCs if much faster; K=16 is a benchmark only",
+    "models.survival.num_pcs": "user decision 2026-09-18 23:40Z: K = 6 (K = 16 cycles in gam's constrained QP; filed as a gam bug)",
+    "models.survival.q_centers": "a joint 6-D Duchon with a linear null space needs more than 7 centers, and gam's default grows with n; 24 is interim until study-pcs sweeps it",
+    "models.survival.slope_centers": "as q_centers: more than 7 needed; 20 for the slope surface, interim until study-pcs",
+    "models.survival.windows": "SPEC section 4 / audit N3: both window covariates in q for every method, entered linearly",
+    "models.survival.latent_law": "SPEC section 4: an empirical latent law, never standard-normal or auto",
+    "models.survival.death_model": "SPEC section 8 M14: one location-scale death fit shared by every method"
+  },
+  "claims": {
+    "rule": "paired difference ours minus each competitor, computed against the simulator's TRUE probabilities, over fresh-seed replicates at production n; not worse when the upper 95% bound is at most the margin, worse (a bug) when the lower bound exceeds it, else inconclusive (SPEC section 8, 23:18Z)",
+    "run_n": "production",
+    "scenarios": [],
+    "convergence": {"starts": 2, "max_dRisk_over_SD": 0.01, "on_fail": "inconclusive_not_converged",
+                    "reason": "SPEC section 8 R1: non-convergence is numerical error, not sampling noise; a cell whose fit fails the 2-start test is never classified and is filed as a gam bug"},
+    "replicates": {"minimum": 5, "t": 1.96, "by_scenario_metric": {}},
+    "margins": {
+      "rmse_true": {"delta": 0.02, "scale": "relative", "floor": 0.0005, "reason": "risk RMSE within max(2% of the competitor's, 0.0005): below a seed-to-seed change"},
+      "oe_true": {"delta": 0.02, "scale": "absolute", "measure": "expected abs(O/E_true - 1)", "reason": "calibration-in-the-large within 2 points of O/E = 1 against the true risk"},
+      "cal_slope_true": {"delta": 0.05, "scale": "absolute", "measure": "expected abs(calibration slope - 1)", "reason": "calibration slope within 0.05 of 1 against the true risk"},
+      "auc_true": {"delta": 0.002, "scale": "absolute", "direction": "competitor minus ours", "reason": "expected AUC loss of at most 0.002, under a DeLong SE at biobank n"},
+      "slope_recovery": {"delta": 0.05, "scale": "relative", "floor": 0.01, "reason": "the PGS slope recovered within max(5%, 0.01) of the competitor's error"}
+    }
   },
   "compute": {
     "total_threads": null,

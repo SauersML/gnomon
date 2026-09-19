@@ -86,19 +86,45 @@ class Worker:
         self.job = None
         self.started = None
         self.affinity = None
+        # CPU the worker has reported for its finished jobs, so a job it dies in
+        # is charged what the worker used beyond them.
+        self.reported_cpu = 0.0
+        self.usage = None
 
     def start(self, job):
         self.job, self.started, self.affinity = job, time.monotonic(), job.affinity
         self.process.stdin.write(json.dumps({"spec": job.spec, "log": str(job.log)}) + "\n")
         self.process.stdin.flush()
 
+    def finished(self, result):
+        self.reported_cpu += result["cpu_seconds"]
+
+    def reap(self, block=True):
+        """Wait for the worker process with wait4 (never Popen.wait, which drops
+        its rusage); returns its exit code, or None if it is still running."""
+        pid, status, usage = os.wait4(self.process.pid, 0 if block else os.WNOHANG)
+        if pid == 0:
+            return None
+        self.process.returncode = os.waitstatus_to_exitcode(status)
+        self.usage = usage
+        return self.process.returncode
+
+    def unreported(self):
+        """(cpu seconds, peak MB) of the job the worker was running when it died."""
+        if self.usage is None:
+            return 0.0, 0.0
+        total = self.usage.ru_utime + self.usage.ru_stime
+        return round(max(total - self.reported_cpu, 0.0), 3), round(self.usage.ru_maxrss / 1024, 1)
+
     def kill(self):
         signal_group(self.process.pid, signal.SIGTERM)
-        try:
-            self.process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            signal_group(self.process.pid, signal.SIGKILL)
-            self.process.wait()
+        deadline = time.monotonic() + 5
+        while self.process.returncode is None and self.reap(block=False) is None:
+            if time.monotonic() > deadline:
+                signal_group(self.process.pid, signal.SIGKILL)
+                self.reap()
+                break
+            time.sleep(0.05)
         self.close()
 
     def close(self):
@@ -179,9 +205,10 @@ def run_jobs(jobs, total_threads, on_finish, command, progress=None, poll=0.05):
             for worker in list(busy):
                 job = worker.job
                 line = worker.results.readline() if worker.results in ready else None
-                code = worker.process.poll()
+                code = worker.reap(block=False) if worker.process.returncode is None else worker.process.returncode
                 if line:
                     result = json.loads(line)
+                    worker.finished(result)
                     outcome = Outcome(result["status"], seconds=now - worker.started,
                                       cpu_seconds=result["cpu_seconds"], max_rss_mb=result["max_rss_mb"],
                                       restarted=job.key in restarted, threads=job.threads)
@@ -189,8 +216,9 @@ def run_jobs(jobs, total_threads, on_finish, command, progress=None, poll=0.05):
                     idle.append(worker)
                 elif code is not None or line == "":
                     # The worker died mid-job (a crash, an abort, the OOM killer).
-                    code = worker.process.wait()
+                    code = worker.process.returncode if worker.process.returncode is not None else worker.reap()
                     worker.close()
+                    cpu, rss = worker.unreported()
                     busy.remove(worker)
                     if code < 0 and job.key not in restarted:
                         restarted.add(job.key)
@@ -199,13 +227,15 @@ def run_jobs(jobs, total_threads, on_finish, command, progress=None, poll=0.05):
                         used -= job.threads
                         waiting.insert(0, job)
                         continue
-                    outcome = Outcome("signal" if code < 0 else "error", seconds=now - worker.started,
-                                      exit_code=code, restarted=job.key in restarted, threads=job.threads)
+                    outcome = Outcome("signal" if code < 0 else "error", seconds=now - worker.started, cpu_seconds=cpu,
+                                      max_rss_mb=rss, exit_code=code, restarted=job.key in restarted,
+                                      threads=job.threads)
                 elif now - worker.started > job.timeout:
                     worker.kill()
                     busy.remove(worker)
-                    outcome = Outcome("timeout", seconds=now - worker.started, restarted=job.key in restarted,
-                                      threads=job.threads)
+                    cpu, rss = worker.unreported()
+                    outcome = Outcome("timeout", seconds=now - worker.started, cpu_seconds=cpu, max_rss_mb=rss,
+                                      restarted=job.key in restarted, threads=job.threads)
                 else:
                     continue
                 used -= job.threads

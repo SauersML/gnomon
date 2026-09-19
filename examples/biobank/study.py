@@ -27,6 +27,7 @@ import hashlib
 import importlib.metadata
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -59,6 +60,14 @@ OUTCOME_CODES = {"binary": {0, 1}, "survival": {0, 1, 2, 3}}
 # study.json primary_censoring_rule -> phenotypes.build_frames(censor=...).
 CENSORING = {"ehr_end": "ehr_end", "min_death_cutoff": "cutoff"}
 UNKNOWN = "unknown"
+# The fit label of a pooled fit refitted from a second start (convergence gate).
+RESTART = "restart"
+# SPEC section 8, minimum events: a fit below the bar is this result, not a failure.
+INSUFFICIENT_EVENTS = "insufficient_events"
+# The event code each survival component models.
+SURVIVAL_CAUSES = {"disease": 1, "death": 2, "exclusion": 3}
+# A config's label: "production" for the shipped study.json, a named dev variant otherwise.
+LABEL = re.compile(r"[a-z0-9_]{1,40}")
 LOG_TAIL = 256 * 1024
 
 
@@ -109,10 +118,23 @@ def load_config(path, source=None):
         config["diseases"] = read_json(path.parent / config["diseases_file"])
     if re.search(r"standard[-_ ]normal", json.dumps(config["models"]), re.IGNORECASE):
         raise ValueError("a shipped study config may not declare a standard-normal latent law (SPEC section 4)")
+    check_reasons(config)
     if config["report"]["small_cell_max"] != digest.LIMIT:
         raise ValueError(f"the small-cell maximum is AoU policy's {digest.LIMIT}, one constant everywhere")
     if not config.get("variants") or not set(config["logo"]["variants"]) <= set(config["variants"]):
         raise ValueError("study.json lists its variants, and the LOGO variants are among them")
+    convergence = config.get("convergence") or {}
+    if (not set(convergence.get("variants", ())) <= set(config["variants"])
+            or convergence.get("start") not in ("permuted_rows", "warm")
+            or not isinstance(convergence.get("max_delta_sd"), (int, float)) or not convergence["max_delta_sd"] > 0):
+        raise ValueError("study.json convergence needs variants among the study's, a start (permuted_rows or warm) "
+                         "and a positive max_delta_sd (SPEC section 8)")
+    minimum = (config.get("fit_gate") or {}).get("min_events")
+    if not isinstance(minimum, int) or minimum < 1:
+        raise ValueError("study.json fit_gate.min_events must be a positive count (SPEC section 8)")
+    check_claims(config)
+    if not LABEL.fullmatch(str(config.get("label", ""))):
+        raise ValueError("study.json needs a label (production, or a named dev configuration such as dev_k6_offspec)")
     unknown = set(config["logo"]["axes"]) - set(LOGO_AXES)
     if unknown:
         raise ValueError(f"LOGO axes are {LOGO_AXES}, not {sorted(unknown)}")
@@ -124,6 +146,97 @@ def load_config(path, source=None):
     if config.get("primary_censoring_rule") not in CENSORING:
         raise ValueError(f"primary_censoring_rule must be one of {sorted(CENSORING)}")
     return config, diseases
+
+
+def leaf_settings(settings, prefix):
+    """Dotted paths of every leaf value under a settings dict."""
+    for key, value in settings.items():
+        path = f"{prefix}.{key}"
+        if isinstance(value, dict) and value:
+            yield from leaf_settings(value, path)
+        else:
+            yield path
+
+
+def check_reasons(config):
+    """User order (SPEC section 4, 23:05Z): set nothing without a reason, and
+    never hard-code a length scale. Every model setting study.json makes (the
+    settings that differ from the fitting library's defaults) carries a
+    one-line reason in study.json "reasons", keyed by its dotted path; a
+    reason on a parent key covers its children. A reason that names no
+    setting is refused too, so the block cannot go stale."""
+    if re.search(r"length[_ ]?scale|kappa|κ", json.dumps(config["models"], ensure_ascii=False), re.IGNORECASE):
+        raise ValueError("no length scale or kappa may be set in study.json (SPEC section 4)")
+    reasons = config.get("reasons", {})
+    settings = [path for kind, block in config["models"].items() for path in leaf_settings(block, f"models.{kind}")]
+    # The shipped arm is gnomon calibrate pinned at a version: its pin needs a reason too,
+    # and so does the number of PCs every model sees.
+    settings += list(leaf_settings(config.get("shipped", {}), "shipped"))
+    settings += list(leaf_settings(config.get("fit_gate", {}), "fit_gate"))
+    if "cohort" in config:
+        settings.append("cohort.num_pcs")
+    if "data" in config:
+        settings.append("data.maximum_bytes_billed")  # the one BigQuery cap (SPEC section 7a)
+    for path in settings:
+        parts = path.split(".")
+        covering = [".".join(parts[:end]) for end in range(len(parts), 1, -1)]
+        if not any(isinstance(reasons.get(key), str) and reasons[key].strip() for key in covering):
+            raise ValueError(f"study.json sets {path} without a reason in its reasons block")
+    stale = [key for key in reasons if not any(path == key or path.startswith(key + ".") for path in settings)]
+    if stale:
+        raise ValueError(f"study.json reasons name no setting: {sorted(stale)}")
+
+
+# SPEC section 8 (23:18Z, 23:35Z): the prespecified non-inferiority margins,
+# against the simulator's true probabilities, frozen with the config.
+CLAIM_MARGINS = ("rmse_true", "oe_true", "cal_slope_true", "auc_true", "slope_recovery")
+
+
+def check_claims(config, claim_run=False):
+    """The claim rule is prespecified and frozen with the config: every margin
+    present (a positive delta, its scale, an optional positive floor, a reason);
+    the two-start convergence rule (R1), the same threshold the pipeline's
+    convergence gate applies; runs at production n. A claim run also needs its
+    replicate counts (R4): every planned (scenario, metric) cell sized from the
+    paired dev-seed spread of converged fits, R >= max(minimum, ceil((2 t sd/delta)^2)),
+    with the job that measured it. There is no fallback count."""
+    claims = config.get("claims") or {}
+    margins = claims.get("margins") or {}
+    replicates = claims.get("replicates") or {}
+    if set(margins) != set(CLAIM_MARGINS) or not claims.get("rule") or claims.get("run_n") != "production":
+        raise ValueError(f"study.json claims needs its rule, run_n production and exactly the margins "
+                         f"{list(CLAIM_MARGINS)}")
+    for name, margin in margins.items():
+        if (not isinstance(margin.get("delta"), (int, float)) or not margin["delta"] > 0
+                or margin.get("scale") not in ("relative", "absolute") or not str(margin.get("reason", "")).strip()
+                or ("floor" in margin and not (isinstance(margin["floor"], (int, float)) and margin["floor"] > 0))):
+            raise ValueError(f"claims margin {name} needs a positive delta, a relative or absolute scale, "
+                             "a positive floor if any, and a reason")
+    rule = claims.get("convergence") or {}
+    if (rule.get("starts") != 2 or rule.get("max_dRisk_over_SD") != config["convergence"]["max_delta_sd"]
+            or rule.get("on_fail") != "inconclusive_not_converged" or not str(rule.get("reason", "")).strip()):
+        raise ValueError("claims.convergence needs 2 starts, the convergence gate's max_delta_sd, "
+                         "on_fail inconclusive_not_converged and a reason (SPEC section 8, R1)")
+    minimum, t = replicates.get("minimum", 0), replicates.get("t", 0)
+    if not isinstance(minimum, int) or minimum < 5 or not isinstance(t, (int, float)) or not t > 0:
+        raise ValueError("claims replicates need a minimum of at least 5 and a positive t")
+    if not claim_run:
+        return
+    cells = [f"{scenario}.{metric}" for scenario in claims.get("scenarios") or [] for metric in CLAIM_MARGINS]
+    if not cells:
+        raise ValueError("a claim run needs its planned scenarios in study.json claims.scenarios")
+    sized = replicates.get("by_scenario_metric") or {}
+    for cell in cells:
+        entry = sized.get(cell)
+        if not entry:
+            raise ValueError(f"claim cell {cell} has no replicate count sized from dev-seed spreads (R4)")
+        sd, delta = entry.get("sd_dev"), entry.get("delta")
+        if not (isinstance(sd, (int, float)) and sd >= 0 and isinstance(delta, (int, float)) and delta > 0):
+            raise ValueError(f"claim cell {cell} needs its dev-seed paired spread sd_dev and the margin delta used")
+        needed = max(minimum, math.ceil((2 * t * sd / delta) ** 2))
+        if (entry.get("converged_starts") is not True or not str(entry.get("source_job", "")).strip()
+                or not isinstance(entry.get("R"), int) or entry["R"] < needed):
+            raise ValueError(f"claim cell {cell} needs R >= {needed} from converged dev-seed fits and its source job")
 
 
 def frame_options(config, build_frames):
@@ -153,14 +266,31 @@ def code_identity():
 
 
 def engine_identity():
-    """The installed gamfit wheel: its version and native library bytes."""
+    """The installed gamfit wheel: its version, its native library bytes and
+    the gam commit they were built from. Any other build is another signature,
+    so a checkpoint's fits are never reloaded under a different engine."""
     try:
         distribution = importlib.metadata.distribution("gamfit")
     except importlib.metadata.PackageNotFoundError:
         return {"gamfit": None}
     native = sorted(str(f) for f in distribution.files or () if str(f).endswith((".so", ".pyd")))
-    return {"gamfit": distribution.version,
-            "native": {name: file_hash(distribution.locate_file(name)) for name in native}}
+    hashes = {name: file_hash(distribution.locate_file(name)) for name in native}
+    return {"gamfit": distribution.version, "native": hashes,
+            "gam_commit": built_from(hashes, Path(sys.prefix) / "PROVENANCE.json")}
+
+
+def built_from(hashes, record):
+    """The gam commit in the venv's build record (study-wheel's PROVENANCE.json;
+    gamfit.build_info() carries none), believed only when the record's engine
+    bytes are the installed extension's."""
+    record = Path(record)
+    if not record.is_file():
+        raise RuntimeError(f"{record} is missing: a study venv carries the build record of its gamfit")
+    provenance = read_json(record)
+    extension = provenance["extension"]
+    if hashes.get(extension["member"]) != extension["engine_sha256"]:
+        raise RuntimeError(f"{record} records another gamfit build than the one installed")
+    return provenance["gam_commit"]
 
 
 def input_identity(path):
@@ -211,6 +341,12 @@ class Study:
         self.parquet = self.config["data"]["source"] == "parquet"
         if not self.parquet:
             check_frozen(self.config)
+        if args.claim:
+            # A claim is made on the simulator, from sized replicates (SPEC section 8, R4).
+            if not self.parquet or self.config["label"] != "production":
+                raise ValueError("a claim run is a simulator run of the production config")
+            check_claims(self.config, claim_run=True)
+        self.run_kind = "claim" if args.claim else "aou" if not self.parquet else "dev"
         self.work = Path(args.work).resolve()
         self.root = self.work / "steps"
         self.status = Status(args.status_uri)
@@ -285,10 +421,22 @@ class Study:
         return f"fits/{slug}/{kind}/{variant}/{fit_slug(fit)}/{component}"
 
     def model_dirs(self, slug, kind, variant, fit):
-        """Every component a variant's prediction needs: its own and the shared ones."""
+        """Every component a variant's prediction needs: its own and the shared
+        ones. A convergence restart pairs its own components with the pooled
+        shared fits, so the check isolates the variant's own solution."""
         dirs = {c: self.fit_step(slug, kind, variant, fit, c) for c in self.own_components(kind, variant)}
-        dirs.update({c: self.fit_step(slug, kind, "shared", fit, c) for c in self.shared_components(kind)})
+        shared = "pooled" if fit == RESTART else fit
+        dirs.update({c: self.fit_step(slug, kind, "shared", shared, c) for c in self.shared_components(kind)})
         return dirs
+
+    def certified(self, slug, kind, variant, fit):
+        """certification() of the component fits one (variant, fit) model predicts with."""
+        paths = [self.path(step) / "fit.json" for step in self.model_dirs(slug, kind, variant, fit).values()]
+        return certification([read_json(path) for path in paths if path.is_file()])
+
+    def checked(self, kind):
+        """The variants whose pooled fits get a second-start convergence check (SPEC section 8)."""
+        return [v for v in self.config["convergence"]["variants"] if v in self.variants(kind)]
 
     def job(self, step, spec, threads, priority=0.0, deps=()):
         """A pool job for `step`, whose directory must already be begun. Its log
@@ -464,7 +612,9 @@ class Study:
             if not self.parquet:
                 self.export_tables(directory / "tables")
             manifest = dict(self.source().manifest)
-            manifest.pop("tables", None)
+            # One hash names the exact tables (every table's own sha256) this run read.
+            manifest["tables_sha256"] = hashlib.sha256(
+                json.dumps(manifest.pop("tables", {}), sort_keys=True).encode()).hexdigest()
             write_json(directory / "manifest.json", manifest)
             self.checkpoint.complete("cohort")
         self.source()
@@ -579,6 +729,7 @@ class Study:
             slug = disease.slug
             for kind in KINDS:
                 rows = read_json(self.path(f"features/{slug}") / "plan.json")[kind]["rows"]
+                frame = None
                 plan = [("shared", c) for c in self.shared_components(kind)]
                 plan += [(v, c) for v in self.variants(kind) for c in self.own_components(kind, v)]
                 for variant, component in plan:
@@ -586,6 +737,10 @@ class Study:
                     for fit in self.fits(slug, kind, None if variant == "shared" else variant):
                         step = self.fit_step(slug, kind, variant, fit, component)
                         if self.checkpoint.done(step):
+                            continue
+                        if frame is None:
+                            frame = pd.read_parquet(self.path(f"features/{slug}") / f"{kind}.parquet")
+                        if not self.enough_events(frame, kind, variant, fit, component, step):
                             continue
                         pooled = self.fit_step(slug, kind, variant, "pooled", component)
                         reuse = fit != "pooled" and self.config["logo"].get("reuse_pooled", False)
@@ -600,11 +755,69 @@ class Study:
                             "component": component, "frame": f"features/{slug}/{kind}.parquet",
                             "reference": pooled if reuse else None,
                         }, threads, priority, deps=[pooled] if reuse and pooled in scheduled else ()))
+                    if variant in self.checked(kind):
+                        jobs += self.restart_jobs(slug, kind, variant, component, threads, rows, scheduled)
         self.pool(jobs, "fits", "fit.json")
 
+    def enough_events(self, frame, kind, variant, fit, component, step):
+        """SPEC section 8, minimum events: a fit is attempted only if its training
+        rows carry fit_gate.min_events of what it models (binary: cases and
+        non-cases alike; survival: its own cause). A shared competing cause with
+        no events at all is a zero hazard, which the model stores without fitting.
+        A fit below the bar is sealed as insufficient_events: a result, never a
+        failure. The count stays in the workspace record."""
+        minimum = self.config["fit_gate"]["min_events"]
+        train = frame.loc[training_rows(frame, fit)]
+        if kind == "binary":
+            events = int(min((train.y == 1).sum(), (train.y == 0).sum()))
+        else:
+            if component not in SURVIVAL_CAUSES:
+                raise ValueError(f"survival component {component!r} names no event code the gate can count")
+            events = int((train.event == SURVIVAL_CAUSES[component]).sum())
+            if variant == "shared" and events == 0:
+                return True
+        if events >= minimum:
+            return True
+        write_json(self.checkpoint.begin(step) / "fit.json",
+                   {"status": INSUFFICIENT_EVENTS, "events": events, "min_events": minimum,
+                    "wall_seconds": 0.0, "cpu_seconds": 0.0, "max_rss_mb": 0.0, "threads": 0})
+        self.checkpoint.complete(step, info={"status": INSUFFICIENT_EVENTS})
+        return False
+
+    def restart_jobs(self, slug, kind, variant, component, threads, rows, scheduled):
+        """The pooled fit again from a second start (SPEC section 8, convergence
+        gate): a warm restart from its own solution ("warm", passed to the model
+        as `reference`), or its training rows in a seeded permuted order
+        ("permuted_rows") until gamfit's warm_start_from exists."""
+        step = self.fit_step(slug, kind, variant, RESTART, component)
+        if self.checkpoint.done(step):
+            return []
+        start = self.config["convergence"]["start"]
+        pooled = self.fit_step(slug, kind, variant, "pooled", component)
+        record = self.path(pooled) / "fit.json"
+        if record.is_file() and read_json(record).get("status") == INSUFFICIENT_EVENTS:
+            return []  # nothing was fitted, so there is nothing to restart
+        self.checkpoint.begin(step)
+        scheduled.add(step)
+        return [self.job(step, {
+            "type": "fit", "disease": slug, "kind": kind, "variant": variant, "fit": "pooled",
+            "component": component, "frame": f"features/{slug}/{kind}.parquet",
+            "reference": pooled if start == "warm" else None,
+            "restart": {"start": start, "seed": self.config["cohort"]["seed"]},
+        }, threads, rows * threads * (2 if kind == "survival" else 1) * 2,
+            deps=[pooled] if start == "warm" and pooled in scheduled else ())]
+
     def fit_ok(self, slug, kind, variant, fit):
-        return all(read_json(self.path(step) / "fit.json")["status"] == "ok"
-                   for step in self.model_dirs(slug, kind, variant, fit).values())
+        records = [self.path(step) / "fit.json" for step in self.model_dirs(slug, kind, variant, fit).values()]
+        return all(record.is_file() and read_json(record)["status"] == "ok" for record in records)
+
+    def restarted(self, slug, kind, variant):
+        """[RESTART] when this variant's pooled fit has a second start (none
+        when the pooled fit itself was skipped for insufficient events)."""
+        if variant not in self.checked(kind):
+            return []
+        steps = [self.fit_step(slug, kind, variant, RESTART, c) for c in self.own_components(kind, variant)]
+        return [RESTART] if all((self.path(s) / "fit.json").is_file() for s in steps) else []
 
     def predict_step(self, slug, kind, variant, fit):
         return f"predict/{slug}/{kind}/{variant}/{fit_slug(fit)}"
@@ -619,7 +832,8 @@ class Study:
                 rows = read_json(self.path(f"features/{disease.slug}") / "plan.json")[kind]["test_rows"]
                 for variant in self.variants(kind):
                     threads = self.budget("predict", kind, variant)
-                    for fit in self.fits(disease.slug, kind, variant):
+                    restart = self.restarted(disease.slug, kind, variant)
+                    for fit in self.fits(disease.slug, kind, variant) + restart:
                         step = self.predict_step(disease.slug, kind, variant, fit)
                         if self.checkpoint.done(step) or not self.fit_ok(disease.slug, kind, variant, fit):
                             continue
@@ -628,10 +842,51 @@ class Study:
                                                     "variant": variant, "fit": fit,
                                                     "models": self.model_dirs(disease.slug, kind, variant, fit),
                                                     "frame": f"features/{disease.slug}/{kind}.parquet"},
-                                             threads, priority=threads * (rows if fit == "pooled" else rows / 4)))
+                                             threads, priority=threads * (rows if fit in ("pooled", RESTART) else rows / 4)))
         self.pool(jobs, "predict", "predict.json")
 
+    def check_convergence(self):
+        """The convergence gate (SPEC section 8): each checked pooled fit against
+        its second start, as max|delta risk| / SD of the pooled risk over the
+        outer-test rows, the worst horizon for survival. Above the threshold the
+        variant's pooled cells are "not converged" (numerical error, not
+        sampling noise). Reads saved predictions only; no outcome is read."""
+        threshold = self.config["convergence"]["max_delta_sd"]
+        for disease in self.diseases:
+            for kind in KINDS:
+                for variant in self.checked(kind):
+                    step = f"convergence/{disease.slug}/{kind}/{variant}"
+                    if self.checkpoint.done(step):
+                        continue
+                    record = {"start": self.config["convergence"]["start"], "threshold": threshold}
+                    steps = [self.path(self.predict_step(disease.slug, kind, variant, fit)) for fit in ("pooled", RESTART)]
+                    outcomes = [read_json(s / "predict.json") if (s / "predict.json").is_file() else {"status": "missing"}
+                                for s in steps]
+                    pooled_fits = [self.path(s) / "fit.json" for s in self.model_dirs(disease.slug, kind, variant, "pooled").values()]
+                    if any(f.is_file() and read_json(f)["status"] == INSUFFICIENT_EVENTS for f in pooled_fits):
+                        record["status"] = INSUFFICIENT_EVENTS
+                    elif any(o["status"] != "ok" for o in outcomes):
+                        record["status"] = "unchecked"
+                    else:
+                        pooled, restart = (np.load(s / "predictions.npz") for s in steps)
+                        if not np.array_equal(pooled["index"], restart["index"]):
+                            raise ValueError(f"{disease.slug} {kind} {variant}: the restart predicted other rows")
+                        record["max_delta_sd"] = delta_over_sd(pooled["risk"], restart["risk"])
+                        record["certification"] = [self.certified(disease.slug, kind, variant, fit)
+                                                   for fit in ("pooled", RESTART)]
+                        # A start its engine did not certify is never counted as converged,
+                        # however closely the two starts agree.
+                        record["status"] = ("not_certified" if "not_certified" in record["certification"]
+                                            else "converged" if record["max_delta_sd"] <= threshold
+                                            else "not_converged")
+                    write_json(self.checkpoint.begin(step) / "convergence.json", record)
+                    self.checkpoint.complete(step, info={"status": record["status"]})
+
+    def convergence(self, slug, kind, variant):
+        return read_json(self.path(f"convergence/{slug}/{kind}/{variant}") / "convergence.json")
+
     def stage_evaluate(self):
+        self.check_convergence()
         # This checkpoint's outer-test look, recorded before any outer-test outcome is read.
         if self.look_marker not in self.looks.names():
             self.looks.put_bytes(self.look_marker, (config_hash(self.config) + "\n").encode())
@@ -677,7 +932,18 @@ class Study:
                 rows += digest.cohort_rows(disease.slug, flow["by_ancestry"])
             for kind in KINDS:
                 record = read_json(self.path(f"evaluate/{disease.slug}/{kind}") / "evaluate.json")
-                rows += record.get("rows", [])
+                # Every pooled cell of a checked variant says whether its fit converged,
+                # and every cell whether its engines certified the fits behind it.
+                status = {v: self.convergence(disease.slug, kind, v)["status"] for v in self.checked(kind)}
+                certified = {(v, fit): self.certified(disease.slug, kind, v, fit)
+                             for v in self.variants(kind) for fit in self.fits(disease.slug, kind, v)}
+                for row in record.get("rows", []):
+                    if row.get("fit") == "pooled" and row.get("variant") in status:
+                        row = {**row, "convergence": status[row["variant"]]}
+                    if (row.get("variant"), row.get("fit")) in certified:
+                        row = {**row, "certification": certified[row["variant"], row["fit"]]}
+                    rows.append(row)
+                rows += self.outcome_rows(disease.slug, kind)
         base = read_json(self.path("features/base") / "base.json")
         rows += digest.flow_rows("base", {"base": base["flow"]}, digest.LIMIT)
         rows += digest.followup_rows(base["followup"]["administrative"], digest.LIMIT)
@@ -700,22 +966,39 @@ class Study:
         print(f"study_digest result_names={len(results)} operation_names={len(operations)}", flush=True)
         self.checkpoint.complete("digest")
 
+    def outcome_rows(self, slug, kind):
+        """A result row for every fit or prediction that did not produce
+        predictions (a fit timeout at the 900 s cap, an error, a signal): the
+        table counts them per cell instead of leaving the variant silently out.
+        Statuses only, so nothing here is a count."""
+        rows = []
+        for variant in self.variants(kind):
+            for fit in self.fits(slug, kind, variant):
+                dirs = self.model_dirs(slug, kind, variant, fit)
+                failed = [read_json(self.path(step) / "fit.json")["status"] for step in dirs.values()
+                          if read_json(self.path(step) / "fit.json")["status"] != "ok"]
+                predict = self.path(self.predict_step(slug, kind, variant, fit)) / "predict.json"
+                status = (INSUFFICIENT_EVENTS if INSUFFICIENT_EVENTS in failed else f"fit_{failed[0]}" if failed else
+                          f"predict_{read_json(predict)['status']}" if predict.is_file()
+                          and read_json(predict)["status"] != "ok" else None)
+                if status:
+                    rows.append({"disease": slug, "model": kind, "variant": variant, "fit": fit,
+                                 "stratum": "overall", "horizon": None, "outcome": status})
+        return rows
+
     def operation_rows(self, base):
         """Aggregates of how the run went: no participant data, so not audited."""
         attempts = self.attempts()
         manifest = read_json(self.path("cohort") / "manifest.json")
         study = {"scope": "study", "item": "run", "config_sha256_12": config_hash(self.config)[:12],
+                 "label": self.config["label"], "run_kind": self.run_kind,
+                 "gam_commit_12": "g" + str(self.signature["engine"].get("gam_commit") or "none")[:12],
+                 **({"caveats": "_and_".join(digest.label(c, 60) for c in self.args.caveat)} if self.args.caveat else {}),
                  "vcpus": self.vcpus, "threads": self.threads, "attempts": len(attempts),
                  "vcpu_hours": round(sum(a["vcpus"] * a["wall_seconds"] for a in attempts.values()) / 3600, 3),
                  "outer_test_looks": len([n for n in self.looks.names() if n.endswith(".txt")]),
-                 "bigquery_bytes_billed": int((manifest.get("bigquery") or {}).get("bytes_billed", 0)),
-                 "horizons": "_".join("h" + digest.token(float(h)) for h in base["horizons"])}
-        bigquery = manifest.get("bigquery") or {}
-        if "plan_bytes" in bigquery:
-            study["bigquery_plan_bytes"] = int(bigquery["plan_bytes"])
-        for key in ("ehr_domains", "ehr_domains_skipped"):
-            if key in manifest:
-                study[key] = "_".join(digest.label(d, 12) for d in manifest[key]) or "none"
+                 "horizons": "_".join("h" + digest.token(float(h)) for h in base["horizons"]),
+                 **manifest_fields(manifest)}
         rows = [study]
         # Which EHR domains moved ehr_end later: exact audited fractions when the
         # manifest carries their denominator (ehr_people, see stage_digest); without
@@ -724,6 +1007,13 @@ class Study:
         if extended and not manifest.get("ehr_people"):
             rows.append({"scope": "ehr_extended_by", "item": "domains",
                          **{digest.label(domain, 20): share_bucket(share) for domain, share in extended.items()}})
+        for disease in self.diseases:
+            for kind in KINDS:
+                for variant in self.checked(kind):
+                    record = self.convergence(disease.slug, kind, variant)
+                    rows.append({"scope": "convergence", "item": f"{disease.slug}.{kind}.{variant}",
+                                 "status": record["status"], "start": record["start"],
+                                 **({"max_delta_sd": record["max_delta_sd"]} if "max_delta_sd" in record else {})})
         rows += [{"scope": "timing", "item": stage, "wall_seconds": round(seconds, 1)}
                  for stage, seconds in self.timings.items()]
         for disease in self.diseases:
@@ -733,18 +1023,24 @@ class Study:
                 for variant, component in plan:
                     records = [read_json(self.path(self.fit_step(disease.slug, kind, variant, fit, component))
                                          / "fit.json")
-                               for fit in self.fits(disease.slug, kind, None if variant == "shared" else variant)]
+                               for fit in self.fits(disease.slug, kind, None if variant == "shared" else variant)
+                               + (self.restarted(disease.slug, kind, variant) if variant != "shared" else [])]
                     seconds = sorted(r.get("fit_seconds", r["wall_seconds"]) for r in records)
                     ok = [r for r in records if r["status"] == "ok"]
+                    skipped = [r for r in records if r["status"] == INSUFFICIENT_EVENTS]
+                    certificates = [certification([r]) for r in ok]
                     rows.append({"scope": "fits", "item": f"{disease.slug}.{kind}.{variant}.{component}",
-                                 "fits": len(records), "ok": len(ok), "failed": len(records) - len(ok),
+                                 "fits": len(records), "ok": len(ok), "insufficient_events": len(skipped),
+                                 "failed": len(records) - len(ok) - len(skipped),
+                                 "not_certified": certificates.count("not_certified"),
+                                 "no_certificate": certificates.count("no_certificate"),
                                  "median_seconds": seconds[len(seconds) // 2], "max_seconds": seconds[-1],
                                  "cpu_seconds": round(sum(r["cpu_seconds"] for r in records), 1),
                                  "threads": records[0]["threads"],
                                  "max_rss_mb": max(r["max_rss_mb"] for r in records)})
                     categories = {}
                     for record in records:
-                        if record["status"] != "ok":
+                        if record["status"] not in ("ok", INSUFFICIENT_EVENTS):
                             label = f"{record['status']}_{record.get('category', 'unclassified')}"
                             categories[label] = categories.get(label, 0) + 1
                     if categories:
@@ -766,8 +1062,53 @@ class Study:
 
 
 
+def certification(records):
+    """Whether the engines certified every fitted component behind one model
+    (its fit.json records): "certified", "not_certified" when any reports
+    converged false (gam keeps some fits uncertified rather than refusing
+    them), "no_certificate" when an engine reports none, "no_fit" when none
+    fitted. A converged flag that is not a bool is refused, not guessed."""
+    flags = []
+    for record in records:
+        if record["status"] != "ok":
+            continue
+        flag = (record.get("info") or {}).get("converged")
+        if flag is not None and not isinstance(flag, bool):
+            raise ValueError(f"a fit reports converged={flag!r}, not a bool")
+        flags.append(flag)
+    if not flags:
+        return "no_fit"
+    if False in flags:
+        return "not_certified"
+    return "certified" if all(flags) else "no_certificate"
+
+
+def manifest_fields(manifest):
+    """The run row's facts about its tables: where they came from, the BigQuery
+    plan and bill, and the derived CDR cutoff. No participant data."""
+    bigquery = manifest.get("bigquery") or {}
+    fields = {"bigquery_bytes_billed": int(bigquery.get("bytes_billed", 0)),
+              "tables_source": digest.label(manifest.get("source", "unknown")),
+              "tables_sha256_12": "t" + str(manifest.get("tables_sha256", ""))[:12]}
+    for key in ("seed", "scenario"):
+        if manifest.get(key) is not None:
+            fields[f"tables_{key}"] = (manifest[key] if isinstance(manifest[key], int)
+                                       else digest.label(manifest[key]))
+    if "plan_bytes" in bigquery:
+        # plan() dry-runs every query, {query name: bytes}; the budget gates the total.
+        fields["bigquery_plan_bytes"] = int(sum(bigquery["plan_bytes"].values()))
+    for key in ("cdr_cutoff", "cdr_cutoff_source"):
+        if manifest.get(key):
+            fields[key] = digest.label(manifest[key])
+    if "ehr_domains" in manifest:
+        fields["ehr_domains"] = "_".join(digest.label(d, 12) for d in manifest["ehr_domains"]) or "none"
+    return fields
+
+
 def share_bucket(share):
-    """A share as a coarse bucket label, which pins no count."""
+    """A share as a coarse bucket label, which pins no count; null is "unknown"."""
+    if share is None:
+        return "unknown"
     for bound, name in ((0.0, "zero"), (0.001, "under_0_1pct"), (0.01, "under_1pct"), (0.1, "under_10pct")):
         if share <= bound:
             return name
@@ -826,6 +1167,15 @@ def load_frame(path):
     return FRAMES[path]
 
 
+def delta_over_sd(reference, other):
+    """max |other - reference| / SD(reference) over rows, the worst horizon for
+    a rows x horizons risk: the convergence gate's measure (SPEC section 8)."""
+    a = np.asarray(reference, dtype=float).reshape(len(reference), -1)
+    b = np.asarray(other, dtype=float).reshape(a.shape)
+    sd = a.std(axis=0)
+    delta = np.abs(b - a).max(axis=0)
+    return float(np.where(sd > 0, delta / np.where(sd > 0, sd, 1.0), np.where(delta > 0, np.inf, 0.0)).max())
+
 def held_out(frame, fit):
     """The rows of a LOGO fit's held-out group (none for the pooled fit)."""
     if fit == "pooled":
@@ -866,6 +1216,12 @@ def run_fit(spec, config, models):
     if spec["reference"] is not None and read_json(root / spec["reference"] / "fit.json")["status"] == "ok":
         reference = root / spec["reference"]
     data = model_frame(train, kind, standardization, predict=False)
+    restart = spec.get("restart")
+    if restart and restart["start"] == "permuted_rows":
+        # The same rows and standardization in another order: a second start
+        # that needs nothing from the model (convergence gate, SPEC section 8).
+        order = np.random.default_rng(restart["seed"]).permutation(len(data))
+        data = data.iloc[order].reset_index(drop=True)
     print("study_fit_started", flush=True)
     started = time.perf_counter()
     info = models.fit(kind, spec["variant"], spec["component"], data, config["models"].get(kind, {}), out, reference)
@@ -876,6 +1232,7 @@ def run_fit(spec, config, models):
         "status": "ok", "fit_seconds": round(seconds, 3), "standardization": standardization,
         "train_rows": int(len(train)), "train_sha256": person_set_hash(train.person_id),
         "held_out_in_train": int(held_out(train, fit).sum()), "warm_reference": reference is not None,
+        "restart": restart["start"] if restart else None,
         "info": json.loads(json.dumps(info or {}, default=str))})
 
 
@@ -898,7 +1255,9 @@ def run_predict(spec, config, models):
     horizon in one call. Evaluation reuses these arrays and never predicts."""
     root = Path(spec["root"])
     out = root / spec["step"]
-    kind, variant, fit = spec["kind"], spec["variant"], spec["fit"]
+    kind, variant = spec["kind"], spec["variant"]
+    # A convergence restart is the pooled fit again: the same rows, the same checks.
+    fit = "pooled" if spec["fit"] == RESTART else spec["fit"]
     frame = load_frame(root / spec["frame"])
     test = frame.loc[frame.test].reset_index(drop=True)
     horizons = spec["horizons"]
@@ -975,6 +1334,10 @@ def main():
     run.add_argument("--threads", type=int, help="total thread budget (default: the CPUs this process may use)")
     run.add_argument("--looks", help="gs:// prefix (or local directory) counting this config's outer-test looks")
     run.add_argument("--digest-uri", help="gs:// prefix the digest writes its token names to (AoU)")
+    run.add_argument("--caveat", action="append", default=[], metavar="LABEL",
+                     help="a fixed label the digest carries, e.g. gam2990_survival_ls_not_interpretable (repeatable)")
+    run.add_argument("--claim", action="store_true",
+                     help="a claim run: refuse unless every planned claim cell has its sized replicate count (R4)")
     run.add_argument("--keep-checkpoint", action="store_true",
                      help="keep the bucket checkpoint after a complete run (default: delete it, SPEC 7a)")
     run.add_argument("--stop-after", choices=STAGES)

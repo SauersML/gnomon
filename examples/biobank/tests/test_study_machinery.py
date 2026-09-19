@@ -111,26 +111,27 @@ def pool(jobs, threads, on_finish=lambda job, outcome: None):
 
 
 def test_pool_keeps_its_thread_budget_and_isolates_failures(tmp_path):
-    marker = tmp_path / "running"
-    marker.mkdir()
-    code = ("import os, time, pathlib; p = pathlib.Path(%r) / str(time.time_ns()); p.write_text("
-            "os.environ['RAYON_NUM_THREADS']); time.sleep(0.6); p.unlink()") % str(marker)
+    # Each job records its thread budget and its [start, end] on the system-wide
+    # monotonic clock, in a file nothing deletes (a listing racing an unlink
+    # raises ESTALE on NFS); the peak overlap is computed afterwards.
+    spans = tmp_path / "spans"
+    spans.mkdir()
+    code = ("import os, time, pathlib; s = time.monotonic_ns(); time.sleep(0.6); "
+            "(pathlib.Path(%r) / f'{os.getpid()}_{s}').write_text("
+            "f\"{os.environ['RAYON_NUM_THREADS']} {s} {time.monotonic_ns()}\")") % str(spans)
     jobs = [python_job(tmp_path, f"j{i}", code, threads=2) for i in range(6)]
     jobs.append(python_job(tmp_path, "bad", "raise ValueError('planted')"))
-    peak = []
-
-    def running_threads(job, outcome):
-        total = 0
-        for path in marker.iterdir():
-            try:
-                total += int(path.read_text() or 0)
-            except FileNotFoundError:
-                pass  # that job finished between the listing and the read
-        peak.append(total)
-    outcomes = pool(jobs, 4, running_threads)
+    outcomes = pool(jobs, 4)
     assert outcomes["bad"].status == "error" and "planted" in (tmp_path / "bad.log").read_text()
     assert all(outcomes[f"j{i}"].status == "ok" for i in range(6))
-    assert max(peak) <= 4
+    records = [tuple(map(int, path.read_text().split())) for path in spans.iterdir()]
+    assert len(records) == 6 and all(threads == 2 for threads, _, _ in records)
+    running, peak = 0, 0
+    # At one instant an end sorts before a start, so back-to-back jobs do not overlap.
+    for _, _, threads in sorted([(s, 1, t) for t, s, _ in records] + [(e, 0, -t) for t, _, e in records]):
+        running += threads
+        peak = max(peak, running)
+    assert peak == 4  # two 2-thread jobs at once: the budget is used and never exceeded
 
 
 def test_workers_are_reused_and_a_crash_replaces_only_its_worker(tmp_path):
@@ -157,9 +158,12 @@ def test_pool_times_out_restarts_after_a_signal_and_orders_dependencies(tmp_path
             python_job(tmp_path, "first", f"open({str(order)!r}, 'a').write('first ')"),
             python_job(tmp_path, "second", f"open({str(order)!r}, 'a').write('second')", deps=["first"],
                        priority=10)]
+    jobs.append(python_job(tmp_path, "spin", "while True: pass", timeout=1.5))
     started = time.monotonic()
     outcomes = pool(jobs, 8)
     assert outcomes["slow"].status == "timeout" and time.monotonic() - started < 15
+    # A job killed at its cap is charged the CPU its worker spent on it.
+    assert outcomes["spin"].status == "timeout" and outcomes["spin"].cpu_seconds > 0.8
     assert outcomes["killed"].status == "ok" and outcomes["killed"].restarted
     assert order.read_text() == "first second"
 
@@ -247,6 +251,15 @@ def test_names_pack_long_cells_and_parse_back():
     assert len(parsed) == 1 and parsed[0]["d_auc_standard_59"] == 0.059 and parsed[0]["n"] == 1000
 
 
+def test_long_operation_items_parse_back_and_colliding_keys_are_refused():
+    item = "primary_open_angle_glaucoma.survival.covariates.exclusion"
+    names = digest.operation_names([{"scope": "fits", "item": item, "status": "ok", "wall_seconds": 12.5}])
+    _, operations = digest.parse(names)
+    assert operations == [{"scope": "fits", "item": item.replace(".", "_"), "status": "ok", "wall_seconds": 12.5}]
+    raises(ValueError, digest.operation_names, [{"scope": "fits", "item": "a.b_c", "status": "ok"},
+                                                {"scope": "fits", "item": "a_b.c", "status": "error"}])
+
+
 def test_flows_never_step_by_a_small_count():
     flow = {"base": [{"step": "cdr_persons", "n": 5000}, {"step": "in_ancestry", "n": 4990},
                      {"step": "adult", "n": 4500}, {"step": "lookback", "n": 4490}]}
@@ -291,6 +304,50 @@ def test_ehr_domain_fractions_need_their_denominator_and_a_safe_count():
     assert digest.ehr_domain_rows({"ehr_extended_by": {"procedure": 0.12}}) == []
 
 
+def test_null_ehr_facts_are_withheld_not_compared():
+    # A null fraction or median means its denominator was empty: undefined, never released.
+    assert digest.ehr_domain_rows({"ehr_people": 300000, "ehr_extended_by": {"procedure": None},
+                                   "ehr_end_from_long_visit": None})[0].keys().isdisjoint(
+        {"extended_by_procedure", "end_from_long_visit"})
+    row, = digest.ehr_rows({"n": 50000, "fraction_without_ehr": None, "median_gap_years": None})
+    assert "fraction_without_ehr" not in row and "median_gap_years" not in row
+
+
+def test_an_uncertified_fit_is_never_counted_as_converged():
+    certification = driver().certification
+    fit = lambda converged="absent", status="ok": {"status": status, "info": {} if converged == "absent"
+                                                   else {"converged": converged}}
+    assert certification([fit(True), fit(True)]) == "certified"
+    assert certification([fit(True), fit(False)]) == "not_certified"  # a planted uncertified component
+    assert certification([fit(True), fit()]) == "no_certificate"
+    assert certification([fit(False, "error"), fit(status="insufficient_events")]) == "no_fit"
+    # A serialized numpy bool arrives as a string: refused, never read as certified.
+    raises(ValueError, certification, [fit("False")])
+
+
+def test_the_gam_commit_is_believed_only_for_the_installed_engine(tmp_path):
+    built_from = driver().built_from
+    record = tmp_path / "PROVENANCE.json"
+    raises(RuntimeError, built_from, {}, record)  # a venv without its build record
+    record.write_text(json.dumps({"gam_commit": "7008a74cb5" + "0" * 30,
+                                  "extension": {"member": "gamfit/_rust.abi3.so", "engine_sha256": "ab" * 32}}))
+    assert built_from({"gamfit/_rust.abi3.so": "ab" * 32}, record).startswith("7008a74cb5")
+    # A record of another build (a stale LS fit's engine): refused, never recorded.
+    raises(RuntimeError, built_from, {"gamfit/_rust.abi3.so": "cd" * 32}, record)
+
+
+def test_the_run_row_totals_the_bigquery_plan():
+    fields = driver().manifest_fields
+    bigquery = fields({"source": "bigquery", "tables_sha256": "ab" * 32, "cdr_cutoff": "2024-07-01",
+                       "cdr_cutoff_source": "observation_period", "ehr_domains": ["visit", "condition"],
+                       "bigquery": {"plan_bytes": {"person": 3 * 10**9, "ehr_procedure": 4 * 10**9},
+                                    "bytes_billed": 6 * 10**9}})
+    assert bigquery["bigquery_plan_bytes"] == 7 * 10**9 and bigquery["bigquery_bytes_billed"] == 6 * 10**9
+    assert bigquery["ehr_domains"] == "visit_condition" and bigquery["cdr_cutoff_source"] == "observation_period"
+    simulator = fields({"source": "simulator", "seed": 1000, "scenario": "realistic_independent"})
+    assert "bigquery_plan_bytes" not in simulator and simulator["tables_seed"] == 1000
+
+
 def test_followup_fractions_that_invert_to_small_counts_are_withheld():
     row, = digest.followup_rows({"n": 100000, "fraction_reaching": {"1": 0.9999, "3": 0.61}}, 20)
     assert "reach_h1" not in row and row["reach_h3"] == 0.61
@@ -310,6 +367,73 @@ def test_suppressed_names_pass_the_differencing_audit_and_a_planted_leak_fires_i
         raises(ValueError, digest.encode, rows, [], REGISTRY)
     finally:
         digest.suppress = original
+
+
+# -------------------------------------------------------------------- reasons
+def driver():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("study_driver", HERE / "study.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_every_model_setting_needs_a_reason_and_no_length_scale_is_allowed():
+    check = driver().check_reasons
+    config = {"models": {"binary": {"centers": 12}, "survival": {"death": {"model": "cox", "knots": 4}}},
+              "reasons": {"models.binary.centers": "12 matched 24 on simulator accuracy at half the cost",
+                          "models.survival.death": "the death hazard needs no slope surface (simulator)"}}
+    check(config)
+    raises(ValueError, check, {**config, "reasons": {"models.survival.death": "x"}})          # centers unexplained
+    raises(ValueError, check, {**config, "reasons": {**config["reasons"], "models.binary.gone": "stale"}})
+    raises(ValueError, check, {**config, "reasons": {**config["reasons"], "models.binary.centers": " "}})
+    raises(ValueError, check, {"models": {"binary": {"length_scale": 0.5}},
+                               "reasons": {"models.binary.length_scale": "planted"}})
+    # The shipped arm's pin needs its reason too, and a reason on "models" alone excuses nothing.
+    raises(ValueError, check, {**config, "shipped": {"calibrate_sha": "de0bd1df"}})
+    check({**config, "shipped": {"calibrate_sha": "de0bd1df"},
+           "reasons": {**config["reasons"], "shipped.calibrate_sha": "gnomon calibrate as shipped"}})
+    raises(ValueError, check, {**config, "reasons": {"models": "everything"}})
+
+
+def test_claims_need_the_convergence_rule_and_sized_replicates():
+    check = driver().check_claims
+    config = json.loads((HERE / "study.json").read_text())
+    check(config)
+    raises(ValueError, check, config, claim_run=True)                  # no planned scenarios
+    planned = json.loads(json.dumps(config))
+    planned["claims"]["scenarios"] = ["realistic"]
+    raises(ValueError, check, planned, claim_run=True)                 # unsized cells: no fallback to 5
+    metrics = list(planned["claims"]["margins"])
+    cell = {"sd_dev": 0.001, "delta": 0.002, "source_job": "1330000", "converged_starts": True}
+    # R = max(5, ceil((2 * 1.96 * 0.001 / 0.002)^2)) = max(5, ceil(3.84)) = 5.
+    planned["claims"]["replicates"]["by_scenario_metric"] = {f"realistic.{m}": {**cell, "R": 5} for m in metrics}
+    check(planned, claim_run=True)
+    wide = json.loads(json.dumps(planned))
+    wide["claims"]["replicates"]["by_scenario_metric"]["realistic.auc_true"]["sd_dev"] = 0.004   # needs R = 62
+    raises(ValueError, check, wide, claim_run=True)
+    unconverged = json.loads(json.dumps(planned))
+    unconverged["claims"]["replicates"]["by_scenario_metric"]["realistic.oe_true"]["converged_starts"] = False
+    raises(ValueError, check, unconverged, claim_run=True)
+    drift = json.loads(json.dumps(config))
+    drift["convergence"]["max_delta_sd"] = 0.05                        # R1 threshold must match the gate's
+    raises(ValueError, check, drift)
+    brier = json.loads(json.dumps(config))
+    brier["claims"]["margins"]["mse_true"] = {"delta": 0.04, "scale": "relative", "reason": "x"}
+    raises(ValueError, check, brier)
+
+
+def test_the_convergence_gate_flags_a_planted_second_start():
+    ratio = driver().delta_over_sd
+    rng = np.random.default_rng(3)
+    risk = rng.uniform(0.02, 0.4, size=(500, 3))
+    assert ratio(risk, risk) == 0.0
+    assert ratio(risk, risk + 1e-9) < 0.01
+    # One person 0.02 away at one horizon is about 0.2 SD here: not converged.
+    planted = risk.copy()
+    planted[17, 2] += 0.02
+    assert ratio(risk, planted) > 0.01
+    assert ratio(risk[:, 0], planted[:, 0]) == 0.0      # binary risks are one column
 
 
 # ----------------------------------------------------------------- provenance

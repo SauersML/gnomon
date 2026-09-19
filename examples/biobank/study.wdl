@@ -82,7 +82,9 @@ task analyze {
         tar -xf "$1" -C wheels
         python -m venv work/venv
         work/venv/bin/python -m pip install --disable-pip-version-check --no-compile --no-cache-dir \
-          --no-index --only-binary=:all: --find-links wheels -r study/requirements.txt' bash "~{wheelhouse_archive}"; then
+          --no-index --only-binary=:all: --find-links wheels -r study/requirements.txt
+        # The wheelhouse build record: study.py reads the gam commit from it.
+        cp wheels/PROVENANCE.json work/venv/PROVENANCE.json' bash "~{wheelhouse_archive}"; then
       python aou_status.py "~{status_uri}" dependencies_ready
     else
       rc=$?

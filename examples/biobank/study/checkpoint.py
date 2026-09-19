@@ -140,7 +140,7 @@ def study_identity(config):
     finished steps. The disease list counts as the file content it resolves to,
     and the frozen hash is excluded because it is this identity's own hash."""
     identity = {key: value for key, value in config.items()
-                if key not in ("compute", "diseases_file", "frozen_config_sha256")}
+                if key not in ("compute", "diseases_file", "frozen_config_sha256", "reasons")}
     # The workspace fills in its project and CDR at submission; the checkpoint
     # signature records them (deployment_identity), the frozen hash does not.
     identity["data"] = {key: value for key, value in result_identity(config["data"]).items()

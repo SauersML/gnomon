@@ -55,6 +55,11 @@ def main():
     print("study config {config_sha256_12}  vcpus {vcpus}  threads {threads}  attempts {attempts}  "
           "vcpu_hours {vcpu_hours}  bigquery_bytes {bigquery_bytes_billed}  outer_test_looks {outer_test_looks}  "
           "horizons {horizons}".format_map(defaultdict(lambda: "?", run)))
+    print("label {label}  run {run_kind}  gam {gam_commit_12}  tables {tables_source} {tables_sha256_12} "
+          "seed {tables_seed}  cdr_cutoff {cdr_cutoff} ({cdr_cutoff_source})".format_map(
+        defaultdict(lambda: "?", run)))
+    if run.get("caveats"):
+        print("CAVEATS: " + str(run["caveats"]).replace("_and_", "; "))
     timings = [(item, row.get("wall_seconds")) for item, row in ops.get("timing", {}).items()]
     if timings:
         total = sum(s for _, s in timings if isinstance(s, (int, float)))

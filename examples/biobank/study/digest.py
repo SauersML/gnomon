@@ -80,11 +80,10 @@ NESTED = {"survival": ("binary", "cohort_survival"), "binary": ("cohort_binary",
 
 
 def slug(text):
+    """A label in [a-z0-9_], never truncated: `pack` bounds each name by NAME_BUDGET."""
     cleaned = re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_")
     if not cleaned:
         raise ValueError("empty digest label")
-    if len(cleaned) > 48:
-        raise ValueError(f"digest label {cleaned[:20]}... is longer than 48 characters")
     return cleaned
 
 
@@ -444,7 +443,9 @@ def followup_rows(administrative, limit=LIMIT):
 def safe_fraction(fraction, n, limit=LIMIT):
     """Whether a fraction of n people pins no count of 1..limit: the people it
     counts and the rest are both safely more than limit, with a margin for its
-    four-digit rounding."""
+    four-digit rounding. An unknown (null) fraction is never released."""
+    if fraction is None or not is_number(fraction) or not math.isfinite(fraction):
+        return False
     reach, margin = fraction * n, 1 + n * 5e-4
     return reach - margin > limit and n - reach - margin > limit
 
@@ -459,10 +460,10 @@ def ehr_rows(ehr, limit=LIMIT):
         return []
     row = {"disease": "base", "model": "followup_ehr", "variant": "all", "fit": "pooled", "stratum": "overall",
            "horizon": None, "n": n}
-    with_ehr = n - round(n * ehr["fraction_without_ehr"])
-    if safe_fraction(ehr["fraction_without_ehr"], n, limit):
+    if safe_fraction(ehr.get("fraction_without_ehr"), n, limit):
+        with_ehr = n - round(n * ehr["fraction_without_ehr"])
         row.update(with_ehr_n=with_ehr, fraction_without_ehr=float(ehr["fraction_without_ehr"]))
-        if safe_fraction(ehr["fraction_obs_end_after_ehr_end"], with_ehr, limit):
+        if safe_fraction(ehr.get("fraction_obs_end_after_ehr_end"), with_ehr, limit):
             row["fraction_obs_end_after_ehr_end"] = float(ehr["fraction_obs_end_after_ehr_end"])
     for name in ("median_gap_years", "median_positive_gap_years"):
         if ehr.get(name) is not None and math.isfinite(ehr[name]):
@@ -483,8 +484,7 @@ def ehr_domain_rows(manifest, limit=LIMIT):
     for domain, fraction in (manifest.get("ehr_extended_by") or {}).items():
         if safe_fraction(fraction, n, limit):
             row[f"extended_by_{label(domain, 24)}"] = float(fraction)
-    if manifest.get("ehr_end_from_long_visit") is not None and safe_fraction(manifest["ehr_end_from_long_visit"], n,
-                                                                             limit):
+    if safe_fraction(manifest.get("ehr_end_from_long_visit"), n, limit):
         row["end_from_long_visit"] = float(manifest["ehr_end_from_long_visit"])
     return [row]
 
@@ -570,8 +570,14 @@ def names(rows, limit=LIMIT, registry=None):
 
 def operation_names(rows):
     """o__<scope>__<item>__<metric>-<value>__...: no participant data."""
-    out = []
+    out, keys = [], set()
     for row in rows:
+        # parse merges an operation row by (scope, item): two rows whose keys
+        # slug alike ("a.b_c", "a_b.c") would read back as one.
+        key = (slug(row["scope"]), slug(row["item"]))
+        if key in keys:
+            raise ValueError(f"two operation rows share the key {key}")
+        keys.add(key)
         items = []
         for metric in sorted(set(row) - {"scope", "item"}):
             value = row[metric]
@@ -581,7 +587,7 @@ def operation_names(rows):
                 items.append(f"{slug(metric)}-{value}")
             else:
                 items.append(f"{slug(metric)}-{token(value)}")
-        out += pack("__".join(["o", slug(row["scope"]), slug(row["item"])]), items)
+        out += pack("__".join(["o", *key]), items)
     if len(set(out)) != len(out):
         raise ValueError("two operation names coincide")
     return out
