@@ -42,6 +42,8 @@ use std::str;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crossbeam_queue::SegQueue;
+
 use crate::files::{
     // Traits
     ByteRangeSource,
@@ -1396,7 +1398,7 @@ const BED_MODE_SNP_MAJOR: u8 = 0x01;
 
 #[derive(Clone)]
 struct VirtualBed {
-    decoders: Arc<DecoderSlots>,
+    decoders: Arc<DecoderPool>,
     plan: VariantPlan,
     n_samples: usize,
     block_bytes: usize, // ceil(n_samples / 4)
@@ -1410,57 +1412,71 @@ struct Decoding {
     hard_buf: Vec<u8>,
 }
 
-/// A decoder for each rayon worker and one for every other thread, each used in
-/// place by the thread holding its slot. Reads on different threads never wait
-/// on one another's decodes, a lone reader pays one uncontended lock per read,
-/// and a worker walking its own range of records keeps the LD anchor it decoded
-/// last. A read that finds its slot held (a nested read on the same worker, or
-/// two threads outside the pool reading at once) takes a spare decoder instead,
-/// forked the first time one is needed. Which decoder serves a block decides
-/// nothing about its bytes.
-struct DecoderSlots {
+/// The decoders no read holds, in a lock-free queue. A read takes one for the blocks it
+/// decodes in order and gives it back once they are decoded, so no two reads share a
+/// decoder and none waits on another; a read that finds none idle forks one, so there are
+/// never more than reads ever ran at once. A decoder keeps the LD anchor it decoded last,
+/// which serves the records after it in its variant block. Which decoder serves a block
+/// decides nothing about its bytes.
+struct DecoderPool {
     template: PgenDecoder,
-    slots: Box<[Mutex<Option<Decoding>>]>,
-    spares: Mutex<Vec<Decoding>>,
+    idle: SegQueue<Decoding>,
 }
 
-impl DecoderSlots {
+/// A decoder taken from a [`DecoderPool`], given back when this is dropped.
+struct TakenDecoding<'a> {
+    pool: &'a DecoderPool,
+    decoding: Option<Decoding>,
+}
+
+impl DecoderPool {
     fn new(template: PgenDecoder) -> Self {
-        let workers = rayon::current_num_threads().max(1);
         Self {
             template,
-            slots: (0..=workers).map(|_| Mutex::new(None)).collect(),
-            spares: Mutex::new(Vec::new()),
+            idle: SegQueue::new(),
         }
     }
 
-    fn fork(&self) -> Decoding {
-        Decoding {
+    fn take(&self) -> TakenDecoding<'_> {
+        let decoding = self.idle.pop().unwrap_or_else(|| Decoding {
             decoder: self.template.fork(),
             hard_buf: Vec::new(),
+        });
+        TakenDecoding {
+            pool: self,
+            decoding: Some(decoding),
         }
     }
+}
 
-    /// Runs `read` with this thread's decoder, or with a spare while that
-    /// decoder is in use.
-    fn with_decoding<R>(&self, read: impl FnOnce(&mut Decoding) -> R) -> R {
-        let shared = self.slots.len() - 1;
-        let index = rayon::current_thread_index().map_or(shared, |index| index.min(shared));
-        if let Ok(mut slot) = self.slots[index].try_lock() {
-            return read(slot.get_or_insert_with(|| self.fork()));
-        }
-        let spare = self.spares.lock().unwrap().pop();
-        let mut decoding = spare.unwrap_or_else(|| self.fork());
-        let result = read(&mut decoding);
-        self.spares.lock().unwrap().push(decoding);
-        result
+impl TakenDecoding<'_> {
+    fn decoding(&mut self) -> &mut Decoding {
+        self.decoding
+            .as_mut()
+            .expect("a taken decoder is held until it is given back")
     }
+}
+
+impl Drop for TakenDecoding<'_> {
+    fn drop(&mut self) {
+        if let Some(decoding) = self.decoding.take() {
+            self.pool.idle.push(decoding);
+        }
+    }
+}
+
+/// One block's share of a read of the virtual `.bed`: bytes `within..within + dst.len()`
+/// of out-variant `out_idx`'s packed block, bound for `dst`.
+struct BlockPiece<'d> {
+    out_idx: usize,
+    within: usize,
+    dst: &'d mut [u8],
 }
 
 impl VirtualBed {
     fn new(decoder: PgenDecoder, plan: VariantPlan, n_samples: usize) -> Self {
         Self {
-            decoders: Arc::new(DecoderSlots::new(decoder)),
+            decoders: Arc::new(DecoderPool::new(decoder)),
             plan,
             n_samples,
             block_bytes: n_samples.div_ceil(4),
@@ -1508,124 +1524,141 @@ impl ByteRangeSource for VirtualBed {
         self.total_len()
     }
 
-    fn read_at(&self, mut offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
-        if dst.is_empty() {
-            return Ok(());
-        }
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
+        let mut pieces = Vec::new();
+        self.split_range(offset, dst, 0, &mut pieces)?;
+        self.decode_pieces(&mut pieces).map_err(|(_, error)| error)
+    }
 
-        let total = self.total_len();
-        let end = offset
-            .checked_add(dst.len() as u64)
-            .ok_or_else(|| ioerr("Overflow in read_at range"))?;
-        if end > total {
-            return Err(ioerr("Attempted to read past end of virtual .bed"));
-        }
-
-        let mut written = 0usize;
-
-        // 1) Serve the 3-byte header if requested.
-        if offset < 3 {
-            let hdr = [BED_MAGIC_0, BED_MAGIC_1, BED_MODE_SNP_MAJOR];
-            while offset < 3 && written < dst.len() {
-                dst[written] = hdr[offset as usize];
-                offset += 1;
-                written += 1;
-            }
-            if written == dst.len() {
-                return Ok(());
+    /// Every range's blocks are decoded together on the rayon pool, so a caller that reads
+    /// scattered rows gets them decoded in parallel as a pass over adjacent rows does.
+    fn read_ranges(
+        &self,
+        offsets: &[u64],
+        dsts: &mut [&mut [u8]],
+    ) -> Result<(), (usize, PipelineError)> {
+        let mut pieces = Vec::with_capacity(dsts.len());
+        for (range, (&offset, dst)) in offsets.iter().zip(dsts.iter_mut()).enumerate() {
+            if let Err(error) = self.split_range(offset, dst, range, &mut pieces) {
+                // Reading one range at a time fills every range before this one first.
+                self.decode_pieces(&mut pieces)?;
+                return Err((range, error));
             }
         }
-
-        // 2) Serve the body: contiguous blocks of size self.block_bytes per variant.
-        let body_off = offset - 3;
-        let mut out_idx = (body_off / (self.block_bytes as u64)) as usize;
-        let within_block = (body_off % (self.block_bytes as u64)) as usize;
-
-        self.decoders.with_decoding(|decoding| {
-            if within_block > 0 && out_idx < self.plan.out_variants {
-                let to_copy = (self.block_bytes - within_block).min(dst.len() - written);
-                copy_virtual_block(
-                    self,
-                    &mut decoding.decoder,
-                    out_idx,
-                    within_block,
-                    &mut dst[written..written + to_copy],
-                    &mut decoding.hard_buf,
-                )?;
-                written += to_copy;
-                out_idx += 1;
-            }
-
-            // A pass over many whole blocks (a PCA pass reads thousands per call)
-            // decodes them on the rayon pool straight into `dst`, one forked
-            // decoder per worker. Each block is the same bytes the one-at-a-time
-            // path produces, and the first error in block order is the one
-            // returned.
-            let whole_blocks = (dst.len() - written) / self.block_bytes;
-            if whole_blocks >= PARALLEL_DECODE_MIN_BLOCKS {
-                use rayon::prelude::*;
-
-                let template = &self.decoders.template;
-                let region = &mut dst[written..written + whole_blocks * self.block_bytes];
-                let results: Vec<Result<(), PipelineError>> = region
-                    .par_chunks_mut(self.block_bytes)
-                    .enumerate()
-                    .map_init(
-                        || (template.fork(), Vec::new()),
-                        |(decoder, hard_buf), (block_idx, block)| {
-                            decode_virtual_block(
-                                self,
-                                decoder,
-                                out_idx + block_idx,
-                                hard_buf,
-                                block,
-                            )
-                        },
-                    )
-                    .collect();
-                if let Some(err) = results.into_iter().find_map(Result::err) {
-                    return Err(err);
-                }
-                written += whole_blocks * self.block_bytes;
-                out_idx += whole_blocks;
-            }
-
-            while written < dst.len() {
-                if out_idx >= self.plan.out_variants {
-                    break;
-                }
-                let to_copy = self.block_bytes.min(dst.len() - written);
-                if to_copy == self.block_bytes {
-                    // A whole block goes straight into `dst`, as a scoring pass
-                    // reads one block per call. Only a partial read, which comes
-                    // back for the rest of its block, goes through the cache.
-                    decode_virtual_block(
-                        self,
-                        &mut decoding.decoder,
-                        out_idx,
-                        &mut decoding.hard_buf,
-                        &mut dst[written..written + to_copy],
-                    )?;
-                } else {
-                    copy_virtual_block(
-                        self,
-                        &mut decoding.decoder,
-                        out_idx,
-                        0,
-                        &mut dst[written..written + to_copy],
-                        &mut decoding.hard_buf,
-                    )?;
-                }
-                written += to_copy;
-                out_idx += 1;
-            }
-            Ok(())
-        })
+        self.decode_pieces(&mut pieces)
     }
 }
 
-/// Whole blocks one `read_at` must span before they are decoded in parallel.
-const PARALLEL_DECODE_MIN_BLOCKS: usize = 16;
+impl VirtualBed {
+    /// Writes the header bytes of the range at `offset` that `dst` covers, and appends its
+    /// block pieces to `pieces`, each beside `range`: a read of that range is a read of
+    /// its pieces.
+    fn split_range<'d>(
+        &self,
+        offset: u64,
+        dst: &'d mut [u8],
+        range: usize,
+        pieces: &mut Vec<(usize, BlockPiece<'d>)>,
+    ) -> Result<(), PipelineError> {
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(dst.len() as u64)
+            .ok_or_else(|| ioerr("Overflow in read_at range"))?;
+        if end > self.total_len() {
+            return Err(ioerr("Attempted to read past end of virtual .bed"));
+        }
+
+        let header = [BED_MAGIC_0, BED_MAGIC_1, BED_MODE_SNP_MAJOR];
+        let in_header = (header.len() as u64)
+            .saturating_sub(offset)
+            .min(dst.len() as u64) as usize;
+        let (head, mut body) = dst.split_at_mut(in_header);
+        if in_header > 0 {
+            head.copy_from_slice(&header[offset as usize..offset as usize + in_header]);
+        }
+
+        let body_offset = offset.saturating_sub(header.len() as u64);
+        let mut out_idx = (body_offset / self.block_bytes as u64) as usize;
+        let mut within = (body_offset % self.block_bytes as u64) as usize;
+        while !body.is_empty() {
+            let len = (self.block_bytes - within).min(body.len());
+            let (piece, rest) = std::mem::take(&mut body).split_at_mut(len);
+            pieces.push((
+                range,
+                BlockPiece {
+                    out_idx,
+                    within,
+                    dst: piece,
+                },
+            ));
+            body = rest;
+            out_idx += 1;
+            within = 0;
+        }
+        Ok(())
+    }
+
+    /// Decodes `pieces` on the rayon pool, each piece with the decoder its worker took for
+    /// the run of pieces it walks in order, and returns the range beside the first piece
+    /// in order that failed, with its error: the error a read of one piece at a time,
+    /// in order, stops at. A lone piece is decoded here, as it has nothing to share out.
+    fn decode_pieces(
+        &self,
+        pieces: &mut [(usize, BlockPiece<'_>)],
+    ) -> Result<(), (usize, PipelineError)> {
+        use rayon::prelude::*;
+
+        if let [(range, piece)] = pieces {
+            return self
+                .decode_piece(self.decoders.take().decoding(), piece)
+                .map_err(|error| (*range, error));
+        }
+        match pieces
+            .par_iter_mut()
+            .map_init(
+                || self.decoders.take(),
+                |taken, (range, piece)| {
+                    self.decode_piece(taken.decoding(), piece)
+                        .err()
+                        .map(|error| (*range, error))
+                },
+            )
+            .find_map_first(|failure| failure)
+        {
+            Some(failure) => Err(failure),
+            None => Ok(()),
+        }
+    }
+
+    /// A whole block is decoded straight into its piece. Only a partial read, which comes
+    /// back for the rest of its block, goes through the cache.
+    fn decode_piece(
+        &self,
+        decoding: &mut Decoding,
+        piece: &mut BlockPiece<'_>,
+    ) -> Result<(), PipelineError> {
+        if piece.within == 0 && piece.dst.len() == self.block_bytes {
+            decode_virtual_block(
+                self,
+                &mut decoding.decoder,
+                piece.out_idx,
+                &mut decoding.hard_buf,
+                piece.dst,
+            )
+        } else {
+            copy_virtual_block(
+                self,
+                &mut decoding.decoder,
+                piece.out_idx,
+                piece.within,
+                piece.dst,
+                &mut decoding.hard_buf,
+            )
+        }
+    }
+}
 
 /// Copies bytes `within_block..within_block + dst.len()` of out-variant
 /// `out_idx`'s packed block into `dst`, from the block cache, or by decoding
@@ -4946,14 +4979,14 @@ mod tests {
         }
     }
 
-    /// Reads served by per-thread decoder slots and their spares must give the
-    /// bytes a lone serial reader gets: from rayon workers reading whole
-    /// blocks, partial blocks and runs long enough to decode in parallel (whose
-    /// work stealing can put another read on a worker already holding its
-    /// slot), from threads outside the pool sharing one slot, and from a pool
-    /// wider than the one the slots were sized for.
+    /// Reads served by decoders taken from the pool must give the bytes a lone
+    /// serial reader gets, one block at a time: from rayon workers reading whole
+    /// blocks, partial blocks and runs of blocks that decode on the pool (whose
+    /// work stealing can put another read on a worker already holding a
+    /// decoder), from threads outside the pool reading at once, in pools of two
+    /// widths, and as scattered ranges read together.
     #[test]
-    fn concurrent_reads_through_decoder_slots_match_a_serial_reader() {
+    fn concurrent_reads_through_the_decoder_pool_match_a_serial_reader() {
         use rayon::prelude::*;
 
         const N: usize = 37;
@@ -5015,17 +5048,19 @@ mod tests {
             "record 2 repeats its anchor, so the fixture decodes through LD anchors"
         );
 
-        let requests: Vec<(usize, usize)> = (0..400usize)
-            .map(|i| {
+        // Reads within the header and across its end, then reads anywhere.
+        let requests: Vec<(usize, usize)> = [(0, 1), (1, 1), (2, 1), (1, 2), (2, block_bytes + 1)]
+            .into_iter()
+            .chain((0..400usize).map(|i| {
                 let start = (i * 7919) % expected.len();
                 let len = match i % 4 {
                     0 => block_bytes,
                     1 => i % block_bytes + 1,
-                    2 => (PARALLEL_DECODE_MIN_BLOCKS + i % 5) * block_bytes,
+                    2 => (2 + i % 19) * block_bytes,
                     _ => 2 * block_bytes + 3,
                 };
                 (start, len.min(expected.len() - start))
-            })
+            }))
             .collect();
         let check = |bed: &VirtualBed, &(start, len): &(usize, usize)| {
             let mut got = vec![0u8; len];
@@ -5036,6 +5071,19 @@ mod tests {
                 "read of {len} bytes at {start}"
             );
         };
+        let check_together = |bed: &VirtualBed, requests: &[(usize, usize)]| {
+            let offsets: Vec<u64> = requests.iter().map(|&(start, _)| start as u64).collect();
+            let mut got: Vec<Vec<u8>> = requests.iter().map(|&(_, len)| vec![0u8; len]).collect();
+            let mut dsts: Vec<&mut [u8]> = got.iter_mut().map(Vec::as_mut_slice).collect();
+            bed.read_ranges(&offsets, &mut dsts).unwrap();
+            for (&(start, len), got) in requests.iter().zip(&got) {
+                assert_eq!(
+                    got[..],
+                    expected[start..start + len],
+                    "range of {len} bytes at {start}, read together"
+                );
+            }
+        };
 
         let narrow = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
@@ -5045,9 +5093,15 @@ mod tests {
             .num_threads(8)
             .build()
             .unwrap();
-        for sized_in in [&narrow, &wide] {
-            let bed = sized_in.install(virtual_bed);
-            wide.install(|| requests.par_iter().for_each(|request| check(&bed, request)));
+        for pool in [&narrow, &wide] {
+            let bed = virtual_bed();
+            pool.install(|| requests.par_iter().for_each(|request| check(&bed, request)));
+            pool.install(|| {
+                requests
+                    .par_chunks(37)
+                    .for_each(|chunk| check_together(&bed, chunk))
+            });
+            check_together(&bed, &requests);
             let (bed, requests, check) = (&bed, &requests, &check);
             std::thread::scope(|scope| {
                 for reader in 0..4 {
@@ -5058,6 +5112,78 @@ mod tests {
                     });
                 }
             });
+        }
+    }
+
+    /// Ranges read together fail as reading them one at a time in order does:
+    /// every range before the first that fails is filled, and that range's
+    /// position and error come back, whichever decode finishes first.
+    #[test]
+    fn ranges_read_together_stop_at_the_first_failing_range() {
+        const N: usize = 9;
+        let m = 40usize;
+        let cats: Vec<u8> = (0..N).map(|i| (i % 3) as u8).collect();
+        let record = pack_twobit_values(&cats);
+        let mut records: Vec<(u8, Vec<u8>)> = vec![(0, record.clone()); m];
+        // A record whose main track is cut short cannot be decoded.
+        records[23] = (0, record[..1].to_vec());
+        let rec_types: Vec<u8> = records.iter().map(|(ty, _)| *ty).collect();
+        let rec_lens: Vec<u32> = records.iter().map(|(_, rec)| rec.len() as u32).collect();
+        let data: Vec<u8> = records.iter().flat_map(|(_, rec)| rec.clone()).collect();
+        let src: Arc<dyn ByteRangeSource> = Arc::new(VecSource::new(data));
+        let hdr = PgenHeader {
+            mode: PgenMode::Var,
+            m_variants: m as u32,
+            n_samples: N as u32,
+            fmt_byte: 0,
+            block_offsets: vec![0],
+            rec_types,
+            rec_lens,
+        };
+        let decoder = PgenDecoder::new(Arc::clone(&src), hdr, N, m, vec![1; m]).unwrap();
+        let plan = VariantPlan {
+            in_variants: m,
+            out_variants: m,
+            out_to_in: (0..m as u32).map(|idx| (idx, 1)).collect(),
+            alts_per_in: vec![1; m],
+        };
+        let bed = VirtualBed::new(decoder, plan, N);
+        let block_bytes = N.div_ceil(4);
+        let row = |idx: usize| 3 + (idx * block_bytes) as u64;
+        let mut one = vec![0u8; block_bytes];
+        bed.read_at(row(0), &mut one).unwrap();
+        let single_error = bed.read_at(row(23), &mut one).unwrap_err().to_string();
+
+        let cases: [(Vec<u64>, Option<usize>); 3] = [
+            // A row that cannot be decoded, among rows that can on both sides.
+            (
+                (0..m)
+                    .step_by(3)
+                    .map(row)
+                    .chain([row(23)])
+                    .chain((24..m).map(row))
+                    .collect(),
+                Some(14),
+            ),
+            // A range past the end of the virtual `.bed`, after a row that cannot be decoded.
+            (vec![row(1), row(23), row(m), row(2)], Some(1)),
+            // A range past the end before any row that fails.
+            (vec![row(4), row(m), row(23)], Some(1)),
+        ];
+        for (offsets, failing) in cases {
+            let mut got: Vec<Vec<u8>> = offsets.iter().map(|_| vec![0xAA; block_bytes]).collect();
+            let mut dsts: Vec<&mut [u8]> = got.iter_mut().map(Vec::as_mut_slice).collect();
+            let result = bed.read_ranges(&offsets, &mut dsts);
+            let (position, error) = result.expect_err("a range fails");
+            assert_eq!(Some(position), failing, "ranges {offsets:?}");
+            if offsets[position] == row(23) {
+                assert_eq!(error.to_string(), single_error);
+            }
+            for (range, (offset, got)) in offsets.iter().zip(&got).enumerate().take(position) {
+                let mut want = vec![0u8; block_bytes];
+                bed.read_at(*offset, &mut want).unwrap();
+                assert_eq!(got, &want, "range {range} before the failing one");
+            }
         }
     }
 

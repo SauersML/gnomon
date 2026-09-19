@@ -298,18 +298,16 @@ impl<'a> BedRows<'a> {
             self.source
         };
         let mut buffer = Vec::new();
+        let mut offsets = Vec::new();
         for batch in indices.chunks((batch_bytes / row_len).max(1)) {
             buffer.resize(batch.len() * row_len, 0);
-            let mut start = 0;
-            while start < batch.len() {
-                let mut end = start + 1;
-                while end < batch.len() && batch[end] == batch[end - 1] + 1 {
-                    end += 1;
-                }
-                let offset = (BED_HEADER_LEN + batch[start] * row_len) as u64;
-                source.read_at_positional(offset, &mut buffer[start * row_len..end * row_len])?;
-                start = end;
-            }
+            offsets.clear();
+            offsets.extend(
+                batch
+                    .iter()
+                    .map(|&index| (BED_HEADER_LEN + index * row_len) as u64),
+            );
+            source.read_rows_positional(&offsets, row_len, &mut buffer)?;
             let rows: Vec<&[u8]> = buffer.chunks_exact(row_len).collect();
             f(&rows);
         }

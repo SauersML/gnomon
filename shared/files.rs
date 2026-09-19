@@ -219,6 +219,22 @@ pub trait ByteRangeSource: Send + Sync {
     }
 
     fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError>;
+
+    /// Fills each of `dsts` from the offset beside it in `offsets`, as a `read_at` of each
+    /// range in order does: on failure every range before the first that fails is filled,
+    /// and that range's position and error are returned. A source that decodes its bytes
+    /// decodes the ranges together.
+    fn read_ranges(
+        &self,
+        offsets: &[u64],
+        dsts: &mut [&mut [u8]],
+    ) -> Result<(), (usize, PipelineError)> {
+        for (position, (&offset, dst)) in offsets.iter().zip(dsts.iter_mut()).enumerate() {
+            self.read_at(offset, dst)
+                .map_err(|error| (position, error))?;
+        }
+        Ok(())
+    }
 }
 
 /// A convenience wrapper that bundles the generic byte source with an optional
@@ -385,6 +401,35 @@ impl BedSource {
                 .map_err(|e| PipelineError::Io(e.to_string()));
         }
         self.read_at(offset, dst)
+    }
+
+    /// Fills consecutive `row_len`-byte rows of `dst` from `offsets`, one row per offset,
+    /// as [`Self::read_at_positional`] does: a local file with one positional read per run
+    /// of adjacent rows, and any other source with one [`ByteRangeSource::read_ranges`] of
+    /// every row, so a source that decodes its rows decodes them together.
+    pub fn read_rows_positional(
+        &self,
+        offsets: &[u64],
+        row_len: usize,
+        dst: &mut [u8],
+    ) -> Result<(), PipelineError> {
+        #[cfg(unix)]
+        if self.file.is_some() {
+            let mut start = 0;
+            while start < offsets.len() {
+                let mut end = start + 1;
+                while end < offsets.len() && offsets[end] == offsets[end - 1] + row_len as u64 {
+                    end += 1;
+                }
+                self.read_at_positional(offsets[start], &mut dst[start * row_len..end * row_len])?;
+                start = end;
+            }
+            return Ok(());
+        }
+        let mut rows: Vec<&mut [u8]> = dst.chunks_exact_mut(row_len).collect();
+        self.byte_source
+            .read_ranges(offsets, &mut rows)
+            .map_err(|(_, error)| error)
     }
 }
 

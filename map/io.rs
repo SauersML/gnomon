@@ -3014,25 +3014,31 @@ impl PlinkVariantBlockSource {
         // allocation leaves their pages uncommitted.
         let mut payload = vec![0u8; payload_len];
         if self.decoded_rows {
-            // Adjacent rows decode with one read, on the rayon pool from sixteen
-            // rows on. A read that fails leaves every row to the streaming
-            // decoder, which reports the failure at the row where it occurs.
-            let mut position = 0;
-            while position < rows.len() {
-                let mut run = 1;
-                while position + run < rows.len()
-                    && rows[position + run] == rows[position] + run as u64
-                {
-                    run += 1;
+            // Every row decodes with one read of them all, on the rayon pool. A read
+            // that fails leaves every row to the streaming decoder, which reports the
+            // failure at the row where it occurs.
+            let offsets: Vec<u64> = rows
+                .iter()
+                .map(|&row| PLINK_HEADER_LEN + row * bytes_per_variant as u64)
+                .collect();
+            let slot_rows = payload.chunks_exact_mut(bytes_per_variant);
+            let mut dsts: Vec<&mut [u8]> = match &slots {
+                Some(slots) => {
+                    let mut read = slots.iter().copied().peekable();
+                    slot_rows
+                        .enumerate()
+                        .filter_map(|(slot, row)| read.next_if_eq(&slot).map(|_| row))
+                        .collect()
                 }
-                let slot = slots.as_ref().map_or(position, |slots| slots[position]);
-                let start = slot * bytes_per_variant;
-                let end = start + run * bytes_per_variant;
-                let offset = PLINK_HEADER_LEN + rows[position] * bytes_per_variant as u64;
-                if self.bed.read_at(offset, &mut payload[start..end]).is_err() {
-                    return Ok(());
-                }
-                position += run;
+                None => slot_rows.collect(),
+            };
+            if self
+                .bed
+                .byte_source()
+                .read_ranges(&offsets, &mut dsts)
+                .is_err()
+            {
+                return Ok(());
             }
         } else {
             let planned = self.bed.with_read_plan(&rows, bytes_per_variant as u64)?;

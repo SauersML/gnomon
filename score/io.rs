@@ -354,10 +354,11 @@ mod pool_tests {
         );
     }
 
-    /// A .bed image of one-byte rows that counts its reads and fails any read touching `bad_row`.
+    /// A .bed image of one-byte rows that records the ranges each `read_ranges` call is given
+    /// and fails any read touching `bad_row`.
     struct CountingImage {
         image: BedImage,
-        reads: AtomicU64,
+        windows: Mutex<Vec<Vec<u64>>>,
         bad_row: Option<u64>,
     }
 
@@ -367,7 +368,6 @@ mod pool_tests {
         }
 
         fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
-            self.reads.fetch_add(1, Ordering::SeqCst);
             if let Some(bad) = self.bad_row
                 && offset <= 3 + bad
                 && 3 + bad < offset + dst.len() as u64
@@ -376,6 +376,18 @@ mod pool_tests {
             }
             self.image.read_at(offset, dst)
         }
+
+        fn read_ranges(
+            &self,
+            offsets: &[u64],
+            dsts: &mut [&mut [u8]],
+        ) -> Result<(), (usize, PipelineError)> {
+            self.windows.lock().unwrap().push(offsets.to_vec());
+            for (position, (&offset, dst)) in offsets.iter().zip(dsts.iter_mut()).enumerate() {
+                self.read_at(offset, dst).map_err(|err| (position, err))?;
+            }
+            Ok(())
+        }
     }
 
     fn counting_image(rows: &[u8], bad_row: Option<u64>) -> Arc<CountingImage> {
@@ -383,86 +395,191 @@ mod pool_tests {
         bytes.extend_from_slice(rows);
         Arc::new(CountingImage {
             image: BedImage(bytes),
-            reads: AtomicU64::new(0),
+            windows: Mutex::new(Vec::new()),
             bad_row,
         })
     }
 
-    /// Runs a producer over the `required` rows of `source` with every row on the dense path,
-    /// giving the rows it sent, in order, and the text of the error it sent, if any.
-    fn run_producer(
-        source: Arc<CountingImage>,
-        required: &[u64],
-        total: u64,
-        read_batch: usize,
+    /// Runs `producer` with a pool of `buffers` buffers and every row on the dense path,
+    /// giving each row back as it arrives, as a consumer does, and returns the rows sent, in
+    /// order, and the text of the error sent, if any.
+    fn run_with_pool(
+        buffers: usize,
+        producer: impl FnOnce(Arc<RowBufferPool>, Sender<Result<WorkItem, PipelineError>>)
+        + Send
+        + 'static,
     ) -> (Vec<Vec<u8>>, Option<String>) {
-        let pool = empty_pool(required.len());
-        for _ in 0..required.len() {
+        let pool = empty_pool(buffers);
+        for _ in 0..buffers {
             pool.push(Vec::new()).expect("room in the pool");
         }
-        let (dense_tx, dense_rx) = bounded(required.len() + 1);
-        producer_thread_with_read_batch(
-            source,
-            prep_for_rows(required, total),
-            None,
-            dense_tx,
-            pool,
-            Arc::new(AtomicU64::new(0)),
-            |_: &[u8]| ComputePath::Pivot,
-            None,
-            read_batch,
-        );
+        let (dense_tx, dense_rx) = bounded(buffers);
+        let handle = {
+            let pool = Arc::clone(&pool);
+            thread::spawn(move || producer(pool, dense_tx))
+        };
         let mut sent = Vec::new();
         let mut error = None;
-        for item in dense_rx.try_iter() {
+        for item in dense_rx.iter() {
             match item {
-                Ok(work_item) => sent.push(work_item.data),
+                Ok(work_item) => {
+                    sent.push(work_item.data.clone());
+                    pool.push(work_item.data).expect("room in the pool");
+                }
                 Err(err) => error = Some(err.to_string()),
             }
         }
+        handle.join().expect("producer");
         (sent, error)
     }
 
-    /// Reading adjacent rows in runs gives every row the bytes one read per row gives, in
-    /// order, with far fewer reads: a long run, a run too short to share a read, a repeated
-    /// row, a gap, and a run that reaches the last row.
+    fn run_producer(
+        source: &Arc<CountingImage>,
+        required: &[u64],
+        total: u64,
+        buffers: usize,
+    ) -> (Vec<Vec<u8>>, Option<String>) {
+        let source: Arc<dyn ByteRangeSource> = Arc::clone(source) as Arc<dyn ByteRangeSource>;
+        let prep = prep_for_rows(required, total);
+        run_with_pool(buffers, move |pool, dense_tx| {
+            producer_thread(
+                source,
+                prep,
+                None,
+                dense_tx,
+                pool,
+                Arc::new(AtomicU64::new(0)),
+                |_: &[u8]| ComputePath::Pivot,
+                None,
+            )
+        })
+    }
+
+    /// Reading rows a window at a time gives every row the bytes one read per row gives, in
+    /// order: long runs, a gap, a repeated row and the last row, with pools of one buffer, a
+    /// few, and one for every row. Every row is read exactly once, in its window's order, and
+    /// a pool that holds every row reads them all in one window.
     #[test]
-    fn reading_rows_in_runs_gives_the_bytes_of_one_read_per_row() {
+    fn reading_rows_in_windows_gives_the_bytes_of_one_read_per_row() {
         let total = 300u64;
         let rows: Vec<u8> = (0..total).map(|row| (row * 7 % 251) as u8).collect();
         let mut required: Vec<u64> = (0..100).collect();
         required.extend(150..160);
         required.push(159);
         required.extend(200..300);
-        let expected: Vec<Vec<u8>> = required.iter().map(|&row| vec![rows[row as usize]]).collect();
-        for read_batch in [1, 16, 32, 1000] {
+        let expected: Vec<Vec<u8>> = required
+            .iter()
+            .map(|&row| vec![rows[row as usize]])
+            .collect();
+        let offsets: Vec<u64> = required.iter().map(|&row| 3 + row).collect();
+        for buffers in [1, 3, 64, required.len()] {
             let source = counting_image(&rows, None);
-            let (sent, error) = run_producer(Arc::clone(&source), &required, total, read_batch);
-            assert_eq!(error, None, "read_batch {read_batch}");
-            assert_eq!(sent, expected, "read_batch {read_batch}");
-            let reads = source.reads.load(Ordering::SeqCst) as usize;
-            if read_batch == 1 {
-                assert_eq!(reads, required.len());
-            } else {
-                assert!(reads * 4 < required.len(), "{reads} reads at read_batch {read_batch}");
+            let (sent, error) = run_producer(&source, &required, total, buffers);
+            assert_eq!(error, None, "{buffers} buffers");
+            assert_eq!(sent, expected, "{buffers} buffers");
+            let windows = source.windows.lock().unwrap();
+            assert_eq!(windows.concat(), offsets, "{buffers} buffers");
+            assert!(windows.iter().all(|window| window.len() <= buffers));
+            if buffers == required.len() {
+                assert_eq!(windows.len(), 1, "one window holds every row");
             }
         }
     }
 
-    /// A run that fails to read sends every row before the unreadable one and then the error,
-    /// exactly as one read per row does.
+    /// A window that fails to read sends every row before the unreadable one and then the
+    /// error, as one read per row does, wherever the window boundaries fall.
     #[test]
-    fn a_run_that_fails_to_read_sends_what_one_read_per_row_sends() {
+    fn a_window_that_fails_to_read_sends_every_row_before_the_unreadable_one() {
         let total = 120u64;
         let rows: Vec<u8> = (0..total).map(|row| row as u8).collect();
         let required: Vec<u64> = (0..total).collect();
         let bad = 70u64;
-        let one_per_row = run_producer(counting_image(&rows, Some(bad)), &required, total, 1);
-        assert_eq!(one_per_row.0.len(), bad as usize);
-        assert!(one_per_row.1.is_some(), "one read per row reports the unreadable row");
-        for read_batch in [16, 32, 64, 1000] {
-            let batched = run_producer(counting_image(&rows, Some(bad)), &required, total, read_batch);
-            assert_eq!(batched, one_per_row, "read_batch {read_batch}");
+        let expected: Vec<Vec<u8>> = (0..bad).map(|row| vec![row as u8]).collect();
+        for buffers in [1, 7, 64, required.len()] {
+            let (sent, error) =
+                run_producer(&counting_image(&rows, Some(bad)), &required, total, buffers);
+            assert_eq!(sent, expected, "{buffers} buffers");
+            assert_eq!(
+                error.as_deref(),
+                Some("I/O error during pipeline execution: row 70 is unreadable"),
+                "{buffers} buffers"
+            );
+        }
+    }
+
+    /// A row past the end of the `.bed` ends the stream after every row before it, with the
+    /// error that names it.
+    #[test]
+    fn a_row_past_the_end_ends_the_stream_after_the_rows_before_it() {
+        let total = 50u64;
+        let rows: Vec<u8> = (0..total).map(|row| row as u8).collect();
+        let required: Vec<u64> = (0..total).chain([total + 5]).collect();
+        let expected: Vec<Vec<u8>> = (0..total).map(|row| vec![row as u8]).collect();
+        for buffers in [1, 16, required.len()] {
+            let (sent, error) =
+                run_producer(&counting_image(&rows, None), &required, total, buffers);
+            assert_eq!(sent, expected, "{buffers} buffers");
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("BIM row 55")),
+                "{buffers} buffers: {error:?}"
+            );
+        }
+    }
+
+    /// A multi-file producer reads each window from one fileset: a window stops where the
+    /// next fileset begins, and every row is read from its own fileset once, in order.
+    #[test]
+    fn a_multi_file_window_stays_within_one_fileset() {
+        let first: Vec<u8> = (0..40u8).collect();
+        let second: Vec<u8> = (100..130u8).collect();
+        let required: Vec<u64> = (5..40).chain(40..52).chain([60, 69]).collect();
+        let expected: Vec<Vec<u8>> = required
+            .iter()
+            .map(|&row| match row {
+                0..40 => vec![first[row as usize]],
+                _ => vec![second[row as usize - 40]],
+            })
+            .collect();
+        for buffers in [1, 8, required.len()] {
+            let parts = [counting_image(&first, None), counting_image(&second, None)];
+            let sources: Vec<BedSource> = parts
+                .iter()
+                .map(|part| {
+                    BedSource::from_byte_source(Arc::clone(part) as Arc<dyn ByteRangeSource>)
+                })
+                .collect();
+            let boundaries: Vec<FilesetBoundary> = [0u64, 40]
+                .iter()
+                .enumerate()
+                .map(|(part, &start)| FilesetBoundary {
+                    bed_path: PathBuf::from(format!("part{part}.bed")),
+                    bim_path: PathBuf::from(format!("part{part}.bim")),
+                    fam_path: PathBuf::from(format!("part{part}.fam")),
+                    starting_global_index: start,
+                })
+                .collect();
+            let prep = prep_for_rows(&required, 70);
+            let (sent, error) = run_with_pool(buffers, move |pool, dense_tx| {
+                multi_file_producer_thread(
+                    prep,
+                    &boundaries,
+                    &sources,
+                    None,
+                    dense_tx,
+                    pool,
+                    Arc::new(AtomicU64::new(0)),
+                    |_: &[u8]| ComputePath::Pivot,
+                    None,
+                )
+            });
+            assert_eq!(error, None, "{buffers} buffers");
+            assert_eq!(sent, expected, "{buffers} buffers");
+            let first_offsets: Vec<u64> = (5..40).map(|row| 3 + row).collect();
+            let second_offsets: Vec<u64> = (0..12).chain([20, 29]).map(|row| 3 + row).collect();
+            assert_eq!(parts[0].windows.lock().unwrap().concat(), first_offsets);
+            assert_eq!(parts[1].windows.lock().unwrap().concat(), second_offsets);
         }
     }
 
@@ -542,21 +659,23 @@ mod pool_tests {
 
     #[test]
     fn a_full_length_buffer_is_reused_without_a_zero_fill() {
-        let stale = vec![0xA5u8; 16];
-        let address = stale.as_ptr();
-        let prepared = prepare_pooled_buffer(stale, 16).expect("buffer");
-        assert_eq!(prepared.as_ptr(), address);
-        assert_eq!(prepared, vec![0xA5u8; 16]);
+        let mut buffer = vec![0xA5u8; 16];
+        let address = buffer.as_ptr();
+        prepare_pooled_buffer(&mut buffer, 16).expect("buffer");
+        assert_eq!(buffer.as_ptr(), address);
+        assert_eq!(buffer, vec![0xA5u8; 16]);
     }
 
     #[test]
     fn a_buffer_of_another_length_is_zero_filled_to_the_row_width() {
-        let fresh = prepare_pooled_buffer(Vec::with_capacity(16), 16).expect("fresh");
-        assert_eq!(fresh, vec![0u8; 16]);
-        let short = prepare_pooled_buffer(vec![9u8; 4], 16).expect("short");
-        assert_eq!(short, vec![0u8; 16]);
-        let long = prepare_pooled_buffer(vec![9u8; 20], 16).expect("long");
-        assert_eq!(long, vec![0u8; 16]);
+        for (mut buffer, label) in [
+            (Vec::with_capacity(16), "fresh"),
+            (vec![9u8; 4], "short"),
+            (vec![9u8; 20], "long"),
+        ] {
+            prepare_pooled_buffer(&mut buffer, 16).expect(label);
+            assert_eq!(buffer, vec![0u8; 16], "{label}");
+        }
     }
 
     #[test]
@@ -840,6 +959,15 @@ impl RowBufferPool {
         }
     }
 
+    /// Takes a buffer if the pool holds one now, without waiting. Returns `None` once the
+    /// pool is closed, as [`Self::take`] does.
+    pub fn try_take(&self) -> Option<Vec<u8>> {
+        if self.closed.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.buffers.pop()
+    }
+
     /// Stops every producer taking from this pool, now and later.
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
@@ -853,13 +981,13 @@ impl RowBufferPool {
 }
 
 fn prepare_pooled_buffer(
-    mut buffer: Vec<u8>,
+    buffer: &mut Vec<u8>,
     bytes_per_variant: usize,
-) -> Result<Vec<u8>, PipelineError> {
+) -> Result<(), PipelineError> {
     // Consumers return buffers at full length, and every `ByteRangeSource::read_at` fills
     // the whole slice or fails, so a returned buffer is reused without a zero fill.
     if buffer.len() == bytes_per_variant {
-        return Ok(buffer);
+        return Ok(());
     }
     buffer.clear();
     if buffer.capacity() < bytes_per_variant {
@@ -871,78 +999,7 @@ fn prepare_pooled_buffer(
         })?;
     }
     buffer.resize(bytes_per_variant, 0);
-    Ok(buffer)
-}
-
-/// The fewest adjacent rows read with one `read_at`. A source that decodes a long read in
-/// parallel does so from sixteen whole rows on; shorter runs gain nothing from sharing a read.
-pub const PARALLEL_READ_ROWS: usize = 16;
-
-/// Reads a producer's required rows: one row per `read_at`, or, with a `read_batch` of at
-/// least [`PARALLEL_READ_ROWS`], a run of adjacent rows with one `read_at` whose rows are then
-/// handed out in order. A run that fails to read is read again one row at a time, so every
-/// row gives the bytes and the error that a one-row read gives.
-struct RowReader {
-    read_batch: usize,
-    /// The first row held in `bytes`, and how many rows it holds.
-    first: u64,
-    held: usize,
-    bytes: Vec<u8>,
-    /// Rows before this one are read one at a time, after a run that failed to read.
-    single_until: u64,
-}
-
-impl RowReader {
-    fn new(read_batch: usize) -> Self {
-        Self {
-            read_batch,
-            first: 0,
-            held: 0,
-            bytes: Vec::new(),
-            single_until: 0,
-        }
-    }
-
-    /// Fills `dst`, one row wide, with required row `i`, which lies inside `source`.
-    fn read(
-        &mut self,
-        source: &dyn ByteRangeSource,
-        required: &[BimRowIndex],
-        i: usize,
-        dst: &mut [u8],
-    ) -> Result<(), PipelineError> {
-        let row = required[i].0;
-        let width = dst.len();
-        let row_bytes = width as u64;
-        if row >= self.first && row < self.first + self.held as u64 {
-            let start = (row - self.first) as usize * width;
-            dst.copy_from_slice(&self.bytes[start..start + width]);
-            return Ok(());
-        }
-        self.held = 0;
-        if self.read_batch >= PARALLEL_READ_ROWS && row >= self.single_until {
-            let mut run = 1usize;
-            while run < self.read_batch
-                && required
-                    .get(i + run)
-                    .is_some_and(|next| next.0 == row + run as u64)
-                && 3 + (row + run as u64 + 1) * row_bytes <= source.len()
-            {
-                run += 1;
-            }
-            if run >= PARALLEL_READ_ROWS {
-                self.bytes.resize(run * width, 0);
-                if source.read_at(3 + row * row_bytes, &mut self.bytes).is_ok() {
-                    self.first = row;
-                    self.held = run;
-                    dst.copy_from_slice(&self.bytes[..width]);
-                    return Ok(());
-                }
-                self.single_until = row + run as u64;
-            }
-        }
-        source.read_at(3 + row * row_bytes, dst)
-    }
+    Ok(())
 }
 
 impl<'a> SpoolPlan<'a> {
@@ -1037,201 +1094,33 @@ pub fn producer_thread<'a, F>(
 ) where
     F: Fn(&[u8]) -> ComputePath,
 {
-    producer_thread_with_read_batch(
-        source,
-        prep_result,
+    let bytes_per_variant = prep_result.bytes_per_variant;
+    let source_len = source.len();
+    let locate = |bim_row_idx: BimRowIndex| {
+        let offset = 3 + bim_row_idx.0 * bytes_per_variant;
+        if offset + bytes_per_variant > source_len {
+            return Err(PipelineError::Io(format!(
+                "Fatal: Attempted to read past the end of the .bed source for variant at BIM row {}. The file may be truncated or inconsistent with the .bim file.",
+                bim_row_idx.0
+            )));
+        }
+        Ok((0, offset))
+    };
+    produce_rows(
+        std::slice::from_ref(&source),
+        locate,
+        &prep_result,
         sparse_tx,
         dense_tx,
-        buffer_pool,
-        variants_processed_count,
+        &buffer_pool,
+        &variants_processed_count,
         path_decider,
         spool,
-        1,
     );
 }
 
-/// As [`producer_thread`], reading a run of up to `read_batch` adjacent required rows with
-/// one `read_at` when at least [`PARALLEL_READ_ROWS`] of them sit together, so a source that
-/// decodes a long read on the rayon pool decodes the run's rows in parallel. Rows go out in
-/// the same order, with the same bytes and the same first error, as one read per row gives.
-#[allow(clippy::too_many_arguments)]
-pub fn producer_thread_with_read_batch<'a, F>(
-    source: Arc<dyn ByteRangeSource>,
-    prep_result: Arc<PreparationResult>,
-    sparse_tx: Option<Sender<Result<WorkItem, PipelineError>>>,
-    dense_tx: Sender<Result<WorkItem, PipelineError>>,
-    buffer_pool: Arc<RowBufferPool>,
-    variants_processed_count: Arc<AtomicU64>,
-    path_decider: F,
-    mut spool: Option<SpoolPlan<'a>>,
-    read_batch: usize,
-) where
-    F: Fn(&[u8]) -> ComputePath,
-{
-    let send_error = |err: PipelineError| {
-        if let Some(tx) = sparse_tx.as_ref() {
-            let _ = tx.send(Err(err.clone()));
-        }
-        let _ = dense_tx.send(Err(err));
-    };
-
-    let bytes_per_variant = prep_result.bytes_per_variant as usize;
-    let bytes_per_variant_u64 = prep_result.bytes_per_variant;
-    let mut local_variants_processed: u64 = 0;
-    let mut reader = RowReader::new(read_batch);
-
-    match spool.as_mut() {
-        Some(sp) => {
-            let sp = sp;
-            for (i, &bim_row_idx) in prep_result.required_bim_indices.iter().enumerate() {
-                // A closed pool means a consumer stopped, and it reports why.
-                let Some(pooled) = buffer_pool.take() else {
-                    break;
-                };
-                let mut buffer = match prepare_pooled_buffer(pooled, bytes_per_variant) {
-                    Ok(buffer) => buffer,
-                    Err(err) => {
-                        send_error(err);
-                        break;
-                    }
-                };
-
-                let offset = 3 + bim_row_idx.0 * bytes_per_variant_u64;
-                let end = offset + bytes_per_variant_u64;
-
-                if end > source.len() {
-                    let err = PipelineError::Io(format!(
-                        "Fatal: Attempted to read past the end of the .bed source for variant at BIM row {}. The file may be truncated or inconsistent with the .bim file.",
-                        bim_row_idx.0
-                    ));
-                    send_error(err);
-                    break;
-                }
-
-                if let Err(err) = reader.read(
-                    source.as_ref(),
-                    &prep_result.required_bim_indices,
-                    i,
-                    buffer.as_mut_slice(),
-                ) {
-                    send_error(err);
-                    break;
-                }
-
-                if let Err(err) = sp.write_variant(i, bim_row_idx, &buffer) {
-                    send_error(err);
-                    break;
-                }
-
-                let path = choose_score_path(&buffer, &prep_result, i, &path_decider);
-
-                let reconciled_variant_index = match reconciled_index_from_usize(i) {
-                    Ok(idx) => idx,
-                    Err(err) => {
-                        send_error(err);
-                        break;
-                    }
-                };
-                let work_item = WorkItem {
-                    data: buffer,
-                    reconciled_variant_index,
-                };
-
-                let tx = if path == ComputePath::Pivot {
-                    &dense_tx
-                } else {
-                    sparse_tx.as_ref().unwrap_or(&dense_tx)
-                };
-
-                if tx.send(Ok(work_item)).is_err() {
-                    break;
-                }
-
-                local_variants_processed += 1;
-                if local_variants_processed == PROGRESS_UPDATE_BATCH_SIZE {
-                    variants_processed_count
-                        .fetch_add(PROGRESS_UPDATE_BATCH_SIZE, Ordering::Relaxed);
-                    local_variants_processed = 0;
-                }
-            }
-        }
-        None => {
-            for (i, &bim_row_idx) in prep_result.required_bim_indices.iter().enumerate() {
-                // A closed pool means a consumer stopped, and it reports why.
-                let Some(pooled) = buffer_pool.take() else {
-                    break;
-                };
-                let mut buffer = match prepare_pooled_buffer(pooled, bytes_per_variant) {
-                    Ok(buffer) => buffer,
-                    Err(err) => {
-                        send_error(err);
-                        break;
-                    }
-                };
-
-                let offset = 3 + bim_row_idx.0 * bytes_per_variant_u64;
-                let end = offset + bytes_per_variant_u64;
-
-                if end > source.len() {
-                    let err = PipelineError::Io(format!(
-                        "Fatal: Attempted to read past the end of the .bed source for variant at BIM row {}. The file may be truncated or inconsistent with the .bim file.",
-                        bim_row_idx.0
-                    ));
-                    send_error(err);
-                    break;
-                }
-
-                if let Err(err) = reader.read(
-                    source.as_ref(),
-                    &prep_result.required_bim_indices,
-                    i,
-                    buffer.as_mut_slice(),
-                ) {
-                    send_error(err);
-                    break;
-                }
-
-                let path = choose_score_path(&buffer, &prep_result, i, &path_decider);
-
-                let reconciled_variant_index = match reconciled_index_from_usize(i) {
-                    Ok(idx) => idx,
-                    Err(err) => {
-                        send_error(err);
-                        break;
-                    }
-                };
-                let work_item = WorkItem {
-                    data: buffer,
-                    reconciled_variant_index,
-                };
-
-                let tx = if path == ComputePath::Pivot {
-                    &dense_tx
-                } else {
-                    sparse_tx.as_ref().unwrap_or(&dense_tx)
-                };
-
-                if tx.send(Ok(work_item)).is_err() {
-                    break;
-                }
-
-                local_variants_processed += 1;
-                if local_variants_processed == PROGRESS_UPDATE_BATCH_SIZE {
-                    variants_processed_count
-                        .fetch_add(PROGRESS_UPDATE_BATCH_SIZE, Ordering::Relaxed);
-                    local_variants_processed = 0;
-                }
-            }
-        }
-    }
-
-    if local_variants_processed > 0 {
-        variants_processed_count.fetch_add(local_variants_processed, Ordering::Relaxed);
-    }
-}
-
-/// The producer for the multi-file pipeline. It seamlessly switches between memory-mapped
-/// files as it iterates through the globally-indexed list of required variants.
+/// The producer for the multi-file pipeline. It seamlessly switches between the filesets'
+/// sources as it iterates through the globally-indexed list of required variants.
 pub fn multi_file_producer_thread<'a, F>(
     prep_result: Arc<PreparationResult>,
     boundaries: &[FilesetBoundary],
@@ -1241,9 +1130,70 @@ pub fn multi_file_producer_thread<'a, F>(
     buffer_pool: Arc<RowBufferPool>,
     variants_processed_count: Arc<AtomicU64>,
     path_decider: F,
+    spool: Option<SpoolPlan<'a>>,
+) where
+    F: Fn(&[u8]) -> ComputePath,
+{
+    debug_assert_eq!(boundaries.len(), bed_sources.len());
+    let sources: Vec<Arc<dyn ByteRangeSource>> =
+        bed_sources.iter().map(BedSource::byte_source).collect();
+    let bytes_per_variant = prep_result.bytes_per_variant;
+    let mut fileset = 0usize;
+    let locate = |global_bim_row_index: BimRowIndex| {
+        while boundaries
+            .get(fileset + 1)
+            .is_some_and(|next| global_bim_row_index.0 >= next.starting_global_index)
+        {
+            fileset += 1;
+        }
+        let local_index = global_bim_row_index.0 - boundaries[fileset].starting_global_index;
+        let offset = 3 + local_index * bytes_per_variant;
+        if offset + bytes_per_variant > sources[fileset].len() {
+            return Err(PipelineError::Io(format!(
+                "Fatal: Read past end of .bed source '{}' for variant with global index {}. Source may be corrupt.",
+                boundaries[fileset].bed_path.display(),
+                global_bim_row_index.0
+            )));
+        }
+        Ok((fileset, offset))
+    };
+    produce_rows(
+        &sources,
+        locate,
+        &prep_result,
+        sparse_tx,
+        dense_tx,
+        &buffer_pool,
+        &variants_processed_count,
+        path_decider,
+        spool,
+    );
+}
+
+/// Reads the required rows in windows and sends them in order.
+///
+/// A window is every buffer the pool holds once the producer has one (waiting for the
+/// first), filled with the next required rows of one source by one
+/// [`ByteRangeSource::read_ranges`], so a source that decodes its rows, as a `.pgen` does,
+/// decodes a window's rows together on the rayon pool. Consumers that keep up leave the
+/// pool full and the windows wide; consumers that lag leave the producer nothing to hurry.
+/// `locate` gives each required row's source, among `sources`, and the offset of its row
+/// there, or the error that ends the stream at that row. Rows go out in order with the
+/// bytes, and the stream ends with the error, that one read per row gives.
+#[allow(clippy::too_many_arguments)]
+fn produce_rows<'a, F, L>(
+    sources: &[Arc<dyn ByteRangeSource>],
+    mut locate: L,
+    prep_result: &PreparationResult,
+    sparse_tx: Option<Sender<Result<WorkItem, PipelineError>>>,
+    dense_tx: Sender<Result<WorkItem, PipelineError>>,
+    buffer_pool: &RowBufferPool,
+    variants_processed_count: &AtomicU64,
+    path_decider: F,
     mut spool: Option<SpoolPlan<'a>>,
 ) where
     F: Fn(&[u8]) -> ComputePath,
+    L: FnMut(BimRowIndex) -> Result<(usize, u64), PipelineError>,
 {
     let send_error = |err: PipelineError| {
         if let Some(tx) = sparse_tx.as_ref() {
@@ -1252,173 +1202,108 @@ pub fn multi_file_producer_thread<'a, F>(
         let _ = dense_tx.send(Err(err));
     };
 
-    let mut current_fileset_idx: usize = 0;
-    let bytes_per_variant = prep_result.bytes_per_variant;
+    let required = &prep_result.required_bim_indices;
+    let bytes_per_variant = prep_result.bytes_per_variant as usize;
     let mut local_variants_processed: u64 = 0;
+    let mut buffers: Vec<Vec<u8>> = Vec::new();
+    let mut offsets: Vec<u64> = Vec::new();
+    let mut next = 0usize;
 
-    debug_assert_eq!(boundaries.len(), bed_sources.len());
+    'rows: while next < required.len() {
+        if buffers.is_empty() {
+            // A closed pool means a consumer stopped, and it reports why.
+            let Some(buffer) = buffer_pool.take() else {
+                break;
+            };
+            buffers.push(buffer);
+        }
+        while buffers.len() < required.len() - next
+            && let Some(buffer) = buffer_pool.try_take()
+        {
+            buffers.push(buffer);
+        }
 
-    let mut current_source = bed_sources[0].byte_source();
-    let mut next_boundary_start_idx = if boundaries.len() > 1 {
-        boundaries[1].starting_global_index
-    } else {
-        u64::MAX
-    };
-
-    match spool.as_mut() {
-        Some(sp) => {
-            let sp = sp;
-            for (i, &global_bim_row_index) in prep_result.required_bim_indices.iter().enumerate() {
-                while global_bim_row_index.0 >= next_boundary_start_idx {
-                    current_fileset_idx += 1;
-                    current_source = bed_sources[current_fileset_idx].byte_source();
-                    next_boundary_start_idx = if boundaries.len() > current_fileset_idx + 1 {
-                        boundaries[current_fileset_idx + 1].starting_global_index
-                    } else {
-                        u64::MAX
-                    };
-                }
-
-                let local_index =
-                    global_bim_row_index.0 - boundaries[current_fileset_idx].starting_global_index;
-                let offset = 3 + local_index * bytes_per_variant;
-                let end = offset + bytes_per_variant;
-
-                if end > current_source.len() {
-                    let err = PipelineError::Io(format!(
-                        "Fatal: Read past end of .bed source '{}' for variant with global index {}. Source may be corrupt.",
-                        boundaries[current_fileset_idx].bed_path.display(),
-                        global_bim_row_index.0
-                    ));
-                    send_error(err);
-                    return;
-                }
-
-                // A closed pool means a consumer stopped, and it reports why.
-                let Some(pooled) = buffer_pool.take() else {
-                    break;
-                };
-                let mut buffer = match prepare_pooled_buffer(pooled, bytes_per_variant as usize) {
-                    Ok(buffer) => buffer,
-                    Err(err) => {
-                        send_error(err);
-                        return;
+        // The window: the next rows of one source, one per buffer, up to the first row that
+        // cannot be read. `failure` is always the error of the earliest row that fails.
+        let mut window_source = None;
+        let mut failure = None;
+        offsets.clear();
+        for &bim_row_idx in &required[next..next + buffers.len()] {
+            match locate(bim_row_idx) {
+                Ok((source, offset)) => {
+                    if *window_source.get_or_insert(source) != source {
+                        break;
                     }
-                };
-
-                if let Err(err) = current_source.read_at(offset, buffer.as_mut_slice()) {
-                    send_error(err);
-                    return;
+                    offsets.push(offset);
                 }
-
-                if let Err(err) = sp.write_variant(i, global_bim_row_index, &buffer) {
-                    send_error(err);
-                    return;
-                }
-
-                let path = choose_score_path(&buffer, &prep_result, i, &path_decider);
-                let reconciled_variant_index = match reconciled_index_from_usize(i) {
-                    Ok(idx) => idx,
-                    Err(err) => {
-                        send_error(err);
-                        return;
-                    }
-                };
-                let work_item = WorkItem {
-                    data: buffer,
-                    reconciled_variant_index,
-                };
-
-                let tx = if path == ComputePath::Pivot {
-                    &dense_tx
-                } else {
-                    sparse_tx.as_ref().unwrap_or(&dense_tx)
-                };
-                if tx.send(Ok(work_item)).is_err() {
+                Err(err) => {
+                    failure = Some(err);
                     break;
-                }
-
-                local_variants_processed += 1;
-                if local_variants_processed == PROGRESS_UPDATE_BATCH_SIZE {
-                    variants_processed_count
-                        .fetch_add(PROGRESS_UPDATE_BATCH_SIZE, Ordering::Relaxed);
-                    local_variants_processed = 0;
                 }
             }
         }
-        None => {
-            for (i, &global_bim_row_index) in prep_result.required_bim_indices.iter().enumerate() {
-                while global_bim_row_index.0 >= next_boundary_start_idx {
-                    current_fileset_idx += 1;
-                    current_source = bed_sources[current_fileset_idx].byte_source();
-                    next_boundary_start_idx = if boundaries.len() > current_fileset_idx + 1 {
-                        boundaries[current_fileset_idx + 1].starting_global_index
-                    } else {
-                        u64::MAX
-                    };
-                }
-
-                let local_index =
-                    global_bim_row_index.0 - boundaries[current_fileset_idx].starting_global_index;
-                let offset = 3 + local_index * bytes_per_variant;
-                let end = offset + bytes_per_variant;
-
-                if end > current_source.len() {
-                    let err = PipelineError::Io(format!(
-                        "Fatal: Read past end of .bed source '{}' for variant with global index {}. Source may be corrupt.",
-                        boundaries[current_fileset_idx].bed_path.display(),
-                        global_bim_row_index.0
-                    ));
-                    send_error(err);
-                    return;
-                }
-
-                // A closed pool means a consumer stopped, and it reports why.
-                let Some(pooled) = buffer_pool.take() else {
-                    break;
-                };
-                let mut buffer = match prepare_pooled_buffer(pooled, bytes_per_variant as usize) {
-                    Ok(buffer) => buffer,
-                    Err(err) => {
-                        send_error(err);
-                        return;
-                    }
-                };
-
-                if let Err(err) = current_source.read_at(offset, buffer.as_mut_slice()) {
-                    send_error(err);
-                    return;
-                }
-
-                let path = choose_score_path(&buffer, &prep_result, i, &path_decider);
-                let reconciled_variant_index = match reconciled_index_from_usize(i) {
-                    Ok(idx) => idx,
-                    Err(err) => {
-                        send_error(err);
-                        return;
-                    }
-                };
-                let work_item = WorkItem {
-                    data: buffer,
-                    reconciled_variant_index,
-                };
-
-                let tx = if path == ComputePath::Pivot {
-                    &dense_tx
-                } else {
-                    sparse_tx.as_ref().unwrap_or(&dense_tx)
-                };
-                if tx.send(Ok(work_item)).is_err() {
-                    break;
-                }
-
-                local_variants_processed += 1;
-                if local_variants_processed == PROGRESS_UPDATE_BATCH_SIZE {
-                    variants_processed_count
-                        .fetch_add(PROGRESS_UPDATE_BATCH_SIZE, Ordering::Relaxed);
-                    local_variants_processed = 0;
-                }
+        let mut filled = offsets.len();
+        for (row, buffer) in buffers[..filled].iter_mut().enumerate() {
+            if let Err(err) = prepare_pooled_buffer(buffer, bytes_per_variant) {
+                failure = Some(err);
+                filled = row;
+                break;
             }
+        }
+        if let Some(source) = window_source.filter(|_| filled > 0) {
+            let mut dsts: Vec<&mut [u8]> = buffers[..filled]
+                .iter_mut()
+                .map(Vec::as_mut_slice)
+                .collect();
+            if let Err((row, err)) = sources[source].read_ranges(&offsets[..filled], &mut dsts) {
+                failure = Some(err);
+                filled = row;
+            }
+        }
+
+        for (row, buffer) in buffers.drain(..filled).enumerate() {
+            let i = next + row;
+            if let Some(sp) = spool.as_mut()
+                && let Err(err) = sp.write_variant(i, required[i], &buffer)
+            {
+                send_error(err);
+                break 'rows;
+            }
+
+            let path = choose_score_path(&buffer, prep_result, i, &path_decider);
+
+            let reconciled_variant_index = match reconciled_index_from_usize(i) {
+                Ok(idx) => idx,
+                Err(err) => {
+                    send_error(err);
+                    break 'rows;
+                }
+            };
+            let work_item = WorkItem {
+                data: buffer,
+                reconciled_variant_index,
+            };
+
+            let tx = if path == ComputePath::Pivot {
+                &dense_tx
+            } else {
+                sparse_tx.as_ref().unwrap_or(&dense_tx)
+            };
+            if tx.send(Ok(work_item)).is_err() {
+                break 'rows;
+            }
+
+            local_variants_processed += 1;
+            if local_variants_processed == PROGRESS_UPDATE_BATCH_SIZE {
+                variants_processed_count.fetch_add(PROGRESS_UPDATE_BATCH_SIZE, Ordering::Relaxed);
+                local_variants_processed = 0;
+            }
+        }
+        next += filled;
+
+        if let Some(err) = failure {
+            send_error(err);
+            break;
         }
     }
 
