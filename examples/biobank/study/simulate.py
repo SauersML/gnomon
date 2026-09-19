@@ -176,22 +176,28 @@ class Link:
         return np.exp(u - (1.0 / self.lam + 1.0) * np.logaddexp(0.0, u + self.loglam))
 
     def dpdf(self, u):
-        return self.evaluate(u)[2]
+        return self.evaluate(u)[3]
+
+    def sf(self, u):
+        return self.evaluate(u)[1]
 
     def evaluate(self, u, cdf=True):
-        """(G, g, g') at u in one pass; G is None when cdf is False."""
+        """(G, 1 - G, g, g') at u in one pass. The survival function 1 - G is computed directly, so it keeps its
+        relative precision where G rounds to 1. G and 1 - G are None when cdf is False."""
         if self.name == "probit":
             g = np.exp(-0.5 * u * u) / np.sqrt(2.0 * np.pi)
-            return (special.ndtr(u) if cdf else None), g, -u * g
+            return (special.ndtr(u) if cdf else None), (special.ndtr(-u) if cdf else None), g, -u * g
         if self.name == "cloglog":
             e = np.exp(np.minimum(u, 700.0))
             g = np.exp(u - e)
-            return (-np.expm1(-e) if cdf else None), g, g * (1.0 - e)
+            return (-np.expm1(-e) if cdf else None), (np.exp(-e) if cdf else None), g, g * (1.0 - e)
         v = u + self.loglam
         log1p_ev = np.logaddexp(0.0, v)
         g = np.exp(u - (1.0 / self.lam + 1.0) * log1p_ev)
         dg = g * (1.0 - (1.0 / self.lam + 1.0) * np.exp(v - log1p_ev))
-        return (-np.expm1(-log1p_ev / self.lam) if cdf else None), g, dg
+        if not cdf:
+            return None, None, g, dg
+        return -np.expm1(-log1p_ev / self.lam), np.exp(-log1p_ev / self.lam), g, dg
 
     def ppf(self, p):
         p = np.asarray(p, dtype=float)
@@ -896,15 +902,16 @@ def last_encounter(people, onset_any, w_rec_age, e0_age, world, rng):
 @dataclass
 class Quad:
     """Quadrature resolution. ``refine`` multiplies every node count; the refinement test compares 1 with 2."""
-    gl: int = 6
+    gl: int = 6          # Gauss-Legendre order in the clustered pieces
+    gl_inc: int = 4      # and in the running recurrences' increments (4 and 6 agree to 1e-10 there)
     first_steps: int = 16
     steps_per_year: int = 8
     binary_steps: int = 56
     refine: int = 1
     abs_step: float = 2.0
 
-    def nodes(self):
-        x, w = np.polynomial.legendre.leggauss(self.gl * self.refine)
+    def nodes(self, increments=False):
+        x, w = np.polynomial.legendre.leggauss((self.gl_inc if increments else self.gl) * self.refine)
         return (x + 1.0) / 2.0, w / 2.0
 
 
@@ -912,15 +919,17 @@ CLUSTER = np.array([0.0, 0.5, 1.5, 4.0, 10.0, 20.0, 40.0])
 CLUSTER_ABS_SPAN = 32.0
 
 
-def _clustered(span, mu, quad: Quad):
-    """Nodes v in [0, min(span, 40 / mu)] clustered near 0 on the scale 1 / mu, in pieces at most quad.abs_step /
-    refine years long (so the onset density's own age scale is resolved too); beyond 40 / mu the kernel e^-mu v
-    is below 5e-18."""
+def _clustered(span, mu, quad: Quad, absolute=True):
+    """Nodes v in [0, min(span, 40 / mu)] clustered near 0 on the scale 1 / mu; beyond 40 / mu the kernel e^-mu v
+    is below 5e-18. With ``absolute`` the pieces are also at most quad.abs_step / refine years long, so an onset
+    density's own age scale is resolved; integrands without the onset density don't need that."""
     x, w = quad.nodes()
     top = np.minimum(40.0 / mu, span)[:, None]
-    step = quad.abs_step / quad.refine
-    grid = np.arange(step, CLUSTER_ABS_SPAN + 1e-9, step)
-    b = np.concatenate([CLUSTER[None, :] / mu[:, None], np.broadcast_to(grid, (len(mu), len(grid)))], axis=1)
+    b = CLUSTER[None, :] / mu[:, None]
+    if absolute:
+        step = quad.abs_step / quad.refine
+        grid = np.arange(step, CLUSTER_ABS_SPAN + 1e-9, step)
+        b = np.concatenate([b, np.broadcast_to(grid, (len(mu), len(grid)))], axis=1)
     b = np.sort(np.minimum(b, top), axis=1)
     lo, hi = b[:, :-1], b[:, 1:]
     v = lo[:, :, None] + (hi - lo)[:, :, None] * x
@@ -938,14 +947,17 @@ class Index:
         return Index(self.lin[j], self.beta[j], self.scale[j])
 
     def at(self, dp, link, a, cdf=True):
-        """F and f at ages a (person axis first), stacked as (value, d/dS); F is None when cdf is False."""
+        """F, f and the onset survival 1 - F at ages a (person axis first), each stacked as (value, d/dS); F and
+        1 - F are None when cdf is False."""
         shape = (slice(None),) + (None,) * (np.ndim(a) - 1)
         lin, beta, scale = self.lin[shape], self.beta[shape], self.scale[shape]
         al, dal = alpha(dp, a)
-        big, g, dg = link.evaluate(scale * al + lin, cdf)
+        big, surv, g, dg = link.evaluate(scale * al + lin, cdf)
         dal = scale * dal
         f = np.stack([dal * g, dal * beta * dg])
-        return (np.stack([big, beta * g]) if cdf else None), f
+        if not cdf:
+            return None, f, None
+        return np.stack([big, beta * g]), f, np.stack([surv, -beta * g])
 
 
 def _q(x):
@@ -963,11 +975,11 @@ def _death(omega, a, a0):
 def _running_corr(dp, link, ix, a0_rate, grid, mu0, mu1, quad, start=None):
     """Corr(t_j) = int_{a0}^{t_j} f(s) e^{-L} (1 + L) ds at every grid point, L = mu0 (s - a0) + mu1 (t_j - s).
     grid: (n, K + 1) ages from a0 upward. start: optional (M0, M1) at grid[:, 0] (a piece before the grid)."""
-    x, w = quad.nodes()
+    x, w = quad.nodes(increments=True)
     n, kp1 = grid.shape
     dt_ = np.diff(grid, axis=1)                                         # (n, K)
     s = grid[:, :-1, None] + dt_[:, :, None] * x                        # (n, K, m)
-    _, f = ix.at(dp, link, s, cdf=False)
+    _, f, _ = ix.at(dp, link, s, cdf=False)
     lam = mu0[:, None, None] * (s - a0_rate[:, None, None]) + mu1[:, None, None] * dt_[:, :, None] * (1.0 - x)
     e = np.exp(-lam) * dt_[:, :, None] * w
     inc0 = (f * e).sum(-1)
@@ -1031,29 +1043,29 @@ def survival_grid(horizons, quad: Quad, lag=0.0):
 def survival_truth(dp, link, ix, e0, a_l, omega, mu0, mu1, horizons, quad: Quad, plant=None, lag=0.0):
     """cif at each horizon, its derivative in S, P(entry | alive), and net death risk; see the module docstring."""
     n = len(e0)
-    one = np.array([1.0, 0.0])[:, None]
     span = a_l - e0
     v, wv = _clustered(span, mu1, quad)
-    _, f_s = ix.at(dp, link, a_l[:, None] - v, cdf=False)
+    _, f_s, _ = ix.at(dp, link, a_l[:, None] - v, cdf=False)
     kern = np.exp(-mu0[:, None] * (span[:, None] - v) - mu1[:, None] * v) * wv
-    big_e0, _ = ix.at(dp, link, e0)
+    big_e0, _, _ = ix.at(dp, link, e0)
     a_term = big_e0 * np.exp(-mu1 * span) + (f_s * kern).sum(-1)
     if plant == "no_undiagnosed_prevalent":
         a_term = np.zeros_like(a_term)
     p0 = np.exp(-mu0 * span)
-    f_al, _ = ix.at(dp, link, a_l)
-    den = a_term + p0 * (one - f_al)
+    _, _, s_al = ix.at(dp, link, a_l)
+    den = a_term + p0 * s_al
 
     tau, simp, index, ends = survival_grid(horizons, quad, lag)
     grid = a_l[:, None] + tau[None, :]
     corr = _running_corr(dp, link, ix, a_l, grid, mu0, mu1, quad)
-    f_g, _ = ix.at(dp, link, grid)
-    b = ((one[..., None] - f_g) * _q(mu0[:, None] * tau) + f_g - f_al[..., None] - corr)
+    _, _, s_g = ix.at(dp, link, grid)
+    # F(t) - F(aL) is written S(aL) - S(t): both survivals keep their precision when onset is nearly certain
+    b = s_g * _q(mu0[:, None] * tau) + (s_al[..., None] - s_g) - corr
     q_grid = a_term[..., None] * _q(mu1[:, None] * tau) + p0[:, None] * b
     if plant == "first_code_event":
         # wrong estimand: onset at the FIRST qualifying date
         q_grid = (a_term[..., None] * -np.expm1(-mu1[:, None] * tau)
-                  + p0[:, None] * ((one[..., None] - f_g) * -np.expm1(-mu0[:, None] * tau) + f_g - f_al[..., None]))
+                  + p0[:, None] * (s_g * -np.expm1(-mu0[:, None] * tau) + s_al[..., None] - s_g))
     lam_g, r_g = _death(omega[:, None], grid, a_l[:, None])
     if plant == "no_competing_death":
         lam_g, r_g = np.zeros_like(lam_g), np.ones_like(r_g)
@@ -1061,7 +1073,7 @@ def survival_truth(dp, link, ix, e0, a_l, omega, mu0, mu1, horizons, quad: Quad,
     num = []
     death = []
     for i, h in enumerate(ends):
-        vv, ww = _clustered(np.full(n, h), mu1, quad)
+        vv, ww = _clustered(np.full(n, h), mu1, quad, absolute=False)
         lam_v, r_v = _death(omega[:, None], a_l[:, None] + vv, a_l[:, None])
         if plant == "no_competing_death":
             lam_v, r_v = np.zeros_like(lam_v), np.ones_like(r_v)
@@ -1069,7 +1081,7 @@ def survival_truth(dp, link, ix, e0, a_l, omega, mu0, mu1, horizons, quad: Quad,
         ia = (1.0 - r_h) - (np.exp(-mu1[:, None] * vv) * (1.0 + mu1[:, None] * vv) * lam_v * r_v * ww).sum(-1)
         if plant == "first_code_event":
             ia = (1.0 - r_h) - (np.exp(-mu1[:, None] * vv) * lam_v * r_v * ww).sum(-1)
-            ib_i = (((one[..., None] - f_g) * -np.expm1(-mu0[:, None] * tau) + f_g - f_al[..., None])
+            ib_i = ((s_g * -np.expm1(-mu0[:, None] * tau) + s_al[..., None] - s_g)
                     * lam_g * r_g) @ simp[i]
         else:
             ib_i = ib[..., i]
@@ -1084,11 +1096,10 @@ def survival_truth(dp, link, ix, e0, a_l, omega, mu0, mu1, horizons, quad: Quad,
 def binary_truth(dp, link, ix, e0, a_b, a_c, omega, mu0, mu1, rate_x, quad: Quad, plant=None):
     """p_ever with exit, p_ever without exit, and d p_ever / dS (see the module docstring)."""
     n = len(e0)
-    one = np.array([1.0, 0.0])[:, None]
     span = a_b - e0
     v, wv = _clustered(span, mu1, quad)
     s = a_b[:, None] - v
-    _, f_s = ix.at(dp, link, s, cdf=False)
+    _, f_s, _ = ix.at(dp, link, s, cdf=False)
     lam = mu0[:, None] * (s - e0[:, None]) + mu1[:, None] * v
     e = np.exp(-lam) * wv
     m0, m1 = (f_s * e).sum(-1), (f_s * e * (1.0 + lam)).sum(-1)
@@ -1096,11 +1107,11 @@ def binary_truth(dp, link, ix, e0, a_b, a_c, omega, mu0, mu1, rate_x, quad: Quad
     step = (a_c - a_b) / k
     grid = a_b[:, None] + step[:, None] * np.arange(k + 1)
     corr = _running_corr(dp, link, ix, e0, grid, mu0, mu1, quad, start=(m0, m1))
-    f_g, _ = ix.at(dp, link, grid)
-    big_e0, _ = ix.at(dp, link, e0)
+    _, _, s_g = ix.at(dp, link, grid)
+    big_e0, _, s_e0 = ix.at(dp, link, e0)
     since = grid - e0[:, None]
-    p2 = (big_e0[..., None] * _q(mu1[:, None] * since) + f_g - big_e0[..., None] - corr
-          + (one[..., None] - f_g) * _q(mu0[:, None] * since))
+    p2 = (big_e0[..., None] * _q(mu1[:, None] * since) + (s_e0[..., None] - s_g) - corr
+          + s_g * _q(mu0[:, None] * since))
     lam_g, r_g = _death(omega[:, None], grid, a_b[:, None])
     out = []
     for rx in (rate_x, np.zeros(n)):
@@ -1154,8 +1165,8 @@ def compute_truth(world, dp, terms, s_latent, people, horizons, quad=None, plant
 
 
 def probit_slope(p, dp_ds, ds_dz):
-    """d Phi^-1(p) / dz from dp/dS (the local probit slope); null where p is not strictly inside (0, 1)."""
-    ok = (p > 1e-300) & (p < 1.0)
+    """d Phi^-1(p) / dz from dp/dS (the local probit slope); null within 1e-12 of 0 or 1."""
+    ok = (p > 1e-12) & (p < 1.0 - 1e-12)     # nearer 0 or 1 the probit slope has no reliable digits
     z = special.ndtri(np.where(ok, p, 0.5))
     dens = np.exp(-0.5 * z * z) / np.sqrt(2.0 * np.pi)
     return np.where(ok, dp_ds * ds_dz / dens, np.nan)

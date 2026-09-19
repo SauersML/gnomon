@@ -307,6 +307,12 @@ def test_link_functions_are_consistent():
         assert np.max(np.abs((link.cdf(u + h) - link.cdf(u - h)) / (2 * h) - link.pdf(u))) < 1e-7
         assert np.max(np.abs((link.pdf(u + h) - link.pdf(u - h)) / (2 * h) - link.dpdf(u))) < 1e-7
     assert abs(sim.Link("ao", 1.0).sd - np.pi / np.sqrt(3.0)) < 1e-6
+    # the survival function keeps its relative precision where the CDF rounds to 1
+    for link, u, exact in ((sim.Link("cloglog"), 5.0, np.exp(-np.exp(5.0))),
+                           (sim.Link("probit"), 12.0, 1.7764821120776e-33),
+                           (sim.Link("ao", 0.5), 40.0, (1.0 + 0.5 * np.exp(40.0)) ** -2.0)):
+        assert abs(link.sf(np.array([u]))[0] / exact - 1.0) < 1e-10, link.name
+        assert abs(link.sf(np.array([-2.0]))[0] + link.cdf(np.array([-2.0]))[0] - 1.0) < 1e-15
 
 
 def test_projection_reader_roundtrip(tmp_path):
