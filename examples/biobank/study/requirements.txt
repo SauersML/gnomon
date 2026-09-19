@@ -1,0 +1,13 @@
+# The study runtime. build_wheel.py stages these as binary wheels for CPython 3.12 / manylinux_2_28, with
+# the gamfit wheel it built; the AoU task installs them from that wheelhouse with --no-index. Every gam pin
+# builds the same gamfit version, so the build is named by its engine_sha256, not by a version here.
+gamfit
+numpy>=2.0,<3
+pandas>=2.3,<3
+pyarrow>=18
+scipy>=1.14,<2
+scikit-learn>=1.5,<2
+google-cloud-bigquery>=3.27,<4
+db-dtypes>=1.3,<2
+google-auth>=2.30,<3
+requests>=2.32,<3
