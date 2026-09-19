@@ -70,6 +70,17 @@ def exclusion_caveats(results):
     return lines
 
 
+def compared(rows):
+    """(rows a table compares, the "excluded" lines of the rest): a cell whose engines did not
+    certify a fit behind it (certification not_certified, a competitor's; ours uncertified
+    fails the run) is never compared, and is listed by model, disease and kind instead."""
+    kept = [r for r in rows if r.get("certification") != "not_certified"]
+    lines = sorted({f"excluded: not_certified {r['variant']} {r['disease']} {r['model']}"
+                    + ("" if r["fit"] == "pooled" else f" {r['fit']}")
+                    for r in rows if r.get("certification") == "not_certified"})
+    return kept, lines
+
+
 def censoring_caveat(run, model="survival"):
     """The caveat a survival table prints with, from the censoring rule the run row
     records for its model: "censoring" for survival, "censoring_<model>" for a twin
@@ -120,17 +131,24 @@ def main():
                   and r["stratum"] == args.stratum]
         logo = [r for r in model_rows if r["model"] == model and r["fit"].startswith("logo_")]
         caveat = censoring_caveat(run, model) if model != "binary" and (chosen or logo) else None
+        # An uncertified competitor's cells are never compared: out of the table, listed under it.
+        chosen, chosen_out = compared(chosen)
+        logo, logo_out = compared(logo)
         rows = [[r["disease"], r["variant"], r["horizon"], *(r.get(m) for m in metrics)]
                 for r in sorted(chosen, key=lambda r: (r["disease"], r["horizon"], r["variant"]))]
         print_table(f"{model}: pooled fits, stratum {args.stratum}", ["disease", "variant", "horizon", *metrics], rows)
         if caveat and rows:
             print(caveat)
+        for line in chosen_out:
+            print(line)
         rows = [[r["disease"], r["variant"], r["fit"][len("logo_"):], r["horizon"], *(r.get(m) for m in metrics)]
                 for r in sorted(logo, key=lambda r: (r["disease"], r["fit"], r["horizon"], r["variant"]))]
         print_table(f"{model}: leave-one-group-out refits, scored on the held-out group's test rows",
                     ["disease", "variant", "held_out", "horizon", *metrics], rows)
         if caveat and rows:
             print(caveat)
+        for line in logo_out:
+            print(line)
 
     fit_fields = ["fits", "ok", "failed", "median_seconds", "max_seconds", "cpu_seconds", "threads", "max_rss_mb"]
     print_table("fits (disease_model_variant_component)", ["fit", *fit_fields],

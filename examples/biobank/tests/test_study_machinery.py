@@ -369,6 +369,13 @@ def test_every_survival_table_prints_its_censoring_caveat(tmp_path):
     text = table(survival + twin, {"censoring": "ehr_end", "censoring_survival_cutoff": "min_death_cutoff"})
     assert text.count(cutoff) == 1 and text.count(last_contact) == 2 and "survival_cutoff: pooled fits" in text
     raises(ValueError, table, survival + twin, {"censoring": "ehr_end"})
+    # An uncertified competitor's cell is left out of the comparison and listed as excluded, by name.
+    uncertified = {**{k: v for k, v in binary[0].items() if k not in ("auc", "observed_risk")},
+                   "variant": "standard", "certification": "not_certified"}
+    text = table(binary + [uncertified], {"label": "production"})
+    assert "excluded: not_certified standard t2d binary" in text
+    assert not any(line.split()[:2] == ["t2d", "standard"] for line in text.splitlines())
+    assert any(line.split()[:2] == ["t2d", "ours"] for line in text.splitlines())
 
 
 def test_the_primary_censoring_rule_is_required_known_and_reasoned(tmp_path):
