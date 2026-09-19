@@ -19,6 +19,7 @@ import argparse
 import functools
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -26,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 from scipy import special
 
@@ -514,6 +516,46 @@ def test_truth_frames_match_study_phenotypes():
     # world, so they keep the same rows; they differ only in where follow-up ends.
     for disease in diseases:
         assert kept["independent", disease.slug] == kept["lastcontact", disease.slug], disease.slug
+
+
+def test_publish_records_each_size_seed(tmp_path):
+    """publish takes a seed per size (name=n:seed; the k-th size defaults to 1000 (k + 1)) and records it."""
+    root = tmp_path / "v"
+    try:
+        sim.main(["publish", "--root", str(root), "--sizes", "tiny=600:4321,wee=500", "--scenarios", "realistic",
+                  "--workers", "1", "--git-sha", "test"])
+        listing = json.loads((root / "MANIFEST.json").read_text())
+        assert {(s["dir"], s["n"], s["seed"]) for s in listing["sets"]} == {
+            (f"{size}/realistic_{rule}", n, seed) for size, n, seed in (("tiny", 600, 4321), ("wee", 500, 2000))
+            for rule in sim.CENSORING}
+        for s in listing["sets"]:
+            assert json.loads((root / s["dir"] / "manifest.json").read_text())["seed"] == s["seed"]
+    finally:  # published fixtures are read-only
+        for path in [root, *root.rglob("*")] if root.exists() else []:
+            path.chmod(0o750 if path.is_dir() else 0o640)
+
+
+def test_truth_short_exits_non_zero_on_a_refused_set(tmp_path):
+    """truth_short refuses a set whose own 1-y truth disagrees with the recomputed one, writes nothing for it, and
+    exits non-zero (it used to print REFUSED and exit 0)."""
+    reference = REFERENCE or "/scratch.global/sauer354/aou-study/study-sim/reference_pcs.parquet"
+    out = tmp_path / "g"
+    sim.main(["generate", "--out", str(out), "--n", "600", "--seed", "5", "--workers", "1", "--git-sha", "test",
+              "--reference", reference])
+    bad = out / "realistic_lastcontact" / "truth.parquet"
+    table = pq.read_table(bad)
+    column = table.schema.get_field_index("cif_1y")
+    cif = table.column(column).to_numpy(zero_copy_only=False)
+    table = table.set_column(column, "cif_1y", pa.array(cif + 1e-6, pa.float64(), mask=~np.isfinite(cif)))
+    pq.write_table(table, bad, compression="zstd")
+    src = Path(__file__).resolve().parents[3]
+    done = subprocess.run([sys.executable, str(src / "examples" / "biobank" / "study" / "truth_short.py"), str(src),
+                           str(out), "realistic"], env={**os.environ, "STUDY_SIM_REFERENCE": reference},
+                          capture_output=True, text=True, timeout=300)
+    assert done.returncode != 0 and "REFUSED: realistic_lastcontact" in done.stderr, (done.returncode,
+                                                                                       done.stderr[-500:])
+    assert (out / "realistic_independent" / "truth_short.parquet").exists()
+    assert not (out / "realistic_lastcontact" / "truth_short.parquet").exists()
 
 
 def main():

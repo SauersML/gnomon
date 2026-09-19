@@ -102,6 +102,7 @@ Usage
     simulate.py reference --projection data.projection_scores.bin --labels kg_pop.tsv --out reference_pcs.parquet
     simulate.py generate --out DIR --n 20000 --seed 1 [--scenario realistic] [--reference reference_pcs.parquet]
     simulate.py publish --root /scratch.global/sauer354/aou-study/sim/vN --reference ... --git-sha SHA [--append]
+        [--sizes small=20000:SEED,medium=100000:SEED,...]   (the k-th size's seed defaults to 1000 (k + 1))
 The scenarios are:
 - ``realistic`` (a);
 - ``null_slope`` (b): a constant slope;
@@ -1658,7 +1659,8 @@ def main(argv=None):
             g.add_argument("--scenario", choices=sorted(SCENARIOS), default="realistic")
         else:
             g.add_argument("--root", required=True)
-            g.add_argument("--sizes", default="small=20000,medium=100000,large=400000")
+            g.add_argument("--sizes", default="small=20000,medium=100000,large=400000",
+                           help="name=n[:seed],...: the k-th size's seed defaults to 1000 (k + 1)")
             g.add_argument("--scenarios", default=",".join(PUBLISHED))
             g.add_argument("--append", action="store_true",
                            help="add sets to an existing version (sets already there are kept, never rewritten)")
@@ -1685,9 +1687,10 @@ def main(argv=None):
         (root / "MANIFEST.json").chmod(0o640)
     have = {s["dir"] for s in listing["sets"]}
     for k, item in enumerate(a.sizes.split(",")):
-        size, n = item.split("=")
+        size, spec = item.split("=")
+        n, _, chosen = spec.partition(":")
+        seed = int(chosen) if chosen else 1000 * (k + 1)
         for scenario in a.scenarios.split(","):
-            seed = 1000 * (k + 1)
             if any(f"{size}/{scenario}_{c}" in have for c in CENSORING):
                 print(f"{size} {scenario} already published; kept", flush=True)
                 continue

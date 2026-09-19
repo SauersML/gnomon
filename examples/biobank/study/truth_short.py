@@ -11,7 +11,8 @@
 
 The file has truth.parquet's rows, keys and order, with the cif and death columns null outside each rule's survival
 frame. A 1-y horizon from the same run must match truth.parquet's cif_1y to 1e-8 (the grids differ) before anything
-is written. Prints one JSON line per file, with its sha256. MSI only; one core.
+is written. Prints one JSON line per file, with its sha256, and exits non-zero if any set was refused. MSI only; one
+core.
 """
 from __future__ import annotations
 
@@ -76,6 +77,7 @@ def main(argv=None):
     _refuse_foreign(sim, root, groups, reference)
     ref, ref_src = sim.load_reference(reference, 20260918)
     world = sim.make_world(world_seed, scenario, sim.load_diseases(sim.DEFAULT_DISEASES), ref, ref_src)
+    refused = []
     for sets in groups:
         t0 = time.time()
         s = sim.simulate(world, sets["independent"]["n"], sets["independent"]["seed"], workers=1, log=lambda *a: None)
@@ -116,12 +118,15 @@ def main(argv=None):
             if not (keys_equal and nulls_equal and diff < 1e-8):
                 print(json.dumps({"dir": entry["dir"], "REFUSED": True, "keys_equal": keys_equal,
                                   "nulls_equal": nulls_equal, "cif_1y_max_abs_diff": diff}), flush=True)
+                refused.append(entry["dir"])
                 continue
             path = d / "truth_short.parquet"
             pq.write_table(sim._arrow_frame(new.drop(columns="_check_1y")), path, compression="zstd")
             print(json.dumps({"dir": entry["dir"], "file": "truth_short.parquet", "rows": len(new),
                               "sha256": _sha(path), "cif_1y_max_abs_diff": diff, "keys_equal": keys_equal,
                               "seconds": round(time.time() - t0, 1)}), flush=True)
+    if refused:
+        sys.exit(f"REFUSED: {', '.join(refused)}")
 
 
 if __name__ == "__main__":
