@@ -43,7 +43,8 @@ latent world, so their tables differ only in ehr_end and obs_end:
   - ``independent`` (SPEC section 8 N2a): ehr_end = min(X, death, cutoff). The censoring is independent of the
     events given site and region.
   - ``lastcontact`` (N2b): ehr_end = the last EHR encounter before min(X, death, cutoff). The encounter rate rises
-    after any onset and in the year before death, and every code is itself an encounter.
+    after any onset and in the year before death, every code is itself an encounter, and 60% of the deaths that
+    occur in the system leave an encounter on the day of death.
 The observation period (every domain, as AoU builds it) is [min(E0, consent), max(ehr_end, last survey)], and 55%
 complete a later survey; survival follow-up ends at ehr_end, as SCHEMA says.
 
@@ -648,9 +649,15 @@ def sample_people(world: World, n: int, rng: np.random.Generator) -> dict:
         pcs += w[:, [ci[comp]]] * x[pick]
     pcs += 0.15 * world.within_sd * rng.standard_normal(pcs.shape)
     dist = np.linalg.norm(pcs[:, :6] - world.c_eur, axis=1) / world.d_afr
-    present = np.array([g for g in groups if (grp == g).any()])
+    # ancestry_pred: a classifier on PC1-6, as AoU's is. Linear discriminants (pooled within-group covariance) with
+    # the groups' shares as priors, so a sparse group such as mid does not claim admixed people near its centroid.
+    present = np.array([g for g in groups if (grp == g).sum() > 6])
     cent = np.stack([pcs[grp == g, :6].mean(0) for g in present])
-    label = present[np.argmin(((pcs[:, None, :6] - cent[None]) ** 2).sum(-1), axis=1)]
+    resid = np.concatenate([pcs[grp == g, :6] - c for g, c in zip(present, cent)])
+    prec = np.linalg.inv(np.cov(resid, rowvar=False))
+    prior = np.log(np.array([GROUP_SHARE[g] for g in present]))
+    score = pcs[:, :6] @ prec @ cent.T - 0.5 * np.einsum("gi,ij,gj->g", cent, prec, cent) + prior
+    label = present[np.argmax(score, axis=1)]
 
     # demographics and dates
     cut = day(CDR_CUTOFF)
@@ -1228,6 +1235,10 @@ def simulate(world: World, n: int, seed: int, horizons=HORIZONS, quad=None, work
     horizon = np.minimum(day(CDR_CUTOFF) + 1.0, birth + people["t_m"] * DAYS)
     people["survey_end"] = np.floor(people["baseline"] + later * rng.random(n)
                                     * np.maximum(horizon - people["baseline"], 0.0)).astype(np.int64)
+    # Most deaths in the health system leave an EHR record on the day of death (last contact, N2b).
+    death_seen = (rng.random(n) < 0.6) & (w_rec == people["t_m"])
+    ehr_end["lastcontact"] = np.where(death_seen, np.maximum(ehr_end["lastcontact"], people["t_m"]),
+                                      ehr_end["lastcontact"])
     out = dict(people=people, diseases=diseases, ehr_end_age=ehr_end, w_rec=w_rec, horizons=tuple(horizons),
                seed=seed)
     rows = None
