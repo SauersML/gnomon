@@ -41,7 +41,8 @@ LABELS = frozenset({
 STUDY_STAGES = ("scores", "cohort", "features", "fits", "predict", "evaluate", "digest")
 LABELS = LABELS | {f"{prefix}{stage}{suffix}" for stage in STUDY_STAGES
                    for prefix, suffix in (("study_", "_started"), ("study_", "_complete"), ("failed_study_", ""))} \
-    | {"study_started", "study_resumed", "study_completed", "study_fits_25", "study_fits_50", "study_fits_75"}
+    | {"study_started", "study_resumed", "study_completed", "study_fits_25", "study_fits_50", "study_fits_75",
+       "failed_study_unexpected_errors"}
 
 
 def scoring_cpu_label(metrics):

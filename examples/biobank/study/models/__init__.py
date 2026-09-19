@@ -8,14 +8,21 @@ binary.py (study-model-bin) and survival.py (study-model-surv) each export:
                                                 variant "shared" and given to every variant
                                                 (survival: the competing causes, death and
                                                 exclusion, so all methods share one CIF basis)
-    fit(variant, component, train, settings, out_dir, reference=None) -> small JSON-able dict
-    predict(variant, model_dirs, frame, settings, horizons) -> {"risk": array, ...}
+    covariates(variant, component, settings, disease)
+                                                the frame columns the fit's design uses; the
+                                                driver refuses sex in any design of a disease
+                                                restricted to one sex (single-sex rule)
+    fit(variant, component, train, settings, out_dir, reference=None, *, disease)
+                                                -> small JSON-able dict
+    predict(variant, model_dirs, frame, settings, horizons, *, disease) -> {"risk": array, ...}
 
 The driver runs each fit in its own process with its thread budget set, gives
 `train` with z standardized on exactly that fit's training rows, and gives
 `predict` a frame without outcome columns and {component: directory} for every
-component the variant needs. Import gamfit inside fit/predict, not at module
-import: the driver imports this package for VARIANTS alone.
+component the variant needs. `disease` is its definition as the models may see
+it: {"slug", "sex"}, sex null or "female" or "male". Import gamfit inside
+fit/predict, not at module import: the driver imports this package for
+VARIANTS alone.
 """
 from __future__ import annotations
 
@@ -51,9 +58,13 @@ def shared_components(kind, settings):
     return list(module.shared_components(settings)) if hasattr(module, "shared_components") else []
 
 
-def fit(kind, variant, component, train, settings, out_dir, reference=None):
-    return _module(kind).fit(variant, component, train, settings, out_dir, reference)
+def covariates(kind, variant, component, settings, disease):
+    return list(_module(kind).covariates(variant, component, settings, disease))
 
 
-def predict(kind, variant, model_dirs, frame, settings, horizons):
-    return _module(kind).predict(variant, model_dirs, frame, settings, horizons)
+def fit(kind, variant, component, train, settings, out_dir, reference=None, *, disease):
+    return _module(kind).fit(variant, component, train, settings, out_dir, reference, disease=disease)
+
+
+def predict(kind, variant, model_dirs, frame, settings, horizons, *, disease):
+    return _module(kind).predict(variant, model_dirs, frame, settings, horizons, disease=disease)

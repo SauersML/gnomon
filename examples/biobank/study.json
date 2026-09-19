@@ -28,6 +28,12 @@
   "fit_gate": {
     "min_events": 100
   },
+  "declared_refusals": [
+    {"kind": "binary", "variant": "calpred", "phrase": "dense hessian shape mismatch", "issue": "gam#3015",
+     "reason": "a binomial location-scale fit is refused at every seed when a noise-formula linear term lies in the location Duchon's null space (study-model-bin, 1-core repro); the calpred competitor is reported as refused until gam#3015 is fixed"},
+    {"kind": "survival", "variant": "calpred", "phrase": "estimationerror::remldidnotconverge", "issue": "gam#3037",
+     "reason": "the survival location-scale calpred fit ends outer smoothing uncertified: its ARC stalls at an indefinite Hessian while one smoothing parameter runs to its tail (study-model-surv, synthetic repro); reported as refused until gam#3037 is fixed"}
+  ],
   "convergence": {
     "variants": ["ours", "shipped"],
     "start": "permuted_rows",
@@ -59,12 +65,14 @@
     }
   },
   "shipped": {
-    "calibrate_sha": "de0bd1df"
+    "calibrate_sha": "1692eab7"
   },
   "reasons": {
-    "shipped.calibrate_sha": "replicates gnomon calibrate as shipped at gnomon de0bd1df; not a tuning choice (update when gnomon-2370's joint-PC purge lands)",
+    "shipped.calibrate_sha": "replicates gnomon calibrate as shipped at gnomon 1692eab7 (one joint Duchon over the PCs on gam's default kernel; Gaussian terms from gam's own term builder, #2393; no Weibull baseline target); not a tuning choice (update at the #2370 cutover pin)",
     "fit_gate.min_events": "SPEC section 8 (23:45Z): a model with fewer training events than about its coefficients is not estimable by any solver; 100, the bar shared competing fits already use",
     "data.maximum_bytes_billed": "SPEC section 7a 01:00Z: the six-domain EHR end is estimated at about 70 GB (66-95), see SCHEMA.md Byte estimate; plan() dry-run gates",
+    "compute.threads": "sp-threads NOTES 01:25Z, measured: survival MS (p6_n50k) 537 s at T4, 297 s at T8, 194 s at T16; T8 keeps today's HTN K=6 fit (612-645 s, gam#3005) under the 900 s cap. Survival LS (pls6_n50k) 54 s at T1, 36 s at T4, 40 s at T16 with about 150 of 263 CPU-s spin at T16, so LS fits (death, exclusion, competitors) run single-threaded, many at once (54 CPU-s against 144 at T4). Single-search BMS keeps 85-90% efficiency at T4. Everything else is single-threaded.",
+    "compute.memory_headroom_fraction": "the pool budgets every worker's measured resident set and the driver's; the rest of the task's memory is kept for the kernel, the page cache the frames are read through, and growth between the pool's 50 ms reads (lead 09-19: concurrency respects memory as well as cores)",
     "cohort.num_pcs": "user 23:40Z: 6 PCs if much faster; K=16 is a benchmark only",
     "models.binary.num_pcs": "user decision 2026-09-18 23:40Z: K = 6, as every model",
     "models.binary.q_centers": "a joint 6-D Duchon with a linear null space needs more than 7 centers, and gam's default grows with n (gam#2993); 24 is the lead's interim until study-pcs sweeps it",
@@ -98,10 +106,11 @@
     "total_threads": null,
     "threads": {
       "fit": {"binary": {"ours": 4, "shipped": 4, "default": 1},
-              "survival": {"ours": 8, "shipped": 8, "shared": 2, "default": 2}},
+              "survival": {"ours": 8, "shipped": 8, "shared": 1, "default": 1}},
       "predict": {"binary": {"default": 1}, "survival": {"ours": 4, "shipped": 4, "default": 1}},
       "evaluate": {"binary": {"default": 1}, "survival": {"default": 1}}
     },
+    "memory_headroom_fraction": 0.1,
     "job_timeout_seconds": 900,
     "scoring_timeout_seconds": 600,
     "checkpoint_interval_seconds": 20

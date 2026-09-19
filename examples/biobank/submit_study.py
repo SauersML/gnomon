@@ -27,6 +27,7 @@ import tarfile
 import time
 import urllib.request
 
+from study import digest
 from study.checkpoint import config_hash
 from submit_aou import HERE, Workbench, required_env
 
@@ -94,6 +95,7 @@ def resolved_config(path, wb):
 
 
 def submit(wb, args):
+    digest.check_caveats(args.caveat)  # refused here, not after the task has started
     config, diseases = resolved_config(args.config, wb)
     # SPEC section 8 (S8): the outer test is evaluated only under the frozen config.
     if config.get("frozen_config_sha256") != config_hash(config):
@@ -146,7 +148,7 @@ def submit(wb, args):
         runtime_image=required_env("AOU_RUNTIME_IMAGE"),
         checkpoint_uri=checkpoint + "/", status_uri=checkpoint,
         digest_uri=f"{wb.bucket}/{DIGEST}/{name}/", looks_uri=f"{wb.bucket}/{LOOKS_PREFIX}/{config_sha[:20]}/",
-        cpu=args.cpu, memory_gb=args.memory_gb, timeout_minutes=args.timeout_minutes).items()}
+        cpu=args.cpu, memory_gb=args.memory_gb, timeout_minutes=args.timeout_minutes, caveats=args.caveat).items()}
     record = wb.run_workflow(name, f"{uri}/{wdl.name}", "AoU single study", inputs, folder, storage_capacity=100)
     with LOOKS.open("a") as ledger:
         ledger.write(json.dumps({"run": name, "run_id": record.get("runId"), "config_sha256": config_sha,
@@ -183,6 +185,8 @@ def main():
     child.add_argument("--memory-limit-gb", type=int, default=64,
                        help="raise only with a measured need (SPEC 7a)")
     child.add_argument("--timeout-minutes", type=int, default=110)
+    child.add_argument("--caveat", action="append", default=[], metavar="LABEL",
+                       help="a fixed label the run's digest carries, e.g. shipped_survival_refused_gam2945 (repeatable)")
     child.set_defaults(handler=submit)
     child = sub.add_parser("tokens")
     child.add_argument("run", help="the submission name, e.g. study-20260918-230000")

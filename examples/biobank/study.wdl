@@ -24,6 +24,8 @@ workflow study {
     Int cpu = 16
     Int memory_gb = 64
     Int timeout_minutes = 110
+    # Fixed labels the digest carries (study.py --caveat), e.g. a known-refused arm.
+    Array[String] caveats = []
   }
   call analyze { input:
     sources=sources, config=config, wheelhouse_archive=wheelhouse_archive, scorer_archive=scorer_archive,
@@ -31,7 +33,7 @@ workflow study {
     ancestry_predictions=ancestry_predictions, relatedness_prune=relatedness_prune,
     features_uri=features_uri, runtime_image=runtime_image, checkpoint_uri=checkpoint_uri,
     status_uri=status_uri, digest_uri=digest_uri, looks_uri=looks_uri, cpu=cpu, memory_gb=memory_gb,
-    timeout_minutes=timeout_minutes
+    timeout_minutes=timeout_minutes, caveats=caveats
   }
   output {
     File tokens = analyze.tokens
@@ -57,6 +59,7 @@ task analyze {
     Int cpu
     Int memory_gb
     Int timeout_minutes
+    Array[String] caveats
   }
   command <<<
     set -euo pipefail
@@ -118,7 +121,7 @@ task analyze {
       --input projection=work/projection_pcs.parquet --input score_cache=work/score_cache \
       --input scorer="$scorer" "${weights[@]}" \
       --checkpoint "~{checkpoint_uri}" --status-uri "~{status_uri}" --digest-uri "~{digest_uri}" \
-      --looks "~{looks_uri}"
+      --looks "~{looks_uri}" ~{sep=" " prefix("--caveat ", caveats)}
   >>>
   output {
     File tokens = "work/study/tokens.txt"

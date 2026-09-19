@@ -23,6 +23,7 @@ others. Only aggregate tokens leave the workspace (study/digest.py).
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import importlib.metadata
 import inspect
@@ -48,7 +49,7 @@ from aou_status import STUDY_STAGES as STAGES  # noqa: E402
 from study import digest  # noqa: E402
 from study.checkpoint import (Checkpoint, GcsStore, LocalStore, config_hash, deployment_identity,  # noqa: E402
                               study_identity)
-from study.pool import Job, run_jobs  # noqa: E402
+from study.pool import Job, run_jobs, task_memory_bytes  # noqa: E402
 
 KINDS = ("binary", "survival")
 # Outcome columns: in a training frame, never in a prediction frame. n_dates
@@ -133,6 +134,7 @@ def load_config(path, source=None):
     if not isinstance(minimum, int) or minimum < 1:
         raise ValueError("study.json fit_gate.min_events must be a positive count (SPEC section 8)")
     check_claims(config)
+    check_declared_refusals(config)
     if not LABEL.fullmatch(str(config.get("label", ""))):
         raise ValueError("study.json needs a label (production, or a named dev configuration such as dev_k6_offspec)")
     unknown = set(config["logo"]["axes"]) - set(LOGO_AXES)
@@ -177,6 +179,10 @@ def check_reasons(config):
         settings.append("cohort.num_pcs")
     if "data" in config:
         settings.append("data.maximum_bytes_billed")  # the one BigQuery cap (SPEC section 7a)
+    # Each fit's thread budget is measured, not guessed (sp-threads), so it needs its reason too.
+    settings += list(leaf_settings(config.get("compute", {}).get("threads", {}), "compute.threads"))
+    if "memory_headroom_fraction" in config.get("compute", {}):
+        settings.append("compute.memory_headroom_fraction")
     for path in settings:
         parts = path.split(".")
         covering = [".".join(parts[:end]) for end in range(len(parts), 1, -1)]
@@ -339,6 +345,10 @@ class Study:
                 raise ValueError(f"inputs are unique NAME=PATH pairs, not {item!r}")
             self.inputs[name] = Path(value).resolve()
         self.parquet = self.config["data"]["source"] == "parquet"
+        # A validation run may scope itself to some kinds and diseases (lead, 09-19);
+        # an AoU run is always the whole study.
+        if (args.kinds or args.diseases) and not self.parquet:
+            raise ValueError("--kinds and --diseases scope a simulator validation run; an AoU run is the whole study")
         if not self.parquet:
             check_frozen(self.config)
         if args.claim:
@@ -346,20 +356,41 @@ class Study:
             if not self.parquet or self.config["label"] != "production":
                 raise ValueError("a claim run is a simulator run of the production config")
             check_claims(self.config, claim_run=True)
+        self.kinds = tuple(kind for kind in KINDS if kind in (args.kinds or KINDS))
+        if args.diseases:
+            unknown = set(args.diseases) - {disease.slug for disease in self.diseases}
+            if unknown:
+                raise ValueError(f"--diseases names no study disease: {sorted(unknown)}")
+            self.diseases = [disease for disease in self.diseases if disease.slug in args.diseases]
+        from study import models
+        self.models = models
+        check_single_sex([definition(disease) for disease in self.diseases],
+                         {kind: [("shared", c) for c in self.shared_components(kind)]
+                          + [(v, c) for v in self.variants(kind) for c in self.own_components(kind, v)]
+                          for kind in self.kinds},
+                         lambda kind, variant, component, disease: models.covariates(
+                             kind, variant, component, self.settings(kind), disease))
+        digest.check_caveats(args.caveat)
         self.run_kind = "claim" if args.claim else "aou" if not self.parquet else "dev"
         self.work = Path(args.work).resolve()
         self.root = self.work / "steps"
         self.status = Status(args.status_uri)
         self.started = time.time()
-        # Cost is charged on the task's vCPUs, whatever share of them the pool uses.
-        self.vcpus = os.cpu_count()
-        available = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else self.vcpus
-        self.threads = args.threads or self.config["compute"].get("total_threads") or available
+        # Cost is charged on the CPUs the task holds (a VM's vCPUs, a Slurm job's cores),
+        # whatever share of them the pool uses; os.cpu_count() is the whole host.
+        self.vcpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+        self.threads = args.threads or self.config["compute"].get("total_threads") or self.vcpus
+        # The memory the pool may fill: the task's (its cgroup limit or the host's;
+        # --memory-gb on a shared node, whose host memory is not this run's), less headroom.
+        held = args.memory_gb * 2**30 if args.memory_gb else task_memory_bytes()
+        self.memory = int(held * (1 - self.config["compute"]["memory_headroom_fraction"]))
+        self.pool_stats = {}
         self.signature = {
             "study": study_identity(self.config),
             "deployment": deployment_identity(self.config),
             "code": code_identity(),
             "engine": engine_identity(),
+            "scope": {"kinds": list(self.kinds), "diseases": [disease.slug for disease in self.diseases]},
             "inputs": {name: input_identity(path) for name, path in sorted(self.inputs.items())},
         }
         store = self.store(args.checkpoint, self.work / "store")
@@ -372,8 +403,6 @@ class Study:
         self.digest_store = self.store(args.digest_uri, None) if args.digest_uri else None
         self.timings = {}
         self.source_handle = None
-        from study import models
-        self.models = models
 
     def store(self, uri, local):
         if uri and uri.startswith("gs://"):
@@ -390,6 +419,9 @@ class Study:
 
     def settings(self, kind):
         return self.config["models"].get(kind, {})
+
+    def disease(self, slug):
+        return next(disease for disease in self.diseases if disease.slug == slug)
 
     def variants(self, kind):
         """study.json's methods, every one of which the kind's model module must
@@ -442,10 +474,15 @@ class Study:
         """A pool job for `step`, whose directory must already be begun. Its log
         lands in the step itself, so a job leaves no files outside its step."""
         spec = dict(spec, step=step, root=str(self.root), config=str(Path(self.args.config).resolve()),
-                    source=self.args.source, horizons=self.horizons())
+                    source=self.args.source, horizons=self.horizons(),
+                    **({"disease_definition": definition(self.disease(spec["disease"]))} if "disease" in spec else {}))
+        # Jobs of one stage, kind, variant and component peak alike, in proportion to their frame.
+        memory_class = "/".join(str(spec.get(key, "-")) for key in ("type", "kind", "variant", "component"))
+        size = (read_json(self.path(f"features/{spec['disease']}") / "plan.json")[spec["kind"]]["rows"]
+                if "disease" in spec and "kind" in spec else 0)
         return Job(key=step, spec=spec, threads=threads, log=self.path(step) / "job.log", deps=tuple(deps),
                    priority=priority, timeout=self.config["compute"]["job_timeout_seconds"],
-                   affinity=spec.get("frame", ""))
+                   affinity=spec.get("frame", ""), memory_class=memory_class, size=size)
 
     def seal_job(self, job, outcome, record_name):
         """Seal a pool job's step as a result, successful or not, with its log tail."""
@@ -465,9 +502,12 @@ class Study:
             written = {"status": outcome.status, "category": failure_category(log)}
             if "invalid_output" in outcome.extra:
                 written["category"] = "invalid_output"
+            issue = declared_refusal(self.config, job.spec, log)
+            if issue:
+                written["declared_refusal"] = issue
         written.update(wall_seconds=round(outcome.seconds, 3), cpu_seconds=round(outcome.cpu_seconds, 3),
                        max_rss_mb=round(outcome.max_rss_mb, 1), threads=outcome.threads,
-                       restarted_after_signal=outcome.restarted)
+                       restarted_after_signal=outcome.restarted, over_budget=bool(outcome.extra.get("over_budget")))
         write_json(record, written)
         self.checkpoint.complete(job.key, info={"status": written["status"]})
 
@@ -479,9 +519,16 @@ class Study:
         def progress(done, total):
             if stage == "fits" and done in marks:
                 self.status(f"study_fits_{marks[done]}")
-        print(f"study_pool {stage} jobs={len(jobs)} threads={self.threads}", flush=True)
-        return run_jobs(jobs, self.threads, lambda job, outcome: self.seal_job(job, outcome, record_name),
-                        lambda threads: [sys.executable, str(HERE / "study.py"), "worker"], progress=progress)
+        print(f"study_pool {stage} jobs={len(jobs)} threads={self.threads} memory_gb={self.memory / 2**30:.1f}",
+              flush=True)
+        stats = {}
+        outcomes = run_jobs(jobs, self.threads, lambda job, outcome: self.seal_job(job, outcome, record_name),
+                            lambda threads: [sys.executable, str(HERE / "study.py"), "worker"], progress=progress,
+                            memory=self.memory, stats=stats)
+        self.pool_stats[stage] = stats
+        print(f"study_pool {stage} max_held_gb={stats['max_bytes'] / 2**30:.2f} memory_waits={stats['memory_waits']}",
+              flush=True)
+        return outcomes
 
     def horizons(self):
         """The survival horizons the prespecified outcome-blind rule chose in this run."""
@@ -519,7 +566,20 @@ class Study:
                 self.checkpoint.delete_store()
             else:
                 self.checkpoint.close()
+        # A failure no declared refusal owns fails the run, after its digest (no masking).
+        failures = unexpected_failures(self.step_records()) if finished else {}
+        if failures:
+            counts = sorted(collections.Counter(failures.values()).items())
+            print(f"study_unexpected_errors n={len(failures)} " + " ".join(f"{c}={n}" for c, n in counts), flush=True)
+            self.status("failed_study_unexpected_errors")
+            raise SystemExit(3)
         self.status("study_completed")
+
+    def step_records(self):
+        """Every sealed fit, predict and evaluate record of this run, by step."""
+        return {path.parent.relative_to(self.root).as_posix(): read_json(path)
+                for stage, name in (("fits", "fit.json"), ("predict", "predict.json"), ("evaluate", "evaluate.json"))
+                for path in sorted((self.root / stage).glob(f"**/{name}"))}
 
     def record_attempt(self):
         """This attempt's vCPUs and wall so far, kept across preemptions so the
@@ -659,10 +719,15 @@ class Study:
             # same run and before any outcome is read (SPEC section 3, 7a).
             write_json(directory / "base.json", {"flow": base.flow, "cuts": base.cuts, "followup": followup,
                                                  "horizons": list(phenotypes.choose_horizons(followup, config)),
-                                                 "sites": len([s for s in sites.values() if s.startswith("site")])})
+                                                 "sites": len([s for s in sites.values() if s.startswith("site")]),
+                                                 # The PC scale the models see (study-sim: confirms the geometry).
+                                                 "pc_sd": {f"PC{i}": float(base.frame[f"PC{i}"].std(ddof=1))
+                                                           for i in range(1, config.num_pcs + 1)}})
             self.checkpoint.complete("features/base")
         truth_path = self.inputs.get("tables", Path("/nonexistent")) / "truth.parquet"
         truth = pd.read_parquet(truth_path) if self.parquet and truth_path.is_file() else None
+        # The simulator's truth slopes are per its own z (score / z_sd); evaluate rescales them.
+        z_scale = read_json(truth_path.parent / "manifest.json")["simulator"]["z_scale"] if truth is not None else None
         for disease in pending:
             directory = self.checkpoint.begin(f"features/{disease.slug}")
             plan = {}
@@ -682,6 +747,7 @@ class Study:
             if truth is not None:
                 truth.loc[truth.disease.astype(str).eq(disease.slug)].to_parquet(directory / "truth.parquet",
                                                                                  index=False)
+                write_json(directory / "truth.json", {"z_sd": float(z_scale[disease.slug]["z_sd"])})
             self.checkpoint.complete(f"features/{disease.slug}")
 
     def site_labels(self, sites):
@@ -727,7 +793,7 @@ class Study:
         jobs, scheduled = [], set()
         for disease in self.diseases:
             slug = disease.slug
-            for kind in KINDS:
+            for kind in self.kinds:
                 rows = read_json(self.path(f"features/{slug}") / "plan.json")[kind]["rows"]
                 frame = None
                 plan = [("shared", c) for c in self.shared_components(kind)]
@@ -828,7 +894,7 @@ class Study:
         marginal-slope prediction is the costliest step per row)."""
         jobs = []
         for disease in self.diseases:
-            for kind in KINDS:
+            for kind in self.kinds:
                 rows = read_json(self.path(f"features/{disease.slug}") / "plan.json")[kind]["test_rows"]
                 for variant in self.variants(kind):
                     threads = self.budget("predict", kind, variant)
@@ -853,7 +919,7 @@ class Study:
         sampling noise). Reads saved predictions only; no outcome is read."""
         threshold = self.config["convergence"]["max_delta_sd"]
         for disease in self.diseases:
-            for kind in KINDS:
+            for kind in self.kinds:
                 for variant in self.checked(kind):
                     step = f"convergence/{disease.slug}/{kind}/{variant}"
                     if self.checkpoint.done(step):
@@ -892,7 +958,7 @@ class Study:
             self.looks.put_bytes(self.look_marker, (config_hash(self.config) + "\n").encode())
         jobs = []
         for disease in self.diseases:
-            for kind in KINDS:
+            for kind in self.kinds:
                 step = f"evaluate/{disease.slug}/{kind}"
                 if self.checkpoint.done(step):
                     continue
@@ -924,13 +990,16 @@ class Study:
             flow = read_json(self.path(f"features/{disease.slug}") / "flow.json")
             # SPEC section 2: the single-record count is reported (they stay in the analysis).
             subgroups = {"binary": {"single_record": flow["binary"]["single_record"]},
-                         "survival": {"single_record_at_risk": flow["survival"]["single_record_at_risk"]}}
+                         "survival": {"single_record_at_risk": flow["survival"]["single_record_at_risk"],
+                                      # Rows an exclusion match censors (study-audit: a dependent
+                                      # censoring caveat where they pass 1% of the frame).
+                                      "exclusion_exits": flow["survival"]["exclusion_exits"]}}
             rows += digest.flow_rows(disease.slug, {name: flow[name] for name in ("disease", "binary", "survival")},
                                      digest.LIMIT, subgroups)
             # Whole-cohort counts by ancestry beside their totals, so the audit partitions them.
             if "by_ancestry" in flow:
                 rows += digest.cohort_rows(disease.slug, flow["by_ancestry"])
-            for kind in KINDS:
+            for kind in self.kinds:
                 record = read_json(self.path(f"evaluate/{disease.slug}/{kind}") / "evaluate.json")
                 # Every pooled cell of a checked variant says whether its fit converged,
                 # and every cell whether its engines certified the fits behind it.
@@ -947,6 +1016,7 @@ class Study:
         base = read_json(self.path("features/base") / "base.json")
         rows += digest.flow_rows("base", {"base": base["flow"]}, digest.LIMIT)
         rows += digest.followup_rows(base["followup"]["administrative"], digest.LIMIT)
+        rows += digest.pc_scale_rows(base["pc_sd"])
         if "ehr" in base["followup"]:
             rows += digest.ehr_rows(base["followup"]["ehr"], digest.LIMIT)
         rows += digest.ehr_domain_rows(read_json(self.path("cohort") / "manifest.json"), digest.LIMIT)
@@ -993,8 +1063,12 @@ class Study:
         study = {"scope": "study", "item": "run", "config_sha256_12": config_hash(self.config)[:12],
                  "label": self.config["label"], "run_kind": self.run_kind,
                  "gam_commit_12": "g" + str(self.signature["engine"].get("gam_commit") or "none")[:12],
-                 **({"caveats": "_and_".join(digest.label(c, 60) for c in self.args.caveat)} if self.args.caveat else {}),
-                 "vcpus": self.vcpus, "threads": self.threads, "attempts": len(attempts),
+                 "scope_kinds": "_".join(self.kinds), "scope_diseases": len(self.diseases),
+                 "unexpected_errors": len(unexpected_failures(self.step_records())),
+                 "declared_refusals": sum(bool(r.get("declared_refusal")) for r in self.step_records().values()),
+                 **({"caveats": "_and_".join(self.args.caveat)} if self.args.caveat else {}),
+                 "vcpus": self.vcpus, "threads": self.threads, "memory_budget_gb": round(self.memory / 2**30, 2),
+                 "attempts": len(attempts),
                  "vcpu_hours": round(sum(a["vcpus"] * a["wall_seconds"] for a in attempts.values()) / 3600, 3),
                  "outer_test_looks": len([n for n in self.looks.names() if n.endswith(".txt")]),
                  "horizons": "_".join("h" + digest.token(float(h)) for h in base["horizons"]),
@@ -1008,7 +1082,7 @@ class Study:
             rows.append({"scope": "ehr_extended_by", "item": "domains",
                          **{digest.label(domain, 20): share_bucket(share) for domain, share in extended.items()}})
         for disease in self.diseases:
-            for kind in KINDS:
+            for kind in self.kinds:
                 for variant in self.checked(kind):
                     record = self.convergence(disease.slug, kind, variant)
                     rows.append({"scope": "convergence", "item": f"{disease.slug}.{kind}.{variant}",
@@ -1016,8 +1090,11 @@ class Study:
                                  **({"max_delta_sd": record["max_delta_sd"]} if "max_delta_sd" in record else {})})
         rows += [{"scope": "timing", "item": stage, "wall_seconds": round(seconds, 1)}
                  for stage, seconds in self.timings.items()]
+        # What the pool held at once against its memory budget, per stage (this attempt's).
+        rows += [{"scope": "pool", "item": stage, "max_held_gb": round(stats["max_bytes"] / 2**30, 2),
+                  "memory_waits": stats["memory_waits"]} for stage, stats in self.pool_stats.items()]
         for disease in self.diseases:
-            for kind in KINDS:
+            for kind in self.kinds:
                 plan = [("shared", c) for c in self.shared_components(kind)]
                 plan += [(v, c) for v in self.variants(kind) for c in self.own_components(kind, v)]
                 for variant, component in plan:
@@ -1037,7 +1114,8 @@ class Study:
                                  "median_seconds": seconds[len(seconds) // 2], "max_seconds": seconds[-1],
                                  "cpu_seconds": round(sum(r["cpu_seconds"] for r in records), 1),
                                  "threads": records[0]["threads"],
-                                 "max_rss_mb": max(r["max_rss_mb"] for r in records)})
+                                 "max_rss_mb": max(r["max_rss_mb"] for r in records),
+                                 "over_budget": sum(bool(r.get("over_budget")) for r in records)})
                     categories = {}
                     for record in records:
                         if record["status"] not in ("ok", INSUFFICIENT_EVENTS):
@@ -1054,12 +1132,34 @@ class Study:
                     rows.append({"scope": "predict", "item": f"{disease.slug}.{kind}.{variant}",
                                  "ok": sum(r["status"] == "ok" for r in records),
                                  "failed": sum(r["status"] != "ok" for r in records),
-                                 "max_seconds": seconds[-1], "cpu_seconds": round(sum(r["cpu_seconds"] for r in records), 1)})
+                                 "max_seconds": seconds[-1], "cpu_seconds": round(sum(r["cpu_seconds"] for r in records), 1),
+                                 "max_rss_mb": max((r["max_rss_mb"] for r in records), default=0.0),
+                                 "over_budget": sum(bool(r.get("over_budget")) for r in records)})
                 record = read_json(self.path(f"evaluate/{disease.slug}/{kind}") / "evaluate.json")
                 rows.append({"scope": "evaluate", "item": f"{disease.slug}.{kind}", "status": record["status"],
-                             "category": record.get("category", "none"), "wall_seconds": record["wall_seconds"]})
+                             "category": record.get("category", "none"), "wall_seconds": record["wall_seconds"],
+                             "max_rss_mb": record["max_rss_mb"], "over_budget": int(bool(record.get("over_budget")))})
         return rows
 
+
+
+def definition(disease):
+    """A disease as the model modules see it: its slug and its sex restriction."""
+    return {"slug": disease.slug, "sex": disease.sex}
+
+
+def check_single_sex(definitions, plans, covariates):
+    """The single-sex rule (lead, 09-19): sex enters no fit of a disease whose
+    definition restricts it to one sex. `plans` is {kind: [(variant, component)]}
+    and `covariates(kind, variant, component, definition)` a fit's design columns."""
+    for disease in definitions:
+        if disease["sex"] is None:
+            continue
+        for kind, plan in plans.items():
+            for variant, component in plan:
+                if "sex" in covariates(kind, variant, component, disease):
+                    raise ValueError(f"{disease['slug']} is {disease['sex']}-only, but sex is in the design of "
+                                     f"its {kind} {variant} {component} fit")
 
 
 def certification(records):
@@ -1090,10 +1190,10 @@ def manifest_fields(manifest):
     fields = {"bigquery_bytes_billed": int(bigquery.get("bytes_billed", 0)),
               "tables_source": digest.label(manifest.get("source", "unknown")),
               "tables_sha256_12": "t" + str(manifest.get("tables_sha256", ""))[:12]}
-    for key in ("seed", "scenario"):
-        if manifest.get(key) is not None:
-            fields[f"tables_{key}"] = (manifest[key] if isinstance(manifest[key], int)
-                                       else digest.label(manifest[key]))
+    if manifest.get("seed") is not None:
+        fields["tables_seed"] = int(manifest["seed"])
+    if "simulator" in manifest:  # a simulated world names its scenario (study-sim's manifest)
+        fields["tables_scenario"] = digest.label(manifest["simulator"]["scenario"])
     if "plan_bytes" in bigquery:
         # plan() dry-runs every query, {query name: bytes}; the budget gates the total.
         fields["bigquery_plan_bytes"] = int(sum(bigquery["plan_bytes"].values()))
@@ -1132,6 +1232,36 @@ FAILURE_PHRASES = (
     ("provenance", "provenance"),
     ("timed out", "timeout"),
 )
+
+
+def check_declared_refusals(config):
+    """study.json declared_refusals: the only failures a run may end with and
+    still succeed. Each names the kind and variant it applies to, a phrase of
+    the engine's refusal message, the gam issue that owns it and a reason; any
+    other failed step makes the run exit non-zero (no masking, SPEC section 5)."""
+    for entry in config.get("declared_refusals", []):
+        if (set(entry) != {"kind", "variant", "phrase", "issue", "reason"} or entry["kind"] not in KINDS
+                or entry["variant"] not in config["variants"] or not str(entry["phrase"]).strip()
+                or entry["phrase"] != entry["phrase"].lower() or not re.fullmatch(r"gam#\d+", str(entry["issue"]))
+                or not str(entry["reason"]).strip()):
+            raise ValueError("a declared refusal is {kind, variant, phrase (lower case), issue gam#N, reason}, "
+                             f"for a configured kind and variant: {entry}")
+
+
+def declared_refusal(config, spec, log):
+    """The gam issue of the declared refusal this failed job's log shows, else None."""
+    text = log[-65536:].decode("utf-8", errors="replace").lower()
+    for entry in config.get("declared_refusals", []):
+        if entry["kind"] == spec.get("kind") and entry["variant"] == spec.get("variant") and entry["phrase"] in text:
+            return entry["issue"]
+    return None
+
+
+def unexpected_failures(records):
+    """The failed steps a run may not pass over, as {step: category}: every
+    record neither ok, nor below the events gate, nor a declared refusal."""
+    return {step: record.get("category", "unclassified") for step, record in records.items()
+            if record["status"] not in ("ok", INSUFFICIENT_EVENTS) and not record.get("declared_refusal")}
 
 
 def failure_category(log):
@@ -1194,6 +1324,12 @@ def standardize(pgs):
     return {"mean": float(pgs.mean()), "sd": float(pgs.std(ddof=1)), "n": int(len(pgs))}
 
 
+def to_pooled_z(slope, fit_sd, pooled_sd):
+    """A slope per one z (score / fit_sd) as a slope per the pooled fit's z
+    (score / pooled_sd): a LOGO fit and the simulator standardize differently."""
+    return np.asarray(slope, dtype=float) * (pooled_sd / fit_sd)
+
+
 def model_frame(rows, kind, standardization, *, predict):
     """Model inputs: z standardized on the fit's own training rows (affine, no
     CTN) in place of the raw score. A prediction frame carries no outcome."""
@@ -1224,7 +1360,8 @@ def run_fit(spec, config, models):
         data = data.iloc[order].reset_index(drop=True)
     print("study_fit_started", flush=True)
     started = time.perf_counter()
-    info = models.fit(kind, spec["variant"], spec["component"], data, config["models"].get(kind, {}), out, reference)
+    info = models.fit(kind, spec["variant"], spec["component"], data, config["models"].get(kind, {}), out, reference,
+                      disease=spec["disease_definition"])
     seconds = time.perf_counter() - started
     print("study_fit_saved", flush=True)
     # Provenance (SPEC section 8, LOGO): the person set this fit saw, checked at predict.
@@ -1267,13 +1404,14 @@ def run_predict(spec, config, models):
     data = model_frame(test.iloc[index], kind, standardizations[0], predict=True)
     started = time.perf_counter()
     prediction = models.predict(kind, variant, {c: root / s for c, s in spec["models"].items()}, data,
-                                config["models"].get(kind, {}), horizons)
+                                config["models"].get(kind, {}), horizons, disease=spec["disease_definition"])
     seconds = time.perf_counter() - started
     risk = np.asarray(prediction["risk"], dtype=float)
     shape = (len(index),) if kind == "binary" else (len(index), len(horizons))
     if risk.shape != shape or not np.isfinite(risk).all() or (risk < 0).any() or (risk > 1).any():
         raise ValueError("predicted risks must be finite probabilities of the expected shape")
-    np.savez(out / "predictions.npz", index=index,
+    # z_sd: the score scale this model's z (and so its slope) is per.
+    np.savez(out / "predictions.npz", index=index, z_sd=standardizations[0]["sd"],
              **{name: np.asarray(value, dtype=float) for name, value in prediction.items()})
     write_json(out / "predict.json", {"status": "ok", "predict_seconds": round(seconds, 3), "rows": int(len(index))})
 
@@ -1286,11 +1424,16 @@ def run_evaluate(spec, config, models):
     frame = load_frame(root / spec["frame"])
     test = frame.loc[frame.test].reset_index(drop=True)
     train = frame.loc[~frame.test].reset_index(drop=True)
+    pooled_sd = standardize(train.pgs)["sd"]
     truth_path = root / f"features/{spec['disease']}/truth.parquet"
     truth = None
     if truth_path.is_file():
         truth = test[["person_id"]].merge(pd.read_parquet(truth_path).drop(columns=["disease"]),
                                           on="person_id", how="left", validate="one_to_one")
+        # Every slope here is per the pooled model's z (score / pooled sd), truth's included.
+        for column in [c for c in truth.columns if c == "slope" or c.startswith("slope_cif_")]:
+            truth[column] = to_pooled_z(truth[column], read_json(truth_path.parent / "truth.json")["z_sd"],
+                                        pooled_sd)
     horizons = spec["horizons"]
     shape = (len(test),) if kind == "binary" else (len(test), len(horizons))
     # Every model's saved prediction, predicted once: pooled over all outer-test
@@ -1302,8 +1445,8 @@ def run_evaluate(spec, config, models):
             predictions[(variant, fit)] = np.full(shape, np.nan)
             predictions[(variant, fit)][saved["index"]] = saved["risk"]
             if "slope" in saved:
-                slopes[(variant, fit)] = np.full(len(test), np.nan)
-                slopes[(variant, fit)][saved["index"]] = saved["slope"]
+                slopes[(variant, fit)] = np.full(shape, np.nan)
+                slopes[(variant, fit)][saved["index"]] = to_pooled_z(saved["slope"], float(saved["z_sd"]), pooled_sd)
     # Per-person slopes (d probit risk / dz) feed slope recovery where evaluate takes them.
     extra = {"slopes": slopes} if slopes and "slopes" in inspect.signature(evaluate.evaluate).parameters else {}
     rows = evaluate.evaluate(kind, test, predictions, horizons, config, train=train, truth=truth, **extra)
@@ -1340,6 +1483,12 @@ def main():
                      help="a claim run: refuse unless every planned claim cell has its sized replicate count (R4)")
     run.add_argument("--keep-checkpoint", action="store_true",
                      help="keep the bucket checkpoint after a complete run (default: delete it, SPEC 7a)")
+    run.add_argument("--memory-gb", type=float,
+                     help="the memory this run holds on a shared node (default: the task's cgroup limit or host memory)")
+    run.add_argument("--kinds", nargs="+", choices=KINDS,
+                     help="a validation run's kinds (simulator only; recorded in the signature and run row)")
+    run.add_argument("--diseases", nargs="+", metavar="SLUG",
+                     help="a validation run's diseases (simulator only; recorded in the signature and run row)")
     run.add_argument("--stop-after", choices=STAGES)
     sub.add_parser("worker", help="serve pool jobs from stdin (internal)")
     frozen = sub.add_parser("hash", help="print the config hash to freeze as frozen_config_sha256")

@@ -40,6 +40,26 @@ def print_table(title, header, rows):
         print("  ".join(cell(v).ljust(w) for v, w in zip(row, widths)))
 
 
+def exclusion_caveats(results):
+    """study-audit: an exclusion match censors, and where the exclusion is not
+    independent of the target codes (T1D among T2D-coded people, bipolar among
+    MDD) that censoring can be dependent. A disease whose exclusion exits pass
+    1% of its survival frame says so, from released counts only."""
+    lines = []
+    for row in results:
+        if row["model"] != "flow_survival":
+            continue
+        steps = sorted(m for m in row if digest.STEP.fullmatch(m))
+        end, exits = (row[steps[-1]] if steps else None), row.get("exclusion_exits_count")
+        if exits is None:
+            lines.append(f"CAVEAT {row['disease']}: exclusion exits withheld (small-cell rule); "
+                         "their share of the survival frame is not shown")
+        elif end and exits > 0.01 * end:
+            lines.append(f"CAVEAT {row['disease']}: exclusion exits are {exits / end:.1%} of the survival frame; "
+                         "censoring at an exclusion match may be dependent")
+    return lines
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("tokens", type=Path)
@@ -52,14 +72,21 @@ def main():
     for row in operations:
         ops[row["scope"]][row["item"]] = row
     run = ops.get("study", {}).get("run", {})
-    print("study config {config_sha256_12}  vcpus {vcpus}  threads {threads}  attempts {attempts}  "
-          "vcpu_hours {vcpu_hours}  bigquery_bytes {bigquery_bytes_billed}  outer_test_looks {outer_test_looks}  "
+    print("study config {config_sha256_12}  vcpus {vcpus}  threads {threads}  memory_gb {memory_budget_gb}  "
+          "attempts {attempts}  vcpu_hours {vcpu_hours}  bigquery_bytes {bigquery_bytes_billed}  "
+          "outer_test_looks {outer_test_looks}  "
           "horizons {horizons}".format_map(defaultdict(lambda: "?", run)))
     print("label {label}  run {run_kind}  gam {gam_commit_12}  tables {tables_source} {tables_sha256_12} "
-          "seed {tables_seed}  cdr_cutoff {cdr_cutoff} ({cdr_cutoff_source})".format_map(
+          "seed {tables_seed} {tables_scenario}  cdr_cutoff {cdr_cutoff} ({cdr_cutoff_source})".format_map(
         defaultdict(lambda: "?", run)))
     if run.get("caveats"):
         print("CAVEATS: " + str(run["caveats"]).replace("_and_", "; "))
+    for line in exclusion_caveats(results):
+        print(line)
+    for row in results:
+        if row["model"] == "pc_scale":
+            print("PC SD over the base: " + "  ".join(f"{m[3:].upper()} {cell(v)}" for m, v in sorted(
+                ((m, v) for m, v in row.items() if m.startswith("sd_pc")), key=lambda item: int(item[0][5:]))))
     timings = [(item, row.get("wall_seconds")) for item, row in ops.get("timing", {}).items()]
     if timings:
         total = sum(s for _, s in timings if isinstance(s, (int, float)))

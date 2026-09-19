@@ -8,6 +8,14 @@ costs its fit, not an interpreter start and a cold import from network
 storage. A worker that crashes or overruns its job's time is killed and
 replaced: the failure ends only that job.
 
+Jobs share the task's memory as well as its threads. Each job's peak resident
+set is measured (the worker resets its high-water mark per job), and a job
+starts only while every worker's resident set now, each busy one counted at
+least at its job's estimate, plus this job's estimate fits the budget. A job's
+estimate is the largest peak measured in its memory class, scaled up for a
+larger frame; a class not yet measured runs one job at a time, estimated at the
+largest peak measured in any class.
+
 Protocol: the driver writes one JSON job per line to a worker's stdin; the
 worker points its stdout and stderr at the job's log, runs it, and writes one
 JSON result line ({"status": "ok" | "error", "cpu_seconds", "max_rss_mb"}) to
@@ -41,6 +49,9 @@ class Job:
     # Jobs with one affinity (study.py: the frame they read) prefer the idle
     # worker that last ran one, so its cached frame is reused.
     affinity: str = ""
+    # Jobs of one memory class peak alike, in proportion to their size (frame rows).
+    memory_class: str = ""
+    size: int = 0
 
 
 @dataclass
@@ -48,7 +59,7 @@ class Outcome:
     status: str                 # ok, error, signal, timeout
     seconds: float = 0.0
     cpu_seconds: float = 0.0
-    max_rss_mb: float = 0.0     # the worker's peak so far: an upper bound for the job
+    max_rss_mb: float = 0.0     # the job's peak (a died job: its worker's, an upper bound)
     exit_code: int | None = None
     restarted: bool = False
     threads: int = 0
@@ -71,6 +82,42 @@ def signal_group(pid, signum):
         os.killpg(pid, signum)
     except ProcessLookupError:
         pass
+
+
+def status_bytes(pid, field):
+    """A /proc status field in bytes (VmRSS: resident now; VmHWM: peak since reset)."""
+    for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+        if line.startswith(field + ":"):
+            return int(line.split()[1]) * 1024
+    raise ValueError(f"/proc/{pid}/status has no {field}")
+
+
+def task_memory_bytes():
+    """The memory this task holds: the smallest cgroup limit on its path (a
+    Slurm job's --mem, a container's limit), else the host's MemTotal."""
+    limits = [meminfo_bytes("MemTotal")]
+    for line in Path("/proc/self/cgroup").read_text().splitlines():
+        hierarchy, controllers, path = line.split(":", 2)
+        parts = [part for part in path.split("/") if part]
+        if hierarchy == "0":
+            root, name = Path("/sys/fs/cgroup"), "memory.max"
+        elif "memory" in controllers.split(","):
+            root, name = Path("/sys/fs/cgroup/memory"), "memory.limit_in_bytes"
+        else:
+            continue
+        for depth in range(len(parts) + 1):
+            limit = root.joinpath(*parts[:depth], name)
+            if limit.is_file() and limit.read_text().strip() != "max":
+                limits.append(int(limit.read_text().strip()))
+    return min(limits)
+
+
+def meminfo_bytes(field):
+    """A /proc/meminfo field in bytes."""
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        if line.startswith(field + ":"):
+            return int(line.split()[1]) * 1024
+    raise ValueError(f"/proc/meminfo has no {field}")
 
 
 class Worker:
@@ -98,6 +145,13 @@ class Worker:
 
     def finished(self, result):
         self.reported_cpu += result["cpu_seconds"]
+
+    def rss(self):
+        """Bytes resident now (0 once the process is gone)."""
+        try:
+            return status_bytes(self.process.pid, "VmRSS")
+        except (FileNotFoundError, ProcessLookupError):
+            return 0
 
     def reap(self, block=True):
         """Wait for the worker process with wait4 (never Popen.wait, which drops
@@ -135,8 +189,10 @@ class Worker:
                 pass
 
 
-def run_jobs(jobs, total_threads, on_finish, command, progress=None, poll=0.05):
-    """Run `jobs` (dependencies first) within `total_threads`; returns key -> Outcome.
+def run_jobs(jobs, total_threads, on_finish, command, progress=None, poll=0.05, memory=None, stats=None):
+    """Run `jobs` (dependencies first) within `total_threads` and `memory`
+    bytes (None: threads alone); returns key -> Outcome. `stats`, a dict, gets
+    the peak bytes held at once and how often memory, not threads, held a job.
 
     `command(threads)` is the argv of a worker with that thread budget. A job
     starts once every dependency has finished, however it ended (the job itself
@@ -157,8 +213,33 @@ def run_jobs(jobs, total_threads, on_finish, command, progress=None, poll=0.05):
     waiting = sorted(jobs, key=lambda job: -job.priority)
     idle, busy, outcomes, restarted = [], [], {}, set()
     used = 0
+    peaks = {}  # memory class -> (largest peak bytes, its job's size)
+    stats = {} if stats is None else stats
+    stats.update(max_bytes=0, memory_waits=0)
+
+    def estimate(job):
+        if job.memory_class in peaks:
+            peak, size = peaks[job.memory_class]
+            return peak * max(1.0, job.size / size) if size else peak
+        return max((peak for peak, _ in peaks.values()), default=0)
+
+    def held():
+        """Bytes held now: the driver's and every worker's resident set, a busy
+        worker's at least its job's estimate."""
+        return (status_bytes("self", "VmRSS") + sum(max(w.rss(), estimate(w.job)) for w in busy)
+                + sum(w.rss() for w in idle))
+
+    def measured(job, outcome):
+        peak = outcome.max_rss_mb * 2**20
+        if peak > peaks.get(job.memory_class, (0, 0))[0]:
+            peaks[job.memory_class] = (peak, job.size)
 
     def finish(job, outcome):
+        measured(job, outcome)
+        # A job that could not fit even alone ran because it was alone: flagged, so the
+        # task size is revisited rather than the overrun passing silently.
+        if memory is not None and status_bytes("self", "VmRSS") + outcome.max_rss_mb * 2**20 > memory:
+            outcome.extra["over_budget"] = True
         if outcome.status == "ok":
             try:
                 on_finish(job, outcome)
@@ -189,12 +270,31 @@ def run_jobs(jobs, total_threads, on_finish, command, progress=None, poll=0.05):
         while waiting or busy:
             # Start what fits, backfilling smaller jobs behind a large one.
             still = []
+            holding = held() if memory is not None else 0
+            stats["max_bytes"] = max(stats["max_bytes"], holding)
             for job in waiting:
                 if all(dep in outcomes for dep in job.deps) and (used + job.threads <= total_threads or not busy):
+                    need = estimate(job)
+                    if memory is not None and busy:
+                        # A class not yet measured runs one job at a time; an idle
+                        # worker's cached frame gives way to a job that needs its memory.
+                        if job.memory_class not in peaks and any(w.job.memory_class == job.memory_class
+                                                                 for w in busy):
+                            still.append(job)
+                            continue
+                        while holding + need > memory and idle:
+                            freed = idle.pop(0)
+                            holding -= freed.rss()
+                            freed.kill()
+                        if holding + need > memory:
+                            stats["memory_waits"] += 1
+                            still.append(job)
+                            continue
                     worker = worker_for(job)
                     worker.start(job)
                     busy.append(worker)
                     used += job.threads
+                    holding += need
                 else:
                     still.append(job)
             waiting = still
@@ -261,6 +361,8 @@ def serve(run):
     for line in sys.stdin:
         message = json.loads(line)
         before = resource.getrusage(resource.RUSAGE_SELF)
+        # This job's peak resident set starts from the worker's resident set now.
+        Path("/proc/self/clear_refs").write_text("5")
         log = os.open(message["log"], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         sys.stdout.flush()
         sys.stderr.flush()
@@ -281,5 +383,5 @@ def serve(run):
         results.write(json.dumps({
             "status": status,
             "cpu_seconds": round(after.ru_utime + after.ru_stime - before.ru_utime - before.ru_stime, 3),
-            "max_rss_mb": round(after.ru_maxrss / 1024, 1)}) + "\n")
+            "max_rss_mb": round(status_bytes("self", "VmHWM") / 2**20, 1)}) + "\n")
         results.flush()

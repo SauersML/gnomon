@@ -134,6 +134,36 @@ def test_pool_keeps_its_thread_budget_and_isolates_failures(tmp_path):
     assert peak == 4  # two 2-thread jobs at once: the budget is used and never exceeded
 
 
+def test_pool_keeps_its_memory_budget_and_measures_each_job(tmp_path):
+    from study.pool import status_bytes, task_memory_bytes
+    assert 0 < task_memory_bytes() <= 2**60
+    # Six jobs that each hold 150 MiB for 1.5 s: the threads allow all six at once,
+    # the budget about two. The first of the class runs alone until it is measured.
+    spans = tmp_path / "spans"
+    spans.mkdir()
+    code = ("import os, time, pathlib; s = time.monotonic_ns(); block = bytearray(150 * 2**20); time.sleep(1.5); "
+            "(pathlib.Path(%r) / f'{os.getpid()}_{s}').write_text(f'{s} {time.monotonic_ns()}')") % str(spans)
+    jobs = [Job(key=f"m{i}", spec={"code": code}, threads=1, log=tmp_path / f"m{i}.log", memory_class="hold", size=1)
+            for i in range(6)]
+    stats = {}
+    budget = status_bytes("self", "VmRSS") + int(2.5 * 170 * 2**20)
+    outcomes = run_jobs(jobs, 6, lambda job, outcome: None, lambda threads: WORKER, memory=budget, stats=stats)
+    assert all(outcome.status == "ok" and outcome.max_rss_mb >= 150 for outcome in outcomes.values())
+    records = [tuple(map(int, path.read_text().split())) for path in spans.iterdir()]
+    running, peak = 0, 0
+    for _, delta in sorted([(s, 1) for s, _ in records] + [(e, -1) for _, e in records], key=lambda x: (x[0], x[1])):
+        running += delta
+        peak = max(peak, running)
+    assert peak == 2 and stats["memory_waits"] > 0 and stats["max_bytes"] <= budget + 170 * 2**20, (peak, stats)
+    assert not any(outcome.extra.get("over_budget") for outcome in outcomes.values())
+    # A job that cannot fit even alone still runs, alone, and is flagged over_budget.
+    big = Job(key="big", spec={"code": "block = bytearray(200 * 2**20)"}, threads=1, log=tmp_path / "big.log",
+              memory_class="big", size=1)
+    alone = run_jobs([big], 6, lambda job, outcome: None, lambda threads: WORKER,
+                     memory=status_bytes("self", "VmRSS") + 50 * 2**20)
+    assert alone["big"].status == "ok" and alone["big"].extra.get("over_budget") is True
+
+
 def test_workers_are_reused_and_a_crash_replaces_only_its_worker(tmp_path):
     pids = tmp_path / "pids"
     record = f"import os; open({str(pids)!r}, 'a').write(str(os.getpid()) + chr(10))"
@@ -272,6 +302,24 @@ def test_flows_never_step_by_a_small_count():
     assert digest.audit([row], REGISTRY) == [] and parsed[0]["step_03_lookback"] == 4490
 
 
+def test_exclusion_exits_release_as_a_subgroup_and_flag_over_one_percent():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tabulate_study", HERE / "tabulate_study.py")
+    tabulate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tabulate)
+    steps = [{"step": "base", "n": 50000}, {"step": "no_prevalent", "n": 30000}]
+
+    def released(exits):
+        rows = digest.flow_rows("t2d", {"survival": steps}, 20, {"survival": {"exclusion_exits": exits}})
+        assert digest.audit(rows, REGISTRY) == []
+        return digest.parse(digest.names(rows, 20, REGISTRY))[0]
+    parsed = released(600)  # 2.0% of the frame: the dependent-censoring caveat
+    assert parsed[0]["exclusion_exits_count"] == 600 and "2.0%" in tabulate.exclusion_caveats(parsed)[0]
+    assert tabulate.exclusion_caveats(released(100)) == []  # 0.3%: no caveat
+    parsed = released(12)  # a small count: withheld, and the table says it cannot show the share
+    assert "exclusion_exits_count" not in parsed[0] and "withheld" in tabulate.exclusion_caveats(parsed)[0]
+
+
 def test_cohort_counts_by_ancestry_are_partitioned_and_nested():
     by_ancestry = {"afr": {"binary_n": 400, "binary_cases": 60, "survival_n": 390, "survival_disease": 30,
                            "survival_death": 25, "survival_exclusion": 0},
@@ -313,6 +361,33 @@ def test_null_ehr_facts_are_withheld_not_compared():
     assert "fraction_without_ehr" not in row and "median_gap_years" not in row
 
 
+def test_an_undeclared_fit_error_fails_the_run_and_a_declared_refusal_does_not():
+    study = driver()
+    config = {"variants": ["ours", "calpred"], "declared_refusals": [
+        {"kind": "binary", "variant": "calpred", "phrase": "dense hessian shape mismatch", "issue": "gam#3015",
+         "reason": "known"}]}
+    study.check_declared_refusals(config)
+    for bad in ({"kind": "binary", "variant": "calpred", "phrase": "x", "issue": "3015", "reason": "r"},
+                {"kind": "binary", "variant": "shipped", "phrase": "x", "issue": "gam#1", "reason": "r"},
+                {"kind": "binary", "variant": "calpred", "phrase": "Dense", "issue": "gam#1", "reason": "r"}):
+        raises(ValueError, study.check_declared_refusals, {**config, "declared_refusals": [bad]})
+    refused = b"gamfit._rust.GamError: dense Hessian shape mismatch 11x11 vs 10x10\n"
+    planted = b"gamfit._rust.GamError: fit_table panicked inside Rust boundary: libcublas unavailable\n"
+    assert study.declared_refusal(config, {"kind": "binary", "variant": "calpred"}, refused) == "gam#3015"
+    # The same message from another variant, or another message from calpred, is not declared.
+    assert study.declared_refusal(config, {"kind": "binary", "variant": "ours"}, refused) is None
+    assert study.declared_refusal(config, {"kind": "binary", "variant": "calpred"}, planted) is None
+    records = {"fits/a": {"status": "ok"}, "fits/b": {"status": INSUFFICIENT}, "fits/c": {
+        "status": "error", "category": "gamerror", "declared_refusal": "gam#3015"}}
+    assert study.unexpected_failures(records) == {}
+    records["fits/d"] = {"status": "error", "category": "gamerror"}  # one planted GamError
+    records["predict/e"] = {"status": "timeout", "category": "unclassified"}
+    assert study.unexpected_failures(records) == {"fits/d": "gamerror", "predict/e": "unclassified"}
+
+
+INSUFFICIENT = "insufficient_events"
+
+
 def test_an_uncertified_fit_is_never_counted_as_converged():
     certification = driver().certification
     fit = lambda converged="absent", status="ok": {"status": status, "info": {} if converged == "absent"
@@ -336,6 +411,51 @@ def test_the_gam_commit_is_believed_only_for_the_installed_engine(tmp_path):
     raises(RuntimeError, built_from, {"gamfit/_rust.abi3.so": "cd" * 32}, record)
 
 
+def test_sex_never_enters_a_fit_of_a_single_sex_disease():
+    check = driver().check_single_sex
+    diseases = [{"slug": "hypertension", "sex": None}, {"slug": "breast_cancer", "sex": "female"}]
+    plans = {"survival": [("shared", "death"), ("ours", "disease")]}
+    by_rule = lambda kind, variant, component, disease: ["age", *([] if disease["sex"] else ["sex"]), "PC1"]
+    check(diseases, plans, by_rule)
+    # A planted design that keeps sex for every disease (the P1a shared death fit).
+    planted = lambda kind, variant, component, disease: ["age", "sex", "PC1"] if component == "death" else ["age"]
+    try:
+        check(diseases, plans, planted)
+    except ValueError as error:
+        assert "breast_cancer" in str(error) and "death" in str(error), error
+    else:
+        raise AssertionError("a single-sex disease kept sex in its death fit")
+
+
+def test_every_slope_is_put_on_the_pooled_z():
+    to_pooled_z = driver().to_pooled_z
+    # g = a * score: its slope per a z of scale s is a * s. A LOGO fit (s = 2.0), the
+    # simulator (s = 0.0003) and the pooled fit (s = 1.5) disagree until rescaled.
+    a, pooled_sd = 0.4, 1.5
+    for sd in (2.0, 0.0003, pooled_sd):
+        assert np.allclose(to_pooled_z(np.full((3, 2), a * sd), sd, pooled_sd), a * pooled_sd, rtol=1e-12)
+
+
+def test_caveats_are_fixed_labels_never_truncated():
+    check = digest.check_caveats
+    check(["shipped_arm_absent", "quick_build_multistart_timings_not_production", "x" * 90])
+    for bad in ("Shipped", "shipped arm", "shipped__arm", "_shipped", "drop_and_refit", "and_x"):
+        raises(ValueError, check, [bad])
+
+
+def test_a_validation_scope_is_refused_on_aou():
+    import argparse
+    study = driver().Study
+    for scope in ({"kinds": ["survival"], "diseases": None}, {"kinds": None, "diseases": ["hypertension"]}):
+        args = argparse.Namespace(config=str(HERE / "study.json"), source="bigquery", input=[], claim=False, **scope)
+        try:
+            study(args)
+        except ValueError as error:
+            assert "validation run" in str(error), error  # refused for its scope, not for anything else
+        else:
+            raise AssertionError("an AoU run accepted a validation scope")
+
+
 def test_the_run_row_totals_the_bigquery_plan():
     fields = driver().manifest_fields
     bigquery = fields({"source": "bigquery", "tables_sha256": "ab" * 32, "cdr_cutoff": "2024-07-01",
@@ -344,8 +464,15 @@ def test_the_run_row_totals_the_bigquery_plan():
                                     "bytes_billed": 6 * 10**9}})
     assert bigquery["bigquery_plan_bytes"] == 7 * 10**9 and bigquery["bigquery_bytes_billed"] == 6 * 10**9
     assert bigquery["ehr_domains"] == "visit_condition" and bigquery["cdr_cutoff_source"] == "observation_period"
-    simulator = fields({"source": "simulator", "seed": 1000, "scenario": "realistic_independent"})
+    simulator = fields({"source": "simulator", "seed": 1000, "simulator": {"scenario": "realistic_independent"}})
     assert "bigquery_plan_bytes" not in simulator and simulator["tables_seed"] == 1000
+    assert simulator["tables_scenario"] == "realistic_independent"
+
+
+def test_pc_scale_rows_are_whole_base_scores_that_pass_the_audit():
+    rows = digest.pc_scale_rows({"PC1": 109.2, "PC2": 82.0, "PC6": 33.1})
+    parsed, _ = digest.parse(digest.names(rows, 20, REGISTRY))
+    assert parsed[0]["sd_pc1"] == 109.2 and parsed[0]["sd_pc6"] == 33.1 and digest.audit(rows, REGISTRY) == []
 
 
 def test_followup_fractions_that_invert_to_small_counts_are_withheld():

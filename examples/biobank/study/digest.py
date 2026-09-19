@@ -63,7 +63,7 @@ REACH = re.compile(r"reach_[a-z0-9_]+")
 FRACTIONS = {"followup": REACH, "ehr_domains": re.compile(r"extended_by_[a-z0-9_]+|end_from_long_visit")}
 # Whole-cohort counts per frame (phenotypes flow by_ancestry): ordinary cells, so
 # suppress and the auditor partition them like evaluation cells.
-COHORT_COUNTS = frozenset({"n", "cases", "deaths", "exclusions"})
+COHORT_COUNTS = frozenset({"n", "cases", "deaths"})
 # The follow-up rows' fixed metrics; an exact proportion names its count ratio.
 FOLLOWUP = {
     "followup": {"n": {"type": "count"}},
@@ -73,6 +73,8 @@ FOLLOWUP = {
                      "fraction_obs_end_after_ehr_end": {"type": "proportion", "of": "obs_end_after_count",
                                                         "per": "with_ehr_n"},
                      "median_gap_years": {"type": "score"}, "median_positive_gap_years": {"type": "score"}},
+    # The SD of each PC the models see, over the base cohort: whole-base aggregates, no counts.
+    "pc_scale": {f"sd_pc{index}": {"type": "score"} for index in range(1, 65)},  # CohortConfig allows 1..64 PCs
 }
 # Inner model -> the models whose cells contain its cells' people.
 NESTED = {"survival": ("binary", "cohort_survival"), "binary": ("cohort_binary",),
@@ -85,6 +87,13 @@ def slug(text):
     if not cleaned:
         raise ValueError("empty digest label")
     return cleaned
+
+
+def check_caveats(caveats):
+    """A run's caveats reach its digest verbatim, joined by "_and_", which tabulate splits on."""
+    for caveat in caveats:
+        if not re.fullmatch(r"[a-z0-9]+(_[a-z0-9]+)*", caveat) or "_and_" in f"_{caveat}_":
+            raise ValueError(f"a caveat is a fixed label of [a-z0-9] words, none of them 'and': {caveat!r}")
 
 
 def label(text, length=40):
@@ -130,7 +139,8 @@ def small(value, limit=LIMIT):
 def special(model):
     """Rows whose metric names vary (flows, descendants, follow-up): named pairs,
     passed through suppress as built (their builders keep them safe)."""
-    return str(model).startswith("flow_") or model in ("descendants", "followup", "followup_ehr", "ehr_domains")
+    return str(model).startswith("flow_") or model in ("descendants", "followup", "followup_ehr", "ehr_domains",
+                                                       "pc_scale")
 
 
 # --------------------------------------------------------------------------- #
@@ -409,10 +419,10 @@ def cohort_rows(disease, by_ancestry):
     """Whole-cohort people and outcomes per frame, overall and by ancestry
     (phenotypes' by_ancestry partitions each frame), as ordinary cells that
     suppress and the auditor treat like any other: model cohort_binary (n,
-    cases) and cohort_survival (n, cases = disease events, deaths, exclusions)."""
+    cases) and cohort_survival (n, cases = disease events, deaths). An exclusion match
+    censors (study-cohort); its count is the survival flow's exclusion_exits subgroup."""
     fields = {"cohort_binary": {"n": "binary_n", "cases": "binary_cases"},
-              "cohort_survival": {"n": "survival_n", "cases": "survival_disease", "deaths": "survival_death",
-                                  "exclusions": "survival_exclusion"}}
+              "cohort_survival": {"n": "survival_n", "cases": "survival_disease", "deaths": "survival_death"}}
     rows = []
     for model, names_ in fields.items():
         cells = {f"ancestry_{label(group)}": {metric: int(counts[source]) for metric, source in names_.items()}
@@ -438,6 +448,14 @@ def followup_rows(administrative, limit=LIMIT):
         if safe_fraction(fraction, n, limit):
             row[f"reach_{label('h' + str(horizon))}"] = float(fraction)
     return [row]
+
+
+def pc_scale_rows(sds):
+    """The SD of each PC the models see over the base cohort (study-sim, lead
+    09-19): it confirms the PC geometry the joint Duchon tests assume. Whole-base
+    aggregates carry no count, so there is nothing to suppress."""
+    return [{"disease": "base", "model": "pc_scale", "variant": "all", "fit": "pooled", "stratum": "overall",
+             "horizon": None, **{f"sd_{label(pc)}": float(sd) for pc, sd in sds.items()}}]
 
 
 def safe_fraction(fraction, n, limit=LIMIT):
