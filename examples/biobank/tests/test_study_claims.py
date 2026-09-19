@@ -140,10 +140,11 @@ def test_replicates_for_uses_t_with_r_minus_one_degrees_of_freedom():
     assert claims.replicates_for(1.0, 1e-6) == claims.MAX_REPLICATES
 
 
-def test_a_cell_where_ours_or_the_competitor_has_no_row_yields_no_difference():
-    """study-pipe's time_scale_not_identified: a method that is not fitted has no rows, and a cell (disease x
-    scenario) where ours or that competitor lacks rows is skipped, never read as a difference; other cells are
-    unchanged."""
+def test_a_cell_where_ours_or_the_competitor_has_no_row_is_not_compared_by_name():
+    """study-pipe's time_scale_not_identified: a method that is not fitted has no rows. A cell (disease x scenario)
+    where ours or that competitor lacks a row in some seed is never read as a difference: it is not compared, and
+    says which row is missing; the differences that do exist are unchanged. A seed with neither side (never run)
+    only leaves the cell short of seeds."""
     competitor = np.full(5, 0.0100)
     values = {"rmse_true": (competitor - 0.001 + 1e-6 * np.arange(5), competitor)}
     both = rows(values) + [dict(r, disease="cad") for r in rows(values)]
@@ -151,10 +152,46 @@ def test_a_cell_where_ours_or_the_competitor_has_no_row_yields_no_difference():
     partial = [r for r in both if not (r["disease"] == "cad" and r["variant"] == "ours")
                and not (r["disease"] == "t2d" and r["variant"] == "standard" and r["seed"] == 4)]
     d = claims.paired_differences(partial, ["ours"], ["standard"])
-    assert set(d.disease) == {"t2d"} and sorted(d.seed) == [0, 1, 2, 3]
+    compared = d.loc[d.missing == ""].drop(columns="missing").reset_index(drop=True)
+    assert set(compared.disease) == {"t2d"} and sorted(compared.seed) == [0, 1, 2, 3]
     full = claims.paired_differences(both, ["ours"], ["standard"])
-    kept = full.loc[(full.disease == "t2d") & (full.seed != 4)].reset_index(drop=True)
-    pd.testing.assert_frame_equal(d.reset_index(drop=True), kept)
-    # Four seeds against a planned five: inconclusive for want of seeds, not a failure.
-    table, _ = claims.classify(d, MARGINS, {})
+    assert (full.missing == "").all()
+    kept = full.loc[(full.disease == "t2d") & (full.seed != 4)].drop(columns="missing").reset_index(drop=True)
+    pd.testing.assert_frame_equal(compared, kept)
+    table, counts = claims.classify(d, MARGINS, {})
+    by = table.set_index("disease")
+    assert by.loc["t2d", "class"] == "not_compared" and by.loc["t2d", "reason"] == "not compared: no standard row"
+    assert by.loc["t2d", "seeds_not_compared"] == "4"
+    assert by.loc["cad", "class"] == "not_compared" and by.loc["cad", "reason"] == "not compared: no ours row"
+    assert counts["not_compared"] == 2 and counts["not_worse"] == 0
+    # A fifth seed never run on either side: four seeds against a planned five, inconclusive, not a failure.
+    four = [r for r in both if r["disease"] == "t2d" and r["seed"] != 4]
+    table, _ = claims.classify(claims.paired_differences(four, ["ours"], ["standard"]), MARGINS, {})
     assert table.iloc[0]["class"] == "inconclusive" and table.iloc[0]["reason"] == "fewer seeds than planned"
+
+
+def test_a_competitor_not_certified_is_not_compared_and_never_a_pass():
+    """study.py shows a competitor cell whose fit was not certified with certification not_certified and no
+    metric (35378b3f). The cell, which would be not worse against the certified competitor, is not compared by
+    name, in any seed it happens, and the disease's claim lists it as missing."""
+    competitor = np.full(5, 0.0100)
+    values = {"rmse_true": (competitor - 0.001 + 1e-6 * np.arange(5), competitor),
+              "oe_true": (np.full(5, 1.001), np.full(5, 1.0))}
+    certified = rows(values)
+    table, counts = claims.classify(claims.paired_differences(certified, ["ours"], ["standard"]), MARGINS, {})
+    assert counts["not_worse"] >= 1 and counts["not_compared"] == 0
+    # The competitor's seed-2 fit is not certified: its row keeps its keys and reason, and shows no metric.
+    strip = lambda r: {k: v for k, v in r.items() if k not in values} | {"certification": "not_certified"}
+    uncertified = [strip(r) if r["variant"] == "standard" and r["seed"] == 2 else r for r in certified]
+    d = claims.paired_differences(uncertified, ["ours"], ["standard"])
+    table, counts = claims.classify(d, MARGINS, {})
+    assert set(table["class"]) == {"not_compared"} and counts["not_worse"] == counts["inconclusive"] == 0
+    assert set(table.reason) == {"not compared: competitor not_certified (standard)"}
+    assert set(table.seeds_not_compared) == {"2"}
+    summary = claims.by_disease(table).iloc[0]
+    assert not summary.complete and summary.not_compared == len(table)
+    assert all(m.endswith("not compared: competitor not_certified (standard)") for m in summary.missing)
+    assert sorted(m.split()[0] for m in summary.missing) == ["oe_true", "rmse_true"]
+    # The certified run's claim is complete.
+    table, _ = claims.classify(claims.paired_differences(certified, ["ours"], ["standard"]), MARGINS, {})
+    assert claims.by_disease(table).iloc[0].complete

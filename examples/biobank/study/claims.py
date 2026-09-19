@@ -1,6 +1,6 @@
 """The simulator claim classifier (SPEC section 8): ours against each competitor, cell by cell, on the TRUE
-probabilities, as not worse, inconclusive, worse (WORSE = BUG: reproduce on >= 3 seeds, then file) or not
-converged.
+probabilities, as not worse, inconclusive, worse (WORSE = BUG: reproduce on >= 3 seeds, then file), not
+converged or not compared.
 
 Input rows are evaluate.evaluate()'s pooled rows over replicate seeds, each carrying `scenario` and `seed`, with
 the truth metrics (rmse_true, oe_true, cal_slope_true, auc_true, slope_bias_true, slope_rmse_true). The paired
@@ -13,7 +13,11 @@ classifies the cell:
 - worse: the lower bound > delta;
 - inconclusive: otherwise (more seeds, never a pass);
 - not converged: fewer than the planned R seeds pass the two-start convergence test for both fits (R1); such
-  seeds never enter d or the dev-seed spreads that size R (R4).
+  seeds never enter d or the dev-seed spreads that size R (R4);
+- not compared: in some seed the comparison could not be made, and the cell says why by name: a competitor whose
+  fit was not certified ("not compared: competitor not_certified (<name>)"; study.py's result rows show such a
+  fit with no metric), or a side with no row or no value for the metric (a method not fitted, say). Such a cell
+  is never a pass or a tie. by_disease lists every missing comparison of a disease's claim.
 """
 from __future__ import annotations
 
@@ -33,7 +37,7 @@ ERRORS = {
     "slope_rmse": ("slope_rmse_true", lambda v: v, "slope_recovery"),
 }
 CELL = ["scenario", "disease", "model", "stratum", "horizon"]
-CLASSES = ("not_worse", "inconclusive", "worse", "not_converged")
+CLASSES = ("not_worse", "inconclusive", "worse", "not_converged", "not_compared")
 # The largest R the sizing rule reports; a cell needing more is unattainable at that margin.
 MAX_REPLICATES = 1000
 
@@ -51,33 +55,56 @@ def converged_seeds(convergence, limit):
 
 
 def paired_differences(rows, ours, competitors, convergence=None, limit=0.01):
-    """One row per (cell, metric, variant, competitor, seed): d, the competitor's error and whether both fits of
-    that seed passed the convergence test (convergence: a frame of scenario, seed, disease, model, variant and
-    max_drisk_over_sd; None marks every seed converged)."""
+    """One row per (cell, metric, variant, competitor, seed): d, the competitor's error, whether both fits of that
+    seed passed the convergence test (convergence: a frame of scenario, seed, disease, model, variant and
+    max_drisk_over_sd; None marks every seed converged), and `missing`, empty where d exists and otherwise the
+    named reason the comparison could not be made: "competitor not_certified (<name>)" (or "<ours> not_certified"),
+    "no <name> row" or "<name> has no <column>". A seed where neither side has a row or a value is not there."""
     frame = pd.DataFrame(rows)
     frame = frame.loc[frame.fit == "pooled"].copy()
+    if frame.empty:
+        return pd.DataFrame()
     # A label per horizon, so binary (None) and survival (years) cells group and sort together.
     frame["horizon"] = frame.horizon.map(lambda h: "none" if h is None or pd.isna(h) else f"{float(h):g}")
+    certification = frame["certification"] if "certification" in frame else pd.Series("", index=frame.index)
+    frame["_uncertified"] = certification.eq("not_certified").to_numpy()
     passed = None if convergence is None else converged_seeds(pd.DataFrame(convergence), limit)
     keys = CELL + ["seed"]
     out = []
     for metric, (column, error, _) in ERRORS.items():
         if column not in frame:
             continue
-        wide = frame.dropna(subset=[column]).pivot_table(index=keys, columns="variant", values=column,
-                                                         aggfunc="first")
         for variant in ours:
             for competitor in competitors:
-                if variant not in wide or competitor not in wide:
+                sides = {}
+                for name in (variant, competitor):
+                    side = frame.loc[frame.variant == name, keys + [column, "_uncertified"]].set_index(keys)
+                    if side.index.has_duplicates:
+                        raise ValueError(f"{name} has two pooled rows for one cell and seed")
+                    sides[name] = side
+                pair = sides[variant].join(sides[competitor], how="outer", lsuffix="_a", rsuffix="_b")
+                if pair.empty:
                     continue
-                pair = wide[[variant, competitor]].dropna()
+                a, b = pair[f"{column}_a"], pair[f"{column}_b"]
+                has_a, has_b = pair["_uncertified_a"].notna(), pair["_uncertified_b"].notna()
+                missing = np.select(
+                    [pair["_uncertified_b"].eq(True), pair["_uncertified_a"].eq(True), ~has_a, ~has_b,
+                     a.isna() & b.isna(), a.isna(), b.isna()],
+                    [f"competitor not_certified ({competitor})", f"{variant} not_certified", f"no {variant} row",
+                     f"no {competitor} row", "neither", f"{variant} has no {column}",
+                     f"{competitor} has no {column}"], "")
+                keep = missing != "neither"
+                pair, a, b, missing = pair.loc[keep], a[keep], b[keep], missing[keep]
                 part = pair.index.to_frame(index=False)
                 part["metric"], part["variant"], part["competitor"] = metric, variant, competitor
-                part["d"] = (error(pair[variant]) - error(pair[competitor])).to_numpy(float)
-                part["competitor_error"] = error(pair[competitor]).to_numpy(float)
+                compared = missing == ""
+                part["d"] = np.where(compared, error(a.fillna(0)).to_numpy(float) - error(b.fillna(0)).to_numpy(float),
+                                     np.nan)
+                part["competitor_error"] = np.where(compared, error(b.fillna(0)).to_numpy(float), np.nan)
                 part["converged"] = True if passed is None else [
                     all((s, seed, dis, mod, v) in passed for v in (variant, competitor))
                     for s, seed, dis, mod in zip(part.scenario, part.seed, part.disease, part.model)]
+                part["missing"] = missing
                 out.append(part)
     return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
 
@@ -93,12 +120,20 @@ def margin(metric, competitor_error, margins):
 def classify(differences, margins, planned, minimum=5):
     """Every cell's class from its per-seed paired differences. planned: (scenario, metric) -> R, the replicate
     count written into study.json before the claim run (study.json claims.replicates.by_scenario_metric), with
-    `minimum` for any pair it lacks. Returns (cells, counts)."""
+    `minimum` for any pair it lacks. A cell with any seed whose comparison is missing is not compared, by name,
+    whatever its other seeds say. Returns (cells, counts)."""
     group = CELL + ["metric", "variant", "competitor"]
     cells = []
     for key, part in differences.groupby(group, dropna=False, sort=True):
         record = dict(zip(group, key))
         R = int(planned.get((record["scenario"], record["metric"]), minimum))
+        absent = part.loc[part.missing != ""]
+        if len(absent):
+            cells.append({**record, "planned": R, "seeds": len(part), "converged_seeds": np.nan, "delta": np.nan,
+                          "class": "not_compared",
+                          "reason": "not compared: " + "; ".join(sorted(set(absent.missing))),
+                          "seeds_not_compared": ",".join(str(s) for s in sorted(absent.seed))})
+            continue
         usable = part.loc[part.converged]
         delta = margin(record["metric"], usable.competitor_error.mean() if len(usable) else np.nan, margins)
         row = {**record, "planned": R, "seeds": len(part), "converged_seeds": len(usable), "delta": delta}
@@ -132,7 +167,7 @@ def replicates_needed(dev_differences, margins, minimum=5, sources=()):
     from the paired spreads on development seeds of fits that passed the two-start test (R4), taking the cell
     that needs the most. Returns one row per (scenario, metric) with sd_dev, delta, the deciding cell, R and the
     dev sources (job ids) it rests on."""
-    usable = dev_differences.loc[dev_differences.converged]
+    usable = dev_differences.loc[dev_differences.converged & dev_differences.missing.eq("")]
     out = []
     for (scenario, metric), part in usable.groupby(["scenario", "metric"], sort=True):
         worst = None
@@ -148,4 +183,18 @@ def replicates_needed(dev_differences, margins, minimum=5, sources=()):
                          "attainable": R < MAX_REPLICATES, "dev_seeds": int(len(cell))}
         if worst is not None:
             out.append({**worst, "sources": list(sources)})
+    return pd.DataFrame(out)
+
+
+def by_disease(table):
+    """One row per (scenario, disease, model, variant, competitor) of classify's cells: how many fall in each class,
+    and every comparison the claim could not make, by name ("<metric> <stratum> <horizon>: <reason>"). A
+    disease's claim is complete only where that list is empty."""
+    group = ["scenario", "disease", "model", "variant", "competitor"]
+    out = []
+    for key, part in table.groupby(group, sort=True):
+        absent = part.loc[part["class"] == "not_compared"]
+        out.append({**dict(zip(group, key)), **{c: int((part["class"] == c).sum()) for c in CLASSES},
+                    "complete": absent.empty,
+                    "missing": [f"{r.metric} {r.stratum} {r.horizon}: {r.reason}" for r in absent.itertuples()]})
     return pd.DataFrame(out)
