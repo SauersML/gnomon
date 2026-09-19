@@ -56,8 +56,8 @@ KINDS = ("binary", "survival")
 # counts the disease's qualifying records, so it is an outcome too.
 OUTCOMES = {"binary": ("y", "n_dates"), "survival": ("exit_age", "event", "followup", "n_dates")}
 LOGO_AXES = ("ancestry", "region", "ehr_site")
-# Binary y; survival event: 0 censored, 1 disease, 2 death, 3 exclusion (competing). Nothing else.
-OUTCOME_CODES = {"binary": {0, 1}, "survival": {0, 1, 2, 3}}
+# Binary y; survival event: 0 censored (an exclusion match censors too), 1 disease, 2 death. Nothing else.
+OUTCOME_CODES = {"binary": {0, 1}, "survival": {0, 1, 2}}
 # study.json primary_censoring_rule -> phenotypes.build_frames(censor=...).
 CENSORING = {"ehr_end": "ehr_end", "min_death_cutoff": "cutoff"}
 UNKNOWN = "unknown"
@@ -66,7 +66,7 @@ RESTART = "restart"
 # SPEC section 8, minimum events: a fit below the bar is this result, not a failure.
 INSUFFICIENT_EVENTS = "insufficient_events"
 # The event code each survival component models.
-SURVIVAL_CAUSES = {"disease": 1, "death": 2, "exclusion": 3}
+SURVIVAL_CAUSES = {"disease": 1, "death": 2}
 # A config's label: "production" for the shipped study.json, a named dev variant otherwise.
 LABEL = re.compile(r"[a-z0-9_]{1,40}")
 LOG_TAIL = 256 * 1024

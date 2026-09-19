@@ -322,9 +322,9 @@ def test_exclusion_exits_release_as_a_subgroup_and_flag_over_one_percent():
 
 def test_cohort_counts_by_ancestry_are_partitioned_and_nested():
     by_ancestry = {"afr": {"binary_n": 400, "binary_cases": 60, "survival_n": 390, "survival_disease": 30,
-                           "survival_death": 25, "survival_exclusion": 0},
+                           "survival_death": 25},
                    "eur": {"binary_n": 900, "binary_cases": 150, "survival_n": 820, "survival_disease": 70,
-                           "survival_death": 40, "survival_exclusion": 0}}
+                           "survival_death": 40}}
     rows = digest.cohort_rows("htn", by_ancestry)
     out = {(r["model"], r["stratum"]): r for r in digest.suppress(rows, 20, REGISTRY)}
     # afr's survival cell sits 10 below its binary cell, so it is withheld, and so its family.

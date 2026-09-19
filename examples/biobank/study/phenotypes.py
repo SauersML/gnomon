@@ -66,9 +66,6 @@ class CohortConfig:
     min_age: float = 18.0
     test_fraction: float = 0.2
     dev_folds: int = 5
-    # Exclusion-rule exits after the landmark become a competing event (3) once
-    # they exceed this fraction of a disease's survival cohort; below it they censor.
-    exclusion_competing_fraction: float = 0.01
     # The prespecified horizon rule (`choose_horizons`): every candidate that at
     # least this fraction of the survival-eligible cohort can reach administratively.
     horizon_candidates: tuple = (1, 2, 3, 4, 5)
@@ -83,8 +80,8 @@ class CohortConfig:
             raise ValueError("unsupported PC count, fold count or test fraction")
         if self.lookback_days < 0 or self.landmark_days < 0:
             raise ValueError("lookback and landmark are non-negative day counts")
-        if not 0 <= self.exclusion_competing_fraction <= 1 or not 0 < self.horizon_min_reach <= 1:
-            raise ValueError("exclusion_competing_fraction and horizon_min_reach are fractions")
+        if not 0 < self.horizon_min_reach <= 1:
+            raise ValueError("horizon_min_reach is a fraction")
         candidates = tuple(self.horizon_candidates)
         if not candidates or list(candidates) != sorted(set(candidates)) or candidates[0] <= 0:
             raise ValueError("horizon_candidates are distinct increasing positive years")
@@ -465,7 +462,7 @@ def binary_frame(rows, base, config):
     return out, counts
 
 
-def survival_frame(rows, base, config, *, onset="second", censor="ehr_end", exclusion="auto"):
+def survival_frame(rows, base, config, *, onset="second", censor="ehr_end"):
     """Incident confirmed case on the age scale, entry at the landmark, death competing.
 
     onset="second" (primary) puts the event at the second distinct qualifying
@@ -475,18 +472,16 @@ def survival_frame(rows, base, config, *, onset="second", censor="ehr_end", excl
     capped at the CDR cutoff because no record exists after it; "cutoff"
     censors at min(death, cutoff) alone. Follow-up needs ehr_end past the landmark.
 
-    Exclusion roots (audit C3) remove only people who meet their case rule by
-    the landmark. Meeting it later ends follow-up at that date: as a censoring
-    (exclusion="censor"), or as competing event 3 ("competing"). "auto"
-    chooses competing when those exits exceed config
-    exclusion_competing_fraction of the frame, else censoring. Same-day exits:
-    a disease event beats death, which beats censoring; an exclusion met that
-    day voids the disease event (the case rule no longer holds) but not death.
+    Exclusion roots (SPEC section 2, audit C3) remove only people who meet their
+    case rule by the landmark; meeting it later CENSORS at that date. The
+    estimand is the disease risk as if the exclusion process did not end
+    follow-up, the same quantity the simulator's truth defines, which treats
+    the exclusion processes as ignorable. There is no other treatment. Same-day
+    exits: a disease event beats death, which beats any censoring (the usual
+    convention that events precede censorings at a tied time).
     """
     if onset not in ("second", "first") or censor not in ("ehr_end", "cutoff"):
         raise ValueError("onset is second|first and censor is ehr_end|cutoff")
-    if exclusion not in ("auto", "censor", "competing"):
-        raise ValueError("exclusion is auto|censor|competing")
     frame = rows.frame
     landmark = frame._baseline.to_numpy() + config.landmark_days
     first, death = frame._first.to_numpy(), frame._death.to_numpy()
@@ -515,14 +510,8 @@ def survival_frame(rows, base, config, *, onset="second", censor="ehr_end", excl
     confirmed = frame.n_dates.to_numpy() >= 2
     event_day = np.where(confirmed, frame._second.to_numpy() if onset == "second" else first, np.nan)
     exit_day = np.fmin(np.fmin(np.fmin(event_day, death), end), excluded)
-    voided = excluded == exit_day
-    event = np.where((event_day == exit_day) & ~voided, 1, np.where(death == exit_day, 2, 0)).astype(np.int8)
-    by_exclusion = voided & (event == 0)
-    exits = int(by_exclusion[keep].sum())
-    if exclusion == "auto":
-        exclusion = "competing" if exits > config.exclusion_competing_fraction * keep.sum() else "censor"
-    if exclusion == "competing":
-        event[by_exclusion] = 3
+    event = np.where(event_day == exit_day, 1, np.where(death == exit_day, 2, 0)).astype(np.int8)
+    exits = int(((excluded == exit_day) & (event == 0))[keep].sum())  # censored by an exclusion match
     birth = frame._birth.to_numpy()
 
     out = frame.loc[keep, _shared(config.num_pcs)].copy()
@@ -536,8 +525,8 @@ def survival_frame(rows, base, config, *, onset="second", censor="ehr_end", excl
     out = out.reset_index(drop=True)
     counts = {"steps": flow.steps,
               "events": {"censored": int((out.event == 0).sum()), "disease": int((out.event == 1).sum()),
-                         "death": int((out.event == 2).sum()), "exclusion": int((out.event == 3).sum())},
-              "exclusion_exits": exits, "exclusion_as": exclusion,
+                         "death": int((out.event == 2).sum())},
+              "exclusion_exits": exits,
               "single_record_at_risk": int((out.n_dates == 1).sum())}
     return out, counts
 
@@ -549,8 +538,7 @@ def ancestry_counts(binary, survival):
         b, s = binary.loc[binary.ancestry == label], survival.loc[survival.ancestry == label]
         counts[str(label)] = {"binary_n": len(b), "binary_cases": int(b.y.sum()), "survival_n": len(s),
                               "survival_disease": int((s.event == 1).sum()),
-                              "survival_death": int((s.event == 2).sum()),
-                              "survival_exclusion": int((s.event == 3).sum())}
+                              "survival_death": int((s.event == 2).sum())}
     return counts
 
 
@@ -561,11 +549,11 @@ class DiseaseFrames:
     flow: dict
 
 
-def build_frames(source, diseases, config, *, censor="ehr_end", exclusion="auto"):
+def build_frames(source, diseases, config, *, censor="ehr_end"):
     """(base, {slug: DiseaseFrames}) for every disease: the binary and survival frames.
 
-    `censor` and `exclusion` choose the survival frames' censoring rule and
-    exclusion treatment (see `survival_frame`); the defaults are the primary analysis."""
+    `censor` chooses the survival frames' censoring rule (see `survival_frame`);
+    the default is the primary analysis."""
     base = base_cohort(source, config)
     missing = sorted({code for d in diseases for code in d.snomed_codes} - set(source.manifest["snomed_codes"]))
     if missing:
@@ -582,7 +570,7 @@ def build_frames(source, diseases, config, *, censor="ehr_end", exclusion="auto"
     for disease in diseases:
         rows = disease_rows(base, source, disease)
         binary, binary_counts = binary_frame(rows, base, config)
-        survival, survival_counts = survival_frame(rows, base, config, censor=censor, exclusion=exclusion)
+        survival, survival_counts = survival_frame(rows, base, config, censor=censor)
         frames[disease.slug] = DiseaseFrames(binary, survival, {
             "disease": rows.flow, "binary": binary_counts, "survival": survival_counts,
             "by_ancestry": ancestry_counts(binary, survival)})

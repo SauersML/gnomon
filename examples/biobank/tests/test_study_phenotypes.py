@@ -202,7 +202,7 @@ def test_survival_entry_exit_competing_death_and_late_exclusions(handmade):
     expected = {1: (0, D(2023, 6, 1)), 2: (1, D(2020, 3, 1)), 3: (0, D(2023, 6, 1)), 8: (2, D(2021, 1, 1)),
                 9: (1, D(2021, 2, 2)), 10: (0, D(2023, 6, 1)), 11: (2, D(2023, 6, 1)),
                 16: (0, CUTOFF), 19: (1, D(2020, 1, 10)),
-                20: (3, D(2020, 9, 1)), 21: (3, D(2020, 5, 5)), 22: (2, D(2021, 3, 3)),
+                20: (0, D(2020, 9, 1)), 21: (1, D(2020, 5, 5)), 22: (2, D(2021, 3, 3)),
                 23: (0, D(2021, 12, 31))}  # censored at the EHR end, before the observation period's
     for pid, (event, exit_date) in expected.items():
         assert frame.loc[pid, "event"] == event, pid
@@ -210,15 +210,9 @@ def test_survival_entry_exit_competing_death_and_late_exclusions(handmade):
     assert (frame.entry_age == age(LANDMARK)).all()  # entry at the landmark, not at baseline (audit M12)
     assert (frame.entry_year == 2019).all()
     assert np.allclose(frame.followup, frame.exit_age - frame.entry_age) and (frame.followup > 0).all()
-    assert survival["events"] == {"censored": 9, "disease": 3, "death": 3, "exclusion": 2}
-    assert survival["exclusion_exits"] == 2 and survival["exclusion_as"] == "competing"  # 2 of 17 > 1%
-    assert survival["single_record_at_risk"] == 1
-    base = phenotypes.base_cohort(handmade, CONFIG)
-    rows = phenotypes.disease_rows(base, handmade, DIABETES)
-    censored, counts = phenotypes.survival_frame(rows, base, CONFIG, exclusion="censor")
-    assert dict(zip(censored.person_id, censored.event))[20] == 0 and counts["events"]["exclusion"] == 0
-    lenient = phenotypes.CohortConfig(seed=CONFIG.seed, exclusion_competing_fraction=0.2)
-    assert phenotypes.survival_frame(rows, base, lenient)[1]["exclusion_as"] == "censor"  # 2 of 17 < 20%
+    # 20 is censored at its later exclusion match; 21's match falls on its event day, and the event counts.
+    assert survival["events"] == {"censored": 10, "disease": 4, "death": 3}
+    assert survival["exclusion_exits"] == 1 and survival["single_record_at_risk"] == 1
 
 
 def test_sensitivity_variants(handmade):
@@ -229,7 +223,7 @@ def test_sensitivity_variants(handmade):
     for pid, when in {2: D(2020, 1, 1), 8: D(2020, 6, 1), 9: D(2020, 2, 2), 10: D(2022, 1, 1),
                       21: D(2020, 1, 1)}.items():
         assert (first.loc[pid, "event"], first.loc[pid, "exit_age"]) == (1, age(when)), pid
-    assert (first.loc[20, "event"], first.loc[20, "exit_age"]) == (3, age(D(2020, 9, 1)))  # 1 of 17 > 1%
+    assert (first.loc[20, "event"], first.loc[20, "exit_age"]) == (0, age(D(2020, 9, 1)))
     cutoff, counts = phenotypes.survival_frame(rows, base, CONFIG, censor="cutoff")
     cutoff = by_id(cutoff)
     assert (cutoff.loc[10, "event"], cutoff.loc[10, "exit_age"]) == (1, age(D(2023, 8, 1)))
@@ -321,7 +315,7 @@ def reference_frames(tables, spec, disease, config):
     ses_cuts = [reference_quantile(deprivations, q) for q in (0.25, 0.5, 0.75)]
     lookbacks = [(p["baseline_date"] - p["obs_start"]).days for p in base]
     lookback_cuts = [reference_quantile(lookbacks, q) for q in (1 / 3, 2 / 3)]
-    binary, survival, ties, exclusion_exits = {}, {}, 0, []
+    binary, survival, ties = {}, {}, 0
     for p in base:
         pid, birth, baseline = p["person_id"], p["birth_date"], p["baseline_date"]
         sex = sexes[p["sex_at_birth_concept_id"]]
@@ -370,19 +364,14 @@ def reference_frames(tables, spec, disease, config):
         dates = [d for d in (event_date, p["death_date"], observed_to, excluded) if d is not None]
         exit_date = min(dates)
         ties += dates.count(exit_date) > 1
-        if event_date == exit_date and excluded != exit_date:
+        if event_date == exit_date:
             event = 1
         elif p["death_date"] == exit_date:
             event = 2
         else:
             event = 0
-            if excluded == exit_date:
-                exclusion_exits.append(pid)
         survival[pid] = {**common, "entry_age": (landmark - birth).days / 365.25, "entry_year": landmark.year,
                          "exit_age": (exit_date - birth).days / 365.25, "event": event}
-    if len(exclusion_exits) > config.exclusion_competing_fraction * len(survival):
-        for pid in exclusion_exits:
-            survival[pid]["event"] = 3
     return binary, survival, ties
 
 
@@ -410,7 +399,7 @@ def test_frames_match_the_reference(tmp_path, seed):
         assert_frame_matches(frames[disease.slug].binary, binary, ["y", *shared])
         assert_frame_matches(frames[disease.slug].survival, survival,
                              ["entry_age", "entry_year", "exit_age", "event", *shared])
-        assert {0, 1, 2} <= set(frames[disease.slug].survival.event)
+        assert set(frames[disease.slug].survival.event) == {0, 1, 2}
         exclusion_exits += frames[disease.slug].flow["survival"]["exclusion_exits"]
     assert ties > 0  # same-day disease, death, exclusion and censoring exits were exercised
     assert exclusion_exits > 0  # and so were exclusions met after the landmark

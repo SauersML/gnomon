@@ -21,7 +21,6 @@
     "min_age": 18,
     "test_fraction": 0.2,
     "dev_folds": 5,
-    "exclusion_competing_fraction": 0.01,
     "horizon_candidates": [1, 2, 3, 4, 5],
     "horizon_min_reach": 0.5
   },
