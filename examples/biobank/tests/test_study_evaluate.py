@@ -217,8 +217,9 @@ def test_cox_censoring_model_solves_its_score_equation_and_reduces_to_nelson_aal
 
 @pytest.mark.parametrize("kind", ["cox", "km", "strata"])
 def test_total_influence_is_the_jackknife_of_the_whole_estimator(kind):
-    """The total influence (given G, plus G's own estimation) of the IPCW AUC, Brier and observed risk is the
-    first-order change when one row is dropped and G refitted without it; the influence given G alone is not."""
+    """The total influence (given G, plus G's own estimation) of the IPCW AUC, Brier, observed risk and
+    calibration intercept and slope is the first-order change when one row is dropped and G refitted without it;
+    the influence given G alone is not."""
     rng = np.random.default_rng(24)
     n, horizon = 3600, 2.0
     site, x = rng.integers(0, 3, size=n), rng.normal(size=n)
@@ -232,21 +233,31 @@ def test_total_influence_is_the_jackknife_of_the_whole_estimator(kind):
     covariates = ("site",) if kind == "strata" else ("site", "age")
 
     def metrics(rows):
+        # Each metric's value, its influence given G, and its derivative in each row's log weight.
         part = frame.loc[rows].reset_index(drop=True)
         model = ev.Censoring(part, horizon, kind, covariates)
         w = ev.ipcw(part, horizon, model)
         y = ((part.event_code == 1) & (part.followup <= horizon)).to_numpy(float)
+        m = len(rows)
         auc, influence = ev.weighted_auc(p[rows], y, w)
-        return model, {"auc": (auc, influence, influence),
-                       "brier": ((w * (y - p[rows]) ** 2).mean(), None, w * (y - p[rows]) ** 2),
-                       "risk": ((w * y).mean(), None, w * y)}
+        loss, observed = w * (y - p[rows]) ** 2, w * y
+        known = w > 0
+        lp = ev.clipped_logit(p[rows][known])
+        out = {"auc": (auc, influence / m, influence / m),
+               "brier": (loss.mean(), (loss - loss.mean()) / m, loss / m),
+               "risk": (observed.mean(), (observed - observed.mean()) / m, observed / m)}
+        for name, X, offset, k in (("cal_int", np.ones((known.sum(), 1)), lp, 0),
+                                   ("cal_slope", np.column_stack([np.ones(known.sum()), lp]), None, 1)):
+            beta, _, _, row_influence = ev.logistic_fit(X, y[known], w[known], offset=offset)
+            padded = np.zeros(m)
+            padded[known] = row_influence[:, k]
+            out[name] = (beta[k], padded, padded)
+        return model, out
 
     everyone = np.arange(n)
     model, full = metrics(everyone)
     fixed, total = {}, {}
-    for name, (value, influence, x_rows) in full.items():
-        given = influence / n if influence is not None else (x_rows - x_rows.mean()) / n
-        sensitivity = influence / n if influence is not None else x_rows / n
+    for name, (value, given, sensitivity) in full.items():
         fixed[name], total[name] = given, model.influence(everyone, given, sensitivity)
         variance = model.variance(everyone, given, sensitivity)
         assert abs(variance - np.sum(total[name] ** 2)) < 1e-10 * variance
@@ -274,6 +285,35 @@ def test_total_influence_is_the_jackknife_of_the_whole_estimator(kind):
         assert errors[name]["given_g"] > 3 * errors[name]["total"], name
 
 
+def test_a_cell_with_a_row_weighted_above_twenty_is_unsupported():
+    # A small site loses almost everyone to follow-up by h, so its few rows followed past h carry weights
+    # 1/G_i(h) > 20 under the Cox G, while the cell's own marginal G(h) is far above the floor.
+    rng = np.random.default_rng(26)
+    n, horizon = 3000, 2.0
+    site = np.where(rng.random(n) < 0.1, "b", "a")
+    t1 = rng.exponential(1 / 0.2, size=n)
+    t2 = rng.exponential(1 / 0.05, size=n)
+    c = rng.exponential(1 / np.where(site == "b", 2.0, 0.05))
+    t = np.minimum.reduce([t1, t2, c])
+    frame = pd.DataFrame({"followup": t, "event_code": np.select([t == t1, t == t2], [1, 2], 0), "site": site})
+    p = np.clip(rng.beta(2, 5, size=n), 0.01, 0.99)[None, :]
+
+    def status(rows):
+        part = frame.loc[rows].reset_index(drop=True)
+        model = ev.Censoring(part, horizon, "cox", ("site",))
+        w = ev.ipcw(part, horizon, model)
+        cell = ev.survival_cell(part.followup.to_numpy(), part.event_code.to_numpy(), w, model,
+                                np.arange(len(part)), p[:, rows], ["ours"], "pooled", "overall", horizon, 21)
+        return cell[0]["status"], float(w.max()), ev.cell_support(part.followup.to_numpy(),
+                                                                  part.event_code.to_numpy(), horizon)[1]
+
+    everyone, weight, g_upper = status(np.arange(n))
+    assert weight > 1 / ev.POSITIVITY_FLOOR and g_upper > ev.POSITIVITY_FLOOR
+    assert everyone == ev.UNSUPPORTED
+    # The same cell without the small site is reported.
+    assert status(np.flatnonzero(site == "a"))[0] == "ok"
+
+
 @pytest.mark.parametrize("kind", ["cox", "km", "strata"])
 def test_a_window_without_censorings_weighs_every_row_one(kind):
     # Censoring only at the CDR cutoff, past the horizon for every eligible row (the censor="cutoff" frames).
@@ -287,7 +327,8 @@ def test_a_window_without_censorings_weighs_every_row_one(kind):
     y = ((code == 1) & (t <= horizon)).astype(float)
     rows = np.arange(len(t))
     # With nothing to estimate in G the total variance is the one given G.
-    assert abs(model.variance(rows, (y - y.mean()) / len(t), y / len(t)) - np.sum(((y - y.mean()) / len(t)) ** 2)) < 1e-15
+    given = (y - y.mean()) / len(t)
+    assert abs(model.variance(rows, given, y / len(t)) - np.sum(given ** 2)) < 1e-15
 
 
 def test_ipcw_weights_are_one_without_censoring_and_zero_for_censored_rows():
@@ -320,6 +361,38 @@ def test_calibration_recovers_known_miscalibration():
     # The intercept with slope fixed at one is the calibration-in-the-large: mean(y) matched on the logit scale.
     p_fitted = 1 / (1 + np.exp(-(lp + cal["cal_int"])))
     assert abs(p_fitted.mean() - y.mean()) < 1e-9
+
+
+def test_expected_auc_is_the_pair_definition_under_the_true_probabilities():
+    rng = np.random.default_rng(27)
+    p_true = rng.beta(2, 6, size=300)
+    p = np.round(p_true + rng.normal(scale=0.05, size=300), 2)  # ties
+    kernel = (p[:, None] > p[None, :]) + 0.5 * (p[:, None] == p[None, :])
+    pair = p_true[:, None] * (1 - p_true[None, :])
+    np.fill_diagonal(pair, 0.0)
+    reference = float(np.sum(pair * kernel) / pair.sum())
+    assert abs(ev.expected_auc(p, p_true) - reference) < 1e-12
+    # Planted: keeping the self pairs (a row as its own control) is not the expected AUC.
+    with_self = p_true[:, None] * (1 - p_true[None, :])
+    assert abs(float(np.sum(with_self * kernel) / with_self.sum()) - reference) > 1e-4
+
+
+def test_truth_metrics_recover_known_miscalibration_and_slope_error():
+    rng = np.random.default_rng(28)
+    true_logit = rng.normal(-1.5, 1.0, size=20000)
+    true_risk = 1 / (1 + np.exp(-true_logit))
+    # A prediction whose logit is 0.2 + 1.25 x the true logit: the slope of true on predicted logit is 1 / 1.25.
+    p = 1 / (1 + np.exp(-(0.2 + 1.25 * true_logit)))
+    true_slope = rng.normal(0.3, 0.05, size=20000)
+    S = (true_slope + 0.02)[None, :]
+    row = ev.truth_metrics(p[None, :], true_risk, S, true_slope)[0]
+    assert abs(row["cal_slope_true"] - 0.8) < 1e-9
+    assert abs(row["oe_true"] - true_risk.mean() / p.mean()) < 1e-15
+    assert abs(row["slope_bias_true"] - 0.02) < 1e-12 and abs(row["slope_rmse_true"] - 0.02) < 1e-12
+    assert row["auc_true"] == ev.expected_auc(p, true_risk)
+    # A perfect prediction has expected O/E and calibration slope 1.
+    perfect = ev.truth_metrics(true_risk[None, :], true_risk)[0]
+    assert abs(perfect["oe_true"] - 1) < 1e-15 and abs(perfect["cal_slope_true"] - 1) < 1e-12
 
 
 def test_integrated_calibration_index_of_a_calibrated_model_is_small_and_of_a_shifted_one_is_not():
@@ -376,8 +449,11 @@ def predictions_for(frame, x, kind, horizons, logo=None):
 def truth_for(frame, kind, horizons, seed=18):
     rng = np.random.default_rng(seed)
     if kind == "binary":
-        return pd.DataFrame({"p_ever": rng.beta(2, 8, size=len(frame))})
+        return pd.DataFrame({"p_ever": rng.beta(2, 8, size=len(frame)),
+                             "slope": rng.normal(0.3, 0.1, size=len(frame))})
     truth = pd.DataFrame({f"cif_{h:g}y": rng.beta(2, 8, size=len(frame)) for h in horizons})
+    for h in horizons:
+        truth[f"slope_cif_{h:g}y"] = rng.normal(0.3, 0.1, size=len(frame))
     truth["uncensored_event"] = np.where(frame.event == 0, rng.integers(0, 3, size=len(frame)), frame.event)
     truth["uncensored_exit_age"] = frame.entry_age + frame.followup + np.where(frame.event == 0, 1.0, 0.0)
     return truth
@@ -389,8 +465,9 @@ def test_every_released_field_is_in_the_registry_and_every_axis_partitions(kind)
     frame, x = table_frame(6000, 12, kind)
     predictions = predictions_for(frame, x, kind, horizons, logo="logo:ancestry:afr")
     rows = ev.evaluate(kind, frame, predictions, horizons, {"report": {"small_cell_max": 20}},
-                       truth=truth_for(frame, kind, horizons))
-    assert any("rmse_true" in r for r in rows)
+                       truth=truth_for(frame, kind, horizons),
+                       slopes={key: np.full_like(risk, 0.3) for key, risk in predictions.items()})
+    assert any("rmse_true" in r and "slope_rmse_true" in r and "auc_true" in r for r in rows)
     if kind == "survival":
         assert any("auc_unc" in r and "c_uno" in r for r in rows)
     for row in rows:
@@ -462,20 +539,17 @@ def test_a_horizon_evaluates_only_rows_whose_administrative_follow_up_reaches_it
         assert overall["n"] == int(np.sum(frame.admin_years - 180 / 365.25 >= horizon))
 
 
-def test_an_exclusion_exit_competes_exactly_like_a_death():
-    horizons = [1.0, 2.0]
-    frame, x = table_frame(6000, 22, "survival")
-    split = np.random.default_rng(23).random(len(frame)) < 0.5
-    three = frame.assign(event=np.where((frame.event == 2) & split, 3, frame.event))
-    assert (three.event == 3).sum() > 100
+def test_an_event_code_other_than_censored_disease_or_death_is_refused():
+    """study-cohort's survival frames carry events 0, 1 and 2 only (4a9bd621): a stray 3, the removed
+    exclusion-rule exit, is refused rather than taken as a competing event."""
+    horizons = [1.0]
+    frame, x = table_frame(3000, 22, "survival")
     predictions = predictions_for(frame, x, "survival", horizons)
-    rows2 = ev.evaluate("survival", frame, predictions, horizons, {})
-    rows3 = ev.evaluate("survival", three, predictions, horizons, {})
-    assert len(rows2) == len(rows3)
-    for a, b in zip(rows2, rows3):
-        assert a.keys() == b.keys()
-        for key, value in a.items():
-            assert value == b[key] or (isinstance(value, float) and np.isnan(value) and np.isnan(b[key])), key
+    assert any(r["status"] == "ok" for r in ev.evaluate("survival", frame, predictions, horizons, {}))
+    three = frame.assign(event=np.where(frame.event == 2, 3, frame.event))
+    assert (three.event == 3).sum() > 0
+    with pytest.raises(ValueError, match="events 0, 1 or 2"):
+        ev.evaluate("survival", three, predictions, horizons, {})
 
 
 def test_paired_differences_are_differences_of_the_rows_own_metrics():
@@ -489,3 +563,110 @@ def test_paired_differences_are_differences_of_the_rows_own_metrics():
                 other = at[(ref, stratum, horizon)]
                 assert abs(row[f"d_auc_{ref}"] - (row["auc"] - other["auc"])) < 1e-12
                 assert abs(row[f"d_brier_{ref}"] - (row["brier"] - other["brier"])) < 1e-12
+
+
+def test_the_uncensored_difference_se_counts_every_case_chance_of_censoring():
+    """The simulator gate's SEs of released minus uncensored observed risk count every case's chance of censoring,
+    given the uncensored outcomes: sum u^2 (1/G - 1) with G known, less with G's estimation. Planted: a cell of
+    40 cases that lost none of them to censoring (about 2 expected), as the N2a gate's small cells often do. The
+    rows' own differences are then all (w - 1) y >= 0, and their sample SD, the SE of 64074309's gate, puts that
+    ordinary cell near z = sqrt(40)."""
+    rng = np.random.default_rng(7)
+    n, cases, censored, h = 4000, 40, 200, 1.0
+    t = np.full(n, 2.0)
+    code = np.zeros(n, int)
+    t[:cases], code[:cases] = rng.uniform(0.01, 0.99, cases), 1
+    t[cases:cases + censored] = rng.uniform(0.01, 0.99, censored)
+    entry = rng.uniform(40, 70, n)
+    frame = pd.DataFrame({"followup": t, "event": code, "entry_age": entry,
+                          **{axis: "all" for axis in ev.AXES["survival"]}})
+    p = rng.uniform(0.005, 0.02, n)
+    # Truth: the censored rows were event-free past h in the uncensored world.
+    t_unc = np.where(code == 1, t, 2.0)
+    truth = pd.DataFrame({"cif_1y": p, "uncensored_event": code, "uncensored_exit_age": entry + t_unc})
+    rows = ev.evaluate("survival", frame, {("ours", "pooled"): p[:, None]}, [h], {"evaluate": {"censoring": "km"}},
+                       truth=truth)
+    row = next(r for r in rows if r["stratum"] == "overall" and r["status"] == "ok")
+    # G(T-) of each case by the reverse Kaplan-Meier (no ties: the risk set at u is every row with t >= u).
+    cuts = np.sort(t[cases:cases + censored])
+    at_risk = np.array([(t >= u).sum() for u in cuts])
+    g = np.array([np.prod(1 - 1 / at_risk[cuts < T]) for T in t[:cases]])
+    expected = np.sqrt(np.sum((1 / n) ** 2 * (1 / g - 1)))
+    assert row["risk_unc_diff_se_known_g"] == pytest.approx(expected, rel=1e-10)
+    assert row["risk_unc_diff_se"] < row["risk_unc_diff_se_known_g"]
+    diff = row["obs_risk"] - row["risk_unc"]
+    assert diff == pytest.approx(np.sum(1 / g - 1) / n, rel=1e-10)
+    assert abs(diff / row["risk_unc_diff_se_known_g"]) < 2 and abs(diff / row["risk_unc_diff_se"]) < 2
+    w = np.zeros(n)
+    w[:cases] = 1 / g
+    w[cases + censored:] = 1 / np.prod(1 - 1 / at_risk)
+    sample = np.sqrt(np.sum(((w * (code == 1) - (code == 1)) / n - diff / n) ** 2))
+    assert diff / sample > 4
+
+
+@pytest.mark.parametrize("kind", ["km", "cox"])
+def test_the_uncensored_difference_se_matches_censoring_redrawn_given_the_truth(kind):
+    """Given one uncensored world, over 1000 redraws of the censoring alone (site-dependent for the Cox model), the
+    released-minus-uncensored observed risk's SE with G's estimation matches the spread of that difference with G
+    refitted each time, and the known-G SE the spread of the difference weighted by the true G (the ratio's own
+    noise is about 2%)."""
+    rng = np.random.default_rng(1)
+    n, cases, h = 4000, 200, 1.0
+    site = rng.integers(0, 2, n)
+    rate = np.where(site == 1, 0.6, 0.2) if kind == "cox" else np.full(n, 0.3)
+    t_unc = np.full(n, 2.0)
+    t_unc[:cases] = rng.uniform(0.01, 0.99, cases)
+    y_unc = (np.arange(n) < cases).astype(float)
+    event = y_unc == 1
+    decided = np.where(event, t_unc, h)
+    covariates = ("ehr_site",) if kind == "cox" else ()
+    released, true_g, with_g, known_g = [], [], [], []
+    for _ in range(1000):
+        c = rng.exponential(1 / rate)
+        frame = pd.DataFrame({"followup": np.minimum(t_unc, c), "event_code": np.where(event & (c >= t_unc), 1, 0),
+                              "ehr_site": site.astype(str)})
+        model = ev.Censoring(frame, h, kind, covariates)
+        w = ev.ipcw(frame, h, model)
+        y = ((frame.event_code == 1) & (frame.followup <= h)).to_numpy(float)
+        released.append(np.mean(w * y) - y_unc.mean())
+        observed = (c >= decided).astype(float)
+        true_g.append(np.mean(y_unc * (observed / np.exp(-rate * decided) - 1)))
+        g = np.where(event, model.at(t_unc, left=True), model.at(h))
+        u = y_unc / n
+        with_g.append(np.sqrt(model.conditional_variance(np.arange(n), u, g, t_unc, event, h)))
+        known_g.append(np.sqrt(np.sum(u ** 2 * (1 / g - 1))))
+    ratio_with, ratio_known = np.mean(with_g) / np.std(released, ddof=1), np.mean(known_g) / np.std(true_g, ddof=1)
+    print(f"{kind}: SE with G's estimation / SD of the released difference {ratio_with:.3f}; known-G SE / SD of "
+          f"the true-G difference {ratio_known:.3f}; known-G / with-G SE {np.mean(known_g) / np.mean(with_g):.3f}")
+    assert 0.9 < ratio_with < 1.1 and 0.9 < ratio_known < 1.1
+    assert np.mean(with_g) < np.mean(known_g)
+
+
+@pytest.mark.parametrize("kind", ["binary", "survival"])
+@pytest.mark.parametrize("missing", ["ours", "covariates", "standard@logo"])
+def test_an_arm_without_predictions_is_omitted_with_its_comparisons_and_nothing_else_changes(kind, missing):
+    """A method with no predictions for a fit (study-pipe's time_scale_not_identified: not fitted, so never
+    predicted) has no rows for it, and no row carries a paired difference against it; every other row is what
+    it is with the arm present. `ours` and `covariates` miss every fit; `standard@logo` misses only its LOGO fit."""
+    horizons = [1.0, 2.0]
+    logo = "logo:ancestry:afr"
+    frame, x = table_frame(6000, 31, kind)
+    full = predictions_for(frame, x, kind, horizons, logo=logo)
+    variant = missing.split("@")[0]
+    drop = {(variant, logo)} if missing.endswith("@logo") else {(variant, "pooled"), (variant, logo)}
+    partial = {k: v for k, v in full.items() if k not in drop}
+    key = lambda r: (r["variant"], r["fit"], r["stratum"], r["horizon"])
+    with_arm = {key(r): r for r in ev.evaluate(kind, frame, full, horizons, {})}
+    without = {key(r): r for r in ev.evaluate(kind, frame, partial, horizons, {})}
+    assert set(without) == {k for k in with_arm if (k[0], k[1]) not in drop}
+    for k, row in without.items():
+        against = (variant, k[1]) in drop
+        expected = {f: v for f, v in with_arm[k].items()
+                    if not (against and (f.startswith(f"d_auc_{variant}") or f.startswith(f"d_brier_{variant}")))}
+        assert row.keys() == expected.keys(), k
+        for f, value in expected.items():
+            if isinstance(value, float):
+                assert np.isclose(row[f], value, rtol=1e-12, atol=1e-13, equal_nan=True), (k, f)
+            else:
+                assert row[f] == value, (k, f)
+    assert any(f.startswith(f"d_auc_{variant}") for r in with_arm.values() for f in r) == (variant != "ours")

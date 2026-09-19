@@ -10,8 +10,7 @@ Binary cells: AUC with its DeLong standard error, Brier, O/E, the calibration in
 slope, the integrated calibration index, and paired AUC and Brier differences against the covariates-only and
 standard competitors.
 
-Survival cells, at each horizon h on time since entry, with death (and an exclusion-rule exit, when study-cohort
-makes it one) a competing event:
+Survival cells, at each horizon h on time since entry, with death a competing event:
 - the IPCW AUC with controls including deaths (Blanche definition 2);
 - the IPCW Brier score, a death before h being a known non-case weighted 1/G(T-);
 - the observed risk, the IPCW incidence (the Aalen-Johansen estimator when G is the cell's reverse KM), and
@@ -22,9 +21,15 @@ makes it one) a competing event:
 
 G, the censoring survival, is an evaluation nuisance fitted on the evaluation rows themselves: a Cox model for
 loss to follow-up over [0, h] on the rows whose potential follow-up reaches h, given site, region, ancestry,
-entry age and entry year. Deaths and disease events end follow-up and are not censorings. The standard errors
-of the IPCW AUC, Brier, observed risk and their paired differences include G's own estimation (the Cox
-model's score residuals and the Breslow or Kaplan-Meier hazard's martingale); the calibration SEs hold G fixed.
+entry age and entry year. Deaths and disease events end follow-up and are not censorings. Every IPCW standard
+error (AUC, Brier, observed risk, calibration intercept and slope, and the paired differences) includes G's own
+estimation (the Cox model's score residuals and the Breslow or Kaplan-Meier hazard's martingale). The
+simulator-only SEs of each released-minus-uncensored difference are instead the censoring's variance given the
+uncensored outcomes, with G's estimation (and, in the _known_g columns, without it: conservative).
+
+Ties at the horizon: an event at exactly h is a case by h, as in the cumulative incidence F(h) = P(T <= h);
+a row followed past h is a known non-case and one censored at exactly h is unknown. (timeROC counts cases T < t
+strictly, so the two differ only where events fall exactly on the horizon.)
 """
 from __future__ import annotations
 
@@ -125,8 +130,9 @@ def expit(x):
 
 def logistic_fit(X, y, weights=None, offset=None, iterations=100):
     """Weighted Newton-Raphson logistic regression with an optional offset: the coefficients, their
-    model-based covariance (R glm's for unit weights) and their sandwich covariance (HC0), which is the one
-    to use when the weights are IPCW weights rather than frequencies."""
+    model-based covariance (R glm's for unit weights), their sandwich covariance (HC0), which is the one to use
+    when the weights are IPCW weights rather than frequencies, and each row's influence (rows x coefficients,
+    summing to beta's error), which is also beta's derivative in the row's log weight."""
     X, y = np.asarray(X, float), np.asarray(y, float)
     w = np.ones(len(y)) if weights is None else np.asarray(weights, float)
     off = np.zeros(len(y)) if offset is None else np.asarray(offset, float)
@@ -159,20 +165,26 @@ def logistic_fit(X, y, weights=None, offset=None, iterations=100):
     p = expit(off + X @ beta)
     information = X.T @ (X * (w * p * (1 - p))[:, None])
     bread = np.linalg.inv(information)
-    score = X * (w * (y - p))[:, None]
-    return beta, bread, bread @ (score.T @ score) @ bread
+    influence = (X * (w * (y - p))[:, None]) @ bread
+    return beta, bread, influence.T @ influence, influence
 
 
-def calibration(target, p, weights=None, robust=False):
+def calibration(target, p, weights=None, robust=False, censoring=None, rows=None):
     """Calibration intercept (logit P(y) = a + logit p, slope fixed at one) and slope (logit P(y) = a + b logit p),
-    each with its standard error."""
+    each with its standard error: model-based, or the HC0 sandwich with robust=True. With IPCW weights from
+    `censoring`, and `rows` these rows' indices among its evaluation rows, the SE also carries the censoring
+    model's own estimation (Censoring.variance)."""
     lp = clipped_logit(p)
     ones = np.ones((len(lp), 1))
-    a, model_a, robust_a = logistic_fit(ones, target, weights, offset=lp)
-    b, model_b, robust_b = logistic_fit(np.column_stack([ones, lp]), target, weights)
-    cov_a, cov_b = (robust_a, robust_b) if robust else (model_a, model_b)
-    return {"cal_int": float(a[0]), "cal_int_se": float(np.sqrt(cov_a[0, 0])),
-            "cal_slope": float(b[1]), "cal_slope_se": float(np.sqrt(cov_b[1, 1]))}
+    a, model_a, robust_a, influence_a = logistic_fit(ones, target, weights, offset=lp)
+    b, model_b, robust_b, influence_b = logistic_fit(np.column_stack([ones, lp]), target, weights)
+    if censoring is not None:
+        se_a = math.sqrt(censoring.variance(rows, influence_a[:, 0], influence_a[:, 0]))
+        se_b = math.sqrt(censoring.variance(rows, influence_b[:, 1], influence_b[:, 1]))
+    else:
+        cov_a, cov_b = (robust_a, robust_b) if robust else (model_a, model_b)
+        se_a, se_b = math.sqrt(cov_a[0, 0]), math.sqrt(cov_b[1, 1])
+    return {"cal_int": float(a[0]), "cal_int_se": float(se_a), "cal_slope": float(b[1]), "cal_slope_se": float(se_b)}
 
 
 def loess(x, y, at, weights=None, span=LOESS_SPAN):
@@ -384,7 +396,7 @@ class Censoring:
             U = (np.where(censored[:, None], Xc - xbar[np.minimum(own, len(times) - 1)], 0.0)
                  - self.risk[:, None] * (Xc * cumulative[:, None] - xbar_lambda[at_risk]))
             self.psi_beta = np.linalg.solve(information, U.T).T
-            self.design, self.xbar_lambda = Xc, xbar_lambda
+            self.design, self.xbar, self.xbar_lambda, self.information = Xc, xbar, xbar_lambda, information
             self.psi_gram = self.psi_beta.T @ self.psi_beta
             # psi_beta summed by each row's own censoring time and by its at-risk count, so that psi_beta' first
             # costs O(censoring times x p) per metric instead of O(rows x p).
@@ -481,6 +493,47 @@ class Censoring:
             total += 2 * float(b @ projection) + float(b @ self.psi_gram @ b)
         return total
 
+    def conditional_variance(self, rows, uncensored, g, decided, event, horizon):
+        """Simulator only: the variance of an IPCW sum's released-minus-uncensored difference over a cell, given
+        the uncensored outcomes, with G's estimation. rows: the cell's indices among the evaluation rows;
+        uncensored: each one's uncensored contribution u_i (its term in the metric when observed); g: G_i where
+        its outcome is decided, at `decided` (T_unc for an event of either cause by h, `event`, else h).
+
+        Row i's total influence is u_i (observed_i / G_i - 1) + int h_i dM_i, with h_i the metric's
+        censoring-martingale integrand (see the class; C_m and b from the expected sensitivities u_j at the decided
+        times). Its conditional mean square is u_i^2 (1/G_i - 1) - 2 u_i H_i + int h_i^2 dA_i: H_i the compensator
+        of h_i up to the decided time and A_i row i's cumulative censoring intensity, taken at its realized risk
+        set (a sum over every row of the curve, which does not collapse where no case was lost)."""
+        total = float(np.sum(uncensored ** 2 * (1 / g - 1)))
+        window = np.where(event, decided, np.nextafter(horizon, np.inf))
+        for c, (times, increments, denominator, _) in enumerate(self.pieces):
+            chosen = self.curve[rows] == c
+            if not len(times) or not chosen.any():
+                continue
+            members, u = rows[chosen], uncensored[chosen]
+            weight = u * self.risk[members]
+            position = np.where(event[chosen], np.searchsorted(times, decided[chosen], side="left"), len(times))
+            mass = np.bincount(position, weights=weight, minlength=len(times) + 1)
+            a = (weight.sum() - np.cumsum(mass)[:-1]) / denominator
+            curve_rows = np.flatnonzero(self.curve == c)
+            # The Cox model's psi_beta term enters h_i as slope' (x_i - xbar(u)), slope = I^-1 b.
+            beta, own_beta, e = np.zeros(len(curve_rows)), np.zeros(len(members)), np.zeros(len(times))
+            if self.psi_beta is not None:
+                cumulative = np.r_[0.0, np.cumsum(increments)]
+                b = self.design[members].T @ (weight * cumulative[position]) - self.xbar_lambda.T @ mass
+                slope = np.linalg.solve(self.information, b)
+                beta, own_beta, e = self.design[curve_rows] @ slope, self.design[members] @ slope, self.xbar @ slope
+                # The Breslow risk set at u is every row with t >= u.
+                reach = np.searchsorted(times, window[chosen], side="right")
+            else:
+                # The reverse Kaplan-Meier's: events leave first.
+                reach = np.searchsorted(times, window[chosen], side="left")
+            p0, p1, p2 = (np.r_[0.0, np.cumsum(increments * v)] for v in (1.0, a - e, (a - e) ** 2))
+            k = self.at_risk[curve_rows]
+            total += float(np.sum(self.risk[curve_rows] * (p2[k] + 2 * beta * p1[k] + beta ** 2 * p0[k])))
+            total -= 2 * float(np.sum(weight * (p1[reach] + own_beta * p0[reach])))
+        return total
+
 
 def ipcw(frame, horizon, censoring):
     """IPCW weights at a horizon: 1/G(T-) for an event of either cause by h, 1/G(h) for a row followed past h,
@@ -534,7 +587,7 @@ CONCORDANCE_BLOCK = 10_000_000
 def wolbers_concordance(time, code, risks, horizon, censoring=None):
     """Wolbers' competing-risk concordance truncated at a horizon, on time since entry, for one risk per row or
     for several (variants x rows) at once. A case i (cause 1 at T_i <= h) is comparable with j when j outlives
-    it (T_j > T_i, or T_j = T_i and j is not a case) or when j left by a competing exit (code 2 or 3) before
+    it (T_j > T_i, or T_j = T_i and j is not a case) or when j died (code 2) before
     T_i; the pair is concordant when risk_i > risk_j, ties counting half. Without `censoring` every pair weighs
     one (Harrell).
     With a Censoring of the same rows every pair weighs the inverse probability that it is seen (Uno's weights,
@@ -555,10 +608,10 @@ def wolbers_concordance(time, code, risks, horizon, censoring=None):
         if (g_left[case] <= 0).any():
             raise MetricRefusal("concordance", "zero censoring survival at a case time")
         inverse_left = np.divide(1.0, g_left, out=np.zeros(n), where=g_left > 0)
-    # j left by a competing exit before the case: ascending time, cases before competing exits at a tied time
-    # (one at the case's own time outlives it instead).
-    died_order = np.lexsort((code >= 2, t))
-    mass = np.where(code >= 2, inverse_left, 0.0)[died_order]
+    # j died before the case: ascending time, cases before deaths at a tied time (a death at the case's own time
+    # outlives it instead).
+    died_order = np.lexsort((code == 2, t))
+    mass = np.where(code == 2, inverse_left, 0.0)[died_order]
     died_total = np.empty(n)
     died_total[died_order] = np.cumsum(mass) - mass
     comparable = float(np.sum((inverse_left * died_total)[case]))
@@ -631,6 +684,10 @@ METRICS = {
     # Simulator only: accuracy against the true risk, and each metric on the uncensored outcomes.
     "rmse_true": "score", "mae_true": "score", "bias_true": "score", "corr_true": "score",
     "mean_true": "proportion", "risk_unc": "proportion", "auc_unc": "score", "brier_unc": "score",
+    "auc_unc_diff_se": "score", "brier_unc_diff_se": "score", "risk_unc_diff_se": "score",
+    "auc_unc_diff_se_known_g": "score", "brier_unc_diff_se_known_g": "score", "risk_unc_diff_se_known_g": "score",
+    "oe_true": "score", "cal_slope_true": "score", "auc_true": "score", "slope_bias_true": "score",
+    "slope_rmse_true": "score",
 }
 INSUFFICIENT = "insufficient_support"
 UNSUPPORTED = "horizon_unsupported"
@@ -672,23 +729,52 @@ def _paired(row, ref, auc_difference, auc_difference_se, loss_difference):
     row[f"d_brier_{ref}_se"] = float(loss_difference.std(ddof=1) / np.sqrt(len(loss_difference)))
 
 
-def truth_metrics(P, true_risk):
-    """Accuracy against the simulator's true risk (SPEC section 5): per variant the RMSE, mean absolute error
-    (the ICI against truth), bias and correlation of predicted against true risk."""
+def expected_auc(p, p_true):
+    """The AUC of predictions p in expectation over outcomes drawn from the true probabilities:
+    sum over pairs i != j of pi_i (1 - pi_j) K(p_i, p_j) / sum of pi_i (1 - pi_j), K counting a tie half. Every
+    row is a case with weight pi and a control with weight 1 - pi, and the self pairs are removed."""
+    p, pi = np.asarray(p, float), np.asarray(p_true, float)
+    n = len(p)
+    both, _ = weighted_auc(np.r_[p, p], np.r_[np.ones(n), np.zeros(n)], np.r_[pi, 1 - pi])
+    total, own = pi.sum() * (1 - pi).sum(), float(np.sum(pi * (1 - pi)))
+    return float((both * total - 0.5 * own) / (total - own))
+
+
+def truth_metrics(P, true_risk, S=None, true_slope=None):
+    """Accuracy against the simulator's true probabilities (SPEC sections 5 and 8), per variant: the RMSE, mean
+    absolute error (the ICI against truth), bias and correlation of predicted against true risk; the expected
+    O/E_true = mean(p_true) / mean(p); the expected calibration slope, the least-squares slope of logit(p_true)
+    on logit(p); the expected AUC under p_true; and with S (variants x rows) the slope recovery against
+    true_slope, both on the pooled model's z scale: bias and RMSE of the predicted slope."""
     rows = []
-    for p in P:
+    true_logit = clipped_logit(true_risk)
+    for a, p in enumerate(P):
         error = p - true_risk
         spread = p.std() * true_risk.std()
-        rows.append({"rmse_true": float(np.sqrt(np.mean(error ** 2))), "mae_true": float(np.mean(np.abs(error))),
-                     "bias_true": float(error.mean()),
-                     "corr_true": float(np.mean((p - p.mean()) * (true_risk - true_risk.mean())) / spread)
-                     if spread > 0 else float("nan")})
+        logit = clipped_logit(p)
+        centred = logit - logit.mean()
+        row = {"rmse_true": float(np.sqrt(np.mean(error ** 2))), "mae_true": float(np.mean(np.abs(error))),
+               "bias_true": float(error.mean()),
+               "corr_true": float(np.mean((p - p.mean()) * (true_risk - true_risk.mean())) / spread)
+               if spread > 0 else float("nan"),
+               "oe_true": float(true_risk.mean() / p.mean()), "auc_true": expected_auc(p, true_risk)}
+        if centred @ centred > 0:
+            row["cal_slope_true"] = float(centred @ (true_logit - true_logit.mean()) / (centred @ centred))
+        if S is not None:
+            known = np.isfinite(S[a]) & np.isfinite(true_slope)
+            if known.any():
+                slope_error = S[a][known] - true_slope[known]
+                row.update(slope_bias_true=float(slope_error.mean()),
+                           slope_rmse_true=float(np.sqrt(np.mean(slope_error ** 2))))
+        rows.append(row)
     return rows
 
 
-def binary_cell(y, P, variants, fit, stratum, minimum, references=REFERENCES, pooled=None, true_risk=None):
+def binary_cell(y, P, variants, fit, stratum, minimum, references=REFERENCES, pooled=None, true_risk=None,
+                slopes=None):
     """Rows for one binary cell: y the outcomes, P the (variants x rows) predictions, pooled the pooled fit's
-    predictions of the same variants for a LOGO cell, true_risk the simulator's p_ever."""
+    predictions of the same variants for a LOGO cell, true_risk the simulator's p_ever, and slopes (simulator only)
+    the (variants x rows) predicted PGS slopes with the true slopes, both on the pooled model's z scale."""
     n, cases = len(y), int(y.sum())
     base = {"model": "binary", "fit": fit, "stratum": stratum, "horizon": None, "n": n, "cases": cases}
     if min(n, cases, n - cases) < minimum:
@@ -696,7 +782,8 @@ def binary_cell(y, P, variants, fit, stratum, minimum, references=REFERENCES, po
     stacked = P if pooled is None else np.vstack([P, pooled])
     aucs, cov = delong(y, stacked)
     losses = (y[None, :] - stacked) ** 2
-    truth = truth_metrics(P, true_risk) if true_risk is not None else [{} for _ in variants]
+    truth = (truth_metrics(P, true_risk, *(slopes or (None, None))) if true_risk is not None
+             else [{} for _ in variants])
     rows = []
     for a, variant in enumerate(variants):
         p = P[a]
@@ -729,11 +816,12 @@ def cell_support(time, code, horizon):
 
 
 def survival_cell(t, code, w, model, rows, P, variants, fit, stratum, horizon, minimum, references=REFERENCES,
-                  pooled=None, truth=None):
-    """Rows for one survival cell at a horizon: t the follow-up from entry; code 0 censored, 1 disease, 2 death,
-    3 an exclusion-rule exit (2 and 3 compete); w the IPCW weights of `model`, the evaluation's censoring model,
+                  pooled=None, truth=None, slopes=None):
+    """Rows for one survival cell at a horizon: t the follow-up from entry; code 0 censored, 1 disease, 2 death
+    (competing); w the IPCW weights of `model`, the evaluation's censoring model,
     and `rows` the cell's indices among its rows; P the (variants x rows) CIFs at the horizon.
-    truth (simulator only): (true CIF at h, uncensored follow-up, uncensored event code) per row.
+    truth (simulator only): (true CIF at h, uncensored follow-up, uncensored event code, G where the
+    uncensored outcome is decided: T- for an event of either cause by h, else h) per row.
 
     Every IPCW standard error carries the censoring model's own estimation (Censoring.variance). Reported only
     where the prespecified support rule holds: at least `minimum` cases, known non-cases and rows followed past
@@ -775,14 +863,32 @@ def survival_cell(t, code, w, model, rows, P, variants, fit, stratum, horizon, m
             concordance[name] = refusal
     truth_rows = [{} for _ in variants]
     if truth is not None:
-        true_cif, t_unc, code_unc = truth
+        true_cif, t_unc, code_unc, g_unc = truth
         y_unc = ((code_unc == 1) & (t_unc <= horizon)).astype(float)
-        truth_rows = truth_metrics(P, true_cif)
+        truth_rows = truth_metrics(P, true_cif, *(slopes or (None, None)))
+
+        event_unc = (code_unc != 0) & (t_unc <= horizon)
+
+        def paired_se(name, uncensored):
+            # The SEs of a released-minus-uncensored difference over the same rows, given the uncensored outcomes
+            # (the IPCW estimator gate's): row i's term is its uncensored contribution u_i times
+            # (observed_i / G_i - 1), with G_i at T_unc- for an event of either cause by h and at h otherwise. They
+            # count every row's chance of censoring, not the censorings that happened: the rows' own differences
+            # are (w - 1) u >= 0 in a cell that lost no case, and their sample SD collapses there (z ~ sqrt(cases);
+            # study-eval's N2a oracle, 09-19). The first carries G's estimation (Censoring.conditional_variance);
+            # the second, sum u_i^2 (1 / G_i - 1), holds G known, which is conservative while G is well estimated.
+            with_g = model.conditional_variance(rows, uncensored, g_unc, t_unc, event_unc, horizon)
+            return {f"{name}_diff_se": float(np.sqrt(with_g)),
+                    f"{name}_diff_se_known_g": float(np.sqrt(np.sum(uncensored ** 2 * (1 / g_unc - 1))))}
+
         for a, p in enumerate(P):
-            truth_rows[a].update(mean_true=float(true_cif.mean()), risk_unc=float(y_unc.mean()),
-                                 brier_unc=float(np.mean((y_unc - p) ** 2)))
+            unc_loss = (y_unc - p) ** 2
+            truth_rows[a].update(
+                mean_true=float(true_cif.mean()), risk_unc=float(y_unc.mean()), brier_unc=float(unc_loss.mean()),
+                **paired_se("risk_unc", y_unc / n), **paired_se("brier_unc", unc_loss / n))
             if 0 < y_unc.sum() < n:
-                truth_rows[a]["auc_unc"] = weighted_auc(p, y_unc, np.ones(n))[0]
+                auc_unc, influence_unc = weighted_auc(p, y_unc, np.ones(n))
+                truth_rows[a].update(auc_unc=auc_unc, **paired_se("auc_unc", influence_unc / n))
     out = []
     for a, variant in enumerate(variants):
         p, (auc, influence) = P[a], fits[a]
@@ -792,7 +898,8 @@ def survival_cell(t, code, w, model, rows, P, variants, fit, stratum, horizon, m
         if observed > 0:
             oe, half = observed / row["mean_risk"], Z95 * observed_se / observed
             row.update(oe=oe, oe_lo=oe * math.exp(-half), oe_hi=oe * math.exp(half))
-        _guarded(row, "calibration", lambda: calibration(y[known], p[known], w[known], robust=True))
+        _guarded(row, "calibration", lambda: calibration(y[known], p[known], w[known], censoring=model,
+                                                         rows=rows[known]))
         _guarded(row, "ici", lambda: {"ici": integrated_calibration_index(y, p, w)})
         for name, value in concordance.items():
             if isinstance(value, MetricRefusal):
@@ -842,16 +949,19 @@ def potential_followup(frame, config):
     return None
 
 
-def evaluate(kind, test, predictions, horizons, config, train=None, truth=None):
+def evaluate(kind, test, predictions, horizons, config, train=None, truth=None, slopes=None):
     """Every row of the single results table for one disease and model, from its outer-test rows.
 
     kind: "binary" or "survival". test: the outer-test frame (binary: `y`; survival: `followup`, `event` (0
-    censored, 1 disease, 2 death, 3 an exclusion-rule exit; 2 and 3 compete) and `entry_age`; both: the axis and
+    censored, 1 disease, 2 death, competing) and `entry_age`; both: the axis and
     censoring columns, and admin_years). predictions: (variant, fit) ->
     risk per test row (binary) or rows x horizons CIF (survival), NaN outside the fit's rows; fit is "pooled"
     or "logo:<axis>:<group>". A LOGO row is the pooled cell of its held-out group, with stratum "overall".
     truth (simulator only): rows aligned with test carrying p_ever (binary) or cif_<h>y, uncensored_event and
-    uncensored_exit_age (survival).
+    uncensored_exit_age (survival). slopes (simulator only): (variant, fit) -> the predicted PGS slope per test row
+    (binary) or rows x horizons (survival), set beside truth's slope (binary) or slope_cif_<h>y (survival); both
+    must be per the POOLED model's z, score / sd over all development rows, LOGO fits included (study.py rescales
+    truth by sd_pooled / z_sd and each fit's slope by sd_pooled / sd_fit).
 
     At a survival horizon only rows whose potential follow-up reaches it are evaluated, and the censoring model
     is fitted on exactly those rows, separately for each LOGO group (SPEC section 8), so `train` is not used.
@@ -879,6 +989,9 @@ def evaluate(kind, test, predictions, horizons, config, train=None, truth=None):
         if fit != "pooled":
             pooled = {v: take(v, "pooled") for v in have if (v, "pooled") in predictions}
             have = [v for v in have if v in pooled]
+        S_fit = None
+        if slopes is not None and sub_truth is not None and all((v, fit) in slopes for v in have):
+            S_fit = [np.asarray(slopes[(v, fit)], float)[mask_all] for v in have]
         if kind == "binary":
             y = sub.y.to_numpy(int)
             if not np.isin(y, (0, 1)).all():
@@ -886,18 +999,22 @@ def evaluate(kind, test, predictions, horizons, config, train=None, truth=None):
             P_all = np.vstack([take(v, fit) for v in have])
             Q_all = None if pooled is None else np.vstack([pooled[v] for v in have])
             true_all = None if sub_truth is None else sub_truth.p_ever.to_numpy(float)
+            slope_all = None
+            if S_fit is not None and "slope" in sub_truth:
+                slope_all = (np.vstack(S_fit), sub_truth.slope.to_numpy(float))
             for stratum, mask in cells(sub, strata):
                 rows += binary_cell(y[mask], P_all[:, mask], have, fit, stratum, minimum,
                                     pooled=None if Q_all is None else Q_all[:, mask],
-                                    true_risk=None if true_all is None else true_all[mask])
+                                    true_risk=None if true_all is None else true_all[mask],
+                                    slopes=None if slope_all is None else (slope_all[0][:, mask], slope_all[1][mask]))
             continue
         potential = potential_followup(sub, config)
         for j, horizon in enumerate(float(h) for h in horizons):
             eligible = np.ones(len(sub), bool) if potential is None else potential >= horizon
             frame = sub.loc[eligible].rename(columns={"event": "event_code"}).reset_index(drop=True)
             t, code = frame.followup.to_numpy(float), frame.event_code.to_numpy(int)
-            if not ((t > 0).all() and np.isin(code, (0, 1, 2, 3)).all()):
-                raise ValueError("follow-up must be positive and events 0, 1, 2 or 3")
+            if not ((t > 0).all() and np.isin(code, (0, 1, 2)).all()):
+                raise ValueError("follow-up must be positive and events 0, 1 or 2")
             model = Censoring(frame, horizon, settings.get("censoring", "cox"),
                               tuple(c for c in settings.get("censoring_covariates", CENSORING_COVARIATES)
                                     if c in frame))
@@ -905,15 +1022,23 @@ def evaluate(kind, test, predictions, horizons, config, train=None, truth=None):
             P_all = np.vstack([take(v, fit).reshape(len(sub), -1)[eligible, j] for v in have])
             Q_all = None if pooled is None else np.vstack([pooled[v].reshape(len(sub), -1)[eligible, j]
                                                            for v in have])
-            truth_all = None
+            truth_all = slope_all = None
             if sub_truth is not None:
                 known = sub_truth.loc[eligible].reset_index(drop=True)
-                truth_all = (known[f"cif_{horizon:g}y"].to_numpy(float),
-                             known.uncensored_exit_age.to_numpy(float) - frame.entry_age.to_numpy(float),
-                             known.uncensored_event.to_numpy(int))
+                t_unc = known.uncensored_exit_age.to_numpy(float) - frame.entry_age.to_numpy(float)
+                code_unc = known.uncensored_event.to_numpy(int)
+                # G where each row's uncensored outcome is decided: T- for an event of either cause by h, else h.
+                g_unc = np.where((code_unc != 0) & (t_unc <= horizon), model.at(t_unc, left=True),
+                                 model.at(horizon))
+                truth_all = (known[f"cif_{horizon:g}y"].to_numpy(float), t_unc, code_unc, g_unc)
+                if S_fit is not None and f"slope_cif_{horizon:g}y" in known:
+                    slope_all = (np.vstack([s.reshape(len(sub), -1)[eligible, j] for s in S_fit]),
+                                 known[f"slope_cif_{horizon:g}y"].to_numpy(float))
             for stratum, mask in cells(frame, strata):
                 rows += survival_cell(t[mask], code[mask], w[mask], model, np.flatnonzero(mask), P_all[:, mask],
                                       have, fit, stratum, horizon, minimum,
                                       pooled=None if Q_all is None else Q_all[:, mask],
-                                      truth=None if truth_all is None else tuple(v[mask] for v in truth_all))
+                                      truth=None if truth_all is None else tuple(v[mask] for v in truth_all),
+                                      slopes=None if slope_all is None
+                                      else (slope_all[0][:, mask], slope_all[1][mask]))
     return rows

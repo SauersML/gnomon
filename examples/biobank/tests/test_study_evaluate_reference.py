@@ -181,6 +181,25 @@ def test_weighted_calibration_matches_r_and_its_sandwich_matches_statsmodels(ref
     fails(abs(ev.calibration(y, p, wk)["cal_slope_se"] - fit.bse[1]), 1e-6 * fit.bse[1])
 
 
+def test_released_survival_calibration_se_is_the_hc0_sandwich_when_g_has_nothing_to_estimate():
+    """At the survival_cell call site: with nobody censored before the horizon every weight is 1 and G's
+    estimation adds nothing, so the released calibration SEs must be statsmodels' HC0 sandwich; the model-based
+    SE, which a call site dropping the censoring model would release, is not."""
+    import statsmodels.api as sm
+    s = survival_data()
+    s.loc[(s.code == 0) & (s.t <= H), "code"] = 2  # every exit before H is a death: no censoring in the window
+    row = released_cell(s, "cox")
+    y = ((s.code == 1) & (s.t <= H)).to_numpy(float)
+    lp = ev.clipped_logit(s.p1.to_numpy())
+    slope = sm.GLM(y, sm.add_constant(lp), family=sm.families.Binomial()).fit(tol=1e-14, cov_type="HC0")
+    intercept = sm.GLM(y, np.ones((len(y), 1)), family=sm.families.Binomial(), offset=lp).fit(tol=1e-14,
+                                                                                               cov_type="HC0")
+    assert abs(row["cal_slope_se"] / slope.bse[1] - 1) < 1e-6
+    assert abs(row["cal_int_se"] / intercept.bse[0] - 1) < 1e-6
+    model_based = sm.GLM(y, sm.add_constant(lp), family=sm.families.Binomial()).fit(tol=1e-14)
+    fails(abs(model_based.bse[1] / slope.bse[1] - 1), 1e-6)
+
+
 def test_loess_matches_r_loess_direct_and_the_ici_grid_is_close(ref):
     values, vectors = ref
     b = binary_data()
@@ -396,84 +415,145 @@ def test_cox_censoring_model_matches_r_coxph(ref, ridge):
 # --------------------------------------------------------------------------- #
 # standard errors and the IPCW estimator gate, by simulation
 # --------------------------------------------------------------------------- #
-def gate_sample(rng, n):
-    """Site drives both the disease hazard and loss to follow-up; given site, censoring is independent. The frame
-    carries every axis evaluate reports (the ones this scenario does not vary are constant), and the truth the
-    uncensored outcome."""
+# The moderate planted defect's size: entry year's effect on the log censoring hazard, which a G without entry year
+# misses. Tuned so that the mutant's worst cell sits about 4-5 SE out, past the Bonferroni critical value (3.38 at
+# 60 replicates), not tens of SE like the gross ones: |z| ~17 at 0.15 (tune_gate.py, Slurm 1342276), 3.52 at 0.04
+# and 3.85 at 0.05 (acn112, 09-19).
+YEAR_EFFECT = 0.06
+
+
+def gate_sample(rng, n, year_effect=YEAR_EFFECT):
+    """Site and entry year drive both the disease hazard and loss to follow-up; given them, censoring is
+    independent. The frame carries every axis evaluate reports (the ones this scenario does not vary are
+    constant), and the truth the uncensored outcome."""
     site = rng.integers(0, 4, size=n)
+    year = rng.integers(0, 3, size=n)
     ancestry = np.where(rng.random(n) < 0.5 + 0.1 * site, "a", "b")
     x = rng.normal(size=n)
-    t1 = rng.exponential(1 / (0.08 * np.exp(0.8 * x + 0.5 * site)))
+    t1 = rng.exponential(1 / (0.08 * np.exp(0.8 * x + 0.5 * site + 0.5 * (year - 1))))
     t2 = rng.exponential(1 / 0.04, size=n)
-    c = rng.exponential(1 / (0.05 * np.exp(0.9 * site)))
+    censoring_rate = 0.05 * np.exp(0.9 * site + year_effect * (year - 1))
+    c = rng.exponential(1 / censoring_rate)
     t_full = np.minimum(t1, t2)
     code_full = np.where(t1 < t2, 1, 2)
-    p = 1 / (1 + np.exp(-(-2.5 + 0.8 * x + 0.5 * site)))
+    p = 1 / (1 + np.exp(-(-2.5 + 0.8 * x + 0.5 * site + 0.5 * (year - 1))))
     q = 1 / (1 + np.exp(-(-2.3 + 0.4 * x + 0.5 * site)))
     frame = pd.DataFrame({"followup": np.minimum(t_full, c), "event": np.where(c < t_full, 0, code_full),
-                          "ehr_site": site.astype(str), "ancestry": ancestry, "entry_age": rng.uniform(40, 70, size=n),
-                          **{axis: "all" for axis in ev.AXES["survival"] if axis not in ("ehr_site", "ancestry")}})
+                          "ehr_site": site.astype(str), "ancestry": ancestry, "entry_year": 2018 + year,
+                          "entry_age": rng.uniform(40, 70, size=n),
+                          **{axis: "all" for axis in ev.AXES["survival"]
+                             if axis not in ("ehr_site", "ancestry", "entry_year")}})
     truth = pd.DataFrame({f"cif_{H:g}y": p, "uncensored_event": code_full,
-                          "uncensored_exit_age": frame.entry_age + t_full})
+                          "uncensored_exit_age": frame.entry_age + t_full, "censoring_rate": censoring_rate})
     return frame, truth, {("ours", "pooled"): p[:, None], ("standard", "pooled"): q[:, None]}
 
 
 def gate_rows(rows):
     """Every released column with an uncensored counterpart, per (metric, variant, stratum): the released value,
-    its SE and the uncensored value. The paired dAUC is set beside the uncensored AUC difference."""
+    its SE, the uncensored value's difference and the released paired SE of that difference. The paired dAUC is
+    set beside the uncensored AUC difference."""
     by = {(r["variant"], r["stratum"]): r for r in rows if r["status"] == "ok" and not r["stratum"].endswith("_all")}
     out = []
     for (variant, stratum), r in by.items():
         for metric, reference in (("auc", "auc_unc"), ("brier", "brier_unc"), ("obs_risk", "risk_unc")):
             out.append({"metric": metric, "variant": variant, "stratum": stratum, "value": r[metric],
-                        "se": r[f"{metric}_se"], "diff": r[metric] - r[reference]})
+                        "se": r[f"{metric}_se"], "diff": r[metric] - r[reference],
+                        "paired_se": r[f"{reference}_diff_se"], "known_g_se": r[f"{reference}_diff_se_known_g"]})
         if variant == "ours" and ("standard", stratum) in by:
             unc = r["auc_unc"] - by[("standard", stratum)]["auc_unc"]
             out.append({"metric": "d_auc_standard", "variant": variant, "stratum": stratum,
-                        "value": r["d_auc_standard"], "se": r["d_auc_standard_se"], "diff": r["d_auc_standard"] - unc})
+                        "value": r["d_auc_standard"], "se": r["d_auc_standard_se"], "diff": r["d_auc_standard"] - unc,
+                        "paired_se": np.nan, "known_g_se": np.nan})
+    return out
+
+
+def known_g_differences(frame, truth, predictions):
+    """Each gate cell's released-minus-uncensored observed risk and Brier with the TRUE G as the weights, the
+    difference the conditional paired SE is exact for (evaluate's uses the fitted G, whose estimation lowers the
+    variance)."""
+    t_unc = (truth.uncensored_exit_age - frame.entry_age).to_numpy()
+    y_unc = ((truth.uncensored_event.to_numpy() == 1) & (t_unc <= H)).astype(float)
+    t, code = frame.followup.to_numpy(), frame.event.to_numpy()
+    known = ((code != 0) & (t <= H)) | (t > H)
+    factor = known / np.exp(-truth.censoring_rate.to_numpy() * np.minimum(t_unc, H)) - 1
+    masks = {"overall": np.ones(len(frame), bool)}
+    for axis in ("ehr_site", "ancestry", "entry_year"):
+        labels = frame[axis].astype(str).to_numpy()
+        masks.update({f"{axis}_{level}": labels == level for level in np.unique(labels)})
+    out = []
+    for variant, p in ((v, predictions[(v, "pooled")][:, 0]) for v in ("ours", "standard")):
+        for stratum, m in masks.items():
+            out.append({"metric": "obs_risk", "variant": variant, "stratum": stratum,
+                        "diff": float(np.mean((y_unc * factor)[m]))})
+            out.append({"metric": "brier", "variant": variant, "stratum": stratum,
+                        "diff": float(np.mean(((y_unc - p) ** 2 * factor)[m]))})
     return out
 
 
 def test_ipcw_estimator_gate_on_every_released_column_under_site_dependent_censoring():
-    """SPEC section 8 (audit N2a), end to end: under independent, site-dependent censoring, every released column
-    of evaluate() with an uncensored counterpart agrees with it in every cell (mean difference over replicate
-    samples within a Bonferroni-corrected two-sided 5% band of the replicate SE), and the SEs match the replicate
-    spread. The planted ancestry-only G and a marginal G (whose observed risk is the plain Aalen-Johansen in a
-    cell, the defect study-audit found in 17ccf27a) must both fire."""
+    """SPEC section 8 (audit N2a), end to end: under independent censoring that depends on site and entry year,
+    every released column of evaluate() with an uncensored counterpart agrees with it in every cell (mean
+    difference over replicate samples within a Bonferroni-corrected two-sided 5% band of the replicate SE), and
+    the released SEs, including the paired SE of each released-minus-uncensored difference, match the replicate
+    spread; the paired SE that holds G known matches that difference taken with the true G and is never below the
+    released difference's own spread. Three planted defects must fire: an ancestry-only G, a marginal G (whose
+    observed risk is the plain Aalen-Johansen in a cell, the defect study-audit found in 17ccf27a) and, a few SE
+    past the critical value, a G that omits a small entry-year effect."""
     rng = np.random.default_rng(31)
     reps, n = 60, 3000
     configs = {"cox": {"censoring": "cox"},
                "ancestry_only": {"censoring": "strata", "censoring_covariates": ["ancestry"]},
-               "marginal": {"censoring": "km"}}
-    records = {name: [] for name in configs}
+               "marginal": {"censoring": "km"},
+               "no_entry_year": {"censoring": "cox", "censoring_covariates": ["ehr_site", "ancestry", "entry_age"]}}
+    records, known_g = {name: [] for name in configs}, []
     for rep in range(reps):
         frame, truth, predictions = gate_sample(rng, n)
+        known_g += known_g_differences(frame, truth, predictions)
         for name, settings in configs.items():
             rows = ev.evaluate("survival", frame, predictions, [H], {"evaluate": settings}, truth=truth)
             records[name] += [dict(r, rep=rep) for r in gate_rows(rows)]
     from statistics import NormalDist
-    for name, expect_fire in (("cox", False), ("ancestry_only", True), ("marginal", True)):
+    worst_by = {}
+    for name, expect_fire in (("cox", False), ("ancestry_only", True), ("marginal", True), ("no_entry_year", True)):
         table = pd.DataFrame(records[name])
         cells = table.groupby(["metric", "variant", "stratum"])["diff"]
         z = cells.mean() / (cells.std(ddof=1) / np.sqrt(cells.size()))
         critical = NormalDist().inv_cdf(1 - 0.025 / len(z))
         worst = z.abs().sort_values(ascending=False).head(3)
+        worst_by[name] = float(worst.iloc[0])
         print(f"gate {name}: {len(z)} cells, critical |z| {critical:.2f}, worst {worst.round(2).to_dict()}")
         assert bool((z.abs() > critical).any()) == expect_fire, name
         if name == "cox":
-            # The SEs (given G) against the replicate spread of each released value, overall cell.
+            # The released SEs against the replicate spread of each released value, overall cell, and the paired
+            # SE of each released-minus-uncensored difference (the censoring's variance given the uncensored
+            # outcomes, with G's estimation) against that difference's spread, every cell. The known-G paired SE is
+            # exact for the difference taken with the true G and at least the released difference's spread.
             overall = table.loc[table.stratum == "overall"].groupby(["metric", "variant"])
             ratio = overall["se"].mean() / overall["value"].std(ddof=1)
-            print(f"mean SE / replicate SD, overall: {ratio.round(3).to_dict()}")
+            by_cell = table.dropna(subset=["paired_se"]).groupby(["metric", "variant", "stratum"])
+            paired = (by_cell["paired_se"].mean() / cells.std(ddof=1)).dropna()
+            known = by_cell["known_g_se"].mean()
+            true_g = pd.DataFrame(known_g).groupby(["metric", "variant", "stratum"])["diff"].std(ddof=1)
+            exact, loose = (known / true_g).dropna(), (known / cells.std(ddof=1)).dropna()
+            print(f"mean SE / replicate SD, overall: {ratio.round(3).to_dict()}; paired SE / replicate SD of the "
+                  f"difference: median {paired.median():.3f}, range {paired.min():.3f}-{paired.max():.3f}; "
+                  f"known-G paired SE / replicate SD of the true-G difference: median {exact.median():.3f}, "
+                  f"range {exact.min():.3f}-{exact.max():.3f}; of the released difference: median {loose.median():.3f}")
             assert ((ratio > 0.8) & (ratio < 1.25)).all()
             assert not ((ratio / 2 > 0.8) & (ratio / 2 < 1.25)).any()
+            assert 0.9 < paired.median() < 1.1 and paired.min() > 0.7 and paired.max() < 1.4
+            assert 0.9 < exact.median() < 1.1 and exact.min() > 0.7 and exact.max() < 1.4
+            assert loose.median() > 0.95 and loose.min() > 0.7
+    # The moderate plant fires by a margin of a few SE, not the gross defects' tens.
+    print(f"moderate plant worst |z| {worst_by['no_entry_year']:.2f}")
+    assert worst_by["no_entry_year"] < 0.5 * min(worst_by["ancestry_only"], worst_by["marginal"])
 
 
 def test_ipcw_standard_errors_match_the_replicate_spread():
-    """Over 400 replicate samples of the gate scenario (site-dependent censoring; a Cox G on site, ancestry and
-    entry age, like production), the released SEs of the IPCW AUC, paired dAUC, Brier and observed risk, which
-    carry G's own estimation, match the replicate standard deviations. The SEs that hold G fixed are printed
-    beside them; a planted half-width SE fails."""
+    """Over 400 replicate samples of the gate scenario (site- and entry-year-dependent censoring; a Cox G on site,
+    ancestry, entry age and entry year, like production), the released SEs of the IPCW AUC, paired dAUC, Brier,
+    observed risk and calibration intercept and slope, which carry G's own estimation, match the replicate SDs.
+    The SEs that hold G fixed are printed beside them; a planted half-width SE fails."""
     rng = np.random.default_rng(32)
     reps, n = 400, 3000
     everyone = np.arange(n)
@@ -481,7 +561,7 @@ def test_ipcw_standard_errors_match_the_replicate_spread():
     for _ in range(reps):
         frame, _, predictions = gate_sample(rng, n)
         frame = frame.rename(columns={"event": "event_code"})
-        model = ev.Censoring(frame, H, "cox", ("ehr_site", "ancestry", "entry_age"))
+        model = ev.Censoring(frame, H, "cox", ("ehr_site", "ancestry", "entry_age", "entry_year"))
         w = ev.ipcw(frame, H, model)
         y = ((frame.event_code == 1) & (frame.followup <= H)).to_numpy(float)
         p, q = predictions[("ours", "pooled")][:, 0], predictions[("standard", "pooled")][:, 0]
@@ -491,8 +571,17 @@ def test_ipcw_standard_errors_match_the_replicate_spread():
         parts = {"auc": (inf_p / n, inf_p / n), "d_auc": ((inf_p - inf_q) / n, (inf_p - inf_q) / n),
                  "brier": ((loss - loss.mean()) / n, loss / n),
                  "obs_risk": ((observed - observed.mean()) / n, observed / n)}
-        total.append({k: np.sqrt(model.variance(everyone, *v)) for k, v in parts.items()})
-        fixed.append({k: np.sqrt(np.sum(v[0] ** 2)) for k, v in parts.items()})
+        rep_total = {k: np.sqrt(model.variance(everyone, *v)) for k, v in parts.items()}
+        rep_fixed = {k: np.sqrt(np.sum(v[0] ** 2)) for k, v in parts.items()}
+        # The calibration intercept (offset) and slope on the known rows, as survival_cell releases them.
+        known = np.flatnonzero(w > 0)
+        cal = ev.calibration(y[known], p[known], w[known], censoring=model, rows=known)
+        values[-1].update(cal_int=cal["cal_int"], cal_slope=cal["cal_slope"])
+        rep_total.update(cal_int=cal["cal_int_se"], cal_slope=cal["cal_slope_se"])
+        hc0 = ev.calibration(y[known], p[known], w[known], robust=True)
+        rep_fixed.update(cal_int=hc0["cal_int_se"], cal_slope=hc0["cal_slope_se"])
+        total.append(rep_total)
+        fixed.append(rep_fixed)
     spread = pd.DataFrame(values).std(ddof=1)
     ratio_total, ratio_fixed = pd.DataFrame(total).mean() / spread, pd.DataFrame(fixed).mean() / spread
     print(f"mean SE / replicate SD over {reps}: total {ratio_total.round(3).to_dict()}; "
