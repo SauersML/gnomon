@@ -34,7 +34,7 @@ type BoxError = Box<dyn Error + Send + Sync>;
 const BGZF_BLOCKS_PER_WORKER: usize = 64;
 /// Parts a batch is cut into per rayon worker, so one slow part leaves few workers idle.
 const PARTS_PER_WORKER: usize = 4;
-/// Compressed bytes requested from the source per read.
+/// Bytes requested from the source per read: compressed bytes of BGZF, or text.
 const SOURCE_READ_LEN: usize = 1 << 20;
 /// Batches of decoded records resident at once: the batch being taken. A pipeline that decodes
 /// the next batch while it takes one holds two, and sets this to 2.
@@ -746,6 +746,12 @@ impl Bytes {
         &mut self.buf[self.len..needed]
     }
 
+    /// Room for `extra` bytes after the filled ones, allocated but not touched, so the reads that
+    /// fill it touch only what they need and move the buffer at most once.
+    fn reserve(&mut self, extra: usize) {
+        self.buf.reserve((self.len + extra).saturating_sub(self.buf.len()));
+    }
+
     fn commit(&mut self, amt: usize) {
         self.len += amt;
     }
@@ -942,21 +948,26 @@ impl InflatedStream {
 
 /// Reads up to `len` bytes from `reader` into `out`, returning `false` when the
 /// reader was already exhausted. What a failing read leaves behind it is kept.
+///
+/// The room for `len` bytes is touched a source read at a time, so text shorter than a batch
+/// touches that text and at most one read more, not the batch (#2399).
 fn read_text(reader: &mut dyn Read, out: &mut Bytes, len: usize) -> io::Result<bool> {
-    let spare = out.spare(len);
+    out.reserve(len);
     let mut filled = 0usize;
     let result = loop {
         if filled == len {
             break Ok(());
         }
-        match reader.read(&mut spare[filled..]) {
+        match reader.read(out.spare(SOURCE_READ_LEN.min(len - filled))) {
             Ok(0) => break Ok(()),
-            Ok(amt) => filled += amt,
+            Ok(amt) => {
+                out.commit(amt);
+                filled += amt;
+            }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => break Err(err),
         }
     };
-    out.commit(filled);
     result.map(|()| filled > 0)
 }
 
@@ -1640,6 +1651,35 @@ mod tests {
                 read += blocks;
                 assert_eq!(bytes.filled(), &text[..read * block], "{path:?}");
             }
+        }
+    }
+
+    /// A fill of plain text, or of gzip members read once the BGZF reader falls back, touches the
+    /// text it reads and at most one source read more, however large the batch it may read
+    /// (#2399): six workers' batch is 24 MiB, and this text 2.5 MB, over three source reads.
+    #[test]
+    fn a_fill_touches_the_text_it_reads_not_its_batch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let text: Vec<u8> = (0..2_500_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let plain = dir.path().join("text.vcf");
+        let members = dir.path().join("members.vcf.gz");
+        std::fs::write(&plain, &text).expect("write text");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&text).expect("gzip");
+        std::fs::write(&members, encoder.finish().expect("finish gzip")).expect("write gzip");
+        let blocks = 6 * super::BGZF_BLOCKS_PER_WORKER;
+        for path in [plain, members] {
+            let mut stream = InflatedStream::new(open_variant_source(&path).expect("open"));
+            let mut bytes = Bytes::default();
+            while stream.fill(&mut bytes, blocks).expect("fill") {
+                assert!(
+                    bytes.buf.len() <= bytes.len + super::SOURCE_READ_LEN,
+                    "{path:?}: {} bytes touched for {} of text",
+                    bytes.buf.len(),
+                    bytes.len
+                );
+            }
+            assert_eq!(bytes.filled(), &text[..], "{path:?}");
         }
     }
 
