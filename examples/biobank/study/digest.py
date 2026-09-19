@@ -79,6 +79,10 @@ FOLLOWUP = {
 # Inner model -> the models whose cells contain its cells' people.
 NESTED = {"survival": ("binary", "cohort_survival"), "binary": ("cohort_binary",),
           "cohort_survival": ("cohort_binary",)}
+# Twin model -> primary model (SPEC section 8 N2b): the survival cells evaluated under a
+# sensitivity censoring rule, from the same fits' predictions. Their persons and events are
+# the primary's, so they publish no count and take their primary cell's release decision.
+TWINS = {"survival_cutoff": "survival"}
 
 
 def slug(text):
@@ -224,7 +228,8 @@ def suppress(rows, limit=LIMIT, registry=None):
     rows = [dict(row) for row in rows]
 
     def cell(row):
-        return (row["disease"], row["model"], slug(row["stratum"]))
+        # A twin row is decided by its primary cell (TWINS).
+        return (row["disease"], TWINS.get(row["model"], row["model"]), slug(row["stratum"]))
 
     # Cells: (disease, model, stratum) over all horizons. Counts do not depend on
     # the variant, so every pooled row of one cell must carry the same counts.
@@ -232,6 +237,10 @@ def suppress(rows, limit=LIMIT, registry=None):
     for row in rows:
         kinds = {m: registry.kind(m, row) for m, v in row.items()
                  if m not in KEYS and v is not None and not isinstance(v, str)}
+        if row["model"] in TWINS:
+            if "count" in kinds.values():
+                raise ValueError(f"a {row['model']} row carries counts: its counts are its {TWINS[row['model']]} twin's")
+            continue
         if row["fit"] != "pooled" or special(row["model"]):
             continue
         horizon = row.get("horizon")
@@ -322,7 +331,7 @@ def suppress(rows, limit=LIMIT, registry=None):
             # and none at all where that group's pooled cell is insufficient.
             if split_stratum(row["stratum"])[0] is not None:
                 continue
-            if (row["disease"], row["model"], logo_group(row["fit"])) in insufficient:
+            if (row["disease"], TWINS.get(row["model"], row["model"]), logo_group(row["fit"])) in insufficient:
                 continue
             out.append(scores_only(row))
         elif cell(row) in insufficient:
@@ -625,7 +634,7 @@ def audit(rows, registry, nested=()):
     for disease, group in sorted(by_disease.items()):
         findings += disclosure.audit(
             group, registry.audit_registry(group), axes=AXES, parts=subgroup_parts(group),
-            cumulative={"survival": {"n": "decreasing"}}, horizon_invariant=(), chain=STEP,
+            cumulative={"survival": {"n": "decreasing"}}, horizon_invariant=(), chain=STEP, twins=TWINS,
             nested_models=[("binary", "cohort_binary", ("n", "cases")), ("survival", "cohort_survival", ("n", "cases")),
                            *([("survival", "binary", ("n", "cases")), ("cohort_survival", "cohort_binary", ("n", "cases"))]
                              if disease in nested else [])])

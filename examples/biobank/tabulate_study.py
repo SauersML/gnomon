@@ -70,10 +70,11 @@ def exclusion_caveats(results):
     return lines
 
 
-def censoring_caveat(run):
+def censoring_caveat(run, model="survival"):
     """The caveat a survival table prints with, from the censoring rule the run row
-    records. A run with no known rule gets no survival table."""
-    rule = run.get("censoring")
+    records for its model: "censoring" for survival, "censoring_<model>" for a twin
+    model (a sensitivity rule, digest.TWINS). A model with no known rule gets no table."""
+    rule = run.get("censoring" if model == "survival" else f"censoring_{model}")
     if rule not in CENSORING_CAVEATS:
         raise ValueError(f"the run records survival censoring {rule!r}: no survival table without its caveat")
     return CENSORING_CAVEATS[rule]
@@ -114,11 +115,11 @@ def main():
     model_rows = [r for r in results if not digest.special(r["model"])]
     metrics = args.metrics.split(",") if args.metrics else sorted(
         {m for row in model_rows for m in row if m not in KEY_FIELDS})
-    for model in ("binary", "survival"):
+    for model in ("binary", "survival", *sorted(digest.TWINS)):
         chosen = [r for r in model_rows if r["model"] == model and r["fit"] == "pooled"
                   and r["stratum"] == args.stratum]
         logo = [r for r in model_rows if r["model"] == model and r["fit"].startswith("logo_")]
-        caveat = censoring_caveat(run) if model == "survival" and (chosen or logo) else None
+        caveat = censoring_caveat(run, model) if model != "binary" and (chosen or logo) else None
         rows = [[r["disease"], r["variant"], r["horizon"], *(r.get(m) for m in metrics)]
                 for r in sorted(chosen, key=lambda r: (r["disease"], r["horizon"], r["variant"]))]
         print_table(f"{model}: pooled fits, stratum {args.stratum}", ["disease", "variant", "horizon", *metrics], rows)

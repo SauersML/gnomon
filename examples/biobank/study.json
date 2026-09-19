@@ -4,6 +4,7 @@
   "diseases_file": "study/diseases.json",
   "frozen_config_sha256": null,
   "primary_censoring_rule": "ehr_end",
+  "sensitivity_censoring_rules": ["min_death_cutoff"],
   "variants": ["ours", "shipped", "covariates", "standard", "z_pc", "calpred"],
   "data": {
     "source": "bigquery",
@@ -70,6 +71,7 @@
   },
   "reasons": {
     "primary_censoring_rule": "SPEC sections 3 and 8 N2b, decided 2026-09-19 17:45Z on study-eval's 5 worlds x 12 diseases: censoring at last EHR contact on the landmark-only frame overstates absolute risk against the truth by +3 to +6% at 1-5 y (pooled +4.5%), with AUC unaffected; min(death, CDR cutoff) understates it by 14-26% (pooled -19.8%) and is a sensitivity row only; the results table carries the caveat",
+    "sensitivity_censoring_rules": "SPEC sections 3 and 8 N2b (lead 2026-09-19 17:45Z and the cutoff-censoring design): the same fits' predictions are also scored with min(death, CDR cutoff) censoring, on the survival frame rebuilt under that rule (the same persons and events, asserted; its own G), as survival_cutoff rows that publish no counts and take their survival cell's release decision; a sensitivity row only, carrying its own caveat",
     "shipped.calibrate_sha": "replicates gnomon calibrate as shipped at gnomon 1692eab7 (one joint Duchon over the PCs on gam's default kernel; Gaussian terms from gam's own term builder, #2393; no Weibull baseline target); not a tuning choice (update at the #2370 cutover pin)",
     "fit_gate.min_events": "SPEC section 8 (23:45Z): a model with fewer training events than about its coefficients is not estimable by any solver; 100, the bar shared competing fits already use",
     "data.maximum_bytes_billed": "SPEC section 7a 01:00Z: the six-domain EHR end is estimated at about 70 GB (66-95), see SCHEMA.md Byte estimate; plan() dry-run gates",

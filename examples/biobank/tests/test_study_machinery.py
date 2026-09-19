@@ -363,6 +363,12 @@ def test_every_survival_table_prints_its_censoring_caveat(tmp_path):
     # A survival table from a run with no recorded rule, or a rule without a caveat, is refused.
     raises(ValueError, table, survival, {"label": "production"})
     raises(ValueError, table, survival, {"censoring": "obs_end"})
+    # A cutoff-censoring twin table prints with its own rule's caveat, and needs that rule recorded.
+    twin = [{**{k: v for k, v in survival[0].items() if k not in ("n", "cases")}, "model": "survival_cutoff"}]
+    cutoff = tabulate.CENSORING_CAVEATS["min_death_cutoff"]
+    text = table(survival + twin, {"censoring": "ehr_end", "censoring_survival_cutoff": "min_death_cutoff"})
+    assert text.count(cutoff) == 1 and text.count(last_contact) == 2 and "survival_cutoff: pooled fits" in text
+    raises(ValueError, table, survival + twin, {"censoring": "ehr_end"})
 
 
 def test_the_primary_censoring_rule_is_required_known_and_reasoned(tmp_path):
@@ -384,6 +390,14 @@ def test_the_primary_censoring_rule_is_required_known_and_reasoned(tmp_path):
     raises(ValueError, load, edited(lambda c: c["reasons"].pop("primary_censoring_rule")))
     raises(ValueError, load, edited(lambda c: c.pop("primary_censoring_rule")))   # its reason is then stale
     raises(ValueError, load, edited(lambda c: (c.pop("primary_censoring_rule"), c["reasons"].pop("primary_censoring_rule"))))
+    # Sensitivity rules: known, not the primary, distinct, reasoned, each with its twin model.
+    assert load(config)["sensitivity_censoring_rules"] == ["min_death_cutoff"]
+    assert load(edited(lambda c: (c.pop("sensitivity_censoring_rules"), c["reasons"].pop("sensitivity_censoring_rules"))))
+    raises(ValueError, load, edited(lambda c: c.update(sensitivity_censoring_rules=["obs_end"])))
+    raises(ValueError, load, edited(lambda c: c.update(sensitivity_censoring_rules=["ehr_end"])))
+    raises(ValueError, load, edited(lambda c: c.update(sensitivity_censoring_rules=["min_death_cutoff"] * 2)))
+    raises(ValueError, load, edited(lambda c: c.update(sensitivity_censoring_rules="min_death_cutoff")))
+    raises(ValueError, load, edited(lambda c: c["reasons"].pop("sensitivity_censoring_rules")))
 
 
 def test_cohort_counts_by_ancestry_are_partitioned_and_nested():
@@ -566,6 +580,52 @@ def test_suppressed_names_pass_the_differencing_audit_and_a_planted_leak_fires_i
         raises(ValueError, digest.encode, rows, [], REGISTRY)
     finally:
         digest.suppress = original
+
+
+def test_a_cutoff_censoring_row_takes_its_survival_cells_decision_and_publishes_no_count():
+    rows = [cell(stratum, n, cases, model="survival", horizon=1.0)
+            for stratum, n, cases in (("overall", 1000, 100), ("ancestry:afr", 400, 12), ("ancestry:eur", 600, 88))]
+    # The same cells scored under cutoff censoring: other proportions, no counts (they are the survival rows').
+    twins = [{**{k: v for k, v in row.items() if k not in ("n", "cases")}, "model": "survival_cutoff",
+              "observed_risk": 0.9 * row["observed_risk"]} for row in rows]
+    out = {(row["model"], digest.slug(row["stratum"])): row for row in digest.suppress(rows + twins, 20, REGISTRY)}
+    assert out[("survival_cutoff", "ancestry_afr")] == {**{k: twins[1][k] for k in digest.KEYS},
+                                                        "support": digest.INSUFFICIENT}
+    eur = out[("survival_cutoff", "ancestry_eur")]
+    assert eur["auc"] == 0.7 and "observed_risk" not in eur and eur["counts"] == digest.WITHHELD
+    assert out[("survival_cutoff", "overall")] == twins[0]
+    results, _ = digest.encode(rows + twins, [], REGISTRY)
+    assert any("survival_cutoff" in name for name in results)
+    # Planted: a twin row that escapes its survival cell's decision is refused, and so is one carrying a count.
+    original = digest.suppress
+    try:
+        digest.suppress = lambda rows_, limit, registry: [
+            row for row in original(rows_, limit, registry) if row["model"] != "survival_cutoff"] + [twins[1]]
+        raises(ValueError, digest.encode, rows + twins, [], REGISTRY)
+    finally:
+        digest.suppress = original
+    raises(ValueError, digest.suppress, rows + [{**twins[0], "n": 1000}], 20, REGISTRY)
+
+
+def test_twin_rows_must_see_the_survival_rows_persons_and_events_and_publish_no_count():
+    study, registry = driver(), digest.Registry()
+    keys = {"disease": "t2d", "variant": "ours", "fit": "pooled", "stratum": "overall"}
+    primary = [{**keys, "model": "survival", "horizon": 1.0, "n": 1000, "cases": 100, "auc": 0.70, "obs_risk": 0.1,
+                "convergence": "converged"},
+               {**keys, "model": "survival", "horizon": 2.0, "n": 1000, "cases": 180, "status": "unsupported"}]
+    evaluated = [{**keys, "model": "survival_cutoff", "horizon": 1.0, "n": 1000, "cases": 100, "auc": 0.70,
+                  "obs_risk": 0.09},
+                 {**keys, "model": "survival_cutoff", "horizon": 2.0, "n": 1000, "cases": 180, "auc": 0.69,
+                  "obs_risk": 0.16}]
+    one, two = study.twin_rows("survival_cutoff", evaluated, primary, registry)
+    # No count leaves; the primary's labels come along; where the primary shows no number, neither does the twin.
+    assert one == {**keys, "model": "survival_cutoff", "horizon": 1.0, "auc": 0.70, "obs_risk": 0.09,
+                   "convergence": "converged"}
+    assert two == {**keys, "model": "survival_cutoff", "horizon": 2.0, "status": "unsupported"}
+    # Another rule's persons or events, or a row without its survival row, stop the run.
+    raises(ValueError, study.twin_rows, "survival_cutoff", [{**evaluated[0], "cases": 101}], primary, registry)
+    raises(ValueError, study.twin_rows, "survival_cutoff", [{**evaluated[0], "n": 999}], primary, registry)
+    raises(ValueError, study.twin_rows, "survival_cutoff", [{**evaluated[0], "horizon": 3.0}], primary, registry)
 
 
 # -------------------------------------------------------------------- reasons

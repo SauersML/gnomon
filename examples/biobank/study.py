@@ -58,6 +58,11 @@ LOGO_AXES = ("ancestry", "region", "ehr_site")
 OUTCOME_CODES = {"binary": {0, 1}, "survival": {0, 1, 2}}
 # study.json primary_censoring_rule -> phenotypes.build_frames(censor=...).
 CENSORING = {"ehr_end": "ehr_end", "min_death_cutoff": "cutoff"}
+
+
+def censoring_model(rule):
+    """The twin model a sensitivity censoring rule's survival rows carry (digest.TWINS)."""
+    return f"survival_{CENSORING[rule]}"
 UNKNOWN = "unknown"
 # The fit label of a pooled fit refitted from a second start (convergence gate).
 RESTART = "restart"
@@ -148,6 +153,13 @@ def load_config(path, source=None):
     # (its reason is required by check_reasons).
     if config.get("primary_censoring_rule") not in CENSORING:
         raise ValueError(f"primary_censoring_rule must be one of {sorted(CENSORING)}")
+    # Sensitivity rules evaluate the same fits under another censoring, each as a twin model.
+    rules = config.get("sensitivity_censoring_rules", [])
+    if (not isinstance(rules, list) or len(set(rules)) != len(rules)
+            or any(r not in CENSORING or r == config["primary_censoring_rule"]
+                   or censoring_model(r) not in digest.TWINS for r in rules)):
+        raise ValueError(f"sensitivity_censoring_rules lists distinct rules of {sorted(CENSORING)} other than the "
+                         f"primary, each with a twin model in the digest ({sorted(digest.TWINS)})")
     return config, diseases
 
 
@@ -184,9 +196,8 @@ def check_reasons(config):
     settings += list(leaf_settings(config.get("compute", {}).get("threads", {}), "compute.threads"))
     if "memory_headroom_fraction" in config.get("compute", {}):
         settings.append("compute.memory_headroom_fraction")
-    # The primary survival censoring rule is a decision with its evidence (SPEC section 8, N2b).
-    if "primary_censoring_rule" in config:
-        settings.append("primary_censoring_rule")
+    # The survival censoring rules are decisions with their evidence (SPEC section 8, N2b).
+    settings += [key for key in ("primary_censoring_rule", "sensitivity_censoring_rules") if key in config]
     for path in settings:
         parts = path.split(".")
         covering = [path, *(".".join(parts[:end]) for end in range(len(parts) - 1, 1, -1))]
@@ -465,6 +476,13 @@ class Study:
         """The variants whose pooled fits get a second-start convergence check (SPEC section 8)."""
         return [v for v in self.config["convergence"]["variants"] if v in self.variants(kind)]
 
+    def sensitivity_models(self):
+        """{twin model: rule} for the sensitivity censoring rules: each re-evaluates the
+        survival fits' predictions on the frame rebuilt under that rule (SPEC section 8 N2b)."""
+        if "survival" not in self.kinds:
+            return {}
+        return {censoring_model(rule): rule for rule in self.config.get("sensitivity_censoring_rules", [])}
+
     def job(self, step, spec, threads, priority=0.0, deps=()):
         """A pool job for `step`, whose directory must already be begun. Its log
         lands in the step itself, so a job leaves no files outside its step."""
@@ -706,6 +724,9 @@ class Study:
         config = phenotypes.CohortConfig.from_json(self.config["cohort"])
         base, frames = phenotypes.build_frames(self.source(), self.diseases, config,
                                                censor=CENSORING[self.config["primary_censoring_rule"]])
+        # The survival frames again under each sensitivity rule; only their outcomes may differ.
+        twins = {model: phenotypes.build_frames(self.source(), self.diseases, config, censor=CENSORING[rule])[1]
+                 for model, rule in self.sensitivity_models().items()}
         sites = self.site_labels(base.frame.ehr_site)
         if not self.checkpoint.done("features/base"):
             directory = self.checkpoint.begin("features/base")
@@ -737,6 +758,20 @@ class Study:
                 frame.to_parquet(directory / f"{kind}.parquet", index=False)
                 plan[kind] = {"rows": len(frame), "test_rows": int(frame.test.sum()),
                               "logo": self.logo_groups(frame, kind)}
+                if kind != "survival":
+                    continue
+                for model, sensitivity in twins.items():
+                    # The same persons, in the same order and outer-test split, so the fits'
+                    # saved predictions (by outer-test row) evaluate against these outcomes.
+                    twin = sensitivity[disease.slug].survival.copy()
+                    twin["ehr_site"] = twin.ehr_site.astype(str).map(sites).astype("category")
+                    if not (np.array_equal(twin.person_id.to_numpy(), frame.person_id.to_numpy())
+                            and np.array_equal(twin.test.to_numpy(), frame.test.to_numpy())):
+                        raise ValueError(f"{disease.slug} {model} frame is not the survival frame's persons "
+                                         "and outer-test rows")
+                    if not set(twin.event.unique()) <= OUTCOME_CODES["survival"]:
+                        raise ValueError(f"{disease.slug} {model} frame has unknown outcome codes")
+                    twin.to_parquet(directory / f"{model}.parquet", index=False)
             write_json(directory / "flow.json", frames[disease.slug].flow)
             write_json(directory / "plan.json", plan)
             if truth is not None:
@@ -954,9 +989,6 @@ class Study:
         jobs = []
         for disease in self.diseases:
             for kind in self.kinds:
-                step = f"evaluate/{disease.slug}/{kind}"
-                if self.checkpoint.done(step):
-                    continue
                 predictions = {}
                 for variant in self.variants(kind):
                     for fit in self.fits(disease.slug, kind, variant):
@@ -964,12 +996,19 @@ class Study:
                         record = self.path(step_) / "predict.json"
                         if record.is_file() and read_json(record)["status"] == "ok":
                             predictions.setdefault(variant, {})[fit] = step_
-                self.checkpoint.begin(step)
-                jobs.append(self.job(step, {"type": "evaluate", "disease": disease.slug, "kind": kind,
-                                            "predictions": predictions,
-                                            "frame": f"features/{disease.slug}/{kind}.parquet"},
-                                     self.budget("evaluate", kind, "default"),
-                                     priority=2 if kind == "survival" else 1))
+                # The survival predictions are evaluated once per censoring rule: the primary,
+                # then each sensitivity rule's twin model on its own frame.
+                models = [kind, *(self.sensitivity_models() if kind == "survival" else ())]
+                for model in models:
+                    step = f"evaluate/{disease.slug}/{model}"
+                    if self.checkpoint.done(step):
+                        continue
+                    self.checkpoint.begin(step)
+                    jobs.append(self.job(step, {"type": "evaluate", "disease": disease.slug, "kind": kind,
+                                                "model": model, "predictions": predictions,
+                                                "frame": f"features/{disease.slug}/{model}.parquet"},
+                                         self.budget("evaluate", kind, "default"),
+                                         priority=2 if kind == "survival" else 1))
         self.pool(jobs, "evaluate", "evaluate.json")
 
 
@@ -980,6 +1019,7 @@ class Study:
         the names are written straight to the digest prefix, one empty object
         each; the step keeps them as one text file."""
         directory = self.checkpoint.begin("digest")
+        registry = digest.Registry()
         rows = []
         for disease in self.diseases:
             flow = read_json(self.path(f"features/{disease.slug}") / "flow.json")
@@ -1001,13 +1041,18 @@ class Study:
                 status = {v: self.convergence(disease.slug, kind, v)["status"] for v in self.checked(kind)}
                 certified = {(v, fit): self.certified(disease.slug, kind, v, fit)
                              for v in self.variants(kind) for fit in self.fits(disease.slug, kind, v)}
+                labelled = []
                 for row in record.get("rows", []):
                     if row.get("fit") == "pooled" and row.get("variant") in status:
                         row = {**row, "convergence": status[row["variant"]]}
                     if (row.get("variant"), row.get("fit")) in certified:
                         row = {**row, "certification": certified[row["variant"], row["fit"]]}
-                    rows.append(row)
+                    labelled.append(row)
+                rows += labelled
                 rows += self.outcome_rows(disease.slug, kind)
+                for model in (self.sensitivity_models() if kind == "survival" else ()):
+                    record = read_json(self.path(f"evaluate/{disease.slug}/{model}") / "evaluate.json")
+                    rows += twin_rows(model, record.get("rows", []), labelled, registry)
         base = read_json(self.path("features/base") / "base.json")
         rows += digest.flow_rows("base", {"base": base["flow"]}, digest.LIMIT)
         rows += digest.followup_rows(base["followup"]["administrative"], digest.LIMIT)
@@ -1057,8 +1102,9 @@ class Study:
         manifest = read_json(self.path("cohort") / "manifest.json")
         study = {"scope": "study", "item": "run", "config_sha256_12": config_hash(self.config)[:12],
                  "label": self.config["label"], "run_kind": self.run_kind,
-                 # The survival table's censoring caveat keys on this (tabulate_study.py).
+                 # The survival tables' censoring caveats key on these (tabulate_study.py).
                  "censoring": self.config["primary_censoring_rule"],
+                 **{f"censoring_{model}": rule for model, rule in self.sensitivity_models().items()},
                  "gam_commit_12": "g" + str(self.signature["engine"].get("gam_commit") or "none")[:12],
                  "scope_kinds": "_".join(self.kinds), "scope_diseases": len(self.diseases),
                  "unexpected_errors": len(unexpected_failures(self.step_records())),
@@ -1229,6 +1275,42 @@ FAILURE_PHRASES = (
     ("provenance", "provenance"),
     ("timed out", "timeout"),
 )
+
+
+def twin_rows(model, rows, primary, registry):
+    """A twin model's rows for the digest (SPEC section 8 N2b). Under a sensitivity
+    censoring rule the persons and events are the primary's: an event is itself an EHR
+    record, so no censoring rule loses one. So each row's n and cases must equal its
+    primary row's, and the twin publishes no count. Where the primary row shows no number
+    (withheld or unsupported), the twin row shows none either and carries the primary's
+    statuses; otherwise it keeps its own metrics, with the primary's convergence and
+    certification labels (the same fits). The digest then gives it its primary cell's
+    release decision (digest.TWINS)."""
+    def key(row):
+        return row["variant"], row["fit"], row["stratum"], row.get("horizon")
+
+    def number(metric, value, row):
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and registry.kind(metric, row) != "count")
+    primaries = {key(row): row for row in primary}
+    out = []
+    for row in rows:
+        twin = primaries.get(key(row))
+        if twin is None:
+            raise ValueError(f"{model} row {key(row)} has no survival row")
+        for metric in ("n", "cases"):
+            if row.get(metric) != twin.get(metric):
+                raise ValueError(f"{model} {metric} {row.get(metric)} is not its survival row's {twin.get(metric)} "
+                                 f"at {key(row)}: the censoring rules do not see the same persons and events")
+        keys = {m: row[m] for m in digest.KEYS if m in row}
+        if not any(number(m, v, twin) for m, v in twin.items() if m not in digest.KEYS):
+            out.append({**keys, **{m: v for m, v in twin.items() if m not in digest.KEYS and isinstance(v, str)},
+                        "model": model})
+            continue
+        kept = {m: v for m, v in row.items() if m not in digest.KEYS and (isinstance(v, str) or number(m, v, row))}
+        labels = {m: twin[m] for m in ("convergence", "certification") if m in twin}
+        out.append({**keys, **kept, **labels, "model": model})
+    return out
 
 
 def check_declared_refusals(config):
@@ -1441,14 +1523,19 @@ def run_evaluate(spec, config, models):
     root = Path(spec["root"])
     out = root / spec["step"]
     kind = spec["kind"]
+    # A twin model (a sensitivity censoring rule, SPEC section 8 N2b) scores the same saved
+    # predictions against its own frame's outcomes and G. Accuracy against the truth does
+    # not depend on censoring, so it takes no truth and no slopes.
+    model = spec.get("model", kind)
+    twin = model != kind
     frame = load_frame(root / spec["frame"])
     test = frame.loc[frame.test].reset_index(drop=True)
     # Evaluation and G keep every development row; slopes are per the pooled fit's own z.
     train = frame.loc[~frame.test].reset_index(drop=True)
-    pooled_sd = standardize(frame.loc[training_rows(frame, "pooled", kind)].pgs)["sd"]
+    pooled_sd = None if twin else standardize(frame.loc[training_rows(frame, "pooled", kind)].pgs)["sd"]
     truth_path = root / f"features/{spec['disease']}/truth.parquet"
     truth = None
-    if truth_path.is_file():
+    if truth_path.is_file() and not twin:
         truth = test[["person_id"]].merge(pd.read_parquet(truth_path).drop(columns=["disease"]),
                                           on="person_id", how="left", validate="one_to_one")
         # Every slope here is per the pooled model's z (score / pooled sd), truth's included.
@@ -1465,14 +1552,18 @@ def run_evaluate(spec, config, models):
             saved = np.load(root / step / "predictions.npz")
             predictions[(variant, fit)] = np.full(shape, np.nan)
             predictions[(variant, fit)][saved["index"]] = saved["risk"]
-            if "slope" in saved:
+            if "slope" in saved and not twin:
                 slopes[(variant, fit)] = np.full(shape, np.nan)
                 slopes[(variant, fit)][saved["index"]] = to_pooled_z(saved["slope"], float(saved["z_sd"]), pooled_sd)
     # Per-person slopes (d probit risk / dz) feed slope recovery.
-    rows = evaluate.evaluate(kind, test, predictions, horizons, config, train=train, truth=truth, slopes=slopes)
+    rows = evaluate.evaluate(kind, test, predictions, horizons, config, train=train, truth=truth,
+                             slopes=None if twin else slopes)
     for row in rows:
         row.setdefault("disease", spec["disease"])
-        row.setdefault("model", kind)
+        if twin:
+            row["model"] = model  # evaluate writes its kind
+        else:
+            row.setdefault("model", kind)
     write_json(out / "evaluate.json", {"status": "ok", "rows": rows})
 
 
