@@ -1806,7 +1806,7 @@ where
     }
 
     let packed_info_size = packed_tri_size(components);
-    let block_variants = packed_projection_variant_block(components, n_samples, expected_variants);
+    let block_variants = packed_projection_variant_block(components, expected_variants);
     let sample_chunk = packed_projection_sample_chunk(n_samples);
     eprintln!(
         "> Projection packed batch: {block_variants} variants/block; {sample_chunk} samples/chunk"
@@ -2058,38 +2058,67 @@ fn packed_score_pair_tables(
     tables
 }
 
+/// Adds one group of up to four consecutive variants to every score row. The
+/// group's contributions are summed first, in variant order, and the sum is then
+/// added to the row, which is the grouped kernel's lookup entry for the same
+/// calls, bit for bit. A missing call adds nothing here where the lookup adds
+/// +0.0; that can change only the sign of a zero sum, and adding a zero of
+/// either sign leaves a score row unchanged, since a row starts at +0.0 and a
+/// sum is -0.0 only if both of its terms are.
 #[inline(always)]
-fn accumulate_packed_scores(
-    bytes: &[u8],
+fn accumulate_packed_group_scores(
+    bytes: &[&[u8]],
     vectors: &[f64],
-    swapped: bool,
-    pair_table: Option<&[f64]>,
+    swapped: &[bool],
+    pair_tables: Option<&[f64]>,
     components: usize,
     scores: &mut [f64],
+    sum: &mut [f64],
 ) {
-    if let Some(table) = pair_table {
+    if let Some(tables) = pair_tables {
         let pair_width = components * 2;
+        let table_width = 16 * pair_width;
         for (pair, dst) in scores.chunks_mut(pair_width).enumerate() {
-            let codes = ((bytes[pair / 2] >> ((pair % 2) * 4)) & 15) as usize;
-            let offset = codes * pair_width;
-            add_score_vector(dst, &table[offset..offset + dst.len()]);
+            let sum = &mut sum[..dst.len()];
+            for (variant, bytes) in bytes.iter().enumerate() {
+                let codes = ((bytes[pair / 2] >> ((pair % 2) * 4)) & 15) as usize;
+                let row = &tables[variant * table_width + codes * pair_width..][..dst.len()];
+                if variant == 0 {
+                    sum.copy_from_slice(row);
+                } else {
+                    add_score_vector(sum, row);
+                }
+            }
+            add_score_vector(dst, sum);
         }
     } else {
         // A small cohort does not amortize constructing the pair table. Index
         // the model's three vectors directly; an empty slice skips missing calls.
-        let score0 = &vectors[..components];
-        let score1 = &vectors[components..2 * components];
-        let score2 = &vectors[2 * components..];
-        let calls = if swapped {
-            [score2, &[], score1, score0]
-        } else {
-            [score0, &[], score1, score2]
-        };
+        let mut calls = [[&[][..]; 4]; genotype_table::VARIANTS_PER_TABLE];
+        for ((calls, vectors), &swapped) in calls
+            .iter_mut()
+            .zip(vectors.chunks_exact(3 * components))
+            .zip(swapped)
+        {
+            let (score0, rest) = vectors.split_at(components);
+            let (score1, score2) = rest.split_at(components);
+            *calls = if swapped {
+                [score2, &[], score1, score0]
+            } else {
+                [score0, &[], score1, score2]
+            };
+        }
+        let calls = &calls[..bytes.len()];
         for (sample, dst) in scores.chunks_exact_mut(components).enumerate() {
-            let code = ((bytes[sample / 4] >> (2 * (sample % 4))) & 3) as usize;
-            for (dst, src) in dst.iter_mut().zip(calls[code]) {
-                *dst += src;
+            let sum = &mut sum[..components];
+            sum.fill(0.0);
+            for (bytes, calls) in bytes.iter().zip(calls) {
+                let code = ((bytes[sample / 4] >> (2 * (sample % 4))) & 3) as usize;
+                for (dst, src) in sum.iter_mut().zip(calls[code]) {
+                    *dst += src;
+                }
             }
+            add_score_vector(dst, sum);
         }
     }
 }
@@ -2106,6 +2135,12 @@ fn accumulate_packed_cpu_block_row_major_dense_missing(
     missing_info_storage: &mut [f64],
 ) {
     let samples = scores_row_major.len() / components;
+    let add_missing = |dst: &mut [f64], variant: usize| {
+        add_score_vector(
+            dst,
+            &block_info_contrib[variant * packed_info_size..(variant + 1) * packed_info_size],
+        )
+    };
     if use_grouped_projection(samples, components, block_variant_bytes.len()) {
         accumulate_grouped_projection(
             block_variant_bytes,
@@ -2116,66 +2151,21 @@ fn accumulate_packed_cpu_block_row_major_dense_missing(
             scores_row_major,
             missing_info_storage,
             packed_info_size,
-            |dst, variant| {
-                add_score_vector(
-                    dst,
-                    &block_info_contrib
-                        [variant * packed_info_size..(variant + 1) * packed_info_size],
-                )
-            },
+            add_missing,
         );
-        return;
+    } else {
+        accumulate_direct_projection(
+            block_variant_bytes,
+            block_score_vectors,
+            block_swapped,
+            sample_chunk,
+            components,
+            scores_row_major,
+            missing_info_storage,
+            packed_info_size,
+            add_missing,
+        );
     }
-    let chunk_scores = sample_chunk * components;
-    let chunk_missing = sample_chunk * packed_info_size;
-    let score_tables = (samples >= 128)
-        .then(|| packed_score_pair_tables(block_score_vectors, block_swapped, components));
-    let table_width = 32 * components;
-    let missing_masks = plink_missing_lane_masks();
-    scores_row_major
-        .par_chunks_mut(chunk_scores)
-        .zip(missing_info_storage.par_chunks_mut(chunk_missing))
-        .enumerate()
-        .for_each(|(chunk_idx, (score_chunk, missing_chunk))| {
-            let sample_start = chunk_idx * sample_chunk;
-            let chunk_samples = score_chunk.len() / components;
-            let byte_start = sample_start >> 2;
-            let byte_len = packed_bytes_per_variant(chunk_samples);
-
-            for (variant, variant_bytes) in block_variant_bytes.iter().enumerate() {
-                debug_assert_eq!(variant_bytes.len(), packed_bytes_per_variant(samples));
-                let bytes = &variant_bytes[byte_start..byte_start + byte_len];
-                accumulate_packed_scores(
-                    bytes,
-                    &block_score_vectors[variant * components * 3..(variant + 1) * components * 3],
-                    block_swapped[variant],
-                    score_tables
-                        .as_ref()
-                        .map(|tables| &tables[variant * table_width..(variant + 1) * table_width]),
-                    components,
-                    score_chunk,
-                );
-                let contrib = &block_info_contrib
-                    [variant * packed_info_size..(variant + 1) * packed_info_size];
-
-                for (byte_idx, &byte) in bytes.iter().enumerate() {
-                    let sample_base = byte_idx << 2;
-                    let lanes = (chunk_samples - sample_base).min(4);
-                    let mut mask = missing_masks[byte as usize] & ((1 << lanes) - 1);
-                    while mask != 0 {
-                        let lane = mask.trailing_zeros() as usize;
-                        mask &= mask - 1;
-                        let sample = sample_base + lane;
-                        let missing_offset = sample * packed_info_size;
-                        let dst =
-                            &mut missing_chunk[missing_offset..missing_offset + packed_info_size];
-                        for idx in 0..packed_info_size {
-                            dst[idx] += contrib[idx];
-                        }
-                    }
-                }
-            }
-        });
 }
 
 fn accumulate_packed_cpu_block_row_major_sparse_missing(
@@ -2189,6 +2179,8 @@ fn accumulate_packed_cpu_block_row_major_sparse_missing(
     missing_variants: &mut [Vec<u32>],
 ) {
     let samples = scores_row_major.len() / components;
+    let add_missing =
+        |dst: &mut [Vec<u32>], variant: usize| dst[0].push((variant_offset + variant) as u32);
     if use_grouped_projection(samples, components, block_variant_bytes.len()) {
         accumulate_grouped_projection(
             block_variant_bytes,
@@ -2199,57 +2191,98 @@ fn accumulate_packed_cpu_block_row_major_sparse_missing(
             scores_row_major,
             missing_variants,
             1,
-            |dst, variant| dst[0].push((variant_offset + variant) as u32),
+            add_missing,
         );
-        return;
+    } else {
+        accumulate_direct_projection(
+            block_variant_bytes,
+            block_score_vectors,
+            block_swapped,
+            sample_chunk,
+            components,
+            scores_row_major,
+            missing_variants,
+            1,
+            add_missing,
+        );
     }
-    let chunk_scores = sample_chunk * components;
-    let score_tables = (samples >= 128)
-        .then(|| packed_score_pair_tables(block_score_vectors, block_swapped, components));
-    let table_width = 32 * components;
-    let missing_masks = plink_missing_lane_masks();
-    scores_row_major
-        .par_chunks_mut(chunk_scores)
-        .zip(missing_variants.par_chunks_mut(sample_chunk))
-        .enumerate()
-        .for_each(|(chunk_idx, (score_chunk, missing_chunk))| {
-            let sample_start = chunk_idx * sample_chunk;
-            let chunk_samples = score_chunk.len() / components;
-            let byte_start = sample_start >> 2;
-            let byte_len = packed_bytes_per_variant(chunk_samples);
-
-            for (variant, variant_bytes) in block_variant_bytes.iter().enumerate() {
-                debug_assert_eq!(variant_bytes.len(), packed_bytes_per_variant(samples));
-                let bytes = &variant_bytes[byte_start..byte_start + byte_len];
-                accumulate_packed_scores(
-                    bytes,
-                    &block_score_vectors[variant * components * 3..(variant + 1) * components * 3],
-                    block_swapped[variant],
-                    score_tables
-                        .as_ref()
-                        .map(|tables| &tables[variant * table_width..(variant + 1) * table_width]),
-                    components,
-                    score_chunk,
-                );
-                let global_variant = (variant_offset + variant) as u32;
-
-                for (byte_idx, &byte) in bytes.iter().enumerate() {
-                    let sample_base = byte_idx << 2;
-                    let lanes = (chunk_samples - sample_base).min(4);
-                    let mut mask = missing_masks[byte as usize] & ((1 << lanes) - 1);
-                    while mask != 0 {
-                        let lane = mask.trailing_zeros() as usize;
-                        mask &= mask - 1;
-                        let sample = sample_base + lane;
-                        missing_chunk[sample].push(global_variant);
-                    }
-                }
-            }
-        });
 }
 
+/// Which kernel a block takes changes its time, never its scores: both add a
+/// score row's variants four consecutive ones at a time from the block's start.
 fn use_grouped_projection(samples: usize, components: usize, variants: usize) -> bool {
     samples >= 1024 && components <= 64 && variants >= 16
+}
+
+/// The kernel for cohorts and panels too small or too wide to repay the
+/// lookups. Each chunk of samples walks the block group by group, with each
+/// group summed as [`accumulate_packed_group_scores`] describes, and records
+/// missing calls in variant order.
+fn accumulate_direct_projection<M: Send, F: Fn(&mut [M], usize) + Sync>(
+    bytes: &[&[u8]],
+    vectors: &[f64],
+    swapped: &[bool],
+    sample_chunk: usize,
+    components: usize,
+    scores: &mut [f64],
+    missing: &mut [M],
+    missing_stride: usize,
+    add_missing: F,
+) {
+    let samples = scores.len() / components;
+    let score_tables =
+        (samples >= 128).then(|| packed_score_pair_tables(vectors, swapped, components));
+    let table_width = 32 * components;
+    let missing_masks = plink_missing_lane_masks();
+    scores
+        .par_chunks_mut(sample_chunk * components)
+        .zip(missing.par_chunks_mut(sample_chunk * missing_stride))
+        .enumerate()
+        .for_each_init(
+            || vec![0.0f64; 2 * components],
+            |sum, (chunk, (scores, missing))| {
+                let sample_start = chunk * sample_chunk;
+                let chunk_samples = scores.len() / components;
+                let byte_start = sample_start >> 2;
+                let byte_len = packed_bytes_per_variant(chunk_samples);
+                for start in (0..bytes.len()).step_by(genotype_table::VARIANTS_PER_TABLE) {
+                    let end = (start + genotype_table::VARIANTS_PER_TABLE).min(bytes.len());
+                    let mut group = [&[][..]; genotype_table::VARIANTS_PER_TABLE];
+                    for (dst, bytes) in group.iter_mut().zip(&bytes[start..end]) {
+                        *dst = &bytes[byte_start..byte_start + byte_len];
+                    }
+                    let group = &group[..end - start];
+                    accumulate_packed_group_scores(
+                        group,
+                        &vectors[start * 3 * components..end * 3 * components],
+                        &swapped[start..end],
+                        score_tables
+                            .as_ref()
+                            .map(|tables| &tables[start * table_width..end * table_width]),
+                        components,
+                        scores,
+                        sum,
+                    );
+                    for (variant, bytes) in (start..end).zip(group) {
+                        for (byte_idx, &byte) in bytes.iter().enumerate() {
+                            let sample_base = byte_idx << 2;
+                            let lanes = (chunk_samples - sample_base).min(4);
+                            let mut mask = missing_masks[byte as usize] & ((1 << lanes) - 1);
+                            while mask != 0 {
+                                let lane = mask.trailing_zeros() as usize;
+                                mask &= mask - 1;
+                                let sample = sample_base + lane;
+                                add_missing(
+                                    &mut missing
+                                        [sample * missing_stride..(sample + 1) * missing_stride],
+                                    variant,
+                                );
+                            }
+                        }
+                    }
+                }
+            },
+        );
 }
 
 /// Compile four variants' contributions into a 256-row lookup shared by all
@@ -2271,7 +2304,8 @@ fn accumulate_grouped_projection<M: Send, F: Fn(&mut [M], usize) + Sync>(
     let sample_chunk = sample_chunk.min(genotype_table::SAMPLE_TILE);
     let columns = genotype_table::table_columns(components);
     let table_len = genotype_table::TABLE_ROWS * columns;
-    let groups_per_tile = (genotype_table::TABLE_BUDGET_BYTES / (table_len * size_of::<f64>()))
+    let groups_per_tile = (grouped_projection_tile_variants(components)
+        / genotype_table::VARIANTS_PER_TABLE)
         .min(bytes.len().div_ceil(4))
         .max(1);
     let mut tables = vec![0.0; groups_per_tile * table_len];
@@ -2483,29 +2517,30 @@ fn packed_bytes_per_variant(n_samples: usize) -> usize {
     (n_samples + 3) >> 2
 }
 
-fn packed_projection_variant_block(
-    components: usize,
-    n_samples: usize,
-    expected_variants: usize,
-) -> usize {
+/// Variants the grouped kernel applies in one pass over every score row: as many
+/// four-variant lookups as its table budget holds.
+fn grouped_projection_tile_variants(components: usize) -> usize {
+    let table_bytes = genotype_table::TABLE_ROWS
+        * genotype_table::table_columns(components)
+        * size_of::<f64>();
+    (genotype_table::TABLE_BUDGET_BYTES / table_bytes).max(1) * genotype_table::VARIANTS_PER_TABLE
+}
+
+/// Variants per packed projection block: whole grouped-kernel tiles, as many as
+/// the fit's block width holds.
+///
+/// Both kernels sum a score four consecutive variants at a time from the start
+/// of a block, so a block that is a multiple of four leaves every group, and so
+/// every score's rounding, the same whatever the block size. The grouped kernel
+/// passes over every score row once per tile, and a block that ends inside a
+/// tile pays for a partial pass. Past that the block size sets only how much
+/// per-variant input one block gathers, so the cohort size has no say in it.
+fn packed_projection_variant_block(components: usize, expected_variants: usize) -> usize {
     if expected_variants == 0 {
         return 1;
     }
-    let packed_info_size = packed_tri_size(components);
-    let bytes_per_variant_host = (components + packed_info_size + 3) * size_of::<f64>();
-    let bytes_per_variant = n_samples
-        .saturating_mul(size_of::<f32>())
-        .saturating_add(packed_bytes_per_variant(n_samples))
-        .saturating_add(bytes_per_variant_host);
-    // Block boundaries decide which variants the grouped kernel sums together,
-    // so this rule fixes the rounding of every score. It is a function of the
-    // shape alone, never of the host.
-    let block_budget = 4 * 1024 * 1024 * 1024usize;
-    let mut block = (block_budget / bytes_per_variant.max(1)).max(16);
-    if n_samples < 50_000 {
-        block = block.min(DEFAULT_BLOCK_WIDTH);
-    }
-    block.min(expected_variants)
+    let tile = grouped_projection_tile_variants(components);
+    (tile * (DEFAULT_BLOCK_WIDTH / tile).max(1)).min(expected_variants)
 }
 
 fn packed_projection_sample_chunk(n_samples: usize) -> usize {
@@ -3818,6 +3853,217 @@ mod tests {
                     assert!((actual - expected).abs() <= 1e-11 * (1.0 + expected.abs()));
                 }
                 assert_eq!(info, expected_info);
+            }
+        }
+    }
+
+    #[test]
+    fn packed_kernels_add_each_four_variant_group_as_one_sum() {
+        let hash = |a: usize, b: usize| {
+            let mut z = ((a as u64) << 32) ^ b as u64 ^ 0x9E37_79B9_7F4A_7C15;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let variants = 203;
+        let swapped: Vec<bool> = (0..variants).map(|variant| variant % 3 == 0).collect();
+        let add_missing =
+            |dst: &mut [Vec<u32>], variant: usize| dst[0].push((17 + variant) as u32);
+        let mut groupings_differ = false;
+        for components in [1usize, 3, 4, 5, 20, 32, 33, 64, 65] {
+            // Magnitudes spread over 2^40, so a group summed before it reaches the
+            // row rounds differently from its variants added one at a time.
+            let vectors: Vec<f64> = (0..variants * 3 * components)
+                .map(|i| {
+                    let h = hash(i, components);
+                    ((h % 2001) as f64 - 1000.0) / 3.0 * 2f64.powi(((h >> 32) % 41) as i32 - 20)
+                })
+                .collect();
+            for samples in [1usize, 2, 5, 31, 127, 128, 129, 1025] {
+                let code = |variant: usize, sample: usize| {
+                    let h = hash(variant, sample + 7919 * components);
+                    if h % 8 == 0 {
+                        1u8
+                    } else {
+                        [0u8, 2, 3][(h >> 8) as usize % 3]
+                    }
+                };
+                let data: Vec<Vec<u8>> = (0..variants)
+                    .map(|variant| {
+                        let mut bytes = vec![0u8; samples.div_ceil(4)];
+                        for sample in 0..samples {
+                            bytes[sample / 4] |= code(variant, sample) << (2 * (sample % 4));
+                        }
+                        bytes
+                    })
+                    .collect();
+                let bytes: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+                let mut grouped = vec![0.0; samples * components];
+                let mut sequential = vec![0.0; samples * components];
+                let mut expected_missing = vec![Vec::new(); samples];
+                for sample in 0..samples {
+                    for variant in 0..variants {
+                        if code(variant, sample) == 1 {
+                            expected_missing[sample].push((17 + variant) as u32);
+                        }
+                    }
+                    for component in 0..components {
+                        let slot = sample * components + component;
+                        for start in (0..variants).step_by(4) {
+                            let mut sum = 0.0;
+                            for variant in start..(start + 4).min(variants) {
+                                let call = code(variant, sample);
+                                if call == 1 {
+                                    continue;
+                                }
+                                let dosage = [0, 0, 1, 2][call as usize];
+                                let dosage = if swapped[variant] { 2 - dosage } else { dosage };
+                                let value = vectors[(variant * 3 + dosage) * components + component];
+                                sum += value;
+                                sequential[slot] += value;
+                            }
+                            grouped[slot] += sum;
+                        }
+                    }
+                }
+                let same_bits = |actual: &[f64]| {
+                    actual
+                        .iter()
+                        .zip(&grouped)
+                        .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
+                };
+                groupings_differ |= !same_bits(&sequential[..]);
+
+                let mut runs = Vec::new();
+                if components <= 64 {
+                    let mut scores = vec![0.0; samples * components];
+                    let mut missing = vec![Vec::new(); samples];
+                    accumulate_grouped_projection(
+                        &bytes,
+                        &vectors,
+                        &swapped,
+                        256,
+                        components,
+                        &mut scores,
+                        &mut missing,
+                        1,
+                        add_missing,
+                    );
+                    runs.push(("grouped", scores, missing));
+                }
+                let mut scores = vec![0.0; samples * components];
+                let mut missing = vec![Vec::new(); samples];
+                accumulate_direct_projection(
+                    &bytes,
+                    &vectors,
+                    &swapped,
+                    256,
+                    components,
+                    &mut scores,
+                    &mut missing,
+                    1,
+                    add_missing,
+                );
+                runs.push(("direct", scores, missing));
+                // Blocks of 8, 92 and 103 variants, each taking the kernel its
+                // shape selects.
+                let mut scores = vec![0.0; samples * components];
+                let mut missing = vec![Vec::new(); samples];
+                for (start, end) in [(0, 8), (8, 100), (100, variants)] {
+                    accumulate_packed_cpu_block_row_major_sparse_missing(
+                        &bytes[start..end],
+                        &vectors[start * 3 * components..end * 3 * components],
+                        &swapped[start..end],
+                        17 + start,
+                        256,
+                        components,
+                        &mut scores,
+                        &mut missing,
+                    );
+                }
+                runs.push(("blocks", scores, missing));
+                for (kernel, scores, missing) in runs {
+                    assert!(
+                        same_bits(&scores[..]),
+                        "{kernel}: {components} components, {samples} samples"
+                    );
+                    assert_eq!(
+                        missing, expected_missing,
+                        "{kernel}: {components} components, {samples} samples"
+                    );
+                }
+            }
+        }
+        assert!(groupings_differ, "the data cannot tell the groupings apart");
+    }
+
+    #[test]
+    fn packed_blocks_hold_whole_tiles() {
+        for components in 1..=80 {
+            let tile = grouped_projection_tile_variants(components);
+            let block = packed_projection_variant_block(components, usize::MAX);
+            assert_eq!(tile % genotype_table::VARIANTS_PER_TABLE, 0, "{components}");
+            assert_eq!(block % tile, 0, "{components}");
+            assert!(block <= DEFAULT_BLOCK_WIDTH && block + tile > DEFAULT_BLOCK_WIDTH);
+            assert_eq!(packed_projection_variant_block(components, 7), 7);
+        }
+    }
+
+    #[test]
+    fn a_person_projects_to_the_same_bits_alone_and_in_a_cohort() {
+        // 1,100 people take the grouped lookups, 200 the pair tables and one
+        // person the direct calls, and all three sum the same variant groups.
+        const VARIANTS: usize = 48;
+        let n_samples = 1100;
+        let genotype = |variant: usize, sample: usize| {
+            let mut z = ((variant as u64) << 32) ^ sample as u64;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) % 3) as f64
+        };
+        let complete: Vec<f64> = (0..VARIANTS)
+            .flat_map(|variant| (0..n_samples).map(move |sample| genotype(variant, sample)))
+            .collect();
+        let mut fit_source =
+            DenseBlockSource::new(&complete, n_samples, VARIANTS).expect("fit source");
+        let model = HwePcaModel::fit_k(&mut fit_source, TEST_COMPONENTS).expect("model fit");
+        let options = ProjectionOptions {
+            missing_axis_renormalization: true,
+            return_alignment: true,
+            return_conditioning: false,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+        let project = |people: &[usize]| {
+            let dense: Vec<f64> = (0..VARIANTS)
+                .flat_map(|variant| people.iter().map(move |&sample| genotype(variant, sample)))
+                .collect();
+            let mut source = PackedDenseBlockSource::new(dense, people.len(), VARIANTS);
+            model
+                .projector()
+                .project_with_options(&mut source, &options)
+                .expect("projection")
+                .scores
+        };
+        let cohort: Vec<usize> = (0..n_samples).collect();
+        let everyone = project(&cohort);
+        let some = project(&cohort[..200]);
+        for person in 0..200 {
+            for component in 0..TEST_COMPONENTS {
+                assert_eq!(
+                    some[(person, component)].to_bits(),
+                    everyone[(person, component)].to_bits(),
+                    "person {person}"
+                );
+            }
+        }
+        for person in [0, 1, 199, 1099] {
+            let alone = project(&[person][..]);
+            for component in 0..TEST_COMPONENTS {
+                assert_eq!(
+                    alone[(0, component)].to_bits(),
+                    everyone[(person, component)].to_bits(),
+                    "person {person} alone"
+                );
             }
         }
     }
