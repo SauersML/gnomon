@@ -244,9 +244,10 @@ struct RecordAccumulator<'a> {
     totals: ScoreTotals,
     pending: PendingPosition,
     effect_only_matches: EffectOnlyMatches,
-    /// Per rule, whether an allele taken so far matched it first among its position's rules:
-    /// a second such allele is a second record of the same allele pair.
-    claimed: Vec<bool>,
+    /// Per rule, whether an allele taken so far matched it first among its position's rules, and
+    /// if so whether the rule's effect allele was that record's REF: a second such allele is a
+    /// second record of the same allele pair.
+    claimed: Vec<Option<bool>>,
 }
 
 impl<'a> RecordAccumulator<'a> {
@@ -257,7 +258,7 @@ impl<'a> RecordAccumulator<'a> {
             totals: ScoreTotals::new(num_people, score_names.len(), rules_by_key),
             pending: PendingPosition::default(),
             effect_only_matches: EffectOnlyMatches::default(),
-            claimed: vec![false; rules_by_key.rules.len()],
+            claimed: vec![None; rules_by_key.rules.len()],
         }
     }
 
@@ -287,13 +288,17 @@ impl<'a> RecordAccumulator<'a> {
             }
         }
         for allele in &mut decoded.alleles[..decoded.allele_count] {
-            if std::mem::replace(&mut self.claimed[allele.first_rule], true) {
+            if let Some(earlier_effect_is_ref) =
+                self.claimed[allele.first_rule].replace(allele.first_rule_effect_is_ref)
+            {
                 let rule = &rules_by_key.rules[allele.first_rule];
                 return Err(repeated_pair_error(
                     &decoded.chromosome,
                     decoded.position,
                     rules_by_key.allele(rule.effect_allele),
                     rules_by_key.allele(rule.other_allele),
+                    earlier_effect_is_ref,
+                    allele.first_rule_effect_is_ref,
                 )
                 .into());
             }
@@ -427,6 +432,8 @@ struct DecodedAllele {
     /// The first rule the allele matched, as an index into every position's rules; the allele
     /// pair it names is the allele's. Unused at an `effect_only` position.
     first_rule: usize,
+    /// Whether that rule's effect allele is this record's REF.
+    first_rule_effect_is_ref: bool,
     /// One dosage per kept person, in output order.
     column: DosageColumn,
     /// The column's scale, once it has been normalized where it was decoded.
@@ -1271,7 +1278,8 @@ impl PendingPosition {
             .collect();
 
         // A rule's allele pair scores one row; a second row carrying it repeats the variant.
-        let mut taken = vec![false; rules.len()];
+        // Per rule, whether a row has taken it, and if so whether its effect allele was that row's REF.
+        let mut taken: Vec<Option<bool>> = vec![None; rules.len()];
         for (row, allele) in &mut self.alleles {
             let (ref_allele, alt_allele) = &self.rows[*row];
             let mut matched = Vec::new();
@@ -1290,12 +1298,14 @@ impl PendingPosition {
                     _ => None,
                 };
                 if let Some(effect_is_ref) = effect_is_ref {
-                    if std::mem::replace(&mut taken[index], true) {
+                    if let Some(earlier_effect_is_ref) = taken[index].replace(effect_is_ref) {
                         return Err(repeated_pair_error(
                             &self.chromosome,
                             key.1,
                             effect_allele,
                             rules_by_key.allele(rule.other_allele),
+                            earlier_effect_is_ref,
+                            effect_is_ref,
                         ));
                     }
                     matched.extend(rules_by_key.applications(rule).iter().map(|application| {
@@ -1474,6 +1484,8 @@ fn decode_scored_fields(
         allele.scale = Some(allele.column.normalize());
         allele.matched_rules = matched_rules;
         allele.first_rule = rules_start + first_rule;
+        allele.first_rule_effect_is_ref =
+            rules_by_key.allele(score_rules[first_rule].effect_allele) == fields.reference_bases;
         decoded.allele_count += 1;
     }
     Ok(())
@@ -1596,6 +1608,7 @@ fn decode_scored_bcf_record(
         allele.scale = Some(allele.column.normalize());
         allele.matched_rules = matched_rules;
         allele.first_rule = rules_start + first_rule;
+        allele.first_rule_effect_is_ref = rules_by_key.allele(score_rules[first_rule].effect_allele) == ref_allele;
         decoded.allele_count += 1;
     }
     Ok(())
@@ -1609,10 +1622,35 @@ fn ref_effect_error(score_name: &str, chromosome: &str, position: u32) -> String
 }
 
 /// The error for a second record carrying an allele pair that score rows name: which record a
-/// row scores is unknown, and scoring both would count the variant twice.
-fn repeated_pair_error(chromosome: &str, position: u32, allele: &str, other_allele: &str) -> String {
+/// row scores is unknown, and scoring both would count the variant twice. `earlier_effect_is_ref`
+/// and `effect_is_ref` say whether `allele` was the REF of the record that first carried the pair
+/// and of this one, which decides the remedy. Records with the same REF and ALT are repeats, which
+/// bcftools removes once multiallelic records are split (bcftools norm --rm-dup exact alone keeps a
+/// record that lists one ALT twice). Records with REF and ALT swapped are different variants that
+/// share their allele strings, such as an insertion and a deletion of one base at a homopolymer:
+/// no deduplication removes either, so only the user can keep the one the row means. The example
+/// drops this record by its REF and ALT once multiallelic records are split: unsplit, a filter on
+/// REF and ALT drops a whole multiallelic record with every ALT it carries.
+fn repeated_pair_error(
+    chromosome: &str,
+    position: u32,
+    allele: &str,
+    other_allele: &str,
+    earlier_effect_is_ref: bool,
+    effect_is_ref: bool,
+) -> String {
+    let (reference, alternate) = if effect_is_ref { (allele, other_allele) } else { (other_allele, allele) };
+    let remedy = if earlier_effect_is_ref == effect_is_ref {
+        format!(
+            "They repeat REF {reference} and ALT {alternate}: remove the repeats, for example with bcftools norm -m -any --rm-dup exact INPUT."
+        )
+    } else {
+        format!(
+            "One has REF {alternate} and ALT {reference}, another REF {reference} and ALT {alternate}, so they are different variants: keep the one the row means, for example splitting multiallelic records and dropping the one with REF {reference} and ALT {alternate}: bcftools norm -m -any INPUT | bcftools view -e 'CHROM==\"{chromosome}\" && POS=={position} && REF==\"{reference}\" && ALT==\"{alternate}\"'."
+        )
+    };
     format!(
-        "More than one record at {chromosome}:{position} carries the alleles {other_allele} and {allele}, which a score row names, so which record the row scores is unknown. Remove the duplicate records, for example with bcftools norm --rm-dup exact."
+        "More than one record at {chromosome}:{position} carries the alleles {other_allele} and {allele}, which a score row names, so which record the row scores is unknown. {remedy}"
     )
 }
 
@@ -3744,26 +3782,40 @@ mod tests {
         let first = "1\t100\ta\tA\tG\t.\tPASS\t.\tGT:DS\t0|1:0.9\t0|0:0.1\n";
         let second = "1\t100\tb\tA\tG\t.\tPASS\t.\tGT:DS\t1|1:1.8\t0|1:1.2\n";
         let swapped = "1\t100\tb\tG\tA\t.\tPASS\t.\tGT:DS\t1|1:1.8\t0|1:1.2\n";
+        let swapped_multiallelic = "1\t100\tb\tG\tA,T\t.\tPASS\t.\tGT:DS\t1|2:1,1\t0|1:1,0\n";
         let other = "1\t200\tc\tC\tT\t.\tPASS\t.\tGT:DS\t0|1:1\t1|1:2\n";
         let unscored = "1\t300\td\tT\tC\t.\tPASS\t.\tGT:DS\t0|1:1\t1|1:2\n";
         let pairs = "variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.5\n1:200\tT\tC\t1\n";
         let with_effect_only = "variant_id\teffect_allele\tother_allele\tS\n\
              1:100\tG\tA\t0.5\n1:100\tT\t.\t2\n1:200\tT\tC\t1\n";
+        let repeated_alt = "1\t100\ta\tA\tG,G\t.\tPASS\t.\tGT:DS\t0|1:0.9,0\t0|0:0.1,0\n";
         let score_path = dir.path().join("score.gnomon.tsv");
-        for (case, body, scores) in [
-            ("adjacent", [first, second, other].concat(), pairs),
-            ("apart", [first, other, second].concat(), pairs),
-            ("swapped", [first, swapped, other].concat(), pairs),
-            ("effect-only position", [first, second, other].concat(), with_effect_only),
+        // Records repeating REF and ALT are repeats, which splitting and deduplicating removes;
+        // records with REF and ALT swapped are different variants, of which the user keeps one.
+        let repeats =
+            "They repeat REF A and ALT G: remove the repeats, for example with bcftools norm -m -any --rm-dup exact INPUT.";
+        let different = "One has REF A and ALT G, another REF G and ALT A, so they are different variants: keep the one the \
+             row means, for example splitting multiallelic records and dropping the one with REF G and ALT A: bcftools \
+             norm -m -any INPUT | bcftools view -e 'CHROM==\"1\" && POS==100 && REF==\"G\" && ALT==\"A\"'.";
+        for (case, body, scores, remedy) in [
+            ("adjacent", [first, second, other].concat(), pairs, repeats),
+            ("apart", [first, other, second].concat(), pairs, repeats),
+            ("swapped", [first, swapped, other].concat(), pairs, different),
+            ("swapped, the second multiallelic", [first, swapped_multiallelic, other].concat(), pairs, different),
+            ("one record repeating an ALT", [repeated_alt, other].concat(), pairs, repeats),
+            ("effect-only position", [first, second, other].concat(), with_effect_only, repeats),
+            ("swapped at an effect-only position", [first, swapped, other].concat(), with_effect_only, different),
         ] {
             std::fs::write(&score_path, scores).expect("write score");
             for path in cohort_files(dir.path(), &format!("{header}{body}")) {
                 let error = score_vcf_streaming(&path, std::slice::from_ref(&score_path), None, None)
-                    .expect_err(case);
+                    .expect_err(case)
+                    .to_string();
                 assert!(
-                    error
-                        .to_string()
-                        .contains("More than one record at 1:100 carries the alleles A and G"),
+                    error.starts_with(
+                        "More than one record at 1:100 carries the alleles A and G, which a score row names, so which \
+                         record the row scores is unknown. "
+                    ) && error.ends_with(remedy),
                     "{case}, {path:?}: {error}"
                 );
             }
