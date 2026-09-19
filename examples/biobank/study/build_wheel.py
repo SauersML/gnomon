@@ -4,11 +4,14 @@ Runs on a Linux build host, never inside AoU:
 
 1. checks out the pinned commit in an existing gam clone (``--ref main`` re-pins to GitHub main);
 2. builds gam-pyffi into a warm cargo target, so a re-pin recompiles only the gam crates that changed,
-   with one of two profiles:
+   with one of three profiles (``fast`` is gam's release-dev: opt-level 3, no cross-crate LTO, 16
+   codegen units, for accuracy re-pins, where only the predictions matter):
    - ``release-pypi``, gam's PyPI profile (opt-level 3, fat LTO, one codegen unit, stripped), which is
      what the AoU wheelhouse ships;
    - ``quick``, gam's release profile (opt-level 3, thin LTO) with 16 codegen units and incremental
      compilation, for development re-pins that take minutes; it keeps symbols for profiling;
+   either for baseline x86-64 or, with ``--cpu`` (e.g. x86-64-v3, hardware FMA), for a newer CPU, in which
+   case the wheel's ``import gamfit`` refuses a CPU without those features by name;
 3. verifies the extension (no overflow-check panic strings, glibc symbol versions within the wheel's
    manylinux tag, no debug sections or symbol table when stripped) and the profile's flags on the final
    rustc call;
@@ -56,9 +59,17 @@ PROFILES = {
                      "flags": ("opt-level=3", "codegen-units=1", "strip=symbols"), "lto": {"lto", "lto=fat"}},
     "quick": {"cargo": "release", "env": {"CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16"}, "suffix": "-quick",
               "stripped": False, "flags": ("opt-level=3", "codegen-units=16"), "lto": {"lto=thin"}},
+    # gam's own iteration profile: no cross-crate LTO, so a re-pin skips relinking every crate through
+    # ThinLTO, which was 62% of a quick re-pin (gam-pyffi 279.6 s of 454.6 s at 40b5044e4f).
+    "fast": {"cargo": "release-dev", "env": {}, "suffix": "-fast", "stripped": False,
+             "flags": ("opt-level=3", "codegen-units=16"), "lto": {None, "lto=off"}},
 }
 # panic must unwind in both, so gam's GPU probe can fall back to the CPU where no driver loads (gam#2972).
 FORBIDDEN_FLAGS = ("debug-assertions=on", "overflow-checks=on", "panic=abort")
+# /proc/cpuinfo's name for each x86 target feature rustc can enable beyond baseline x86-64 (--cpu).
+CPU_FLAGS = {"avx": "avx", "avx2": "avx2", "bmi1": "bmi1", "bmi2": "bmi2", "cmpxchg16b": "cx16", "f16c": "f16c",
+             "fma": "fma", "lahfsahf": "lahf_lm", "lzcnt": "abm", "movbe": "movbe", "popcnt": "popcnt",
+             "sse3": "pni", "sse4.1": "sse4_1", "sse4.2": "sse4_2", "ssse3": "ssse3", "xsave": "xsave"}
 # Only overflow-checked arithmetic panics with these; division and remainder are checked in every
 # profile, so their messages are reported but prove nothing.
 OVERFLOW_CHECKS = [f"attempt to {op} with overflow".encode()
@@ -131,7 +142,7 @@ def download_dependencies(lines, deps):
     return stamp
 
 
-def build(gam, target, out, maturin, jobs, timeout, profile, extra=()):
+def build(gam, target, out, maturin, jobs, timeout, profile, cpu=None, extra=()):
     """Build the wheel into ``out`` and return it with the build log's evidence."""
     env = {key: value for key, value in os.environ.items()
            if key not in {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER", "LIBRARY_PATH",
@@ -140,6 +151,8 @@ def build(gam, target, out, maturin, jobs, timeout, profile, extra=()):
     # without it the whole dependency graph recompiles.
     env.update(CARGO_INCREMENTAL="1", CARGO_TARGET_DIR=str(target), CARGO_BUILD_JOBS=str(jobs),
                CARGO_TERM_VERBOSE="true", CARGO_TERM_COLOR="never", **PROFILES[profile]["env"])
+    if cpu:
+        env["RUSTFLAGS"] = f"-C target-cpu={cpu}"
     out.mkdir(parents=True, exist_ok=True)
     for stale in [*out.glob("gamfit-*.whl"), *out.glob("wheelhouse-*.tar")]:
         stale.unlink()
@@ -147,7 +160,8 @@ def build(gam, target, out, maturin, jobs, timeout, profile, extra=()):
     start = time.monotonic()
     with log.open("w") as handle:
         child = subprocess.Popen([maturin, "build", "--profile", PROFILES[profile]["cargo"], "--locked", "--offline",
-                                  "--compatibility", POLICY, "--interpreter", sys.executable, "--out", out, *extra],
+                                  "--timings", "--compatibility", POLICY, "--interpreter", sys.executable, "--out", out,
+                                  *extra],
                                  cwd=gam, env=env, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             code = child.wait(timeout=timeout)
@@ -161,12 +175,29 @@ def build(gam, target, out, maturin, jobs, timeout, profile, extra=()):
         print(text[-4000:], file=sys.stderr)
         raise SystemExit(f"maturin build failed with exit {code} after {seconds} s")
     [wheel] = out.glob("gamfit-*.whl")
+    slowest = slowest_units(target, out)
     if extra:
-        return wheel, {"seconds": seconds}
-    return wheel, {"seconds": seconds, **compile_evidence(text, out / "compile.json", profile)}
+        return wheel, {"seconds": seconds, "slowest_units": slowest}
+    return wheel, {"seconds": seconds, "slowest_units": slowest,
+                   **compile_evidence(text, out / "compile.json", profile, cpu)}
 
 
-def compile_evidence(text, saved, profile):
+def slowest_units(target, out):
+    """Where a re-pin's time went, from cargo's --timings report (kept beside the build log)."""
+    report = target / "cargo-timings" / "cargo-timing.html"
+    if not report.is_file():
+        return None
+    shutil.copy2(report, out / "cargo-timing.html")
+    found = re.search(r"const UNIT_DATA = (\[.*?\]);\n", report.read_text(errors="replace"), re.S)
+    try:
+        units = json.loads(found.group(1))
+        return [f"{unit['name']} {unit.get('target', '').strip()} {unit['duration']:.1f}s"
+                for unit in sorted(units, key=lambda unit: -unit["duration"])[:6]]
+    except (AttributeError, ValueError, KeyError, TypeError):
+        return "unparsed: see cargo-timing.html"
+
+
+def compile_evidence(text, saved, profile, cpu):
     """The final rustc call must carry the profile; the other calls show how warm the target was.
 
     Rebuilding a pin whose extension is already built leaves gam_pyffi fresh, with no rustc call to
@@ -185,9 +216,12 @@ def compile_evidence(text, saved, profile):
     [final] = final
     flags = re.findall(r"-C (\S+)", final)
     expected = PROFILES[profile]
-    missing = [flag for flag in expected["flags"] if flag not in flags]
-    if not expected["lto"] & set(flags):
-        missing.append(" or ".join(sorted(expected["lto"])))
+    missing = [flag for flag in (*expected["flags"], *([f"target-cpu={cpu}"] if cpu else [])) if flag not in flags]
+    if not cpu and any(flag.startswith("target-cpu=") for flag in flags):
+        missing.append("baseline x86-64 (saw a target-cpu)")
+    lto = [flag for flag in flags if flag == "lto" or flag.startswith("lto=")] or [None]
+    if not set(lto) <= expected["lto"]:
+        missing.append(f"lto in {sorted(map(str, expected['lto']))} (saw {lto})")
     forbidden = [flag for flag in FORBIDDEN_FLAGS if flag in flags]
     if missing or forbidden:
         raise SystemExit(f"gam_pyffi rustc flags are not the {profile} profile: missing {missing}, "
@@ -237,7 +271,7 @@ def text_sha256(extension, work):
     return digest
 
 
-def unstripped_twin(gam, target, out, maturin, jobs, timeout, wheel):
+def unstripped_twin(gam, target, out, maturin, jobs, timeout, wheel, cpu):
     """Relink the release-pypi build with its symbol table kept, for perf and gdb.
 
     The profile sets strip = true, which maturin's --strip does not control; ``-C strip=none`` reaches
@@ -245,7 +279,7 @@ def unstripped_twin(gam, target, out, maturin, jobs, timeout, wheel):
     prove. Rebuilding the shipped wheel afterwards relinks gam-pyffi once more.
     """
     twin = out / "unstripped"
-    built, compiled = build(gam, target, twin, maturin, jobs, timeout, "release-pypi", ("--", "-C", "strip=none"))
+    built, compiled = build(gam, target, twin, maturin, jobs, timeout, "release-pypi", cpu, ("--", "-C", "strip=none"))
     _, extension = extract_extension(built, twin)
     built.unlink()
     _, shipped = extract_extension(wheel, twin)
@@ -373,6 +407,9 @@ def publish(root, base, wheel, name, provenance, jobs, latest):
         venv = venv.rename(root / name)
     result["path"] = str(venv)
     (venv / "VENV.md").write_text(venv_notes(venv, base, provenance, result.pop("packages"), result))
+    # The driver reads sys.prefix/PROVENANCE.json and believes gam_commit only while its engine_sha256 is
+    # the installed engine's.
+    write_json(venv / "PROVENANCE.json", {key: value for key, value in provenance.items() if key != "venv"})
     if result["ok"] and latest:
         link, staging = root / "venv", root / ".venv-next"
         if link.exists() and not link.is_symlink():
@@ -409,20 +446,42 @@ def check_venv(root, venv, base, provenance, jobs):
     result["smoke"] = json.loads(printed[-1]) if printed and printed[-1].startswith("{") else None
     if smoke.returncode:
         result["smoke_stderr"] = smoke.stderr[-2000:]
-    result["ok"] = (result["engine_matches"] and not result["differs_from_resolution"]
+    guard_ok = True
+    if provenance.get("cpu_guard"):
+        # The guard ran on this CPU when gamfit imported above; here it must refuse a baseline one by name.
+        result["guard_on_baseline"] = json.loads(run([python, "-c", GUARD_PROBE], cwd=root))
+        guard_ok = (result["guard_on_baseline"]["import_error"]
+                    and result["guard_on_baseline"]["missing"] == sorted(provenance["cpu_guard"]["required"]))
+    result["ok"] = (result["engine_matches"] and not result["differs_from_resolution"] and guard_ok
                     and smoke.returncode == 0 and bool((result["smoke"] or {}).get("ok")))
     return result
+
+
+GUARD_PROBE = r"""
+import json
+import gamfit._cpu_guard as guard
+try:
+    guard.check("fpu sse sse2")
+except guard.UnsupportedCPUError as error:
+    print(json.dumps({"import_error": isinstance(error, ImportError), "missing": error.missing, "message": str(error)}))
+else:
+    print(json.dumps({"import_error": False, "missing": [], "message": "baseline CPU accepted"}))
+"""
 
 
 def venv_notes(venv, base, provenance, packages, result):
     listing = "\n".join(f"- {name} {version}" for name, version in sorted(packages.items()))
     note = f"**{provenance['note']}**\n\n" if provenance.get("note") else ""
+    guard = provenance.get("cpu_guard")
+    cpu_line = (f"compiled for {guard['cpu']}; `import gamfit` raises gamfit._cpu_guard.UnsupportedCPUError on a CPU "
+                f"lacking any of {', '.join(guard['required'])}" if guard else "baseline x86-64")
     return f"""# Study venv {venv.name}
 
 {note}`{venv}/bin/python` (CPython {PYTHON}): gamfit from gam `{provenance['gam_commit']}` built with the
 `{provenance['profile']}` profile, over `{base}`, which holds the AoU wheelhouse's other packages
 at the versions the wheelhouse resolves to. Written by `examples/biobank/study/build_wheel.py`.
 
+- CPU: {cpu_line}
 - engine_sha256 (`gamfit/_rust.abi3.so`): `{provenance['engine_sha256']}`
 - final rustc flags: {' '.join(provenance['build']['final_rustc_flags'])}
 - wheelhouse: {provenance.get('wheelhouse') or 'none (only release-pypi builds are staged for AoU)'}
@@ -437,11 +496,116 @@ the newest. Run fits from outside any gam checkout, whose source `gamfit/` would
 """
 
 
+def cpu_features(cpu):
+    """The target features ``-C target-cpu=cpu`` adds to baseline x86-64, with their /proc/cpuinfo flags."""
+    def enabled(*flags):
+        return {line.split('"')[1] for line in run(["rustc", "--print", "cfg", *flags]).splitlines()
+                if line.startswith("target_feature=")}
+    added = sorted(enabled("-C", f"target-cpu={cpu}") - enabled())
+    unknown = [feature for feature in added if feature not in CPU_FLAGS]
+    if unknown or not added:
+        raise SystemExit(f"target-cpu={cpu} adds {added}; no /proc/cpuinfo flag is known for {unknown}")
+    return {feature: CPU_FLAGS[feature] for feature in added}
+
+
+GUARD = '''"""Refuse to load an engine compiled for {cpu} on a CPU that lacks it.
+
+Written into the wheel by gnomon's examples/biobank/study/build_wheel.py. The engine uses these
+instructions anywhere, so on such a CPU it would die of SIGILL mid-fit; there is no baseline fallback.
+"""
+from pathlib import Path
+
+CPU = {cpu!r}
+REQUIRED = {required!r}
+
+
+class UnsupportedCPUError(ImportError):
+    """This CPU lacks target features the gamfit engine was compiled to use."""
+
+    def __init__(self, missing):
+        self.missing = missing
+        super().__init__(f"gamfit's engine was compiled for {{CPU}}; this CPU lacks {{', '.join(missing)}}")
+
+
+def check(flags=None):
+    if flags is None:
+        try:
+            text = Path("/proc/cpuinfo").read_text()
+        except OSError as error:
+            raise UnsupportedCPUError([f"/proc/cpuinfo ({{error}})"]) from error
+        flags = next((line.split(":", 1)[1] for line in text.splitlines() if line.startswith("flags")), "")
+    present = set(flags.split())
+    missing = sorted(feature for feature, flag in REQUIRED.items() if flag not in present)
+    if missing:
+        raise UnsupportedCPUError(missing)
+
+
+check()
+'''
+
+
+def add_cpu_guard(wheel, cpu, required):
+    """Make ``import gamfit`` run the guard before anything loads the engine, and rewrite the RECORD."""
+    import ast
+    import base64
+    with zipfile.ZipFile(wheel) as archive:
+        entries = [(info, archive.read(info)) for info in archive.infolist()]
+    init = next(data for info, data in entries if info.filename == "gamfit/__init__.py").decode()
+    # After the docstring and any __future__ import, which must stay first.
+    body = ast.parse(init).body
+    first = next(node for index, node in enumerate(body)
+                 if not (index == 0 and isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))
+                 and not (isinstance(node, ast.ImportFrom) and node.module == "__future__"))
+    at = min([first.lineno, *(node.lineno for node in getattr(first, "decorator_list", []))]) - 1
+    lines = init.splitlines(keepends=True)
+    guarded = "".join(lines[:at] + [f"from . import _cpu_guard  # refuses a CPU without {cpu}\n"] + lines[at:]).encode()
+    guard = GUARD.format(cpu=cpu, required=required).encode()
+    files = []
+    for info, data in entries:
+        if info.filename.endswith(".dist-info/RECORD"):
+            record = info
+            continue
+        files.append((info, guarded if info.filename == "gamfit/__init__.py" else data))
+        if info.filename == "gamfit/__init__.py":
+            added = zipfile.ZipInfo("gamfit/_cpu_guard.py", date_time=info.date_time)
+            added.external_attr, added.compress_type = info.external_attr, zipfile.ZIP_DEFLATED
+            files.append((added, guard))
+
+    def digest(data):
+        return base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+    rows = [f"{info.filename},sha256={digest(data)},{len(data)}" for info, data in files] + [f"{record.filename},,"]
+    staged = wheel.with_name(wheel.name + ".partial")
+    with zipfile.ZipFile(staged, "w", zipfile.ZIP_DEFLATED) as archive:
+        for info, data in [*files, (record, ("\n".join(rows) + "\n").encode())]:
+            archive.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED)
+    staged.replace(wheel)
+    return {"cpu": cpu, "required": required, "guard_sha256": hashlib.sha256(guard).hexdigest()}
+
+
+def fma_instructions(wheel, work):
+    """Hardware FMA sites in the engine; a baseline build reaches fma through a software call instead."""
+    _, extension = extract_extension(wheel, work)
+    disassembly = subprocess.Popen(["objdump", "-d", "--no-show-raw-insn", extension], stdout=subprocess.PIPE)
+    counted = subprocess.run(["grep", "-c", "-E", r"[[:space:]]vfn?m(add|sub)"], stdin=disassembly.stdout,
+                             capture_output=True, text=True)
+    disassembly.stdout.close()
+    disassembly.wait()
+    extension.unlink()
+    return int(counted.stdout.strip() or 0)
+
+
 def verified_build(args, sha, stamp, lines, out):
-    wheel, compiled = build(args.gam, args.target_dir, out, args.maturin, args.jobs, args.build_timeout, args.profile)
+    required = cpu_features(args.cpu) if args.cpu else None
+    wheel, compiled = build(args.gam, args.target_dir, out, args.maturin, args.jobs, args.build_timeout, args.profile,
+                            args.cpu)
     print(f"BUILT {wheel.name} in {compiled['seconds']} s: {compiled['rustc_calls']} rustc calls, "
           f"{compiled['fresh_units']} fresh units", flush=True)
+    guard = add_cpu_guard(wheel, args.cpu, required) if args.cpu else None
     extension = inspect_extension(wheel, out, args.profile)
+    if args.cpu:
+        extension["fma_instructions"] = fma_instructions(wheel, out)
+        if not extension["fma_instructions"]:
+            raise SystemExit(f"a target-cpu={args.cpu} engine with no hardware FMA instruction was not built for it")
     if compiled.setdefault("flags_engine_sha256", extension["engine_sha256"]) != extension["engine_sha256"]:
         raise SystemExit("gam_pyffi was fresh, but the saved flags belong to a different extension")
     write_json(out / "compile.json", {"final_rustc_flags": compiled["final_rustc_flags"],
@@ -449,7 +613,7 @@ def verified_build(args, sha, stamp, lines, out):
     provenance = {"gam_commit": sha, "profile": args.profile, "policy": POLICY, "python": PYTHON,
                   "wheel": str(wheel), "wheel_sha256": sha256(wheel), "engine_sha256": extension["engine_sha256"],
                   "rustc": run(["rustc", "--version"]).strip(), "maturin": run([args.maturin, "--version"]).strip(),
-                  "build": compiled, "extension": extension, "dependencies": stamp}
+                  "build": compiled, "extension": extension, "dependencies": stamp, "cpu_guard": guard}
     tar = resolve(wheel, args.deps, lines, out, provenance, archive=args.profile == "release-pypi")
     if tar:
         provenance["wheelhouse"] = {"path": str(tar), "sha256": sha256(tar)}
@@ -477,6 +641,8 @@ def main():
                         help="release-pypi: also relink with symbols kept, as <out>/<sha>/unstripped/, for profiling")
     parser.add_argument("--reuse", action="store_true",
                         help="skip the build: reuse this pin's verified wheel recorded in its PROVENANCE.json")
+    parser.add_argument("--cpu", help="compile for this target-cpu (e.g. x86-64-v3); the wheel then refuses, at import, "
+                                      "a CPU without its features; build it in its own --target-dir")
     args = parser.parse_args()
     if f"{sys.version_info.major}.{sys.version_info.minor}" != PYTHON:
         raise SystemExit(f"run under CPython {PYTHON}, the AoU runtime's version")
@@ -486,12 +652,14 @@ def main():
     sha = checkout(args.gam, args.ref)
     print(f"PIN gam {sha} profile {args.profile}", flush=True)
     stamp = download_dependencies(lines, args.deps)
-    out = args.out / (sha[:10] + ("" if args.profile == "release-pypi" else f"-{args.profile}"))
+    variant = f"-{args.cpu.removeprefix('x86-64-')}" if args.cpu else ""
+    out = args.out / (sha[:10] + ("" if args.profile == "release-pypi" else f"-{args.profile}") + variant)
     record = out / "PROVENANCE.json"
     if args.reuse:
         provenance = json.loads(record.read_text())
         wheel = Path(provenance["wheel"])
-        if (provenance["gam_commit"], provenance["profile"], provenance["dependencies"]) != (sha, args.profile, stamp) \
+        if (provenance["gam_commit"], provenance["profile"], provenance["dependencies"],
+                (provenance.get("cpu_guard") or {}).get("cpu")) != (sha, args.profile, stamp, args.cpu) \
                 or sha256(wheel) != provenance["wheel_sha256"]:
             raise SystemExit(f"{record} does not describe this pin, profile and dependency set")
         print(f"REUSED {wheel} (engine {provenance['engine_sha256']})", flush=True)
@@ -502,14 +670,14 @@ def main():
         provenance["note"] = args.note
     if args.venv_root:
         base = ensure_base(args.venv_root, args.deps, stamp, lines, provenance["resolved"], args.tool)
-        name = f"venv-{sha[:10]}{PROFILES[args.profile]['suffix']}"
+        name = f"venv-{sha[:10]}{PROFILES[args.profile]['suffix']}{variant}"
         provenance["venv"] = publish(args.venv_root, base, wheel, name, provenance, args.jobs, not args.no_link)
         write_json(record, provenance)
     print("PUBLISHED " + json.dumps({key: provenance.get(key) for key in ("gam_commit", "profile", "engine_sha256",
                                                                        "wheelhouse", "venv")}), flush=True)
     if args.unstripped:
         provenance["unstripped"] = unstripped_twin(args.gam, args.target_dir, out, args.maturin, args.jobs,
-                                                   args.build_timeout, wheel)
+                                                   args.build_timeout, wheel, args.cpu)
         write_json(record, provenance)
         print("UNSTRIPPED " + json.dumps(provenance["unstripped"]), flush=True)
     failed = [key for key, good in (("venv", provenance.get("venv", {"ok": True})["ok"]),
