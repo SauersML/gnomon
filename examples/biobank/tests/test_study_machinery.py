@@ -484,6 +484,27 @@ def test_an_uncertified_fit_is_never_counted_as_converged():
     assert certification([fit(False, "error"), fit(status="insufficient_events")]) == "no_fit"
     # A serialized numpy bool arrives as a string: refused, never read as certified.
     raises(ValueError, certification, [fit("False")])
+    # A latent law gam labels gaussian-uncertified is uncertified, whatever the fit reports.
+    labelled = {"status": "ok", "info": {"converged": True, "latent_measure": {"kind": "gaussian-uncertified"}}}
+    assert certification([fit(True), labelled]) == "not_certified"
+
+
+def test_our_own_model_uncertified_fails_the_run_and_a_competitors_is_only_labelled():
+    uncertified = driver().uncertified_primaries
+    labels = {("htn", "survival", "ours", "restart"): "not_certified",
+              ("htn", "binary", "shipped", "logo:ancestry:afr"): "not_certified",
+              ("htn", "binary", "standard", "pooled"): "not_certified",
+              ("htn", "binary", "ours", "pooled"): "certified",
+              ("t2d", "binary", "ours", "pooled"): "no_fit"}
+    assert uncertified(labels) == {"model/htn/survival/ours/restart": "not_certified",
+                                   "model/htn/binary/shipped/logo__ancestry__afr": "not_certified"}
+    # The uncertified competitor's cell stays in the results with its reason, and shows no metric.
+    exclude, registry = driver().exclude_uncertified, digest.Registry()
+    keys = {"disease": "htn", "model": "binary", "fit": "pooled", "stratum": "overall", "horizon": None}
+    row = {**keys, "variant": "standard", "n": 1000, "cases": 100, "auc": 0.7, "obs_risk": 0.1}
+    assert exclude({**row, "certification": "not_certified"}, registry) == {
+        **keys, "variant": "standard", "n": 1000, "cases": 100, "certification": "not_certified"}
+    assert exclude({**row, "certification": "certified"}, registry) == {**row, "certification": "certified"}
 
 
 def test_the_gam_commit_is_believed_only_for_the_installed_engine(tmp_path):

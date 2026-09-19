@@ -579,9 +579,13 @@ class Study:
                 self.checkpoint.delete_store()
             else:
                 self.checkpoint.close()
-        # A failure no declared refusal owns fails the run, after its digest (no masking).
-        failures = unexpected_failures(self.step_records()) if finished else {}
+        # A failure no declared refusal owns fails the run, after its digest (no masking),
+        # and so does our own model uncertified.
+        failures = ({**unexpected_failures(self.step_records()), **uncertified_primaries(self.certifications())}
+                    if finished else {})
         if failures:
+            for step, category in sorted(failures.items()):
+                print(f"study_unexpected_error {step} {category}", flush=True)
             counts = sorted(collections.Counter(failures.values()).items())
             print(f"study_unexpected_errors n={len(failures)} " + " ".join(f"{c}={n}" for c, n in counts), flush=True)
             self.status("failed_study_unexpected_errors")
@@ -907,6 +911,12 @@ class Study:
         records = [self.path(step) / "fit.json" for step in self.model_dirs(slug, kind, variant, fit).values()]
         return all(record.is_file() and read_json(record)["status"] == "ok" for record in records)
 
+    def certifications(self):
+        """{(disease, kind, variant, fit): certification()} of every fitted model, second starts included."""
+        return {(disease.slug, kind, variant, fit): self.certified(disease.slug, kind, variant, fit)
+                for disease in self.diseases for kind in self.kinds for variant in self.variants(kind)
+                for fit in self.fits(disease.slug, kind, variant) + self.restarted(disease.slug, kind, variant)}
+
     def restarted(self, slug, kind, variant):
         """[RESTART] when this variant's pooled fit has a second start (none
         when the pooled fit itself was skipped for insufficient events)."""
@@ -1047,7 +1057,7 @@ class Study:
                         row = {**row, "convergence": status[row["variant"]]}
                     if (row.get("variant"), row.get("fit")) in certified:
                         row = {**row, "certification": certified[row["variant"], row["fit"]]}
-                    labelled.append(row)
+                    labelled.append(exclude_uncertified(row, registry))
                 rows += labelled
                 rows += self.outcome_rows(disease.slug, kind)
                 for model in (self.sensitivity_models() if kind == "survival" else ()):
@@ -1210,7 +1220,9 @@ def certification(records):
     (its fit.json records): "certified", "not_certified" when any reports
     converged false (gam keeps some fits uncertified rather than refusing
     them), "no_certificate" when an engine reports none, "no_fit" when none
-    fitted. A converged flag that is not a bool is refused, not guessed."""
+    fitted. A converged flag that is not a bool is refused, not guessed. A fit
+    whose latent law gam labels gaussian-uncertified is not certified, whatever
+    it reports (SPEC section 4, 2026-09-19 03:50Z)."""
     flags = []
     for record in records:
         if record["status"] != "ok":
@@ -1218,7 +1230,7 @@ def certification(records):
         flag = (record.get("info") or {}).get("converged")
         if flag is not None and not isinstance(flag, bool):
             raise ValueError(f"a fit reports converged={flag!r}, not a bool")
-        flags.append(flag)
+        flags.append(False if "gaussian-uncertified" in json.dumps(record.get("info") or {}) else flag)
     if not flags:
         return "no_fit"
     if False in flags:
@@ -1275,6 +1287,18 @@ FAILURE_PHRASES = (
     ("provenance", "provenance"),
     ("timed out", "timeout"),
 )
+
+
+def exclude_uncertified(row, registry):
+    """A competitor's result row whose engines did not certify a fit behind it keeps
+    its keys, its counts (the cell's, shared by every variant) and its statuses, with
+    certification "not_certified" as the reason, and shows no metric: an uncertified
+    fit is never compared. Our own model uncertified fails the run instead
+    (uncertified_primaries)."""
+    if row.get("certification") != "not_certified" or row.get("variant") in PRIMARY:
+        return row
+    return {m: v for m, v in row.items() if m in digest.KEYS or isinstance(v, str) or v is None
+            or registry.kind(m, row) == "count"}
 
 
 def twin_rows(model, rows, primary, registry):
@@ -1348,6 +1372,16 @@ def unexpected_failures(records):
     record neither ok, nor below the events gate, nor a declared refusal."""
     return {step: record.get("category", "unclassified") for step, record in records.items()
             if record["status"] not in ("ok", INSUFFICIENT_EVENTS) and not record.get("declared_refusal")}
+
+
+def uncertified_primaries(certifications):
+    """The ours and shipped models among {(disease, kind, variant, fit): certification()}
+    that are not_certified, as {model: "not_certified"}. Our own model uncertified fails
+    the run like an undeclared error (lead 09-19); a competitor's uncertified cell stays
+    in the results, excluded by its certification label."""
+    return {f"model/{disease}/{kind}/{variant}/{fit_slug(fit)}": "not_certified"
+            for (disease, kind, variant, fit), label in certifications.items()
+            if variant in PRIMARY and label == "not_certified"}
 
 
 def failure_category(log):

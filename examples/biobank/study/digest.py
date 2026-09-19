@@ -626,7 +626,11 @@ def audit(rows, registry, nested=()):
     whole-cohort cells for every disease; `nested` names the diseases whose
     survival cohort is also a subset of the binary cohort (no exclusion roots,
     SPEC C3)."""
-    parsed, _ = parse(names(rows, LIMIT, registry))
+    return audit_parsed(parse(names(rows, LIMIT, registry))[0], registry, nested)
+
+
+def audit_parsed(parsed, registry, nested=()):
+    """audit() of rows as `parse` gives them back, e.g. from a run's tokens."""
     by_disease = defaultdict(list)
     for row in parsed:
         by_disease[row["disease"]].append(row)
