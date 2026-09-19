@@ -1301,7 +1301,7 @@ fn prepare_for_computation_with_retry(
             boundaries,
             total_variants,
         }) => {
-            let rows = BimRows::parsed(records, errors, &boundaries, &mut seen_invalid_bim_chrs);
+            let rows = BimRows::parsed(records, errors, &boundaries, &mut seen_invalid_bim_chrs)?;
             parsed_layout = Some((total_variants, boundaries));
             rows
         }
@@ -3326,22 +3326,23 @@ impl<'i, 'a> BimRows<'i, 'a> {
 
     /// Rows parsed whole. Rows in key order are yielded as they are. Otherwise
     /// the unparsable rows are reported and every row is sorted by key, as
-    /// `sorted` does, without reading the files again.
+    /// `sorted` does, without reading the files again, and a row error that is
+    /// not a parse error ends the run, as it ends `sorted`.
     fn parsed(
         mut records: Vec<KeyedBimRecord>,
         errors: Vec<(usize, PrepError)>,
         boundaries: &[FilesetBoundary],
         seen_invalid_bim_chrs: &mut AHashSet<String>,
-    ) -> Self {
+    ) -> Result<Self, PrepError> {
         let Some(descent) = records
             .windows(2)
             .position(|pair| pair[1].key < pair[0].key)
         else {
-            return Self::Parsed {
+            return Ok(Self::Parsed {
                 records: records.into_iter(),
                 errors: errors.into_iter().peekable(),
                 yielded: 0,
-            };
+            });
         };
         let row = records[descent + 1].bim_row_index.0;
         let fileset = boundaries.partition_point(|b| b.starting_global_index <= row) - 1;
@@ -3350,8 +3351,10 @@ impl<'i, 'a> BimRows<'i, 'a> {
             boundaries[fileset].bim_path.display()
         );
         for (_, error) in errors {
-            if let PrepError::Parse(msg) = error
-                && let Some(chr_name) = extract_chr_from_parse_error(&msg)
+            let PrepError::Parse(msg) = error else {
+                return Err(error);
+            };
+            if let Some(chr_name) = extract_chr_from_parse_error(&msg)
                 && seen_invalid_bim_chrs.insert(chr_name.to_string())
             {
                 eprintln!(
@@ -3360,7 +3363,7 @@ impl<'i, 'a> BimRows<'i, 'a> {
             }
         }
         records.par_sort_unstable_by_key(|record| (record.key, record.bim_row_index));
-        Self::Sorted(records.into_iter())
+        Ok(Self::Sorted(records.into_iter()))
     }
 
     /// Every row still to come, when all of them are in memory in key order with no

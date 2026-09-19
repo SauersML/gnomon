@@ -840,14 +840,20 @@ fn open_pgen_as_bed_source(
     let pvar: crate::adapt_plink2::PvarFactory =
         Arc::new(move || open_text_source(&pvar_for_factory));
 
+    // Only a local `.pvar` is read from its mapped file; a remote one streams.
     let virtual_plink = crate::adapt_plink2::open_virtual_plink19_with_local_pvar(
         pgen,
         pvar,
-        Some(pvar_path.as_path()),
+        local_path(&pvar_path),
         &mut *psam,
         genome_build,
     )?;
     Ok(BedSource::new(virtual_plink.bed_source(), None))
+}
+
+/// `path` when it names a file on this machine rather than a `gs://` or HTTP object.
+fn local_path(path: &Path) -> Option<&Path> {
+    (!is_gcs_path(path) && !is_http_path(path)).then_some(path)
 }
 
 pub fn validate_plink_bed_header(header: &[u8], path: &Path) -> Result<(), String> {
@@ -3147,6 +3153,27 @@ fn cached_block(
 
 #[cfg(test)]
 mod tests {
+    /// A remote PGEN's `.pvar` is streamed, never opened as a local file: its
+    /// variant plan reads the mapped file only for a path on this machine.
+    #[test]
+    fn only_a_path_on_this_machine_is_local() {
+        use super::*;
+        for remote in [
+            "gs://bucket/set.pvar",
+            "http://127.0.0.1:8/set.pvar",
+            "https://x/set.pvar",
+        ] {
+            assert_eq!(local_path(Path::new(remote)), None, "{remote}");
+        }
+        for local in ["set.pvar", "/data/set.pvar", "./gs/set.pvar"] {
+            assert_eq!(
+                local_path(Path::new(local)),
+                Some(Path::new(local)),
+                "{local}"
+            );
+        }
+    }
+
     /// The AoU whole-genome layout splits chrX into `chrX_par1`, `chrX_non_par`
     /// and `chrX_par2` objects. Named order streams the body before PAR1, which
     /// the position-sorted check rejects; chromosome order is PAR1, body, PAR2.

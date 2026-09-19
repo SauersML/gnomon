@@ -22,12 +22,17 @@ pub(super) struct ParsedBim {
 }
 
 /// Parses every `.bim` of `filesets` at once, or returns `None` when they are not
-/// all local `.bim` files, cannot be read here, or would need more than an eighth
-/// of the available memory together with their parsed rows. The caller then
-/// streams them, which also reports any I/O error in the usual words.
+/// all local `.bim` or `.pvar` files, cannot be read here, or would need more than
+/// an eighth of the available memory together with their parsed rows. The caller
+/// then streams them, which also reports any I/O error in the usual words. A
+/// `.pvar` gives the rows of the virtual `.bim` the streaming reader renders from it.
 pub(super) fn parse_local_bims(filesets: &[FilesetPaths]) -> Option<ParsedBim> {
     let (_, available) = crate::memory::memory_bytes();
     parse_local_bims_within(filesets, available / 8, MIN_BLOCK_BYTES)
+}
+
+fn is_pvar(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "pvar")
 }
 
 fn parse_local_bims_within(
@@ -35,10 +40,9 @@ fn parse_local_bims_within(
     budget: u64,
     min_block_bytes: usize,
 ) -> Option<ParsedBim> {
-    if filesets
-        .iter()
-        .any(|f| f.bim.extension().is_none_or(|e| e != "bim") || !f.bim.is_file())
-    {
+    if filesets.iter().any(|f| {
+        f.bim.extension().is_none_or(|e| e != "bim") && !is_pvar(&f.bim) || !f.bim.is_file()
+    }) {
         return None;
     }
     let mut total_bytes = 0u64;
@@ -79,6 +83,30 @@ fn parse_local_bims_within(
             fam_path: fileset.fam.clone(),
             starting_global_index: parsed.total_variants,
         });
+        if is_pvar(&fileset.bim) {
+            let pieces = crate::adapt_plink2::render_virtual_bim_pieces(
+                file_blocks,
+                |piece: &mut PvarPiece, line| piece.take(line, &fileset.bim),
+            );
+            for piece in pieces {
+                let before = parsed.records.len();
+                parsed.errors.extend(
+                    piece
+                        .errors
+                        .into_iter()
+                        .map(|(i, error)| (before + i, error)),
+                );
+                let first_row = parsed.total_variants;
+                parsed
+                    .records
+                    .extend(piece.records.into_iter().map(|mut record| {
+                        record.bim_row_index.0 += first_row;
+                        record
+                    }));
+                parsed.total_variants += piece.rows;
+            }
+            continue;
+        }
         let first_rows: Vec<u64> = lines
             .iter()
             .scan(parsed.total_variants, |next, &count| {
@@ -102,6 +130,46 @@ fn parse_local_bims_within(
         parsed.total_variants += lines.iter().sum::<u64>();
     }
     Some(parsed)
+}
+
+/// The rows of one piece of a `.pvar`, numbered from the piece's first row, as the
+/// streaming `.bim` reader keys the virtual `.bim` rows it renders: every row takes
+/// a number, and a line the renderer refuses is an error in its place that takes
+/// none.
+#[derive(Default)]
+struct PvarPiece {
+    records: Vec<KeyedBimRecord>,
+    errors: Vec<(usize, PrepError)>,
+    rows: u64,
+}
+
+impl PvarPiece {
+    fn take(
+        &mut self,
+        line: Result<&crate::adapt_plink2::VirtualBimLines, crate::pipeline_error::PipelineError>,
+        path: &Path,
+    ) {
+        let rows = match line {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.errors.push((
+                    self.records.len(),
+                    super::map_pipeline_error(error, path.to_path_buf()),
+                ));
+                return;
+            }
+        };
+        let mut index = 0;
+        while let Some(row) = rows.row(index) {
+            match parse_bim_row(row, BimRowIndex(self.rows), path) {
+                Some(Ok(record)) => self.records.push(record),
+                Some(Err(error)) => self.errors.push((self.records.len(), error)),
+                None => {}
+            }
+            self.rows += 1;
+            index += 1;
+        }
+    }
 }
 
 /// Splits `bytes` into pieces of about a pool task each, every piece but the last
@@ -389,6 +457,73 @@ mod tests {
             assert_eq!(starts(&parsed.boundaries), starts(&streamed.boundaries));
         }
         assert!(parse_local_bims_within(&filesets, 64, 1).is_none());
+    }
+
+    /// A local `.pvar` parses to the rows, row numbers and errors the streaming reader
+    /// gives for the virtual `.bim` it renders, on any block size: split multiallelic
+    /// sites, sites without an ALT, a header among the data, lines the renderer
+    /// refuses, rows the key parser refuses, and a headerless `.pvar` after it.
+    #[test]
+    fn parsed_pvar_rows_match_streamed_rows_for_any_block_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let first: &[u8] = b"##fileformat=PVARv1.0\n#CHROM\tPOS\tID\tREF\tALT\n\
+            chr1\t100\trs1\tA\tG\n\
+            1  200 . AC A,T\r\n\
+            \n\
+            1\t300\trs3\tA\n\
+            1\x0b400\x0crs4 G T\n\
+            2\tx\trs5\tA\tC\n\
+            Un_gl000220\t9\trs6\tA\tC\n\
+            4\t10\trs7\t\xff\tC\n\
+            #CHROM\tID\tPOS\tREF\tALT\n\
+            6\trs8\t12\tA\t.\n\
+            MT\trs9\t13\tA\tC,G\n\
+            7\trs10\t1e5\tA\tG";
+        let second: &[u8] = b"22 rs11 0 13 A G\n\n\ny rs12 0 14 C T\n";
+        let mut filesets = Vec::new();
+        for (name, bytes) in [("first", first), ("second", second)] {
+            let prefix = dir.path().join(name);
+            std::fs::write(prefix.with_extension("pvar"), bytes).unwrap();
+            filesets.push(FilesetPaths {
+                bed: prefix.with_extension("pgen"),
+                bim: prefix.with_extension("pvar"),
+                fam: prefix.with_extension("psam"),
+            });
+        }
+
+        let mut streamed = BimIterator::new(&filesets).unwrap();
+        let expected: Vec<String> = streamed
+            .by_ref()
+            .map(|item| describe(item.as_ref()))
+            .collect();
+        assert!(expected.iter().any(|d| d.contains("missing ALT")));
+        assert!(expected.iter().any(|d| d.contains("Invalid UTF-8")));
+        assert!(
+            expected
+                .iter()
+                .any(|d| d.to_lowercase().contains("un_gl000220"))
+        );
+
+        for block_bytes in [1, 7, 40, 1 << 20] {
+            let parsed = parse_local_bims_within(&filesets, u64::MAX, block_bytes).unwrap();
+            let mut actual = Vec::new();
+            let mut errors = parsed.errors.iter().peekable();
+            for (i, record) in parsed.records.iter().enumerate() {
+                while let Some((_, error)) = errors.next_if(|(before, _)| *before == i) {
+                    actual.push(describe(Err(error)));
+                }
+                actual.push(describe(Ok(record)));
+            }
+            actual.extend(errors.map(|(_, error)| describe(Err(error))));
+            assert_eq!(actual, expected, "block size {block_bytes}");
+            assert_eq!(parsed.total_variants, streamed.total_variants());
+            let starts = |b: &[FilesetBoundary]| {
+                b.iter()
+                    .map(|b| (b.bim_path.clone(), b.starting_global_index))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(starts(&parsed.boundaries), starts(&streamed.boundaries));
+        }
     }
 
     #[test]
