@@ -123,7 +123,7 @@ pub(crate) fn gram_leaf_rows(rows: usize, flops_per_row: usize) -> usize {
 }
 
 fn gram_rows_in_leaves(
-    mut out: MatMut<'_, f64>,
+    out: MatMut<'_, f64>,
     a: MatRef<'_, f64>,
     b: MatRef<'_, f64>,
     leaf: usize,
