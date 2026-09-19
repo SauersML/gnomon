@@ -1075,6 +1075,9 @@ class Study:
             rows += digest.descendant_rows(pd.read_parquet(descendants), digest.LIMIT)
         # Survival nests inside binary only for diseases without exclusion roots (SPEC C3).
         nested = {digest.slug(d.slug) for d in self.diseases if not d.exclusions}
+        # The rows the digest encodes, labelled and before suppression, stay in the workspace
+        # for the simulator's claim check (study/claims.py reads them as they are).
+        write_json(directory / "results.json", rows)
         results, operations = digest.encode(rows, self.operation_rows(base), nested=nested)
         written = [*results, *operations]
         (directory / "tokens.txt").write_text("\n".join(written) + "\n")
