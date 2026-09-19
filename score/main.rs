@@ -1647,127 +1647,6 @@ fn write_sscore_header<W: Write>(
     writeln!(writer)
 }
 
-/// Writes an `.sscore` as score blocks stream in, and publishes the file whole on
-/// [`SscoreSink::finish`]. Rows are formatted exactly as [`write_scores_to_file`]
-/// formats them, but from finished values: the sink divides nothing. A sink dropped
-/// before `finish`, as when scoring fails, publishes nothing.
-// Called once pipeline::run streams score blocks (team-score-determinism).
-#[allow(dead_code)]
-pub struct SscoreSink<'a> {
-    file: gnomon::output::AtomicFile,
-    person_iids: &'a [String],
-    score_variant_counts: &'a [u32],
-    num_scores: usize,
-    emit_components: bool,
-    block_columns: Option<&'a [bool]>,
-    rows_per_block: usize,
-    blocks: Vec<Vec<u8>>,
-    next_person: usize,
-}
-
-#[allow(dead_code)]
-impl<'a> SscoreSink<'a> {
-    /// Starts publishing `path` and writes the header rows.
-    #[allow(clippy::too_many_arguments)]
-    pub fn create(
-        path: &Path,
-        person_iids: &'a [String],
-        score_names: &[String],
-        score_variant_counts: &'a [u32],
-        score_regions: Option<&HashMap<String, GenomicRegion>>,
-        emit_components: bool,
-        block_columns: Option<&'a [bool]>,
-    ) -> io::Result<Self> {
-        let mut file = gnomon::output::AtomicFile::create(path)?;
-        write_sscore_header(
-            file.writer(),
-            score_names,
-            score_variant_counts,
-            score_regions,
-            emit_components,
-        )?;
-        let num_scores = score_names.len();
-        Ok(Self {
-            file,
-            person_iids,
-            score_variant_counts,
-            num_scores,
-            emit_components,
-            block_columns,
-            rows_per_block: score_rows_per_block(person_iids, num_scores),
-            blocks: Vec::new(),
-            next_person: 0,
-        })
-    }
-
-    /// Writes the rows of the persons from `first_person` on, from finished values
-    /// laid out person × score. Blocks must arrive in person order, without gaps.
-    pub fn write_values(
-        &mut self,
-        first_person: usize,
-        sums: &[f64],
-        avgs: &[f64],
-        missing_counts: &[u32],
-    ) -> io::Result<()> {
-        let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
-        if first_person != self.next_person {
-            return Err(invalid(format!(
-                "score block for person {first_person} arrived while person {} was expected",
-                self.next_person
-            )));
-        }
-        let cells = sums.len();
-        if self.num_scores == 0
-            || cells % self.num_scores != 0
-            || avgs.len() != cells
-            || missing_counts.len() != cells
-        {
-            return Err(invalid(format!(
-                "score block is not whole persons x {} scores: {cells} sums, {} averages, {} missing counts",
-                self.num_scores,
-                avgs.len(),
-                missing_counts.len()
-            )));
-        }
-        let end = first_person + cells / self.num_scores;
-        if end > self.person_iids.len() {
-            return Err(invalid(format!(
-                "score block ends at person {end} of {}",
-                self.person_iids.len()
-            )));
-        }
-        write_rows_with(
-            self.file.writer(),
-            &mut self.blocks,
-            &self.person_iids[first_person..end],
-            self.score_variant_counts,
-            &Finished { sums, avgs },
-            missing_counts,
-            self.num_scores,
-            self.emit_components,
-            self.rows_per_block,
-            self.block_columns,
-        )?;
-        self.next_person = end;
-        Ok(())
-    }
-
-    /// Publishes the file once every person's row has been written.
-    pub fn finish(self) -> io::Result<()> {
-        if self.next_person != self.person_iids.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "score stream ended after {} of {} persons",
-                    self.next_person,
-                    self.person_iids.len()
-                ),
-            ));
-        }
-        self.file.commit()
-    }
-}
-
 /// The finished values of `.sscore` cells, laid out person × score.
 trait ScoreValues: Sync {
     /// How many cells there are.
@@ -1860,26 +1739,6 @@ impl ScoreValues for F64Sums<'_> {
     }
 }
 
-/// Sums and averages finished by the caller.
-struct Finished<'a> {
-    sums: &'a [f64],
-    avgs: &'a [f64],
-}
-
-impl ScoreValues for Finished<'_> {
-    fn cells(&self) -> usize {
-        self.sums.len().min(self.avgs.len())
-    }
-
-    fn sum(&self, cell: usize) -> f64 {
-        self.sums[cell]
-    }
-
-    fn average(&self, cell: usize, _variants_used: u32) -> f64 {
-        self.avgs[cell]
-    }
-}
-
 /// Text formatted per block of `.sscore` rows. At most one block per worker
 /// thread is held at once, so the rows cost a few MiB beyond the scores
 /// themselves whatever the cohort size.
@@ -1899,36 +1758,6 @@ fn score_rows_per_block(person_iids: &[String], num_scores: usize) -> usize {
 #[allow(clippy::too_many_arguments)]
 fn write_score_rows<W: Write, V: ScoreValues>(
     writer: &mut W,
-    person_iids: &[String],
-    score_variant_counts: &[u32],
-    values: &V,
-    missing_counts: &[u32],
-    num_scores: usize,
-    emit_components: bool,
-    rows_per_block: usize,
-    block_columns: Option<&[bool]>,
-) -> io::Result<()> {
-    write_rows_with(
-        writer,
-        &mut Vec::new(),
-        person_iids,
-        score_variant_counts,
-        values,
-        missing_counts,
-        num_scores,
-        emit_components,
-        rows_per_block,
-        block_columns,
-    )
-}
-
-/// [`write_score_rows`] with the caller's text buffers. `blocks` holds the formatted text of one block per worker
-/// thread, and is sized on first use, so a caller writing many batches of rows can
-/// keep its buffers from one batch to the next.
-#[allow(clippy::too_many_arguments)]
-fn write_rows_with<W: Write, V: ScoreValues>(
-    writer: &mut W,
-    blocks: &mut Vec<Vec<u8>>,
     person_iids: &[String],
     score_variant_counts: &[u32],
     values: &V,
@@ -1960,9 +1789,8 @@ fn write_rows_with<W: Write, V: ScoreValues>(
     }
 
     let rows_per_block = rows_per_block.max(1);
-    if blocks.is_empty() {
-        blocks.resize(rayon::current_num_threads().max(1), Vec::new());
-    }
+    // The formatted text of one block per worker thread.
+    let mut blocks = vec![Vec::new(); rayon::current_num_threads().max(1)];
     let batch_rows = rows_per_block.saturating_mul(blocks.len());
     let mut batch_start = 0;
     while batch_start < n_persons {
@@ -2042,9 +1870,7 @@ fn format_score_rows<V: ScoreValues>(
 
 #[cfg(test)]
 mod output_tests {
-    use super::{
-        F64Sums, GenomicRegion, HashMap, SscoreSink, write_score_rows, write_scores_to_file,
-    };
+    use super::{F64Sums, write_score_rows, write_scores_to_file};
     use std::fs;
 
     /// A directory scored once holds each file's `<stem>.sorted.gnomon.tsv`
@@ -2290,146 +2116,6 @@ mod output_tests {
                 );
             }
         }
-    }
-
-    /// Score blocks streamed with finished averages, computed as pipeline::run computes
-    /// them, must publish exactly the file that write_scores_to_file writes from
-    /// whole-cohort sums.
-    #[test]
-    fn a_streamed_sscore_matches_the_whole_cohort_file() {
-        let (iids, counts, sums, missing) = cohort(1_001, 3);
-        let names: Vec<String> = ["A", "B", "C"].map(String::from).to_vec();
-        let regions = HashMap::from([(
-            "B".to_string(),
-            GenomicRegion {
-                chromosome: 23,
-                start: 10,
-                end: 2_000,
-            },
-        )]);
-        let avgs: Vec<f64> = sums
-            .iter()
-            .zip(&missing)
-            .enumerate()
-            .map(|(cell, (&sum, &missing_count))| {
-                let variants_used = counts[cell % 3].saturating_sub(missing_count);
-                if variants_used > 0 {
-                    sum / (variants_used as f64)
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-        let dir = tempfile::tempdir().expect("temporary directory");
-        for emit_components in [false, true] {
-            let whole = dir.path().join(format!("whole-{emit_components}.sscore"));
-            write_scores_to_file(
-                &whole,
-                &iids,
-                &names,
-                &counts,
-                &F64Sums { sums: &sums },
-                &missing,
-                Some(&regions),
-                emit_components,
-                None,
-            )
-            .expect("the whole-cohort file should be written");
-            let expected = fs::read(&whole).expect("the whole-cohort file should be readable");
-            for block in [1, 7, 333, 4_096] {
-                let streamed = dir
-                    .path()
-                    .join(format!("streamed-{emit_components}-{block}.sscore"));
-                let mut sink = SscoreSink::create(
-                    &streamed,
-                    &iids,
-                    &names,
-                    &counts,
-                    Some(&regions),
-                    emit_components,
-                    None,
-                )
-                .expect("the sink should be created");
-                let mut first = 0;
-                while first < iids.len() {
-                    let end = (first + block).min(iids.len());
-                    let cells = first * 3..end * 3;
-                    sink.write_values(
-                        first,
-                        &sums[cells.clone()],
-                        &avgs[cells.clone()],
-                        &missing[cells],
-                    )
-                    .expect("the block should be written");
-                    first = end;
-                }
-                assert!(!streamed.exists(), "nothing is published before finish");
-                sink.finish().expect("the stream should be published");
-                assert!(
-                    fs::read(&streamed).expect("the streamed file should be readable") == expected,
-                    "emit_components={emit_components} block={block}"
-                );
-            }
-        }
-    }
-
-    /// A block out of person order, not whole persons or running past the cohort is
-    /// refused without advancing the stream, and a sink dropped unfinished publishes
-    /// nothing and leaves no temporary file.
-    #[test]
-    fn a_score_stream_refuses_misplaced_blocks_and_publishes_nothing_when_dropped() {
-        let (iids, counts, sums, missing) = cohort(10, 2);
-        let names = vec!["A".to_string(), "B".to_string()];
-        let dir = tempfile::tempdir().expect("temporary directory");
-        let path = dir.path().join("refused.sscore");
-        let mut sink = SscoreSink::create(&path, &iids, &names, &counts, None, false, None)
-            .expect("the sink should be created");
-        sink.write_values(0, &sums[..4], &sums[..4], &missing[..4])
-            .expect("persons 0 and 1 should be written");
-        let past_the_cohort = (vec![0.0; 18], vec![0; 18]);
-        let refused: [(usize, &[f64], &[f64], &[u32]); 5] = [
-            (3, &sums[6..8], &sums[6..8], &missing[6..8]),
-            (0, &sums[..4], &sums[..4], &missing[..4]),
-            (2, &sums[4..7], &sums[4..7], &missing[4..7]),
-            (2, &sums[4..6], &sums[4..5], &missing[4..6]),
-            (
-                2,
-                &past_the_cohort.0,
-                &past_the_cohort.0,
-                &past_the_cohort.1,
-            ),
-        ];
-        for (first, block_sums, block_avgs, block_missing) in refused {
-            let error = sink
-                .write_values(first, block_sums, block_avgs, block_missing)
-                .expect_err("a misplaced block must be refused");
-            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        }
-        sink.write_values(2, &sums[4..], &sums[4..], &missing[4..])
-            .expect("the stream should continue at person 2");
-        drop(sink);
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
-    }
-
-    /// A stream that ends before every person's row is written is refused at finish, and
-    /// leaves the previous file in place and no temporary file.
-    #[test]
-    fn an_incomplete_score_stream_publishes_nothing() {
-        let (iids, counts, sums, missing) = cohort(10, 2);
-        let names = vec!["A".to_string(), "B".to_string()];
-        let dir = tempfile::tempdir().expect("temporary directory");
-        let path = dir.path().join("incomplete.sscore");
-        fs::write(&path, "previous\n").expect("the previous file should be written");
-        let mut sink = SscoreSink::create(&path, &iids, &names, &counts, None, true, None)
-            .expect("the sink should be created");
-        sink.write_values(0, &sums[..18], &sums[..18], &missing[..18])
-            .expect("nine persons should be written");
-        let error = sink
-            .finish()
-            .expect_err("an incomplete stream must be refused");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "previous\n");
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
