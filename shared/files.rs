@@ -626,6 +626,13 @@ fn local_read_window(available_bytes: u64) -> usize {
         .clamp(4 * BedReadPlan::MAX_RANGE, 256 * 1024 * 1024)
 }
 
+/// A local read plan's worker stack. Its fetch is a positional read into a heap buffer, and on a
+/// 140,000-variant .bed the workers touched 8-16 KiB of their stacks, a sixteenth of this. A test
+/// below runs their deepest path, a read past a truncated file, on a stack of this size. Planned
+/// local reads are Unix-only (positional reads through `FileExt`), and so is this.
+#[cfg(unix)]
+const LOCAL_WORKER_STACK_BYTES: usize = 256 << 10;
+
 #[cfg(unix)]
 fn open_planned_local_bed(
     path: &Path,
@@ -650,7 +657,7 @@ fn open_planned_local_bed(
             in_flight_bytes: 4 * 1024 * 1024,
             min_workers: 1,
             max_workers: 2,
-            stack_bytes: crate::range_fetch::LOCAL_WORKER_STACK_BYTES,
+            stack_bytes: LOCAL_WORKER_STACK_BYTES,
         },
     );
     eprintln!(
@@ -3170,7 +3177,7 @@ mod tests {
                 in_flight_bytes: 2 * 1024 * 1024,
                 min_workers: 1,
                 max_workers: 2,
-                stack_bytes: crate::range_fetch::LOCAL_WORKER_STACK_BYTES,
+                stack_bytes: LOCAL_WORKER_STACK_BYTES,
             },
         );
         let source = PlannedLocalSource { len, reader };
@@ -3234,7 +3241,7 @@ mod tests {
             held >= rows.len() * row_bytes && held <= n_rows * row_bytes,
             "{held}"
         );
-        assert!(planned.read_stack_bytes() >= crate::range_fetch::LOCAL_WORKER_STACK_BYTES);
+        assert!(planned.read_stack_bytes() >= LOCAL_WORKER_STACK_BYTES);
         assert_eq!(
             (mapped.read_buffer_bytes(), mapped.read_stack_bytes()),
             (0, 0)

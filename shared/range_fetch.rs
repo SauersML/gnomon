@@ -185,11 +185,6 @@ pub(crate) struct Limits {
 /// stack stays as it was and is charged in full.
 pub(crate) const REMOTE_WORKER_STACK_BYTES: usize = 2 << 20;
 
-/// A local read plan's worker stack. Its fetch is a positional read into a heap buffer, and on a
-/// 140,000-variant .bed the workers touched 8-16 KiB of their stacks, a sixteenth of this. A files
-/// test runs their deepest path, a read past a truncated file, on a stack of this size.
-pub(crate) const LOCAL_WORKER_STACK_BYTES: usize = 256 << 10;
-
 /// Sized for a cohort whose rows are ~100 KB: a full window of such rows
 /// keeps a 10-30 Gbps VM busy while request latency stays the bottleneck.
 pub(crate) const LIMITS: Limits = Limits {
