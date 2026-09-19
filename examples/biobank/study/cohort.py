@@ -590,7 +590,8 @@ def merge_ehr(person, extra):
         moved = ~(later <= end[at[found]])  # also counts people whose only EHR is in this domain
         start[at[found]] = np.fmin(start[at[found]], days(table.column("ehr_start"))[found])
         end[at[found]] = np.fmax(end[at[found]], later)
-        extended[domain] = float(moved.sum() / max(1, int((~np.isnan(end)).sum())))
+        with_ehr = int((~np.isnan(end)).sum())
+        extended[domain] = float(moved.sum() / with_ehr) if with_ehr else None
 
     def column(values):
         null = np.isnan(values)
@@ -799,8 +800,8 @@ class AouSource(Source):
     qualify for it. Resolved concepts must match the declarations
     (`phenotypes.phenotype_codes` builds both from diseases.json).
 
-    ehr_end widens the visit and condition EHR range by the EHR_DOMAINS in
-    `ehr_domains` ("auto": each in order while the plan fits the budget).
+    ehr_end is the EHR range over visits, conditions and every EHR_DOMAINS
+    table: one definition, which the plan must fit whole.
 
     Before any query bills, every query is dry-run and the plan is refused if
     it would exceed the client's remaining budget (SPEC 7a). Tables are built
@@ -809,11 +810,8 @@ class AouSource(Source):
     """
 
     def __init__(self, client, cdr, *, snomed_codes, scores, ancestry, prune, projection, score_cache,
-                 excluded_branches=None, ehr_domains="auto", num_pcs=None):
+                 excluded_branches=None, num_pcs=None):
         self.client = client
-        if ehr_domains != "auto" and not set(ehr_domains) <= set(EHR_DOMAINS):
-            raise ValueError(f"EHR domains are chosen from {list(EHR_DOMAINS)}")
-        self.ehr_domains = ehr_domains
         self.cdr = _check_cdr(cdr)
         declared = snomed_codes if isinstance(snomed_codes, dict) else dict.fromkeys(snomed_codes)
         self.snomed_codes = [str(code) for code in declared]
@@ -841,51 +839,32 @@ class AouSource(Source):
         return self._facts["ses"]
 
     def _cutoff_sql(self):
-        columns = self.client.columns(f"{self.cdr}._cdr_metadata")
-        if columns is not None and "ehr_cutoff_date" in columns:
-            return (f"SELECT CAST(MAX(ehr_cutoff_date) AS DATE) AS cutoff FROM `{self.cdr}._cdr_metadata`",
-                    "_cdr_metadata.ehr_cutoff_date")
-        return (f"SELECT MAX(observation_period_end_date) AS cutoff FROM `{self.cdr}.observation_period`",
-                "max(observation_period_end_date)")
+        """The CDR's data cutoff: AoU's curation caps every observation period at ehr_cutoff_date."""
+        return f"SELECT MAX(observation_period_end_date) AS cutoff FROM `{self.cdr}.observation_period`"
 
     def _members(self):
         pairs = [f"{root}:{branch}" for root, branches in self.branches.items() for branch in sorted(branches)]
         return {"codes": ("STRING", self.snomed_codes), "branch_pairs": ("STRING", pairs)}
 
     def _queries(self):
-        """Every billed query of an extraction but the extra EHR domains: {name: (sql, parameters)}."""
+        """Every billed query of an extraction: {name: (sql, parameters)}."""
         every_code = self.snomed_codes + sorted({b for branches in self.branches.values() for b in branches})
         return {"person": (person_sql(self.cdr, self._ses_columns()), None),
                 "condition": (condition_sql(self.cdr), self._members()),
                 "root": (root_sql(self.cdr), {"codes": ("STRING", every_code)}),
                 "descendants": (descendant_sql(self.cdr), self._members()),
-                "cutoff": (self._cutoff_sql()[0], None),
-                **{f"ehr_{domain}": (ehr_sql(self.cdr, domain), None) for domain in self._facts.get("ehr", ())}}
+                "cutoff": (self._cutoff_sql(), None),
+                **{f"ehr_{domain}": (ehr_sql(self.cdr, domain), None) for domain in EHR_DOMAINS}}
 
     def plan(self):
-        """Dry-run every query and refuse a plan over the remaining budget. {name: bytes}.
-
-        With ehr_domains="auto" the extra EHR domains join in EHR_DOMAINS order
-        while the plan stays within budget (outcome-blind and deterministic);
-        the manifest records which ones did. An explicit list must fit whole.
-        """
+        """Dry-run every query and refuse a plan over the remaining budget. {name: bytes}."""
         if "plan" not in self._facts:
-            self._facts["ehr"] = ()
             estimates = {name: self.client.estimate(sql, parameters)
                          for name, (sql, parameters) in self._queries().items()}
-            chosen, skipped = [], []
-            for domain in (EHR_DOMAINS if self.ehr_domains == "auto" else self.ehr_domains):
-                cost = self.client.estimate(ehr_sql(self.cdr, domain))
-                if self.ehr_domains == "auto" and sum(estimates.values()) + cost > self.client.remaining:
-                    skipped.append(domain)
-                    continue
-                estimates[f"ehr_{domain}"] = cost
-                chosen.append(domain)
             total = sum(estimates.values())
             if total > self.client.remaining:
                 raise RuntimeError(f"the BigQuery plan would bill up to {total:,} bytes, over the remaining "
                                    f"budget of {self.client.remaining:,}: {estimates}")
-            self._facts["ehr"], self._facts["ehr_skipped"] = tuple(chosen), skipped
             self._facts["plan"] = estimates
         return self._facts["plan"]
 
@@ -901,13 +880,14 @@ class AouSource(Source):
                 column = person.column(name)
                 person = person.set_column(person.schema.get_field_index(name), name,
                                            _conform_column(f"person.{name}", column, column.type, pa.date32()))
-            extra = {domain: self._query(f"ehr_{domain}") for domain in self._facts["ehr"]}
+            extra = {domain: self._query(f"ehr_{domain}") for domain in EHR_DOMAINS}
             person, self._facts["ehr_extended"] = merge_ehr(person, extra)
             # Outcome-blind check: how often the EHR end is a visit end more than 30 days after its start.
             end, long_end = days(person.column("ehr_end")), days(person.column("ehr_long_end"))
             known = ~np.isnan(end)
-            share = (long_end[known] == end[known]).mean() if known.any() else 0.0
-            self._facts["ehr_end_from_long_visit"] = float(share)
+            if not known.any():
+                raise SchemaError("no person in the CDR has an EHR-sourced record")
+            self._facts["ehr_end_from_long_visit"] = float((long_end[known] == end[known]).mean())
             self._facts["ehr_people"] = int(known.sum())  # the two shares' denominator
             return person.drop_columns(["ehr_long_end"])
         if name == "condition":
@@ -960,10 +940,9 @@ class AouSource(Source):
                         "excluded_branches": {root: sorted(b) for root, b in self.branches.items()},
                         "num_pcs": len(raw["pcs"].column_names) - 1,
                         "ses_available": self._ses_columns() is not None,
-                        "cdr_cutoff": cutoff.isoformat(), "cdr_cutoff_source": self._cutoff_sql()[1],
+                        "cdr_cutoff": cutoff.isoformat(), "cdr_cutoff_source": "max(observation_period_end_date)",
                         "prune_unmatched": self._facts["prune_unmatched"],
-                        "ehr_domains": ["visit", "condition", *self._facts["ehr"]],
-                        "ehr_domains_skipped": self._facts["ehr_skipped"],
+                        "ehr_domains": ["visit", "condition", *EHR_DOMAINS],
                         "ehr_extended_by": self._facts["ehr_extended"],
                         "ehr_end_from_long_visit": self._facts["ehr_end_from_long_visit"],
                         "ehr_people": self._facts["ehr_people"],

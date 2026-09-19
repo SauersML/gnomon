@@ -165,7 +165,6 @@ def cdr():
         create(con, f"{table}_ext", **{f"{table}_id": list(range(len(rows_))), "src_id": [r[2] for r in rows_]})
     create(con, "zip3_ses_map", zip3=[553, 553, 100], zip3_as_string=["553", "553", "100"],
            deprivation_index=[0.29, 0.31, 0.40], acs=["2016", "2017", "2017"])
-    create(con, "_cdr_metadata", etl_version=["v8"], ehr_cutoff_date=dates([D(2023, 10, 1)]))
     return con
 
 
@@ -243,12 +242,12 @@ def test_roots_descendants_and_manifest(exported):
     assert got == {(T2D, "root", 2011): 27, (CKD, "root", 7093): 26, (STAGE1, "excluded_branch", 7091): 26}
     assert set(descendants.root_code) == {T2D, CKD}  # stage 2 (1 person) is under the >20 rule
     manifest = source.manifest
-    assert manifest["cdr_cutoff"] == "2023-10-01"
-    assert manifest["cdr_cutoff_source"] == "_cdr_metadata.ehr_cutoff_date"
+    assert manifest["cdr_cutoff"] == "2023-09-01"  # the latest observation-period end
+    assert manifest["cdr_cutoff_source"] == "max(observation_period_end_date)"
     assert manifest["excluded_branches"] == {CKD: [STAGE1, STAGE2]} and manifest["prune_unmatched"] == 0
     assert manifest["ses_available"] is True
     # One query per table for all roots, the cutoff, and one grouped pass per extra EHR domain.
-    assert len(client.statements) == 9 and manifest["ehr_domains_skipped"] == []
+    assert len(client.statements) == 9
     # Each extra domain moved these people's ehr_end later, of the 28 with EHR: procedure 1001,
     # observation 2 and measurement 1; the drug rows are earlier or not EHR-sourced.
     assert manifest["ehr_extended_by"] == {"procedure": 1 / 28, "drug": 0.0, "observation": 1 / 28,

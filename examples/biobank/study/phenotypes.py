@@ -66,7 +66,6 @@ class CohortConfig:
     min_age: float = 18.0
     test_fraction: float = 0.2
     dev_folds: int = 5
-    max_prune_unmatched: int = 0
     # Exclusion-rule exits after the landmark become a competing event (3) once
     # they exceed this fraction of a disease's survival cohort; below it they censor.
     exclusion_competing_fraction: float = 0.01
@@ -80,8 +79,6 @@ class CohortConfig:
             raise ValueError("the split seed must be a non-negative integer")
         if self.seed in SPENT_SEEDS:
             raise ValueError(f"split seed {self.seed} has already seen AoU outer-test rows; record a new one")
-        if self.max_prune_unmatched < 0:
-            raise ValueError("max_prune_unmatched is a non-negative count")
         if not 1 <= self.num_pcs <= 64 or self.dev_folds < 2 or not 0 < self.test_fraction < 1:
             raise ValueError("unsupported PC count, fold count or test fraction")
         if self.lookback_days < 0 or self.landmark_days < 0:
@@ -310,9 +307,8 @@ def base_cohort(source, config):
     # the ancestry file mean the two universes differ, so relatives of them
     # could enter unpruned.
     unmatched = int(manifest.get("prune_unmatched", 0))
-    if unmatched > config.max_prune_unmatched:
-        raise ValueError(f"{unmatched} relatedness-prune IDs are outside the ancestry universe "
-                         f"(allowed: {config.max_prune_unmatched})")
+    if unmatched:
+        raise ValueError(f"{unmatched} relatedness-prune IDs are outside the ancestry universe")
     person = source.table("person")
     person_id = person.column("person_id").to_numpy()
     flow = Flow("cdr_persons", len(person_id))
@@ -348,6 +344,8 @@ def base_cohort(source, config):
     flow.step("lookback", keep)
 
     rows = np.flatnonzero(keep)
+    if not len(rows):
+        raise ValueError("the base cohort is empty")
     base_id = person_id[rows]
     cutoff = float((datetime.date.fromisoformat(manifest["cdr_cutoff"]) - EPOCH).days)
 
@@ -622,6 +620,8 @@ def followup_distribution(base, config):
     ehr_end, obs_end, death = frame._ehr_end.to_numpy(), frame._obs_end.to_numpy(), frame._death.to_numpy()
     observed_to = np.minimum(ehr_end, base.cdr_cutoff_day)
     eligible = ~(death <= landmark) & (observed_to > landmark)
+    if not eligible.any():
+        raise ValueError("no base participant is alive with EHR past the landmark")
     administrative = (base.cdr_cutoff_day - landmark)[eligible] / YEAR
     observed = (observed_to - landmark)[eligible] / YEAR
     entry_year = _year(landmark[eligible])
@@ -630,11 +630,11 @@ def followup_distribution(base, config):
     gap = (obs_end - ehr_end)[both] / YEAR
     died = ~np.isnan(death)
 
-    def fraction(mask, within):
-        return float(mask[within].mean()) if within.any() else 0.0
+    def fraction(mask, within):  # None where the denominator is empty: undefined, not zero
+        return float(mask[within].mean()) if within.any() else None
 
     def median(values):
-        return float(np.median(values)) if len(values) else 0.0
+        return float(np.median(values)) if len(values) else None
 
     return {
         "quantiles": list(QUANTILES),

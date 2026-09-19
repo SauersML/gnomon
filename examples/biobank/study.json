@@ -9,7 +9,7 @@
     "google_project": null,
     "workspace_cdr": null,
     "query_timeout_seconds": 1800,
-    "maximum_bytes_billed": 50000000000,
+    "maximum_bytes_billed": 100000000000,
     "genotype_prefix": "gs://vwb-aou-datasets-controlled/v8/microarray/plink/arrays"
   },
   "cohort": {
@@ -20,7 +20,6 @@
     "min_age": 18,
     "test_fraction": 0.2,
     "dev_folds": 5,
-    "max_prune_unmatched": 0,
     "exclusion_competing_fraction": 0.01,
     "horizon_candidates": [1, 2, 3, 4, 5],
     "horizon_min_reach": 0.5

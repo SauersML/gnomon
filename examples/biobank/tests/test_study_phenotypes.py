@@ -270,8 +270,6 @@ def test_prune_outside_the_ancestry_universe_is_refused(tmp_path):
     source = cohort.ParquetSource(tmp_path)
     with pytest.raises(ValueError, match="outside the ancestry universe"):
         phenotypes.base_cohort(source, CONFIG)
-    allowed = phenotypes.CohortConfig(seed=CONFIG.seed, max_prune_unmatched=3)
-    assert len(phenotypes.base_cohort(source, allowed).frame) == 24
 
 
 # --------------------------------------------------------------------------- #
@@ -556,3 +554,10 @@ def test_build_frames_at_400k(tmp_path):
           f"{len(base.frame)} base rows, {rows} frame rows")
     assert len(base.frame) > 200_000  # the fixture draws about 65% eligible (ancestry, prune, PCs, lookback ...)
     assert built - opened < 60, "frame construction is no longer vectorized"
+
+
+def test_the_shipped_study_config_loads():
+    """study.json's cohort block is exactly CohortConfig's fields (from_json refuses unknown keys)."""
+    config = json.loads((Path(__file__).resolve().parents[1] / "study.json").read_text())
+    cohort_config = phenotypes.CohortConfig.from_json(config["cohort"])
+    assert cohort_config.seed not in phenotypes.SPENT_SEEDS
