@@ -684,7 +684,7 @@ METRICS = {
     # Simulator only: accuracy against the true risk, and each metric on the uncensored outcomes.
     "rmse_true": "score", "mae_true": "score", "bias_true": "score", "corr_true": "score",
     "mean_true": "proportion", "risk_unc": "proportion", "auc_unc": "score", "brier_unc": "score",
-    "auc_unc_diff_se": "score", "brier_unc_diff_se": "score", "risk_unc_diff_se": "score",
+    "n_unc": "count", "auc_unc_diff_se": "score", "brier_unc_diff_se": "score", "risk_unc_diff_se": "score",
     "auc_unc_diff_se_known_g": "score", "brier_unc_diff_se_known_g": "score", "risk_unc_diff_se_known_g": "score",
     "oe_true": "score", "cal_slope_true": "score", "auc_true": "score", "slope_bias_true": "score",
     "slope_rmse_true": "score",
@@ -821,7 +821,8 @@ def survival_cell(t, code, w, model, rows, P, variants, fit, stratum, horizon, m
     (competing); w the IPCW weights of `model`, the evaluation's censoring model,
     and `rows` the cell's indices among its rows; P the (variants x rows) CIFs at the horizon.
     truth (simulator only): (true CIF at h, uncensored follow-up, uncensored event code, G where the
-    uncensored outcome is decided: T- for an event of either cause by h, else h) per row.
+    uncensored outcome is decided: T- for an event of either cause by h, else h, and whether the row has an
+    uncensored outcome at all) per row.
 
     Every IPCW standard error carries the censoring model's own estimation (Censoring.variance). Reported only
     where the prespecified support rule holds: at least `minimum` cases, known non-cases and rows followed past
@@ -863,10 +864,18 @@ def survival_cell(t, code, w, model, rows, P, variants, fit, stratum, horizon, m
             concordance[name] = refusal
     truth_rows = [{} for _ in variants]
     if truth is not None:
-        true_cif, t_unc, code_unc, g_unc = truth
-        y_unc = ((code_unc == 1) & (t_unc <= horizon)).astype(float)
+        true_cif, t_unc, code_unc, g_unc, defined = truth
         truth_rows = truth_metrics(P, true_cif, *(slopes or (None, None)))
-
+        # The uncensored comparisons run over the m rows that have an uncensored outcome (see evaluate()); the
+        # released values count all n rows. The k0 others censored at entry sit inside G's jump at 0, so with no
+        # bias a row with an outcome is observed with probability n / (n - k0) G_i, and that is its G in the
+        # paired SEs: under the marginal G it is exactly those rows' own G. (Others followed past entry, as the
+        # cutoff frame's are, are observed non-cases and stay in the released values.)
+        m = int(defined.sum())
+        at_entry = int(np.sum(~defined & (t == 0)))
+        t_unc, code_unc, own = t_unc[defined], code_unc[defined], rows[defined]
+        g_unc = np.minimum(g_unc[defined] * n / max(n - at_entry, 1), 1.0)
+        y_unc = ((code_unc == 1) & (t_unc <= horizon)).astype(float)
         event_unc = (code_unc != 0) & (t_unc <= horizon)
 
         def paired_se(name, uncensored):
@@ -877,18 +886,19 @@ def survival_cell(t, code, w, model, rows, P, variants, fit, stratum, horizon, m
             # are (w - 1) u >= 0 in a cell that lost no case, and their sample SD collapses there (z ~ sqrt(cases);
             # study-eval's N2a oracle, 09-19). The first carries G's estimation (Censoring.conditional_variance);
             # the second, sum u_i^2 (1 / G_i - 1), holds G known, which is conservative while G is well estimated.
-            with_g = model.conditional_variance(rows, uncensored, g_unc, t_unc, event_unc, horizon)
+            with_g = model.conditional_variance(own, uncensored, g_unc, t_unc, event_unc, horizon)
             return {f"{name}_diff_se": float(np.sqrt(with_g)),
                     f"{name}_diff_se_known_g": float(np.sqrt(np.sum(uncensored ** 2 * (1 / g_unc - 1))))}
 
-        for a, p in enumerate(P):
+        for a, p in enumerate(P[:, defined] if m else ()):
             unc_loss = (y_unc - p) ** 2
             truth_rows[a].update(
-                mean_true=float(true_cif.mean()), risk_unc=float(y_unc.mean()), brier_unc=float(unc_loss.mean()),
-                **paired_se("risk_unc", y_unc / n), **paired_se("brier_unc", unc_loss / n))
-            if 0 < y_unc.sum() < n:
-                auc_unc, influence_unc = weighted_auc(p, y_unc, np.ones(n))
-                truth_rows[a].update(auc_unc=auc_unc, **paired_se("auc_unc", influence_unc / n))
+                n_unc=m, mean_true=float(true_cif[defined].mean()), risk_unc=float(y_unc.mean()),
+                brier_unc=float(unc_loss.mean()), **paired_se("risk_unc", y_unc / m),
+                **paired_se("brier_unc", unc_loss / m))
+            if 0 < y_unc.sum() < m:
+                auc_unc, influence_unc = weighted_auc(p, y_unc, np.ones(m))
+                truth_rows[a].update(auc_unc=auc_unc, **paired_se("auc_unc", influence_unc / m))
     out = []
     for a, variant in enumerate(variants):
         p, (auc, influence) = P[a], fits[a]
@@ -953,12 +963,14 @@ def evaluate(kind, test, predictions, horizons, config, train=None, truth=None, 
     """Every row of the single results table for one disease and model, from its outer-test rows.
 
     kind: "binary" or "survival". test: the outer-test frame (binary: `y`; survival: `followup`, `event` (0
-    censored, 1 disease, 2 death, competing) and `entry_age`; both: the axis and
-    censoring columns, and admin_years). predictions: (variant, fit) ->
+    censored, 1 disease, 2 death, competing; a follow-up of 0 only censored at entry) and `entry_age`; both: the
+    axis and censoring columns, and admin_years). predictions: (variant, fit) ->
     risk per test row (binary) or rows x horizons CIF (survival), NaN outside the fit's rows; fit is "pooled"
     or "logo:<axis>:<group>". A LOGO row is the pooled cell of its held-out group, with stratum "overall".
     truth (simulator only): rows aligned with test carrying p_ever (binary) or cif_<h>y, uncensored_event and
-    uncensored_exit_age (survival). slopes (simulator only): (variant, fit) -> the predicted PGS slope per test row
+    uncensored_exit_age (survival; the two uncensored columns are null on a row the no-exit world would not admit,
+    which the frame censors at entry, and those rows drop out of the uncensored comparisons alone, counted by
+    n_unc). slopes (simulator only): (variant, fit) -> the predicted PGS slope per test row
     (binary) or rows x horizons (survival), set beside truth's slope (binary) or slope_cif_<h>y (survival); both
     must be per the POOLED model's z, score / sd over all development rows, LOGO fits included (study.py rescales
     truth by sd_pooled / z_sd and each fit's slope by sd_pooled / sd_fit).
@@ -1013,8 +1025,14 @@ def evaluate(kind, test, predictions, horizons, config, train=None, truth=None, 
             eligible = np.ones(len(sub), bool) if potential is None else potential >= horizon
             frame = sub.loc[eligible].rename(columns={"event": "event_code"}).reset_index(drop=True)
             t, code = frame.followup.to_numpy(float), frame.event_code.to_numpy(int)
-            if not ((t > 0).all() and np.isin(code, (0, 1, 2)).all()):
-                raise ValueError("follow-up must be positive and events 0, 1 or 2")
+            if (t < 0).any():
+                raise ValueError("survival follow-up must be non-negative")
+            if not np.isin(code, (0, 1, 2)).all():
+                raise ValueError("a survival event code outside events 0, 1 or 2 (censored, disease, death)")
+            # A row may exit at entry only censored: study-cohort's frames censor an EHR with no record after the
+            # landmark there (gnomon#2400), and a disease event or death at the landmark cannot occur in a kept row.
+            if ((t == 0) & (code != 0)).any():
+                raise ValueError("a survival row exiting at entry must be censored, not an event")
             model = Censoring(frame, horizon, settings.get("censoring", "cox"),
                               tuple(c for c in settings.get("censoring_covariates", CENSORING_COVARIATES)
                                     if c in frame))
@@ -1025,12 +1043,27 @@ def evaluate(kind, test, predictions, horizons, config, train=None, truth=None, 
             truth_all = slope_all = None
             if sub_truth is not None:
                 known = sub_truth.loc[eligible].reset_index(drop=True)
-                t_unc = known.uncensored_exit_age.to_numpy(float) - frame.entry_age.to_numpy(float)
-                code_unc = known.uncensored_event.to_numpy(int)
+                true_cif = known[f"cif_{horizon:g}y"].to_numpy(dtype=float, na_value=np.nan)
+                if not np.isfinite(true_cif).all():
+                    raise ValueError(f"the truth lacks cif_{horizon:g}y on {int((~np.isfinite(true_cif)).sum())} rows")
+                # A frame row the no-exit world would not admit (its EHR exit came by the landmark, and a latent
+                # code after that exit and by the landmark was never recorded) has no uncensored outcome. The
+                # last-contact frame censors it at entry; the cutoff frame follows it, event-free or to a death, as
+                # no record can follow its EHR exit. Its uncensored terms are skipped by name, never cast. A null
+                # on a recorded disease event, or on one of the two columns only, is a truth defect.
+                exit_unc = known.uncensored_exit_age.to_numpy(dtype=float, na_value=np.nan)
+                event_unc = known.uncensored_event.to_numpy(dtype=float, na_value=np.nan)
+                defined = np.isfinite(exit_unc) & np.isfinite(event_unc)
+                partial = np.isfinite(exit_unc) != np.isfinite(event_unc)
+                if partial.any() or (~defined & (code == 1)).any():
+                    raise ValueError("a truth row's uncensored outcome is partly null, or null on a recorded disease "
+                                     "event")
+                t_unc = np.where(defined, exit_unc - frame.entry_age.to_numpy(float), np.nan)
+                code_unc = np.where(defined, event_unc, 0.0).astype(int)
                 # G where each row's uncensored outcome is decided: T- for an event of either cause by h, else h.
-                g_unc = np.where((code_unc != 0) & (t_unc <= horizon), model.at(t_unc, left=True),
-                                 model.at(horizon))
-                truth_all = (known[f"cif_{horizon:g}y"].to_numpy(float), t_unc, code_unc, g_unc)
+                decided = defined & (code_unc != 0) & (t_unc <= horizon)
+                g_unc = np.where(decided, model.at(np.where(decided, t_unc, horizon), left=True), model.at(horizon))
+                truth_all = (true_cif, t_unc, code_unc, g_unc, defined)
                 if S_fit is not None and f"slope_cif_{horizon:g}y" in known:
                     slope_all = (np.vstack([s.reshape(len(sub), -1)[eligible, j] for s in S_fit]),
                                  known[f"slope_cif_{horizon:g}y"].to_numpy(float))

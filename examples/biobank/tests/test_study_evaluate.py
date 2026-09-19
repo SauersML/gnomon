@@ -604,6 +604,110 @@ def test_the_uncensored_difference_se_counts_every_case_chance_of_censoring():
     assert diff / sample > 4
 
 
+RELEASED = ("obs_risk", "obs_risk_se", "auc", "auc_se", "brier", "brier_se", "cal_int", "cal_int_se", "cal_slope",
+            "cal_slope_se", "c_harrell", "c_uno")
+
+
+def test_a_row_censored_at_entry_is_a_censoring_at_time_zero():
+    """study-cohort's frames censor an EHR with no record after the landmark at entry: follow-up 0, event 0. Under
+    the marginal G that is a censoring before every event, which the Aalen-Johansen incidence ignores, so every
+    released IPCW value and its SE (with G's estimation) equal those of the frame without such rows, while n
+    counts them. A follow-up of 0 with a disease event or a death is refused, and so is a negative one, each by
+    its own message."""
+    rng = np.random.default_rng(29)
+    t, code, risk, _ = survival_sample(3000, 29)
+    frame = pd.DataFrame({"followup": t, "event": code, "entry_age": rng.uniform(40, 70, len(t)),
+                          **{axis: "all" for axis in ev.AXES["survival"]}})
+    silent = frame.iloc[:300].assign(followup=0.0, event=0)
+    horizons = [1.0, 2.0]
+
+    def overall(f, p):
+        rows = ev.evaluate("survival", f, {("ours", "pooled"): np.column_stack([p, p])}, horizons,
+                           {"evaluate": {"censoring": "km"}})
+        return {r["horizon"]: r for r in rows if r["stratum"] == "overall" and r["status"] == "ok"}
+
+    alone = overall(frame, risk)
+    both = pd.concat([frame, silent], ignore_index=True)
+    with_silent = overall(both, np.r_[risk, risk[:300]])
+    assert set(alone) == set(with_silent) == set(horizons)
+    for h in horizons:
+        a, b = alone[h], with_silent[h]
+        assert b["n"] == a["n"] + 300 and b["cases"] == a["cases"]
+        for name in RELEASED:
+            assert b[name] == pytest.approx(a[name], rel=1e-9, abs=1e-15), (h, name)
+    predictions = {("ours", "pooled"): np.column_stack([np.r_[risk, risk[:300]]] * 2)}
+    for bad in (1, 2):
+        planted = both.copy()
+        planted.loc[len(frame), "event"] = bad
+        with pytest.raises(ValueError, match="exiting at entry must be censored"):
+            ev.evaluate("survival", planted, predictions, horizons, {})
+    planted = both.copy()
+    planted.loc[len(frame), "followup"] = -0.01
+    with pytest.raises(ValueError, match="follow-up must be non-negative"):
+        ev.evaluate("survival", planted, predictions, horizons, {})
+
+
+def test_a_truth_row_without_an_uncensored_outcome_leaves_the_uncensored_comparisons_only():
+    """study-cohort's truth has no uncensored outcome for a frame row the no-exit world would not admit (its EHR
+    exit came by the landmark, before a latent code that was never recorded). The last-contact frame censors it
+    at entry; the cutoff frame follows it, event-free or to a death. Such rows leave the uncensored comparisons
+    (risk_unc, brier_unc, auc_unc, mean_true and the paired SEs; n_unc counts the rest) and nothing else, and are
+    never cast to an event code. Censored at entry under the marginal G, the comparisons equal those of the frame
+    without them: the released values exactly, and the known-G paired SE through its n / (n - k0) G. A null on a
+    recorded disease event, or on one column only, is a truth defect."""
+    rng = np.random.default_rng(30)
+    n, cases, censored, silent, h = 4000, 60, 400, 150, 1.0
+    t = np.full(n, 2.0)
+    code = np.zeros(n, int)
+    t[:cases], code[:cases] = rng.uniform(0.01, 0.99, cases), 1
+    t[cases:cases + censored] = rng.uniform(0.01, 0.99, censored)
+    entry = rng.uniform(40, 70, n + silent)
+    p = rng.uniform(0.005, 0.03, n + silent)
+    t_unc = np.where(code == 1, t, 2.0)
+
+    def run(k, followed=False, event_free=False, **null):
+        # k extra rows: censored at entry, or (followed) event-free past h with one death at 0.5 y; their truth is
+        # null, or (event_free) an uncensored non-case.
+        extra_t, extra_code = np.zeros(k), np.zeros(k, int)
+        if followed and k:
+            extra_t[:], extra_t[0], extra_code[0] = 2.0, 0.5, 2
+        frame = pd.DataFrame({"followup": np.r_[t, extra_t], "event": np.r_[code, extra_code],
+                              "entry_age": entry[:n + k], **{axis: "all" for axis in ev.AXES["survival"]}})
+        extra_event, extra_exit = (np.zeros(k), np.full(k, 2.0)) if event_free else (np.full(k, np.nan),) * 2
+        truth = pd.DataFrame({"cif_1y": p[:n + k], "uncensored_event": np.r_[code, extra_event],
+                              "uncensored_exit_age": entry[:n + k] + np.r_[t_unc, extra_exit]})
+        for column, row in null.items():
+            truth.loc[row, column] = np.nan
+        rows = ev.evaluate("survival", frame, {("ours", "pooled"): p[:n + k, None]}, [h],
+                           {"evaluate": {"censoring": "km"}}, truth=truth)
+        return next(r for r in rows if r["stratum"] == "overall" and r["status"] == "ok")
+
+    alone, with_null = run(0), run(silent)
+    assert with_null["n"] == n + silent and with_null["n_unc"] == n == alone["n_unc"]
+    assert with_null["risk_unc"] == alone["risk_unc"] == cases / n
+    assert with_null["mean_true"] == pytest.approx(p[:n].mean(), rel=1e-12)
+    # Planted: the same rows read as uncensored non-cases (what the NaN cast did) move risk_unc.
+    as_non_cases = run(silent, event_free=True)
+    assert as_non_cases["risk_unc"] == pytest.approx(cases / (n + silent), rel=1e-12)
+    assert with_null["risk_unc"] != pytest.approx(as_non_cases["risk_unc"], rel=1e-6)
+    for name in ("obs_risk", "risk_unc", "brier_unc", "auc_unc", "risk_unc_diff_se_known_g",
+                 "brier_unc_diff_se_known_g", "auc_unc_diff_se_known_g"):
+        assert with_null[name] == pytest.approx(alone[name], rel=1e-9), name
+    # G's estimation adds the entry censorings' own jump, a small term.
+    for name in ("risk_unc_diff_se", "brier_unc_diff_se", "auc_unc_diff_se"):
+        assert with_null[name] == pytest.approx(alone[name], rel=0.02), name
+    # Followed null rows (the cutoff frame's) are skipped too, and stay in the released values as non-cases.
+    followed = run(silent, followed=True)
+    assert followed["n"] == n + silent and followed["n_unc"] == n and followed["risk_unc"] == cases / n
+    assert followed["cases"] == cases and np.isfinite(followed["risk_unc_diff_se"])
+    # Row 0 is a recorded case: both columns null there, or one of them; and one column null on another row.
+    for null in ({"uncensored_event": 0, "uncensored_exit_age": 0}, {"uncensored_event": 0}):
+        with pytest.raises(ValueError, match="partly null, or null on a recorded disease event"):
+            run(silent, **null)
+    with pytest.raises(ValueError, match="partly null"):
+        run(silent, event_free=True, uncensored_exit_age=n)
+
+
 @pytest.mark.parametrize("kind", ["km", "cox"])
 def test_the_uncensored_difference_se_matches_censoring_redrawn_given_the_truth(kind):
     """Given one uncensored world, over 1000 redraws of the censoring alone (site-dependent for the Cox model), the
