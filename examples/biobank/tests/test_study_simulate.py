@@ -382,8 +382,10 @@ def test_planted_errors_fire():
 def test_competitor_true_worlds_have_closed_forms():
     """Without death, exit and rule-out codes, and with a next-day second code, the truth reduces to G of the index:
     p_ever = G(u(cutoff)), P(entry) = 1 - F(aL), and cif_h = (F(t_h) - F(aL)) / (1 - F(aL)). The binary worlds then
-    lie exactly in the named competitor's family."""
-    for scenario in ("true_standard_binary", "true_zpc_binary", "true_covariates_binary", "true_calpred_binary"):
+    lie exactly in the named competitor's family: G^-1(p_ever) is linear in its covariates (probit for the true_*
+    worlds, the pipeline's link; logit for the logittrue_* misspecification world)."""
+    for scenario in ("true_standard_binary", "true_zpc_binary", "true_covariates_binary", "true_calpred_binary",
+                     "logittrue_standard_binary"):
         world, s = world_and_sample(5000, 5, scenario)
         p = s["people"]
         birth = p["birth"]
@@ -408,17 +410,17 @@ def test_competitor_true_worlds_have_closed_forms():
                 assert np.max(np.abs(t["cif"][ok, i] - closed[ok])) < 1e-7, (scenario, dp.spec.slug, h)
             if scenario == "true_calpred_binary":
                 continue
-            # logit p_ever is linear in the covariates the logistic competitors use (z x PC terms for zpc)
+            # G^-1(p_ever) is linear in the covariates the competitor uses (z x PC terms for zpc)
             z = (rec["pgs"] - rec["pgs"][ok].mean()) / rec["pgs"][ok].std()
             age = (p["baseline"] - birth) / sim.DAYS
             admin = (sim.day(sim.CDR_CUTOFF) - p["baseline"]) / sim.DAYS
             cols = [np.ones(len(z)), age, admin, p["male"], *p["pcs"][:, :6].T]
-            if scenario != "true_covariates_binary":
+            if "covariates" not in scenario:
                 cols.append(z)
-            if scenario == "true_zpc_binary":
+            if "zpc" in scenario:
                 cols += [z * p["pcs"][:, k] for k in range(6)]
             x = np.column_stack(cols)[ok]
-            y = np.log(t["p_ever"][ok] / (1.0 - t["p_ever"][ok]))
+            y = world.link.ppf(t["p_ever"][ok])
             coef, *_ = np.linalg.lstsq(x, y, rcond=None)
             assert np.max(np.abs(y - x @ coef)) < 1e-6, (scenario, dp.spec.slug, np.max(np.abs(y - x @ coef)))
 

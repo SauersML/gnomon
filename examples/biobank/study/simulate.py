@@ -93,10 +93,16 @@ Usage
     simulate.py reference --projection data.projection_scores.bin --labels kg_pop.tsv --out reference_pcs.parquet
     simulate.py generate --out DIR --n 20000 --seed 1 [--scenario realistic] [--reference reference_pcs.parquet]
     simulate.py publish --root /scratch.global/sauer354/aou-study/sim/v1 --reference ... --git-sha SHA
-The scenarios are ``realistic`` (a), ``null_slope`` (b, constant slope), and ``gaussian_pgs`` (c, a Gaussian
-score law in every ancestry). The ``true_*`` worlds make each competitor the true model (see SCENARIOS), and
-``holdout`` is the claim run's scenario, never to be used for selection. Each writes one table directory per
-censoring rule. ``--world-seed`` fixes the data-
+The scenarios are:
+- ``realistic`` (a);
+- ``null_slope`` (b): a constant slope;
+- ``gaussian_pgs`` (c): a Gaussian score law in every ancestry;
+- ``age_slope``: the slope also weakens with age;
+- ``subcontinental``: per-1KG-population effects that live in PC7-16;
+- the competitor-true worlds: ``true_*`` under the pipeline's probit link, and the ``logittrue_*`` and ``coxtrue_*``
+  link-misspecification worlds (see SCENARIOS);
+- ``holdout``: the claim run's scenario, never to be used for selection.
+Each scenario writes one table directory per censoring rule. ``--world-seed`` fixes the data-
 generating process (sites, disease parameters, ancestry shifts), and ``--seed`` draws a fresh sample from it, so
 replicate seeds are samples of one world. ``publish`` uses one seed per size for every scenario, so the scenarios
 are paired: the same people, scores and uniforms, differing only in the scenario's knobs.
@@ -416,34 +422,43 @@ def load_diseases(path: str | Path) -> list[DiseaseSpec]:
 
 
 REALISTIC = dict(link=("ao", 0.5), pgs_shape=True, slope="distance", eta="full", law="ancestry", coding="ehr",
-                 death=True, exit=True, alpha="saturating", scale="one", site_scale=1.0)
-# Competitor-true worlds (audit S3): the named competitor's family holds the truth exactly, so ours must tie. No
-# unobserved heterogeneity (eta = sex + linear PC1-6), one affine law of z in every ancestry (still skewed and
-# heavy tailed), no rule-out codes and a second code on the day after onset.
-#   binary (no death, no exit, linear alpha): logit P(y) is linear in age at baseline, admin years, sex, PCs, and z
-#     (covariates: no z; standard: + beta z; zpc: + (beta + zeta'PC) z); calpred: probit with the whole index
-#     divided by exp(nu'PC), i.e. PC-dependent mean and log-variance of the liability;
-#   survival (cloglog, saturating alpha): proportional hazards on the age scale, so Cox with delayed entry is true
-#     (covariates, standard, zpc as above; death competes); calpred: probit location-scale in log age.
-_BIN = dict(REALISTIC, link=("ao", 1.0), eta="linear", law="affine", coding="instant", death=False, exit=False,
+                 death=True, exit=True, alpha="saturating", scale="one", site_scale=1.0, pop_effects=False)
+# Competitor-true worlds (audit S3; SPEC section 8: "generates data from the competitor EXACTLY as the pipeline fits
+# it"). The competitors share ours' probit link and covariate part (s(age), sex, duchon(PC1..6), windows) and differ
+# only in how z enters, so these worlds use the probit link, with no unobserved heterogeneity (eta = sex + linear
+# PC1-6), one affine law of z in every ancestry (still skewed and heavy tailed), no rule-out codes, and a second
+# code on the day after onset.
+#   binary (no death, no exit, linear alpha): Phi^-1 P(y) is linear in age at baseline, admin years, sex and PCs,
+#     plus nothing (covariates), beta z (standard), (beta + zeta'PC) z (zpc); calpred divides the whole index by
+#     exp(nu'PC), a PC-dependent mean and log-SD of the liability;
+#   survival (death competes, exit on): P(T <= a) = Phi(c0 + c1 log(a / 50) + the same index), a probit
+#     transformation model on the age scale.
+# The logittrue_* and coxtrue_* worlds keep the earlier logit (binary) and cloglog (survival, so Cox with delayed
+# entry is true) versions as link-misspecification worlds (lead, 23:55Z).
+_BIN = dict(REALISTIC, link=("probit",), eta="linear", law="affine", coding="instant", death=False, exit=False,
             alpha="linear")
-_SURV = dict(REALISTIC, link=("cloglog",), eta="linear", law="affine", coding="instant")
+_SURV = dict(REALISTIC, link=("probit",), eta="linear", law="affine", coding="instant", alpha="log")
+_COMPETITOR_SLOPES = {"covariates": dict(slope="zero"), "standard": dict(slope="constant"),
+                      "zpc": dict(slope="linear_pc"), "calpred": dict(slope="constant", scale="calpred")}
 SCENARIOS = {
     "realistic": REALISTIC,
     "null_slope": dict(REALISTIC, slope="constant"),
     "gaussian_pgs": dict(REALISTIC, pgs_shape=False),
-    "true_covariates_binary": dict(_BIN, slope="zero"),
-    "true_standard_binary": dict(_BIN, slope="constant"),
-    "true_zpc_binary": dict(_BIN, slope="linear_pc"),
-    "true_calpred_binary": dict(_BIN, link=("probit",), slope="constant", scale="calpred"),
-    "true_covariates_survival": dict(_SURV, slope="zero"),
-    "true_standard_survival": dict(_SURV, slope="constant"),
-    "true_zpc_survival": dict(_SURV, slope="linear_pc"),
-    "true_calpred_survival": dict(_SURV, link=("probit",), slope="constant", scale="calpred", alpha="log"),
+    # a slope that also weakens with age at consent: the evidence the SPEC asks for before ours adds an age term
+    "age_slope": dict(REALISTIC, slope="distance_age"),
+    # per-1KG-population baseline and slope effects: sub-continental structure that lives in PC7-16 (audit)
+    "subcontinental": dict(REALISTIC, pop_effects=True),
+    **{f"true_{k}_binary": dict(_BIN, **v) for k, v in _COMPETITOR_SLOPES.items()},
+    **{f"true_{k}_survival": dict(_SURV, **v) for k, v in _COMPETITOR_SLOPES.items()},
+    **{f"logittrue_{k}_binary": dict(_BIN, link=("ao", 1.0), **_COMPETITOR_SLOPES[k])
+       for k in ("covariates", "standard", "zpc")},
+    **{f"coxtrue_{k}_survival": dict(_SURV, link=("cloglog",), alpha="saturating", **_COMPETITOR_SLOPES[k])
+       for k in ("covariates", "standard", "zpc")},
     # The claim run's scenario, never used for selection (SPEC section 8, S4): a heavier-tailed link, a slope that also
     # weakens with age at consent, and larger site effects. Draw it only at claim time, with a fresh world seed.
     "holdout": dict(REALISTIC, link=("ao", 2.0), slope="distance_age", site_scale=1.5),
 }
+COMPETITOR_WORLDS = tuple(k for k in SCENARIOS if k.startswith(("true_", "logittrue_", "coxtrue_")))
 PUBLISHED = ("realistic", "null_slope", "gaussian_pgs")
 CENSORING = ("independent", "lastcontact")
 
@@ -465,6 +480,8 @@ class DiseaseParams:
     pc_effect: np.ndarray = field(default_factory=lambda: np.zeros(6))
     pc_slope: np.ndarray = field(default_factory=lambda: np.zeros(6))
     pc_scale: np.ndarray = field(default_factory=lambda: np.zeros(6))
+    pop_eta: dict = field(default_factory=dict)       # 1KG population -> baseline shift (probit units)
+    pop_slope: dict = field(default_factory=dict)     # 1KG population -> log slope multiplier
 
     def describe(self) -> dict:
         s = self.spec
@@ -476,7 +493,8 @@ class DiseaseParams:
                 "pgs_offset": self.offset, "law": {k: list(v) for k, v in self.law.items()},
                 "region_effect": self.region_effect, "alpha_kind": self.alpha_kind,
                 "pc_effect": self.pc_effect.tolist(), "pc_slope": self.pc_slope.tolist(),
-                "pc_scale": self.pc_scale.tolist(), "site_effect": [float(v) for v in self.site_effect]}
+                "pc_scale": self.pc_scale.tolist(), "pop_eta": self.pop_eta, "pop_slope": self.pop_slope,
+                "site_effect": [float(v) for v in self.site_effect]}
 
 
 @dataclass
@@ -568,6 +586,11 @@ def make_world(world_seed: int, scenario: str, specs: list[DiseaseSpec], ref: pd
                            "Midwest": float(rng.normal(0.0, 0.04)), "Northeast": 0.0},
             alpha_kind=cfg["alpha"], pc_effect=rng.normal(0.0, 0.12, 6), pc_slope=rng.normal(0.0, 0.15, 6),
             pc_scale=rng.normal(0.0, 0.10, 6)))
+    # Sub-continental effects per 1KG population, drawn last so every other world value is unchanged.
+    pops = sorted(ref["pop"].unique())
+    for dp in diseases:
+        dp.pop_eta = dict(zip(pops, rng.normal(0.0, 0.25, len(pops)).tolist()))
+        dp.pop_slope = dict(zip(pops, rng.normal(0.0, 0.20, len(pops)).tolist()))
     return World(scenario, link, sites, zip3, diseases, ref, ref_source, c_eur, d_afr, within,
                  x[:, :6].mean(0), x[:, :6].std(0))
 
@@ -643,10 +666,14 @@ def sample_people(world: World, n: int, rng: np.random.Generator) -> dict:
         w[m] = ww
     # Projection is linear in dosage, so an admixed genome projects near the mixture of its sources.
     pcs = np.zeros((n, x.shape[1]))
+    picks = np.zeros((n, len(COMPONENTS)), np.int64)
     for comp in COMPONENTS:
         idx, pw = pools[comp]
         pick = idx[rng.choice(len(idx), n, p=pw)]
+        picks[:, ci[comp]] = pick
         pcs += w[:, [ci[comp]]] * x[pick]
+    # the 1KG population of each person's main source individual (sub-continental structure, in PC7-16)
+    pop = ref["pop"].to_numpy()[picks[np.arange(n), np.argmax(w, axis=1)]]
     pcs += 0.15 * world.within_sd * rng.standard_normal(pcs.shape)
     dist = np.linalg.norm(pcs[:, :6] - world.c_eur, axis=1) / world.d_afr
     # ancestry_pred: a classifier on PC1-6, as AoU's is. Linear discriminants (pooled within-group covariance) with
@@ -750,7 +777,7 @@ def sample_people(world: World, n: int, rng: np.random.Generator) -> dict:
     in_ancestry = rng.random(n) > 0.05
     related = in_ancestry & (rng.random(n) < 0.05)
     genotyped = rng.random(n) > 0.02
-    return dict(n=n, person_id=ids, group=grp, w=w, pcs=pcs, dist=dist, label=label, birth=birth,
+    return dict(n=n, person_id=ids, group=grp, pop=pop, w=w, pcs=pcs, dist=dist, label=label, birth=birth,
                 baseline=baseline, has_baseline=has_baseline, a_base=a_base, sex_code=sex_code, male=male,
                 ehr=ehr, site=site, state=state, state_null=state_null, region=region, zip3=zip3,
                 zip_known=zip_known, zip_post=zip_post, in_map=in_map, dep=dep, ses_z=ses_z, e0=e0, x_exit=x_exit,
@@ -789,6 +816,8 @@ def person_disease_terms(world: World, dp: DiseaseParams, people: dict) -> dict:
         beta = base_slope * (1.0 + pcz @ dp.pc_slope)
     else:
         beta = np.zeros(n)
+    if cfg["pop_effects"]:
+        beta = beta * np.exp(pd.Series(people["pop"]).map(dp.pop_slope).fillna(0.0).to_numpy())
     beta = beta * scale
     site = people["site"]
     if cfg["eta"] == "full":
@@ -798,6 +827,8 @@ def person_disease_terms(world: World, dp: DiseaseParams, people: dict) -> dict:
         reg = pd.Series(people["region"]).map(dp.region_effect).fillna(0.0).to_numpy()
         eta = sd * (spec.male * people["male"] + anc + spec.ses * people["ses_z"] + reg + site_eff
                     + 0.05 * np.tanh(pcz[:, 3]))
+        if cfg["pop_effects"]:
+            eta = eta + sd * pd.Series(people["pop"]).map(dp.pop_eta).fillna(0.0).to_numpy()
     else:
         eta = sd * (spec.male * people["male"] + pcz @ dp.pc_effect)
     depth = world.sites.depth.to_numpy()[site]
@@ -1524,6 +1555,7 @@ def write_tables(sim, world, out: Path, censoring: str, meta: dict) -> dict:
     person_truth = pa.table({
         "person_id": pa.array(p["person_id"], pa.int64()),
         "group": pa.array(p["group"], pa.string()),
+        "pop1kg": pa.array(p["pop"], pa.string()),
         **{f"w_{c.lower()}": pa.array(p["w"][:, i], pa.float64()) for i, c in enumerate(COMPONENTS)},
         "genetic_distance": pa.array(p["dist"], pa.float64()),
         "site": pa.array(list(np.where(p["ehr"], world.sites.src_id.to_numpy()[p["site"]], None)), pa.string()),
@@ -1613,6 +1645,8 @@ def main(argv=None):
             g.add_argument("--root", required=True)
             g.add_argument("--sizes", default="small=20000,medium=100000,large=400000")
             g.add_argument("--scenarios", default=",".join(PUBLISHED))
+            g.add_argument("--append", action="store_true",
+                           help="add sets to an existing version (sets already there are kept, never rewritten)")
     a = ap.parse_args(argv)
     if a.cmd == "reference":
         ref = build_reference(a.projection, a.labels, a.out)
@@ -1623,13 +1657,25 @@ def main(argv=None):
         generate(Path(a.out), a.n, a.seed, a.scenario, a.world_seed, a.reference, a.diseases, sha, a.workers)
         return
     root = Path(a.root)
-    if root.exists() and any(root.iterdir()):
-        raise SystemExit(f"{root} exists and is not empty; published fixtures are read-only, use a new version")
     listing = {"generator": GENERATOR_VERSION, "git_sha": sha, "world_seed": a.world_seed, "sets": []}
+    if root.exists() and any(root.iterdir()):
+        if not a.append:
+            raise SystemExit(f"{root} exists and is not empty; published fixtures are read-only, use a new version")
+        listing = json.loads((root / "MANIFEST.json").read_text())
+        if listing["git_sha"] != sha or listing["world_seed"] != a.world_seed:
+            raise SystemExit(f"{root} was published from {listing['git_sha']}; append only from the same generator")
+        for path in [root, *root.iterdir()]:
+            if path.is_dir():
+                path.chmod(0o750)
+        (root / "MANIFEST.json").chmod(0o640)
+    have = {s["dir"] for s in listing["sets"]}
     for k, item in enumerate(a.sizes.split(",")):
         size, n = item.split("=")
         for scenario in a.scenarios.split(","):
             seed = 1000 * (k + 1)
+            if any(f"{size}/{scenario}_{c}" in have for c in CENSORING):
+                print(f"{size} {scenario} already published; kept", flush=True)
+                continue
             print(f"{size} {scenario} n={n} seed={seed}", flush=True)
             for m in generate(root / size, int(n), seed, scenario, a.world_seed, a.reference, a.diseases, sha,
                               a.workers):
