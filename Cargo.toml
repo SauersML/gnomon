@@ -155,6 +155,23 @@ grep = "0.3.2"
 name = "path_benchmark"
 harness = false
 
+# The probes are programs with their own main, which the default bench harness would never call.
+[[bench]]
+name = "map_memory_probe"
+harness = false
+
+[[bench]]
+name = "packed_score_probe"
+harness = false
+
+[[bench]]
+name = "prepare_probe"
+harness = false
+
+[[bench]]
+name = "process_census_probe"
+harness = false
+
 [[test]]
 name = "score"
 path = "score/tests/mod.rs"

@@ -137,7 +137,7 @@ fn setup_benchmark_context(
 
     let names: Vec<String> = (0..num_scores).map(|i| format!("score_{}", i)).collect();
     let exact = ExactPlan::new(
-        &sparse_weights,
+        sparse_weights,
         &sparse_missing_corrections,
         &sparse_score_columns,
         &sparse_row_offsets,
