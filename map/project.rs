@@ -35,8 +35,6 @@ pub(crate) struct GappedProjectionSource<S> {
     model_cursor: usize,
     n_samples: usize,
     inner_storage: Vec<f64>,
-    inner_quality: Vec<f64>,
-    block_quality: Vec<f64>,
     buffered_variants: usize,
     buffered_cursor: usize,
 }
@@ -61,8 +59,6 @@ where
             present_mask,
             model_cursor: 0,
             inner_storage: Vec::new(),
-            inner_quality: Vec::new(),
-            block_quality: Vec::new(),
             buffered_variants: 0,
             buffered_cursor: 0,
         })
@@ -86,14 +82,6 @@ where
             .next_block_into(max_variants.max(1), &mut self.inner_storage)?;
         self.buffered_variants = filled;
         self.buffered_cursor = 0;
-
-        if self.inner_quality.len() < filled {
-            self.inner_quality.resize(filled, 1.0);
-        }
-        if filled > 0 {
-            self.inner
-                .variant_quality(filled, &mut self.inner_quality[..filled]);
-        }
 
         Ok(filled > 0)
     }
@@ -130,10 +118,6 @@ where
             return Ok(0);
         }
 
-        if self.block_quality.len() < max_variants {
-            self.block_quality.resize(max_variants, 0.0);
-        }
-
         let mut filled = 0usize;
         while filled < max_variants && self.model_cursor < self.model_variants {
             let remaining_output = max_variants - filled;
@@ -149,7 +133,6 @@ where
                 let start = filled * self.n_samples;
                 let end = start + missing_run * self.n_samples;
                 storage[start..end].fill(f64::NAN);
-                self.block_quality[filled..filled + missing_run].fill(0.0);
                 self.model_cursor += missing_run;
                 filled += missing_run;
                 continue;
@@ -164,7 +147,6 @@ where
             let dst_start = filled * self.n_samples;
             let dst_end = dst_start + self.n_samples;
             storage[dst_start..dst_end].copy_from_slice(&self.inner_storage[src_start..src_end]);
-            self.block_quality[filled] = self.inner_quality[self.buffered_cursor];
 
             self.buffered_cursor += 1;
             self.model_cursor += 1;
@@ -183,11 +165,6 @@ where
             self.model_cursor.min(self.model_variants),
             Some(self.model_variants),
         ))
-    }
-
-    fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
-        let limit = filled.min(storage.len()).min(self.block_quality.len());
-        storage[..limit].copy_from_slice(&self.block_quality[..limit]);
     }
 
     fn hard_call_packed(&mut self) -> Option<HardCallPacked<'_>> {
@@ -1323,7 +1300,6 @@ impl<'model> HwePcaProjector<'model> {
                     conditioning_out,
                     &missing_info_storage,
                     projection_global_info_packed,
-                    projection_global_info_packed,
                     normalization,
                     components,
                     packed_info_size,
@@ -1336,7 +1312,6 @@ impl<'model> HwePcaProjector<'model> {
                     conditioning_out,
                     &missing_variants,
                     projection_global_info_packed,
-                    projection_global_info_packed,
                     normalization,
                     loadings,
                     model_variants,
@@ -1348,7 +1323,6 @@ impl<'model> HwePcaProjector<'model> {
             eprintln!(
                 "> Projection backend path: dense/streaming input (no packed hard-call source)"
             );
-            let mut global_info_packed = vec![0.0f64; packed_info_size];
             let mut missing_info_storage = vec![
                 0.0f64;
                 n_samples.checked_mul(packed_info_size).ok_or_else(
@@ -1361,8 +1335,6 @@ impl<'model> HwePcaProjector<'model> {
                 .checked_mul(block_capacity)
                 .ok_or_else(|| HwePcaError::InvalidInput("Projection workspace size overflow"))?;
             let mut block_storage = vec![0.0f64; elements];
-            // Storage for per-variant imputation quality scores (INFO/R²)
-            let mut quality_storage = vec![1.0f64; block_capacity];
             let mut block_info_contrib = vec![0.0f64; block_capacity * packed_info_size];
             let mut processed = 0usize;
             let total_work = n_samples
@@ -1405,30 +1377,29 @@ impl<'model> HwePcaProjector<'model> {
                     ));
                 }
 
-                // Get per-variant imputation quality for this block
-                source.variant_quality(filled, &mut quality_storage[..filled]);
                 let loadings_block = loadings.submatrix(processed, 0, filled, components);
 
-                // Build per-variant packed contributions and accumulate global ideal info:
-                // C_j = quality_j * vech(L_j L_j^T), A_global += C_j
+                // The information a sample loses when variant j is missing:
+                // C_j = vech(L_j L_j^T). A value is observed or it is missing,
+                // and nothing else weights it. The projection is linear in the
+                // genotypes for a fixed set of observed markers, so a dosage
+                // E[g | data] projects to E[projection | data] with no weight at
+                // all; a per-variant imputation quality (INFO, R2, DR2) is a
+                // statistic of whichever samples were imputed together, and
+                // weighting by it would make one person's scores depend on the
+                // others.
                 let block_contrib_len = filled * packed_info_size;
                 if block_info_contrib.len() < block_contrib_len {
                     block_info_contrib.resize(block_contrib_len, 0.0);
-                } else {
-                    block_info_contrib[..block_contrib_len].fill(0.0);
                 }
                 for j_local in 0..filled {
-                    let quality = quality_storage[j_local];
                     let contrib = &mut block_info_contrib
                         [j_local * packed_info_size..(j_local + 1) * packed_info_size];
                     let mut idx = 0usize;
                     for k in 0..components {
                         let l_jk = loadings_block[(j_local, k)];
                         for l in k..components {
-                            let l_jl = loadings_block[(j_local, l)];
-                            let value = quality * l_jk * l_jl;
-                            contrib[idx] = value;
-                            global_info_packed[idx] += value;
+                            contrib[idx] = l_jk * loadings_block[(j_local, l)];
                             idx += 1;
                         }
                     }
@@ -1489,29 +1460,24 @@ impl<'model> HwePcaProjector<'model> {
                 );
                 standardize_projection_block(scaler, block.as_mut(), processed, filled, par);
 
-                // WLS: Apply omega weights to block for RHS calculation.
-                // omega = quality × w (linear weight)
-                // This ensures RHS matches standard projection (which uses x * w)
+                // The fit's LD weights, the same `x * w` the packed path's
+                // coefficient tables carry.
                 let weights_slice = ld_weights.unwrap_or(&[]);
                 for j in 0..filled {
                     let j_global = processed + j;
-                    let quality = quality_storage[j];
                     let w = if j_global < weights_slice.len() {
                         weights_slice[j_global]
                     } else {
                         1.0
                     };
-                    let omega = quality * w; // Linear weight!
-
-                    // Apply omega to this column
                     for i in 0..n_samples {
-                        block[(i, j)] *= omega;
+                        block[(i, j)] *= w;
                     }
                 }
 
                 let standardized = block.as_ref();
 
-                // RHS: scores += (x × omega) × V = V^T × Ω × x
+                // RHS: scores += (x × w) × V = V^T × W × x
                 let mut used_cuda = false;
                 if let Some(runtime) = cuda_rhs.as_mut() {
                     let packed_len = filled.saturating_mul(components);
@@ -1591,20 +1557,19 @@ impl<'model> HwePcaProjector<'model> {
             }
 
             progress.on_stage_finish(ProjectionProgressStage::Projection);
-            // `processed` is the number of per-variant terms that were summed
-            // into `global_info_packed`, i.e. the length of the accumulation
-            // whose rounding error the identity test has to allow for.
+            // Every sample's system is the model's global one less what that
+            // sample is missing, exactly as on the packed path, so both paths
+            // solve against the same cached matrix of `model_variants` terms.
             solve_projection_with_dense_missing_info(
                 scores,
                 alignment_out,
                 conditioning_out,
                 &missing_info_storage,
-                &global_info_packed,
                 projection_global_info_packed,
                 normalization,
                 components,
                 packed_info_size,
-                processed,
+                model_variants,
                 opts.on_zero_alignment,
             );
         }
@@ -1700,7 +1665,7 @@ impl RidgePolicy {
 struct ProjectionSolveBase {
     diag_indices: Vec<usize>,
     global_diag: Vec<f64>,
-    /// The global information matrix `VᵀΩV` itself — no ridge. Every per-sample
+    /// The global information matrix `VᵀV` itself — no ridge. Every per-sample
     /// system is this matrix minus the mass the sample is missing, so a ridge
     /// baked in here would ride into every solve whether or not it was needed.
     base_info: Vec<f64>,
@@ -1708,7 +1673,7 @@ struct ProjectionSolveBase {
     base_factor_ready: bool,
     global_trace: f64,
     base_alignment: Vec<f64>,
-    /// `VᵀΩV == I` to within the accumulation's own rounding error, so a fully
+    /// `VᵀV == I` to within the accumulation's own rounding error, so a fully
     /// observed sample needs no solve at all.
     info_is_identity: bool,
     /// Retained-mass trace below which a sample is declared undetermined.
@@ -1722,7 +1687,6 @@ struct ProjectionSolveBase {
 
 fn build_projection_solve_base(
     global_info_packed: &[f64],
-    model_info_packed: &[f64],
     normalization: &[f64],
     components: usize,
     accumulated_variants: usize,
@@ -1736,12 +1700,11 @@ fn build_projection_solve_base(
         .collect();
     let base_info = build_dense_lower_info_matrix(global_info_packed, components);
     let global_trace: f64 = global_diag.iter().sum();
-    // The ridge and the retention floor are fractions of the *model's* information,
-    // not of what this pass accumulated: a gap served with zero quality adds nothing
-    // to the accumulated system, so scaling from it made the ridge depend on how a
-    // caller spelled its gaps.
-    let model_trace: f64 = diag_indices.iter().map(|&idx| model_info_packed[idx]).sum();
-    let policy = RidgePolicy::new(model_trace, components);
+    // The ridge and the retention floor are fractions of the model's information.
+    // `global_info_packed` is the model's own matrix on every path, and a gap is
+    // information the sample is missing, so how a caller spelled its gaps cannot
+    // move either.
+    let policy = RidgePolicy::new(global_trace, components);
     let base_norm = symmetric_lower_one_norm(&base_info, components);
 
     let mut base_factor = base_info.clone();
@@ -1781,7 +1744,7 @@ fn build_projection_solve_base(
             components,
             accumulated_variants,
         ),
-        information_floor: model_trace * MIN_RETAINED_INFORMATION_FRACTION,
+        information_floor: global_trace * MIN_RETAINED_INFORMATION_FRACTION,
         policy,
         base_conditioning,
     }
@@ -1790,9 +1753,9 @@ fn build_projection_solve_base(
 /// Is the global information matrix the identity?
 ///
 /// This is the question the projection turns on. `global_info_packed` holds
-/// `VᵀΩV`; when the loadings are orthonormal and nothing is quality-down-weighted
-/// it is `I`, the weighted least squares system for a fully observed sample is
-/// `I ŝ = Vᵀy`, and the projection is just `Vᵀy`. Solving it anyway is not merely
+/// `VᵀV`; when the loadings are orthonormal it is `I`, the least squares system
+/// for a fully observed sample is `I ŝ = Vᵀy`, and the projection is just
+/// `Vᵀy`. Solving it anyway is not merely
 /// wasted work: the accumulated matrix is `I` plus rounding, so the solve
 /// *injects* that rounding into the scores instead of removing anything.
 ///
@@ -1801,8 +1764,7 @@ fn build_projection_solve_base(
 /// recursive summation of `n` terms has forward error bounded by `n·ε·Σ|terms|`,
 /// and each diagonal entry sums `‖V_k‖² = 1`, so `n·ε` bounds the relative
 /// deviation. Deviations larger than that are real structure — a
-/// non-orthonormal basis, or genuine quality weights — and must go to the
-/// solver.
+/// non-orthonormal basis — and must go to the solver.
 fn information_matrix_is_identity(
     global_info_packed: &[f64],
     components: usize,
@@ -2217,7 +2179,6 @@ fn solve_projection_with_dense_missing_info(
     mut conditioning_out: Option<MatMut<'_, f64>>,
     missing_info_storage: &[f64],
     global_info_packed: &[f64],
-    model_info_packed: &[f64],
     normalization: &[f64],
     components: usize,
     packed_info_size: usize,
@@ -2227,7 +2188,6 @@ fn solve_projection_with_dense_missing_info(
     let n_samples = scores.nrows();
     let solve_base = build_projection_solve_base(
         global_info_packed,
-        model_info_packed,
         normalization,
         components,
         accumulated_variants,
@@ -2357,7 +2317,6 @@ fn solve_projection_with_sparse_missing_variants(
     mut conditioning_out: Option<MatMut<'_, f64>>,
     missing_variants: &[Vec<u32>],
     global_info_packed: &[f64],
-    model_info_packed: &[f64],
     normalization: &[f64],
     loadings: faer::MatRef<'_, f64>,
     accumulated_variants: usize,
@@ -2367,7 +2326,6 @@ fn solve_projection_with_sparse_missing_variants(
     let components = scores.ncols();
     let solve_base = build_projection_solve_base(
         global_info_packed,
-        model_info_packed,
         normalization,
         components,
         accumulated_variants,
@@ -5022,109 +4980,33 @@ mod tests {
     }
 
     #[test]
-    fn gapped_projection_source_preserves_missing_gaps_quality_and_reset() {
-        struct QualityDenseBlockSource {
-            data: Vec<f64>,
-            qualities: Vec<f64>,
-            n_samples: usize,
-            cursor: usize,
-            last_block_start: usize,
-        }
-
-        impl QualityDenseBlockSource {
-            fn new(data: Vec<f64>, qualities: Vec<f64>, n_samples: usize) -> Self {
-                assert_eq!(data.len(), qualities.len() * n_samples);
-                Self {
-                    data,
-                    qualities,
-                    n_samples,
-                    cursor: 0,
-                    last_block_start: 0,
-                }
-            }
-        }
-
-        impl VariantBlockSource for QualityDenseBlockSource {
-            type Error = Infallible;
-
-            fn n_samples(&self) -> usize {
-                self.n_samples
-            }
-
-            fn n_variants(&self) -> usize {
-                self.qualities.len()
-            }
-
-            fn reset(&mut self) -> Result<(), Self::Error> {
-                self.cursor = 0;
-                self.last_block_start = 0;
-                Ok(())
-            }
-
-            fn next_block_into(
-                &mut self,
-                max_variants: usize,
-                storage: &mut [f64],
-            ) -> Result<usize, Self::Error> {
-                if max_variants == 0 {
-                    return Ok(0);
-                }
-                let remaining = self.n_variants().saturating_sub(self.cursor);
-                if remaining == 0 {
-                    return Ok(0);
-                }
-                let filled = remaining.min(max_variants);
-                let start = self.cursor * self.n_samples;
-                let len = filled * self.n_samples;
-                storage[..len].copy_from_slice(&self.data[start..start + len]);
-                self.last_block_start = self.cursor;
-                self.cursor += filled;
-                Ok(filled)
-            }
-
-            fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
-                let start = self.last_block_start;
-                let end = start + filled;
-                storage[..filled].copy_from_slice(&self.qualities[start..end]);
-            }
-        }
-
-        let inner = QualityDenseBlockSource::new(
-            vec![
-                10.0, 11.0, //
-                20.0, 21.0, //
-                30.0, 31.0,
-            ],
-            vec![0.25, 0.75, 0.5],
-            2,
-        );
+    fn gapped_projection_source_preserves_missing_gaps_and_reset() {
+        let data = vec![
+            10.0, 11.0, //
+            20.0, 21.0, //
+            30.0, 31.0,
+        ];
+        let inner = DenseBlockSource::new(&data, 2, 3).expect("dense source");
         let mut source =
             GappedProjectionSource::new(inner, vec![false, true, false, true, true, false])
                 .expect("gapped source");
 
         let mut storage = vec![0.0; 4];
-        let mut quality = vec![1.0; 2];
 
         let filled = source.next_block_into(2, &mut storage).expect("block 1");
         assert_eq!(filled, 2);
         assert!(storage[0].is_nan() && storage[1].is_nan());
         assert_eq!(&storage[2..4], &[10.0, 11.0]);
-        source.variant_quality(filled, &mut quality);
-        assert_eq!(quality, vec![0.0, 0.25]);
 
         let filled = source.next_block_into(2, &mut storage).expect("block 2");
         assert_eq!(filled, 2);
         assert!(storage[0].is_nan() && storage[1].is_nan());
         assert_eq!(&storage[2..4], &[20.0, 21.0]);
-        source.variant_quality(filled, &mut quality);
-        assert_eq!(quality, vec![0.0, 0.75]);
 
         let filled = source.next_block_into(2, &mut storage).expect("block 3");
         assert_eq!(filled, 2);
         assert_eq!(&storage[0..2], &[30.0, 31.0]);
         assert!(storage[2].is_nan() && storage[3].is_nan());
-        source.variant_quality(filled, &mut quality);
-        assert_eq!(quality, vec![0.5, 0.0]);
 
         let filled = source.next_block_into(2, &mut storage).expect("eof");
         assert_eq!(filled, 0);
@@ -5132,13 +5014,11 @@ mod tests {
 
         source.reset().expect("reset");
         let mut full_storage = vec![0.0; 12];
-        let mut full_quality = vec![1.0; 6];
         let filled = source
             .next_block_into(6, &mut full_storage)
             .expect("full block");
         assert_eq!(filled, 6);
         assert_eq!(source.progress_variants(), Some((6, Some(6))));
-        source.variant_quality(filled, &mut full_quality);
 
         assert!(full_storage[0].is_nan() && full_storage[1].is_nan());
         assert_eq!(&full_storage[2..4], &[10.0, 11.0]);
@@ -5146,7 +5026,6 @@ mod tests {
         assert_eq!(&full_storage[6..8], &[20.0, 21.0]);
         assert_eq!(&full_storage[8..10], &[30.0, 31.0]);
         assert!(full_storage[10].is_nan() && full_storage[11].is_nan());
-        assert_eq!(full_quality, vec![0.0, 0.25, 0.0, 0.75, 0.5, 0.0]);
     }
 
     #[test]

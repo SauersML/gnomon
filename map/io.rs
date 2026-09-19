@@ -34,10 +34,6 @@ use noodles_vcf::{
         keys::key,
         series::{self, Value as SeriesValue, value::Array as SeriesArray},
     },
-    variant::record::{
-        info::Info as VcfInfoTrait, info::field::Value as InfoValue,
-        info::field::value::Array as InfoArray,
-    },
 };
 use rayon::prelude::*;
 use serde::Serialize;
@@ -1893,13 +1889,6 @@ impl VariantBlockSource for DatasetBlockSource {
         match self {
             Self::Plink(source) => source.progress_variants(),
             Self::Variants(source) => source.progress_variants(),
-        }
-    }
-
-    fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
-        match self {
-            Self::Plink(source) => source.variant_quality(filled, storage),
-            Self::Variants(source) => source.variant_quality(filled, storage),
         }
     }
 
@@ -4105,9 +4094,6 @@ pub struct VcfLikeVariantBlockSource {
     processed: usize,
     spool_entries: Vec<Option<Arc<SpoolEntry>>>,
     spool_root: Option<PathBuf>,
-    /// Per-variant imputation quality scores (INFO/R²/DR2) for the current block.
-    /// Values are in [0, 1] range where 1.0 = hard call, 0.0 = no information.
-    block_quality: Vec<f64>,
     block_keys: Vec<VariantKey>,
     collected_keys: Vec<VariantKey>,
     /// For a selection not in file order: the selection position of each
@@ -4121,7 +4107,6 @@ pub struct VcfLikeVariantBlockSource {
 struct ReadAheadVariant {
     dosages: Vec<f64>,
     key: Option<VariantKey>,
-    quality: f64,
 }
 
 struct SpoolEntry {
@@ -4779,7 +4764,6 @@ impl VcfLikeVariantBlockSource {
             processed: 0,
             spool_entries: Vec::new(),
             spool_root: None,
-            block_quality: Vec::new(),
             block_keys: Vec::new(),
             collected_keys: Vec::new(),
             selected_positions,
@@ -5088,19 +5072,6 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
         Some((self.emitted, self.total_variants_hint))
     }
 
-    fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
-        // Copy stored quality scores for the current block
-        // If we have fewer stored than requested, fill remaining with 1.0 (hard call)
-        let storage_len = storage.len();
-        let limit = filled.min(storage_len);
-        let available = self.block_quality.len().min(limit);
-
-        storage[..available].copy_from_slice(&self.block_quality[..available]);
-        for value in storage.iter_mut().skip(available).take(limit - available) {
-            *value = 1.0;
-        }
-    }
-
     fn block_variant_keys(&self) -> Option<&[VariantKey]> {
         if self.block_keys.is_empty() {
             None
@@ -5244,117 +5215,6 @@ impl VcfLikeVariantBlockSource {
             )));
         }
         Ok(())
-    }
-
-    /// Extract imputation quality score from the current variant's INFO field.
-    /// Looks for common INFO fields: R2, DR2, INFO (for imputation quality).
-    /// Returns 1.0 if no quality field is found (assumes hard call).
-    fn current_variant_quality(&self, alt_index: usize) -> f64 {
-        // VCF INFO field parsing requires header
-        let Some(header) = self.header.as_ref() else {
-            return 1.0;
-        };
-
-        match self.format {
-            Some(VariantFormat::Vcf) => {
-                let info = self.vcf_record.info();
-
-                // Try DR2 first (BEAGLE style)
-                if let Some(quality) = Self::get_info_float(&info, header, "DR2", alt_index) {
-                    if quality.is_finite() {
-                        return quality.clamp(0.0, 1.0);
-                    }
-                    return 0.0; // Conservative value for NaN/Inf
-                }
-                // Try R2 (minimac, Michigan Imputation Server)
-                if let Some(quality) = Self::get_info_float(&info, header, "R2", alt_index) {
-                    if quality.is_finite() {
-                        return quality.clamp(0.0, 1.0);
-                    }
-                    return 0.0;
-                }
-                // Try INFO (some pipelines use this key)
-                if let Some(quality) = Self::get_info_float(&info, header, "INFO", alt_index) {
-                    if quality.is_finite() {
-                        return quality.clamp(0.0, 1.0);
-                    }
-                    return 0.0;
-                }
-                // No quality field found.
-                // Check if 'IMP' flag is present (indicating Imputed data).
-                // If imputed but missing quality scores, it's unsafe to assume perfection.
-                if info.get(header, "IMP").is_some() {
-                    return 0.0;
-                }
-
-                // No IMP flag -> Assume Genotyped (hard call)
-                1.0
-            }
-            Some(VariantFormat::Bcf) => {
-                let info = self.bcf_record.info();
-
-                // Try DR2 first (BEAGLE style)
-                if let Some(quality) = Self::get_info_float(&info, header, "DR2", alt_index) {
-                    if quality.is_finite() {
-                        return quality.clamp(0.0, 1.0);
-                    }
-                    return 0.0;
-                }
-                // Try R2 (minimac, Michigan Imputation Server)
-                if let Some(quality) = Self::get_info_float(&info, header, "R2", alt_index) {
-                    if quality.is_finite() {
-                        return quality.clamp(0.0, 1.0);
-                    }
-                    return 0.0;
-                }
-                // Try INFO (some pipelines use this key)
-                if let Some(quality) = Self::get_info_float(&info, header, "INFO", alt_index) {
-                    if quality.is_finite() {
-                        return quality.clamp(0.0, 1.0);
-                    }
-                    return 0.0;
-                }
-                // Check if 'IMP' flag is present (indicating Imputed data)
-                if info.get(header, "IMP").is_some() {
-                    return 0.0;
-                }
-
-                // No IMP flag -> Assume Genotyped (hard call)
-                1.0
-            }
-            None => 1.0,
-        }
-    }
-
-    /// Helper to extract a float value from an INFO field.
-    /// Handles scalars and arrays (taking first element).
-    fn get_info_float(
-        info: &dyn VcfInfoTrait,
-        header: &vcf::Header,
-        key: &str,
-        alt_index: usize,
-    ) -> Option<f64> {
-        let allele_offset = alt_index.checked_sub(1)?;
-        match info.get(header, key)? {
-            Ok(Some(value)) => match value {
-                InfoValue::Float(f) => Some(f as f64),
-                InfoValue::Integer(i) => Some(i as f64),
-                InfoValue::String(s) => s.parse::<f64>().ok(),
-                InfoValue::Array(arr) => match arr {
-                    InfoArray::Float(v) => match v.iter().nth(allele_offset) {
-                        Some(Ok(Some(f))) => Some(f as f64),
-                        _ => None,
-                    },
-                    InfoArray::Integer(v) => match v.iter().nth(allele_offset) {
-                        Some(Ok(Some(i))) => Some(i as f64),
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        }
     }
 
     fn load_current_alt_alleles(&mut self) -> Result<(), VariantIoError> {
@@ -5546,8 +5406,6 @@ impl VcfLikeVariantBlockSource {
         max_variants: usize,
         storage: &mut [f64],
     ) -> Result<usize, VariantIoError> {
-        // Clear and prepare quality storage for this block
-        self.block_quality.clear();
         self.block_keys.clear();
 
         let mut filled = 0usize;
@@ -5563,10 +5421,6 @@ impl VcfLikeVariantBlockSource {
                 self.block_keys.push(key.clone());
                 self.collected_keys.push(key);
             }
-
-            // Store imputation quality for this variant
-            self.block_quality
-                .push(self.current_variant_quality(alt_index));
             filled += 1;
         }
 
@@ -5585,8 +5439,6 @@ impl VcfLikeVariantBlockSource {
         max_variants: usize,
         storage: &mut [f64],
     ) -> Result<usize, VariantIoError> {
-        // Clear and prepare quality storage for this block
-        self.block_quality.clear();
         self.block_keys.clear();
 
         let target_total = indices.len();
@@ -5604,7 +5456,7 @@ impl VcfLikeVariantBlockSource {
                 && let Some(variant) = self.read_ahead.remove(&target_index)
             {
                 dest.copy_from_slice(&variant.dosages);
-                self.push_selected_variant(variant.key, variant.quality);
+                self.push_selected_variant(variant.key);
                 filled += 1;
                 continue;
             }
@@ -5614,9 +5466,8 @@ impl VcfLikeVariantBlockSource {
             };
 
             if current_index == target_index {
-                let (key, quality) =
-                    self.decode_selected_variant(alt_index, swap_at(position), dest)?;
-                self.push_selected_variant(key, quality);
+                let key = self.decode_selected_variant(alt_index, swap_at(position), dest)?;
+                self.push_selected_variant(key);
                 filled += 1;
                 continue;
             }
@@ -5630,16 +5481,9 @@ impl VcfLikeVariantBlockSource {
                 .and_then(|positions| positions.get(&current_index))
             {
                 let mut dosages = vec![0.0; self.n_samples];
-                let (key, quality) =
-                    self.decode_selected_variant(alt_index, swap_at(later), &mut dosages)?;
-                self.read_ahead.insert(
-                    current_index,
-                    ReadAheadVariant {
-                        dosages,
-                        key,
-                        quality,
-                    },
-                );
+                let key = self.decode_selected_variant(alt_index, swap_at(later), &mut dosages)?;
+                self.read_ahead
+                    .insert(current_index, ReadAheadVariant { dosages, key });
                 continue;
             }
 
@@ -5663,14 +5507,13 @@ impl VcfLikeVariantBlockSource {
 
     /// Decodes the current variant into `dest`: its `alt_index` ALT dosage, or
     /// its REF dosage when the selection matched it with alleles swapped.
-    /// Returns the variant's key as the selection sees it, and its imputation
-    /// quality.
+    /// Returns the variant's key as the selection sees it.
     fn decode_selected_variant(
         &mut self,
         alt_index: usize,
         swap: bool,
         dest: &mut [f64],
-    ) -> Result<(Option<VariantKey>, f64), VariantIoError> {
+    ) -> Result<Option<VariantKey>, VariantIoError> {
         self.decode_current_variant(if swap { 0 } else { alt_index }, dest)?;
         let mut key = self.current_variant_key_for_alt(alt_index)?;
         if swap
@@ -5681,16 +5524,14 @@ impl VcfLikeVariantBlockSource {
         {
             std::mem::swap(reference, alternate);
         }
-        Ok((key, self.current_variant_quality(alt_index)))
+        Ok(key)
     }
 
-    fn push_selected_variant(&mut self, key: Option<VariantKey>, quality: f64) {
+    fn push_selected_variant(&mut self, key: Option<VariantKey>) {
         if let Some(key) = key {
             self.block_keys.push(key.clone());
             self.collected_keys.push(key);
         }
-        // Store imputation quality for this variant
-        self.block_quality.push(quality);
     }
 
     fn next_block_keys(
@@ -5699,8 +5540,6 @@ impl VcfLikeVariantBlockSource {
         max_variants: usize,
         storage: &mut [f64],
     ) -> Result<usize, VariantIoError> {
-        // Clear and prepare quality storage for this block
-        self.block_quality.clear();
         self.block_keys.clear();
 
         let mut filled = 0usize;
@@ -5730,10 +5569,6 @@ impl VcfLikeVariantBlockSource {
                         },
                         dest,
                     )?;
-
-                    // Store imputation quality for this variant
-                    self.block_quality
-                        .push(self.current_variant_quality(alt_index));
 
                     let model_key = selected_model_key(status, &requested_key, key);
                     self.block_keys.push(model_key.clone());
@@ -8144,60 +7979,78 @@ mod tests {
         assert_eq!(parse_vcf_genotype("./10", 10).unwrap(), None);
     }
 
+    /// Imputation INFO (DR2, R2, INFO, the IMP flag) is a statistic of the batch
+    /// a record was imputed in, so it must not change what the reader delivers
+    /// for any selection, block width or reset.
     #[test]
-    fn dataset_source_preserves_variant_quality_through_selection_and_reset() {
+    fn dataset_source_dosages_do_not_depend_on_imputation_info() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("quality.vcf");
-        fs::write(
-            &path,
-            "\
+        let records = [
+            ("1\t100\tvar1\tA\tG,T", "DR2=0.25,0.75", "1/2"),
+            ("1\t200\tvar2\tA\tC", "IMP", "0/1"),
+            ("1\t300\tvar3\tA\tG", "DR2=0", "1/1"),
+        ];
+        let write = |name: &str, annotated: bool| {
+            let mut text = String::from(
+                "\
 ##fileformat=VCFv4.2
 ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
 ##INFO=<ID=DR2,Number=A,Type=Float,Description=\"Imputation quality\">
 ##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed\">
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1
-1\t100\tvar1\tA\tG,T\t.\tPASS\tDR2=0.25,0.75\tGT\t1/2
-1\t200\tvar2\tA\tC\t.\tPASS\tIMP\tGT\t0/1
-1\t300\tvar3\tA\tG\t.\tPASS\t.\tGT\t1/1
 ",
-        )
-        .unwrap();
-        let dataset = GenotypeDataset::open(&path, None).unwrap();
-        for (plan, expected) in [
-            (SelectionPlan::All, vec![0.25, 0.75, 0.0, 1.0]),
-            (SelectionPlan::ByIndices(vec![1, 2]), vec![0.75, 0.0]),
-            (
+            );
+            for (site, info, call) in records {
+                let info = if annotated { info } else { "." };
+                text.push_str(&format!("{site}\t.\tPASS\t{info}\tGT\t{call}\n"));
+            }
+            let path = dir.path().join(name);
+            fs::write(&path, text).unwrap();
+            GenotypeDataset::open(&path, None).unwrap()
+        };
+        let annotated = write("annotated.vcf", true);
+        let bare = write("bare.vcf", false);
+        let plans = || {
+            [
+                SelectionPlan::All,
+                SelectionPlan::ByIndices(vec![1, 2]),
                 SelectionPlan::Ordered(OrderedSelectionPlan::new(
                     vec![0, 2],
                     vec![MatchKind::Exact, MatchKind::Swap],
                 )),
-                vec![0.25, 0.0],
-            ),
-            (
                 SelectionPlan::ByKeys(Arc::new(VariantFilter::from_keys([
                     VariantKey::new_with_alleles("1", 100, "T", "A"),
                     VariantKey::new("1", 300),
                 ]))),
-                vec![0.75, 1.0],
-            ),
-        ] {
+            ]
+        };
+        let read = |dataset: &GenotypeDataset, plan: SelectionPlan| {
             let mut source = dataset.block_source_with_plan(plan).unwrap();
+            let mut passes = Vec::new();
             for block_width in [1, 3] {
                 source.reset().unwrap();
-                let mut dosages = vec![0.0; block_width];
-                let mut quality = vec![f64::NAN; block_width];
+                let mut dosages = vec![f64::NAN; block_width];
                 let mut observed = Vec::new();
                 loop {
                     let filled = source.next_block_into(block_width, &mut dosages).unwrap();
                     if filled == 0 {
                         break;
                     }
-                    source.variant_quality(filled, &mut quality);
-                    observed.extend_from_slice(&quality[..filled]);
+                    observed.extend_from_slice(&dosages[..filled]);
                 }
-                assert_eq!(observed, expected);
+                passes.push(observed);
             }
+            passes
+        };
+        for (annotated_plan, bare_plan) in plans().into_iter().zip(plans()) {
+            let from_annotated = read(&annotated, annotated_plan);
+            assert_eq!(from_annotated[0], from_annotated[1]);
+            assert_eq!(from_annotated, read(&bare, bare_plan));
         }
+        assert_eq!(
+            read(&annotated, SelectionPlan::All)[0],
+            vec![1.0, 1.0, 1.0, 2.0]
+        );
     }
 
     #[test]

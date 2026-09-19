@@ -2882,6 +2882,261 @@ mod tests {
         Ok(())
     }
 
+    /// One person's projection may not depend on who else was imputed with them
+    /// (#2381). Imputation INFO is a statistic of the batch: minimac's R2, written
+    /// here as DR2, is `Var(DS) / (2p̂(1−p̂))` over the batch's dosages, so the same
+    /// dosages carry a different INFO in every batch. For a fixed set of observed
+    /// markers the projection is linear in the genotypes, so the dosage
+    /// `E[g | data]` projects to `E[projection | data]` with no weight: a person's
+    /// scores are `Vᵀy` of their own standardized dosages in whatever batch they
+    /// arrive, and a training person's are the scores the fit gave them.
+    #[test]
+    fn run_project_scores_a_person_the_same_in_every_imputation_batch()
+    -> Result<(), Box<dyn Error>> {
+        const TRAIN: [[usize; 6]; 8] = [
+            [0, 0, 1, 2, 2, 1],
+            [1, 0, 0, 1, 2, 2],
+            [2, 1, 0, 0, 1, 2],
+            [0, 1, 2, 1, 0, 2],
+            [2, 2, 1, 0, 0, 1],
+            [1, 2, 2, 1, 0, 0],
+            [0, 1, 1, 2, 1, 0],
+            [2, 1, 0, 1, 2, 1],
+        ];
+        // Every dosage is a multiple of 1/16, exact in f32 and f64 alike, so the
+        // reference below sees the values the reader decodes.
+        const TARGET: [f64; 8] = [0.125, 1.875, 0.9375, 0.375, 1.625, 1.0625, 0.1875, 1.3125];
+        const CALLS: [&str; 3] = ["0/0", "0/1", "1/1"];
+        let dir = tempdir()?;
+
+        let mut train = String::from(
+            "##fileformat=VCFv4.2\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT",
+        );
+        for sample in 0..TRAIN[0].len() {
+            train.push_str(&format!("\tR{sample}"));
+        }
+        train.push('\n');
+        for (variant, calls) in TRAIN.iter().enumerate() {
+            train.push_str(&format!(
+                "1\t{}\tv{variant}\tA\tG\t.\tPASS\t.\tGT",
+                100 * (variant + 1)
+            ));
+            for &call in calls {
+                train.push_str(&format!("\t{}", CALLS[call]));
+            }
+            train.push('\n');
+        }
+        let train_path = dir.path().join("train.vcf");
+        fs::write(&train_path, train)?;
+        let train_dataset = GenotypeDataset::open(&train_path, None)?;
+        let mut fit_source = train_dataset.block_source()?;
+        let mut model = HwePcaModel::fit_k(&mut fit_source, 2)?;
+        model.set_variant_keys(Some(
+            train_dataset.variant_keys_for_plan(&SelectionPlan::All)?,
+        ));
+        let model_path = save_hwe_model(&train_dataset, &model)?;
+        let components = model.components();
+
+        // `Vᵀy` for one person's dosages, and how far two evaluations of it may
+        // lie apart. Each score is an m-term sum of y_j·V_jk, y_j = (d_j − 2p_j)/σ_j:
+        // two operations standardize, one multiplies and m − 1 add, so an
+        // evaluation in any order is within γ_{m+2}·Σ_j|y_j·V_jk| of the exact sum
+        // (Higham, Accuracy and Stability of Numerical Algorithms, §3.1) and two
+        // evaluations are within twice that. A fully observed person's system is
+        // VᵀV = I, so no solve follows the sum; the conditioning report of the
+        // training cohort below certifies that path.
+        assert!(model.ld().is_none(), "the reference below carries no LD weights");
+        let frequencies = model.scaler().allele_frequencies();
+        let scales = model.scaler().variant_scales();
+        let loadings = model.variant_loadings();
+        let unit_roundoff = f64::EPSILON / 2.0;
+        let terms = (TARGET.len() + 2) as f64;
+        let gamma = terms * unit_roundoff / (1.0 - terms * unit_roundoff);
+        let reference = |dosages: &[f64; 8]| -> (Vec<f64>, Vec<f64>) {
+            (0..components)
+                .map(|k| {
+                    let (sum, magnitude) =
+                        (0..dosages.len()).fold((0.0f64, 0.0f64), |(sum, magnitude), j| {
+                            let term = (dosages[j] - 2.0 * frequencies[j]) / scales[j]
+                                * loadings[(j, k)];
+                            (sum + term, magnitude + term.abs())
+                        });
+                    (sum, 2.0 * gamma * magnitude)
+                })
+                .unzip()
+        };
+
+        // One batch's VCF: every person's DS beside its best-guess GT and, with
+        // `with_info`, each variant's DR2 computed over this batch.
+        let write_batch = |name: &str,
+                           people: &[[f64; 8]],
+                           with_info: bool|
+         -> Result<PathBuf, Box<dyn Error>> {
+            let mut text = String::from(
+                "##fileformat=VCFv4.2\n\
+                 ##INFO=<ID=DR2,Number=A,Type=Float,Description=\"Imputation quality\">\n\
+                 ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+                 ##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Dosage\">\n\
+                 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT",
+            );
+            for person in 0..people.len() {
+                text.push_str(&format!("\tP{person}"));
+            }
+            text.push('\n');
+            for variant in 0..TARGET.len() {
+                let dosages: Vec<f64> = people.iter().map(|person| person[variant]).collect();
+                let n = dosages.len() as f64;
+                let mean = dosages.iter().sum::<f64>() / n;
+                let variance = dosages.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / n;
+                let p = mean / 2.0;
+                let r2 = (variance / (2.0 * p * (1.0 - p))).min(1.0);
+                let info = if with_info {
+                    format!("DR2={r2:.4}")
+                } else {
+                    ".".to_string()
+                };
+                text.push_str(&format!(
+                    "1\t{}\tv{variant}\tA\tG\t.\tPASS\t{info}\tGT:DS",
+                    100 * (variant + 1)
+                ));
+                for dosage in dosages {
+                    text.push_str(&format!("\t{}:{dosage}", CALLS[dosage.round() as usize]));
+                }
+                text.push('\n');
+            }
+            let path = dir.path().join(name);
+            fs::write(&path, text)?;
+            Ok(path)
+        };
+
+        // Projects one batch holding TARGET at `row` among `mates` through the
+        // `project` command, and returns TARGET's scores.
+        let project_batch = |name: &str,
+                             mates: &[[f64; 8]],
+                             row: usize,
+                             with_info: bool|
+         -> Result<Vec<f64>, Box<dyn Error>> {
+            let mut people = mates.to_vec();
+            people.insert(row, TARGET);
+            let path = write_batch(name, &people, with_info)?;
+            let dataset = GenotypeDataset::open(&path, None)?;
+            fs::copy(&model_path, dataset.output_path("hwe.json"))?;
+            run_project(&path, None, None, None)?;
+            let scores = read_projection_scores_column_major(
+                &dataset.output_path("projection_scores.bin"),
+                people.len(),
+                components,
+            )?;
+            Ok((0..components)
+                .map(|k| scores[k * people.len() + row])
+                .collect())
+        };
+
+        // Every comparison is printed before any is judged, so a failure shows
+        // the whole pattern rather than its first entry.
+        let mut violations = Vec::new();
+        let (target_reference, target_bound) = reference(&TARGET);
+        assert!(
+            target_reference.iter().any(|score| score.abs() > 0.0),
+            "the person must carry a real projection: {target_reference:?}"
+        );
+        for (label, scores) in [
+            (
+                "batch A",
+                project_batch(
+                    "batch_a.vcf",
+                    &[
+                        [1.875, 0.125, 1.25, 1.6875, 0.3125, 0.1875, 1.8125, 0.625],
+                        [0.8125, 1.125, 0.0625, 1.875, 0.875, 1.625, 0.375, 1.9375],
+                    ],
+                    0,
+                    true,
+                )?,
+            ),
+            (
+                "batch B",
+                project_batch(
+                    "batch_b.vcf",
+                    &[
+                        [1.0, 0.3125, 1.875, 0.125, 1.1875, 0.6875, 1.125, 0.25],
+                        [0.1875, 1.6875, 0.625, 1.3125, 1.875, 0.125, 0.875, 1.375],
+                        [1.625, 0.875, 1.375, 0.8125, 0.0625, 1.875, 0.3125, 1.0],
+                    ],
+                    2,
+                    true,
+                )?,
+            ),
+            (
+                "alone without INFO",
+                project_batch("alone.vcf", &[], 0, false)?,
+            ),
+        ] {
+            for k in 0..components {
+                let moved = (scores[k] - target_reference[k]).abs();
+                let line = format!(
+                    "{label} PC{}: |score - Vᵀy| = {moved:e}, bound {:e}",
+                    k + 1,
+                    target_bound[k]
+                );
+                eprintln!("{line}");
+                if !(moved <= target_bound[k]) {
+                    violations.push(line);
+                }
+            }
+        }
+
+        // The training cohort itself as one imputed batch, its dosages its calls:
+        // every person must get Vᵀy, the score the fit gave them.
+        let train_people: Vec<[f64; 8]> = (0..TRAIN[0].len())
+            .map(|person| std::array::from_fn(|variant| TRAIN[variant][person] as f64))
+            .collect();
+        let train_imputed =
+            GenotypeDataset::open(&write_batch("train_imputed.vcf", &train_people, true)?, None)?;
+        let mut source = train_imputed.block_source()?;
+        let options = ProjectionOptions {
+            return_conditioning: true,
+            ..ProjectionOptions::default()
+        };
+        let result = model.projector().project_with_options(&mut source, &options)?;
+        let conditioning = result
+            .conditioning
+            .ok_or("the conditioning report was requested")?;
+        let mut fit_disagreement = 0.0f64;
+        for (person, dosages) in train_people.iter().enumerate() {
+            let report = [
+                conditioning[(person, 0)],
+                conditioning[(person, 1)],
+                conditioning[(person, 2)],
+            ];
+            if report != [1.0, 1.0, 0.0] {
+                violations.push(format!(
+                    "training person {person} went through a solve: conditioning {report:?}"
+                ));
+            }
+            let (expected, bound) = reference(dosages);
+            for k in 0..components {
+                let moved = (result.scores[(person, k)] - expected[k]).abs();
+                let line = format!(
+                    "training person {person} PC{}: |score - Vᵀy| = {moved:e}, bound {:e}",
+                    k + 1,
+                    bound[k]
+                );
+                eprintln!("{line}");
+                if !(moved <= bound[k]) {
+                    violations.push(line);
+                }
+                fit_disagreement =
+                    fit_disagreement.max((expected[k] - model.sample_scores()[(person, k)]).abs());
+            }
+        }
+        eprintln!("training cohort: max |Vᵀy - fitted score| = {fit_disagreement:e}");
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
+
+        Ok(())
+    }
+
     const HGDP_CHR20_BCF: &str = "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/\
          hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf";
     const HGDP_FULL_DATASET: &str =

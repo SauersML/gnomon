@@ -574,8 +574,6 @@ where
     retained_variants_hint: Option<usize>,
     retained_indices: Vec<usize>,
     inner_storage: Vec<f64>,
-    inner_quality: Vec<f64>,
-    block_quality: Vec<f64>,
     retained_keys: Option<Vec<VariantKey>>,
 }
 
@@ -618,8 +616,6 @@ where
             retained_variants_hint: None,
             retained_indices: Vec::with_capacity(hint),
             inner_storage: Vec::new(),
-            inner_quality: Vec::new(),
-            block_quality: Vec::new(),
             retained_keys: Some(Vec::with_capacity(hint)),
         })
     }
@@ -636,12 +632,6 @@ where
         let capacity = self.n_samples.saturating_mul(max_variants.max(1));
         if self.inner_storage.len() < capacity {
             self.inner_storage.resize(capacity, 0.0);
-        }
-        if self.inner_quality.len() < max_variants {
-            self.inner_quality.resize(max_variants, 1.0);
-        }
-        if self.block_quality.len() < max_variants {
-            self.block_quality.resize(max_variants, 1.0);
         }
     }
 }
@@ -669,7 +659,6 @@ where
         self.inner.reset()?;
         self.observed_variants = 0;
         self.retained_indices.clear();
-        self.block_quality.clear();
         if let Some(keys) = self.retained_keys.as_mut() {
             keys.clear();
         }
@@ -698,8 +687,6 @@ where
                 break;
             }
 
-            self.inner
-                .variant_quality(inner_filled, &mut self.inner_quality[..inner_filled]);
             let inner_keys = self.inner.block_variant_keys();
 
             for local_idx in 0..inner_filled {
@@ -714,7 +701,6 @@ where
                 let dst_start = filled * self.n_samples;
                 let dst_end = dst_start + self.n_samples;
                 storage[dst_start..dst_end].copy_from_slice(values);
-                self.block_quality[filled] = self.inner_quality[local_idx];
                 self.retained_indices.push(self.observed_variants);
                 if let (Some(keys), Some(inner_keys)) =
                     (self.retained_keys.as_mut(), inner_keys.as_ref())
@@ -737,14 +723,6 @@ where
 
     fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
         self.inner.progress_variants()
-    }
-
-    fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
-        let limit = filled.min(storage.len()).min(self.block_quality.len());
-        storage[..limit].copy_from_slice(&self.block_quality[..limit]);
-        for value in storage.iter_mut().take(filled).skip(limit) {
-            *value = 1.0;
-        }
     }
 
     fn take_variant_keys(&mut self) -> Option<Vec<VariantKey>> {
@@ -937,10 +915,6 @@ where
 
     fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
         self.inner.progress_variants()
-    }
-
-    fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
-        self.inner.variant_quality(filled, storage);
     }
 
     fn block_variant_keys(&self) -> Option<&[VariantKey]> {
@@ -1165,20 +1139,6 @@ pub trait VariantBlockSource {
 
     fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
         None
-    }
-
-    /// Returns per-variant imputation quality scores for the most recently fetched block.
-    /// Quality values should be in [0, 1] range where:
-    /// - 1.0 = perfectly genotyped (hard call, no imputation uncertainty)
-    /// - 0.0 = completely uncertain (equivalent to missing)
-    /// - 0.0-1.0 = imputed with INFO/DR2/R² quality score
-    ///
-    /// The storage slice should have at least `filled` elements (from last next_block_into).
-    /// Default implementation returns 1.0 for all variants (assumes hard calls).
-    fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
-        for value in storage.iter_mut().take(filled) {
-            *value = 1.0;
-        }
     }
 
     fn block_variant_keys(&self) -> Option<&[VariantKey]> {
@@ -1863,17 +1823,6 @@ where
                 Some((self.cursor.min(self.n_variants), Some(self.n_variants)))
             }
             _ => self.source.progress_variants(),
-        }
-    }
-
-    fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
-        match self.state {
-            CacheState::ReadyHardCall { .. } | CacheState::ReadyDense { .. } => {
-                for value in storage.iter_mut().take(filled) {
-                    *value = 1.0;
-                }
-            }
-            _ => (&*self.source).variant_quality(filled, storage),
         }
     }
 
