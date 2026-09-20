@@ -415,7 +415,7 @@ impl<'a> RecordAccumulator<'a> {
         }
         if self.pending.key.is_none() {
             self.pending
-                .open(key, decoded.chromosome.clone(), self.rules_by_key)?;
+                .open(key, std::mem::take(&mut decoded.chromosome), self.rules_by_key)?;
         }
         self.pending.push(decoded);
         Ok(())
@@ -774,9 +774,9 @@ fn seen_need(rows: usize, text: usize, grown: usize) -> usize {
 /// What deciding a position allocates for one of its records, with `rows` ALT alleles, as the
 /// position's `runs` of rules are matched to its variants and scored: the rows as its [`Site`]
 /// reads them, with the site's variants, readings and per-row reading; the runs naming each
-/// variant, as they are found and in variant order; each variant's conflicts and each person's
-/// measured copies of it; the record's measured ploidy and first row; and the columns measuring a
-/// variant. Counted per record as if its rows were the position's, each allocation is at least
+/// variant, as they are found and in variant order; each variant's conflicts; each row's column
+/// and variant and the record's rows, as the REF's column reads them; and the columns measuring
+/// a variant. Counted per record as if its rows were the position's, each allocation is at least
 /// the record's share of the position's, with a chunk of its own. The one column a position
 /// builds at a time is counted once, in [`RecordAccumulator::bytes`].
 fn site_need(rows: usize, runs: usize) -> usize {
@@ -797,9 +797,9 @@ fn site_need(rows: usize, runs: usize) -> usize {
         grown(runs, size_of::<(usize, (usize, bool))>()),
         allocation_bytes(runs.saturating_mul(size_of::<(usize, bool)>())),
         each(size_of::<u64>()),
-        each(size_of::<Measure<Decimal>>()),
-        allocation_bytes(size_of::<Option<Decimal>>()),
-        allocation_bytes(size_of::<usize>()),
+        each(size_of::<&DosageColumn>()),
+        each(size_of::<(usize, usize)>()),
+        grown(1, size_of::<(usize, usize)>()),
         grown(rows, size_of::<&DosageColumn>()),
     ]
     .into_iter()
@@ -1042,26 +1042,38 @@ impl DosageColumn {
         }
     }
 
-    /// One person's doses of the ALT and of the REF, each `None` where missing.
-    fn dose(&self, person: usize) -> [Option<Decimal>; 2] {
+    /// The most decimal places any dose of the column has.
+    fn most_places(&self) -> u8 {
+        match self {
+            Self::Calls(_) => 0,
+            Self::Dosages(doses) => doses
+                .places
+                .iter()
+                .flatten()
+                .filter(|&&places| places != u8::MAX)
+                .fold(0, |most, &places| most.max(places)),
+        }
+    }
+
+    /// One person's doses of the ALT and of the REF as whole numbers at `places` decimal places,
+    /// each `None` where missing; `None` when one does not fit i64 there.
+    #[inline(always)]
+    fn dose_at(&self, person: usize, places: u8) -> Option<[Option<i64>; 2]> {
         match self {
             Self::Calls(codes) => match codes[person] {
-                MISSING_CALL => [None, None],
-                code => [code & 0x0f, code >> 4].map(|copies| {
-                    Some(Decimal {
-                        digits: i128::from(copies),
-                        places: 0,
-                    })
-                }),
+                MISSING_CALL => Some([None, None]),
+                code => Some([
+                    Some(at_places(i64::from(code & 0x0f), 0, places)?),
+                    Some(at_places(i64::from(code >> 4), 0, places)?),
+                ]),
             },
             Self::Dosages(doses) => {
-                let (digits, places) = (doses.digits[person], doses.places[person]);
-                [0, 1].map(|side| {
-                    (places[side] != u8::MAX).then_some(Decimal {
-                        digits: i128::from(digits[side]),
-                        places: places[side],
-                    })
-                })
+                let (digits, from) = (doses.digits[person], doses.places[person]);
+                let side = |side: usize| match from[side] {
+                    u8::MAX => Some(None),
+                    from => at_places(digits[side], from, places).map(Some),
+                };
+                Some([side(0)?, side(1)?])
             }
         }
     }
@@ -2164,7 +2176,7 @@ impl PendingPosition {
             let (column, conflicting) = site_column(
                 &site,
                 variant,
-                (refs.len(), &rows[..]),
+                &rows[..],
                 &alleles[..],
                 || error(ref_score.unwrap_or(0)),
                 (chromosome, position),
@@ -2224,139 +2236,204 @@ fn run_names_reference(rules_by_key: &ScoreRules, (first_rule, first_is_ref): (u
 /// ALT, the one value its rows agree on, and of the REF, the ploidy the records agree on less the
 /// copies of every variant at the site. A person whose measurements disagree, or whose ALTs'
 /// copies pass the ploidy, has no dose, and is counted in the conflicts returned. A record with an
-/// ALT dose and no REF dose gives `ref_error`.
+/// ALT dose and no REF dose gives `ref_error`. Every dose is a whole number at the most decimal
+/// places any row's dose has, so each sum and comparison is one integer operation, and the
+/// people are built a range at a time on the pool.
 fn site_column(
     site: &Site<'_>,
     variant: usize,
-    (records, rows): (usize, &[(usize, String)]),
+    rows: &[(usize, String)],
     alleles: &[(usize, DecodedAllele)],
-    ref_error: impl Fn() -> String,
+    ref_error: impl Fn() -> String + Sync,
     (chromosome, position): (&str, u32),
 ) -> Result<(DosageColumn, u64), String> {
-    let row_variants = site.row_variants();
     // A REF dose reads every ALT at the site, and every one was decoded for it: the alleles are
     // in row order, one a row.
     if alleles.len() != rows.len() {
         return Err(undecoded_error(chromosome, position));
     }
-    let people = alleles.first().map_or(0, |(_, allele)| allele.column.people());
-    let mut built = Doses::default();
-    built.reserve(people);
-    let mut conflicting = 0u64;
-    let mut copies = vec![Measure::Uncalled; site.variants().len()];
-    let mut record_ploidy = vec![None; records];
-    let mut first_row_of_record = vec![usize::MAX; records];
-    for (row, (record, _)) in rows.iter().enumerate() {
-        first_row_of_record[*record] = first_row_of_record[*record].min(row);
-    }
-    for person in 0..people {
-        copies.fill(Measure::Uncalled);
-        // Each record's ploidy: its REF's copies, which each of its rows carries, and its ALTs'.
-        record_ploidy.fill(Some(Decimal::ZERO));
-        for (row, (_, allele)) in alleles.iter().enumerate() {
-            let [alternate, reference] = allele.column.dose(person);
-            copies[row_variants[row]].measure(alternate);
-            let record = rows[row].0;
-            let reference = if first_row_of_record[record] == row {
-                if alternate.is_some() && reference.is_none() {
-                    return Err(ref_error());
+    let inexact = || inexact_error(chromosome, position);
+    let columns: Vec<&DosageColumn> = alleles.iter().map(|(_, allele)| &allele.column).collect();
+    let people = columns.first().map_or(0, |column| column.people());
+    let places = columns.iter().map(|column| column.most_places()).max().unwrap_or(0);
+    let calls = columns.iter().all(|column| matches!(column, DosageColumn::Calls(_)));
+    // Each variant's rows, and each record's, which are consecutive and start at its first row.
+    let mut by_variant: Vec<(usize, usize)> = site.row_variants().iter().copied().zip(0..).collect();
+    by_variant.sort_unstable();
+    let by_record: Vec<(usize, usize)> = rows
+        .chunk_by(|a, b| a.0 == b.0)
+        .scan(0, |start, record| {
+            let range = (*start, *start + record.len());
+            *start = range.1;
+            Some(range)
+        })
+        .collect();
+    let dose = |person: usize| -> Result<Measure<(i64, Option<i64>)>, String> {
+        let at = |row: usize| columns[row].dose_at(person, places).ok_or_else(inexact);
+        // Every variant's copies, the one value its rows agree on.
+        let (mut alternates, mut target, mut uncalled, mut disagreeing) = (0i64, None, false, false);
+        for rows in by_variant.chunk_by(|a, b| a.0 == b.0) {
+            let mut copies = Measure::Uncalled;
+            for &(_, row) in rows {
+                copies.measure(at(row)?[0]);
+            }
+            match copies {
+                Measure::Uncalled => uncalled = true,
+                Measure::Disagreeing => disagreeing = true,
+                Measure::Copies(copies) => {
+                    alternates = alternates.checked_add(copies).ok_or_else(inexact)?;
+                    if rows[0].0 == variant {
+                        target = Some(copies);
+                    }
                 }
-                reference
-            } else {
-                Some(Decimal::ZERO)
-            };
-            record_ploidy[record] = match (record_ploidy[record], alternate, reference) {
-                (Some(sum), Some(alternate), Some(reference)) => Some(
-                    sum.add(alternate)
-                        .and_then(|sum| sum.add(reference))
-                        .ok_or_else(|| inexact_error(chromosome, position))?,
-                ),
-                _ => None,
-            };
-        }
-        let mut ploidy = Measure::Uncalled;
-        for measured in record_ploidy.iter().copied() {
-            ploidy.measure(measured);
-        }
-        let dose = site_dose(&copies, variant, ploidy).ok_or_else(|| inexact_error(chromosome, position))?;
-        match dose {
-            Measure::Copies([alternate, reference]) => built.push([
-                alternate.dose().ok_or_else(|| inexact_error(chromosome, position))?,
-                reference.dose().ok_or_else(|| inexact_error(chromosome, position))?,
-            ]),
-            Measure::Uncalled => built.push([Dose::MISSING; 2]),
-            Measure::Disagreeing => {
-                conflicting += 1;
-                built.push([Dose::MISSING; 2]);
             }
         }
-    }
-    Ok((DosageColumn::Dosages(built), conflicting))
-}
-
-/// A person's doses of `variant`'s ALT and of the site's REF, from every variant's measured
-/// copies and the measured ploidy, or `None` when the arithmetic leaves i128.
-fn site_dose(copies: &[Measure<Decimal>], variant: usize, ploidy: Measure<Decimal>) -> Option<Measure<[Decimal; 2]>> {
-    if ploidy == Measure::Disagreeing || copies.contains(&Measure::Disagreeing) {
-        return Some(Measure::Disagreeing);
-    }
-    let Measure::Copies(ploidy) = ploidy else {
-        return Some(Measure::Uncalled);
-    };
-    let mut alternates = Decimal::ZERO;
-    for measured in copies {
-        let Measure::Copies(copies) = measured else {
-            return Some(Measure::Uncalled);
+        // Each record's ploidy: its REF's copies, which each of its rows carries, and its ALTs'.
+        let mut ploidy = Measure::Uncalled;
+        for &(first, end) in &by_record {
+            let mut sum = Some(0i64);
+            for row in first..end {
+                let [alternate, reference] = at(row)?;
+                let reference = if row == first {
+                    if alternate.is_some() && reference.is_none() {
+                        return Err(ref_error());
+                    }
+                    reference
+                } else {
+                    Some(0)
+                };
+                sum = match (sum, alternate, reference) {
+                    (Some(sum), Some(alternate), Some(reference)) => Some(
+                        sum.checked_add(alternate)
+                            .and_then(|sum| sum.checked_add(reference))
+                            .ok_or_else(inexact)?,
+                    ),
+                    _ => None,
+                };
+            }
+            ploidy.measure(sum);
+        }
+        if disagreeing || ploidy == Measure::Disagreeing {
+            return Ok(Measure::Disagreeing);
+        }
+        let (Measure::Copies(ploidy), false, Some(alternate)) = (ploidy, uncalled, target) else {
+            return Ok(Measure::Uncalled);
         };
-        alternates = alternates.add(*copies)?;
-    }
-    let reference = ploidy.sub(alternates)?;
-    let Measure::Copies(alternate) = copies[variant] else {
-        return Some(Measure::Uncalled);
+        let reference = ploidy.checked_sub(alternates).ok_or_else(inexact)?;
+        Ok(if reference < 0 {
+            Measure::Disagreeing
+        } else {
+            Measure::Copies((alternate, Some(reference)))
+        })
     };
-    Some(if reference.digits < 0 {
-        Measure::Disagreeing
-    } else {
-        Measure::Copies([alternate, reference])
-    })
+    build_column(calls, people, places, dose, inexact)
 }
 
 /// The column of one variant measured by several rows, for rules reading the `sides` it names
 /// (ALT, REF): each person's copies of each side read, the one value the rows that have it agree
 /// on, and the people whose rows disagree on a side read, who have no dose. A side no rule reads is
-/// a present zero on the ALT side and missing on the REF side, which no rule then asks for. `None`
-/// when a dose leaves i64.
+/// a present zero on the ALT side, and on the REF side missing, or zero among hard calls, which
+/// hold no side missing alone; no rule asks for it. Every dose is compared as a whole number at
+/// the most decimal places any row's dose has, and the people are built a range at a time on the
+/// pool. `None` when a dose leaves i64.
 fn consensus_column(measurements: &[&DosageColumn], sides: [bool; 2]) -> Option<(DosageColumn, u64)> {
     let people = measurements.first().map_or(0, |column| column.people());
-    let mut built = Doses::default();
-    built.reserve(people);
-    let mut conflicting = 0u64;
-    for person in 0..people {
+    let places = measurements.iter().map(|column| column.most_places()).max().unwrap_or(0);
+    let calls = measurements.iter().all(|column| matches!(column, DosageColumn::Calls(_)));
+    let dose = |person: usize| -> Result<Measure<(i64, Option<i64>)>, ()> {
         let mut copies = [Measure::Uncalled; 2];
         for column in measurements {
-            let doses = column.dose(person);
+            let doses = column.dose_at(person, places).ok_or(())?;
             for side in 0..2 {
                 copies[side].measure(doses[side]);
             }
         }
         let read = |side: usize| sides[side].then_some(copies[side]);
-        if [read(0), read(1)].contains(&Some(Measure::Disagreeing)) {
-            conflicting += 1;
-            built.push([Dose::MISSING; 2]);
-            continue;
-        }
-        match (read(0), read(1)) {
-            (Some(Measure::Uncalled), _) | (_, Some(Measure::Uncalled)) => built.push([Dose::MISSING; 2]),
+        Ok(match (read(0), read(1)) {
+            (Some(Measure::Disagreeing), _) | (_, Some(Measure::Disagreeing)) => Measure::Disagreeing,
+            (Some(Measure::Uncalled), _) | (_, Some(Measure::Uncalled)) => Measure::Uncalled,
             (alternate, reference) => {
-                let dose = |measured: Option<Measure<Decimal>>, unread: Dose| match measured {
-                    Some(Measure::Copies(copies)) => copies.dose(),
-                    _ => Some(unread),
+                let copies = |measured: Option<Measure<i64>>| match measured {
+                    Some(Measure::Copies(copies)) => Some(copies),
+                    _ => None,
                 };
-                built.push([dose(alternate, Dose::copies(0))?, dose(reference, Dose::MISSING)?]);
+                Measure::Copies((copies(alternate).unwrap_or(0), copies(reference)))
             }
-        }
+        })
+    };
+    build_column(calls, people, places, dose, || ()).ok()
+}
+
+/// The column of `people` doses, `dose(person)` each (copies of the ALT and of the REF, the REF
+/// `None` where no rule reads it), and how many people's measurements disagree, who have none. It
+/// holds hard calls when `calls`, as its rows do, whose copies are whole numbers at no decimal
+/// places, and exact dosages at `places` otherwise. People are built a range at a time on the
+/// pool, into the column's own buffers; `inexact` is the error for a dose the column cannot hold.
+fn build_column<E: Send>(
+    calls: bool,
+    people: usize,
+    places: u8,
+    dose: impl Fn(usize) -> Result<Measure<(i64, Option<i64>)>, E> + Sync,
+    inexact: impl Fn() -> E + Sync,
+) -> Result<(DosageColumn, u64), E> {
+    let range = people
+        .div_ceil(rayon::current_num_threads().max(1) * RANGES_PER_WORKER)
+        .max(MIN_PEOPLE_PER_RANGE);
+    if calls {
+        let mut codes = vec![MISSING_CALL; people];
+        let conflicting = codes
+            .par_chunks_mut(range)
+            .enumerate()
+            .map(|(part, codes)| {
+                let mut conflicting = 0u64;
+                for (offset, code) in codes.iter_mut().enumerate() {
+                    match dose(part * range + offset)? {
+                        Measure::Copies((alternate, reference)) => {
+                            // A site's copies of an allele are no more than a record's own, which
+                            // a code holds.
+                            let copies = |value: i64| u8::try_from(value).ok().filter(|&copies| copies <= 14);
+                            *code = copies(alternate)
+                                .zip(copies(reference.unwrap_or(0)))
+                                .map(|(alternate, reference)| alternate | reference << 4)
+                                .ok_or_else(&inexact)?;
+                        }
+                        Measure::Uncalled => {}
+                        Measure::Disagreeing => conflicting += 1,
+                    }
+                }
+                Ok(conflicting)
+            })
+            .sum::<Result<u64, E>>()?;
+        return Ok((DosageColumn::Calls(codes), conflicting));
     }
-    Some((DosageColumn::Dosages(built), conflicting))
+    let mut digits = vec![[Dose::MISSING.digits; 2]; people];
+    let mut dose_places = vec![[Dose::MISSING.places; 2]; people];
+    let conflicting = digits
+        .par_chunks_mut(range)
+        .zip(dose_places.par_chunks_mut(range))
+        .enumerate()
+        .map(|(part, (digits, dose_places))| {
+            let mut conflicting = 0u64;
+            for (offset, (digits, dose_places)) in digits.iter_mut().zip(dose_places.iter_mut()).enumerate() {
+                match dose(part * range + offset)? {
+                    Measure::Copies((alternate, reference)) => {
+                        *digits = [alternate, reference.unwrap_or(Dose::MISSING.digits)];
+                        *dose_places = [places, reference.map_or(Dose::MISSING.places, |_| places)];
+                    }
+                    Measure::Uncalled => {}
+                    Measure::Disagreeing => conflicting += 1,
+                }
+            }
+            Ok(conflicting)
+        })
+        .sum::<Result<u64, E>>()?;
+    Ok((
+        DosageColumn::Dosages(Doses {
+            digits,
+            places: dose_places,
+        }),
+        conflicting,
+    ))
 }
 
 fn undecoded_error(chromosome: &str, position: u32) -> String {
@@ -2367,52 +2444,14 @@ fn inexact_error(chromosome: &str, position: u32) -> String {
     format!("The doses at {chromosome}:{position} have too many decimal places to combine exactly.")
 }
 
-/// An exact decimal: `digits × 10^-places`.
-#[derive(Clone, Copy, Debug)]
-struct Decimal {
-    digits: i128,
-    places: u8,
-}
-
-impl PartialEq for Decimal {
-    /// The same number, whatever places each is written at.
-    fn eq(&self, other: &Self) -> bool {
-        self.aligned(*other).is_some_and(|(a, b, _)| a == b)
-    }
-}
-
-impl Decimal {
-    const ZERO: Self = Self { digits: 0, places: 0 };
-
-    /// Both numbers' digits at the more places of the two, and those places.
-    fn aligned(self, other: Self) -> Option<(i128, i128, u8)> {
-        let places = self.places.max(other.places);
-        let at = |value: Self| value.digits.checked_mul(10i128.checked_pow(u32::from(places - value.places))?);
-        Some((at(self)?, at(other)?, places))
-    }
-
-    fn add(self, other: Self) -> Option<Self> {
-        let (a, b, places) = self.aligned(other)?;
-        Some(Self {
-            digits: a.checked_add(b)?,
-            places,
-        })
-    }
-
-    fn sub(self, other: Self) -> Option<Self> {
-        let (a, b, places) = self.aligned(other)?;
-        Some(Self {
-            digits: a.checked_sub(b)?,
-            places,
-        })
-    }
-
-    /// The decimal as a column's dose, when its digits fit i64.
-    fn dose(self) -> Option<Dose> {
-        Some(Dose {
-            digits: i64::try_from(self.digits).ok()?,
-            places: self.places,
-        })
+/// `digits × 10^-from` as a whole number of `10^-places`, when `places` is at least `from` and the
+/// number fits i64, as a column's doses do. A site's doses are whole numbers at one scale, so each
+/// sum and comparison is one machine operation.
+#[inline(always)]
+fn at_places(digits: i64, from: u8, places: u8) -> Option<i64> {
+    match places.checked_sub(from)? {
+        0 => Some(digits),
+        shift => digits.checked_mul(i64::try_from(*POWERS_OF_TEN.get(usize::from(shift))?).ok()?),
     }
 }
 
