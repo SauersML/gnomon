@@ -2,19 +2,18 @@ use super::fit::{
     DEFAULT_BLOCK_WIDTH, DenseBlockSource, HardCallPacked, HwePcaError, HwePcaModel, HweScaler,
     VariantBlockSource,
 };
-use super::partitioned::mul_rows;
 use super::progress::{
     NoopProjectionProgress, ProjectionProgressObserver, ProjectionProgressStage,
 };
 use super::variant_filter::MatchKind;
 use crate::genotype_table;
-use core::cmp::min;
 use faer::prelude::ReborrowMut;
-use faer::{Accum, Mat, MatMut, Par};
+use faer::{Mat, MatMut, Par};
 use rayon::prelude::*;
 use std::error::Error;
 use std::mem::size_of;
-use std::simd::Simd;
+use std::ops::Range;
+use std::simd::{Simd, StdFloat};
 use std::sync::OnceLock;
 
 pub struct HwePcaProjector<'model> {
@@ -550,13 +549,17 @@ impl<'model> HwePcaProjector<'model> {
                     || { HwePcaError::InvalidInput("WLS info matrix storage overflow") }
                 )?
             ];
-            let block_capacity =
-                projection_block_capacity(self.model.n_samples(), n_samples, expected_variants);
+            let block_capacity = projection_block_capacity(n_samples, expected_variants);
             let elements = n_samples
                 .checked_mul(block_capacity)
                 .ok_or_else(|| HwePcaError::InvalidInput("Projection workspace size overflow"))?;
             let mut block_storage = vec![0.0f64; elements];
             let mut block_info_contrib = vec![0.0f64; block_capacity * packed_info_size];
+            // Window rows are padded to whole four-wide lanes; the padding stays zero.
+            let width = components.div_ceil(4) * 4;
+            let mut loadings_rows = Vec::with_capacity(block_capacity * width);
+            let mut window_sums = vec![0.0f64; n_samples * width];
+            let mut scores_row_major = vec![0.0f64; n_samples * components];
             let mut processed = 0usize;
 
             loop {
@@ -672,19 +675,51 @@ impl<'model> HwePcaProjector<'model> {
                     }
                 }
 
-                let standardized = block.as_ref();
-
-                // RHS: scores += (x × w) × V = V^T × W × x
-                mul_rows(
-                    scores.as_mut(),
-                    Accum::Add,
-                    standardized,
-                    loadings_block,
-                    1.0,
-                );
+                // RHS: scores += (x × w) × V = V^T × W × x, a window of model
+                // variants at a time (see `accumulate_dense_projection_window`).
+                loadings_rows.clear();
+                for j_local in 0..filled {
+                    loadings_rows.extend((0..width).map(|k| {
+                        if k < components {
+                            loadings_block[(j_local, k)]
+                        } else {
+                            0.0
+                        }
+                    }));
+                }
+                let standardized = &block_storage[..n_samples * filled];
+                let mut start = 0usize;
+                while start < filled {
+                    let window_end = (processed + start) / DEFAULT_BLOCK_WIDTH * DEFAULT_BLOCK_WIDTH
+                        + DEFAULT_BLOCK_WIDTH;
+                    let end = (window_end - processed).min(filled);
+                    accumulate_dense_projection_window(
+                        standardized,
+                        n_samples,
+                        start..end,
+                        &loadings_rows,
+                        width,
+                        &mut window_sums,
+                    );
+                    if processed + end == window_end {
+                        add_dense_projection_window(
+                            &mut window_sums,
+                            width,
+                            &mut scores_row_major,
+                            components,
+                        );
+                    }
+                    start = end;
+                }
 
                 processed += filled;
                 progress.on_stage_advance(ProjectionProgressStage::Projection, processed);
+            }
+            add_dense_projection_window(&mut window_sums, width, &mut scores_row_major, components);
+            for (sample, row) in scores_row_major.chunks_exact(components).enumerate() {
+                for (k, &value) in row.iter().enumerate() {
+                    scores[(sample, k)] = value;
+                }
             }
 
             if processed != expected_variants {
@@ -1713,42 +1748,129 @@ fn standardize_projection_block(
     scaler.standardize_block(block, offset..offset + filled, par);
 }
 
-fn projection_block_capacity(
-    fitted_samples: usize,
-    projected_samples: usize,
-    n_variants: usize,
-) -> usize {
+/// Variants one streamed projection block holds: the fit's block width, or
+/// fewer when that many for every projected sample would pass the tile budget.
+/// The block sets only memory. Each score sums fixed windows of model variants
+/// whatever blocks the source delivers (see [`accumulate_dense_projection_window`]).
+fn projection_block_capacity(projected_samples: usize, n_variants: usize) -> usize {
     if n_variants == 0 {
         return 1;
     }
-    let default = DEFAULT_BLOCK_WIDTH.max(1);
-    let safe_reference = fitted_samples.saturating_mul(default);
-    let mut capacity = if projected_samples == 0 {
-        default
-    } else {
-        safe_reference / projected_samples
-    };
-    if capacity == 0 {
-        capacity = 1;
-    }
-    capacity = min(capacity, default);
-    capacity = min(capacity, n_variants);
-    let bytes_per_column = projected_samples.saturating_mul(size_of::<f64>());
-    if bytes_per_column > 0 {
-        let budget_limited = (PROJECTION_BLOCK_BUDGET_BYTES / bytes_per_column).max(1);
-        capacity = min(capacity, budget_limited);
-    }
-    capacity
+    let bytes_per_variant = projected_samples.saturating_mul(size_of::<f64>()).max(1);
+    DEFAULT_BLOCK_WIDTH
+        .min(n_variants)
+        .min((PROJECTION_BLOCK_BUDGET_BYTES / bytes_per_variant).max(1))
 }
 
-/// Bytes of standardized genotypes one streamed projection tile holds at most.
-///
-/// A tile groups every score's sum, so its size may depend on the shape and on
-/// nothing else. It used to grow with the thread count, which made the scores
-/// depend on how many threads computed them. The threads now go to the row
-/// leaves of each tile's product (see [`mul_rows`]), and every thread count
-/// gets the tile the many-core setting chose.
+/// Bytes of standardized genotypes one streamed projection block holds at most.
 const PROJECTION_BLOCK_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Adds one delivered block's variants in `variants` to each sample's open
+/// window sum, `sum = fma(x, v, sum)` per term in variant order. A window is
+/// `DEFAULT_BLOCK_WIDTH` model variants counted from the first. The caller adds
+/// a finished window to the score, and a score is therefore the same sum of the
+/// same window sums however many samples, blocks or threads computed it: a
+/// sample's row reads only that sample's calls, and the fused product rounds
+/// once, the same on every host. Rows and loadings are `width` wide, whole
+/// four-wide lanes; each lane holds four components' separate chains, so the
+/// lane width decides nothing but the speed.
+fn accumulate_dense_projection_window(
+    block: &[f64],
+    n_samples: usize,
+    variants: Range<usize>,
+    loadings_rows: &[f64],
+    width: usize,
+    window_sums: &mut [f64],
+) {
+    const ROWS: usize = 64;
+    let segment = variants.len();
+    let (loadings, _) = loadings_rows[variants.start * width..variants.end * width].as_chunks::<4>();
+    window_sums
+        .par_chunks_mut(ROWS * width)
+        .enumerate()
+        .for_each(|(chunk, sums)| {
+            let first = chunk * ROWS;
+            for (person, row) in sums.chunks_exact_mut(width).enumerate() {
+                let (row, _) = row.as_chunks_mut::<4>();
+                let lanes = row.len();
+                let first_call = variants.start * n_samples + first + person;
+                // At most eight lanes stay in registers at once; wider rows go
+                // eight lanes at a time, and every component's chain still runs
+                // through the window's variants in order.
+                let mut start = 0;
+                while start < lanes {
+                    let group = (lanes - start).min(8);
+                    let sums = &mut row[start..start + group];
+                    let loadings = &loadings[start..];
+                    macro_rules! lanes {
+                        ($($lanes:literal)*) => {
+                            match group {
+                                $($lanes => add_person_window::<$lanes>(
+                                    sums, block, first_call, n_samples, loadings, lanes, segment,
+                                ),)*
+                                _ => unreachable!("a lane group holds one to eight lanes"),
+                            }
+                        };
+                    }
+                    lanes!(1 2 3 4 5 6 7 8);
+                    start += group;
+                }
+            }
+        });
+}
+
+/// `LANES` lanes of one person's window sums held in registers across the
+/// window's variants: per variant, one broadcast call and one fused
+/// multiply-add per lane. The person's calls start at `block[first_call]`,
+/// one variant `call_stride` apart; `loadings` starts at the group's first
+/// lane, one variant `stride` lanes apart.
+#[inline(always)]
+fn add_person_window<const LANES: usize>(
+    sums: &mut [[f64; 4]],
+    block: &[f64],
+    first_call: usize,
+    call_stride: usize,
+    loadings: &[[f64; 4]],
+    stride: usize,
+    segment: usize,
+) {
+    let mut acc = [Simd::<f64, 4>::splat(0.0); LANES];
+    for lane in 0..LANES {
+        acc[lane] = Simd::from_array(sums[lane]);
+    }
+    for (variant, loadings) in loadings.chunks(stride).take(segment).enumerate() {
+        let call = Simd::splat(block[first_call + variant * call_stride]);
+        let loadings = &loadings[..LANES];
+        for lane in 0..LANES {
+            acc[lane] = call.mul_add(Simd::from_array(loadings[lane]), acc[lane]);
+        }
+    }
+    for lane in 0..LANES {
+        sums[lane] = acc[lane].to_array();
+    }
+}
+
+/// Adds every sample's finished window sum to its score and opens the next
+/// window at zero.
+fn add_dense_projection_window(
+    window_sums: &mut [f64],
+    width: usize,
+    scores: &mut [f64],
+    components: usize,
+) {
+    const ROWS: usize = 512;
+    scores
+        .par_chunks_mut(ROWS * components)
+        .zip(window_sums.par_chunks_mut(ROWS * width))
+        .for_each(|(scores, sums)| {
+            for (score, sum) in scores.chunks_exact_mut(components).zip(sums.chunks_exact_mut(width)) {
+                for (score, &value) in score.iter_mut().zip(sum.iter()) {
+                    *score += value;
+                }
+                sum.fill(0.0);
+            }
+        });
+}
 
 #[inline]
 fn packed_tri_size(components: usize) -> usize {
@@ -4542,5 +4664,160 @@ mod tests {
         let dense_alignment = dense_result.alignment.expect("dense alignment");
         let chunked_alignment = chunked_result.alignment.expect("chunked alignment");
         assert_mats_close(&dense_alignment, &chunked_alignment, TOLERANCE);
+    }
+
+    #[test]
+    fn a_dense_projection_is_the_same_bits_in_any_batch_and_any_blocks() {
+        // 1,100 variants span two whole score windows and part of a third. A
+        // source may deliver them in blocks of any size, and a person may be
+        // projected alone or with others; the scores must not notice either.
+        let n_samples = 300;
+        let n_variants = 1_100;
+        let components = 4;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let factors: Vec<u64> = (0..n_samples).map(|_| next() % 3).collect();
+        let mut complete = Vec::with_capacity(n_samples * n_variants);
+        for _ in 0..n_variants {
+            let flipped = next() % 2 == 1;
+            for &factor in &factors {
+                let call = if next() % 3 == 0 { next() % 3 } else { factor };
+                let call = if flipped { 2 - call } else { call };
+                complete.push(call as f64);
+            }
+        }
+        let mut fit_source =
+            DenseBlockSource::new(&complete, n_samples, n_variants).expect("fit source");
+        let fit_options = FitOptions {
+            allow_unconverged: true,
+            ..FitOptions::default()
+        };
+        let progress = Arc::new(NoopFitProgress::default());
+        let model = HwePcaModel::fit_k_with_options_and_progress(
+            &mut fit_source,
+            components,
+            &fit_options,
+            &progress,
+        )
+        .expect("model fit");
+        let mut observed = complete;
+        for value in observed.iter_mut() {
+            if next() % 13 == 0 {
+                *value = f64::NAN;
+            }
+        }
+        let options = ProjectionOptions {
+            missing_axis_renormalization: true,
+            return_alignment: true,
+            return_conditioning: false,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+        let project = |people: &[usize], chunk: usize| {
+            let data: Vec<f64> = (0..n_variants)
+                .flat_map(|variant| {
+                    people
+                        .iter()
+                        .map(|&sample| observed[variant * n_samples + sample])
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let mut source = ChunkedBlockSource::new(&data, people.len(), n_variants, chunk);
+            model
+                .projector()
+                .project_with_options(&mut source, &options)
+                .expect("projection")
+                .scores
+        };
+        let everyone: Vec<usize> = (0..n_samples).collect();
+        let reference = project(&everyone[..], n_variants);
+        let same_rows = |scores: &Mat<f64>, people: &[usize]| {
+            people.iter().enumerate().all(|(row, &person)| {
+                (0..components)
+                    .all(|k| scores[(row, k)].to_bits() == reference[(person, k)].to_bits())
+            })
+        };
+        for chunk in [1, 7, 512, 513] {
+            assert!(same_rows(&project(&everyone[..], chunk), &everyone[..]), "blocks of {chunk}");
+        }
+        for people in [vec![0], vec![299], (0..40).collect(), (150..300).rev().collect()] {
+            assert!(same_rows(&project(&people[..], 97), &people[..]), "people {people:?}");
+        }
+    }
+
+    #[test]
+    fn dense_window_sums_are_scalar_fused_chains() {
+        // Whatever lanes the compiler gives the kernel, each sum must be the
+        // scalar chain sum = fma(x, v, sum) in variant order, bit for bit.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut value = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state % 2001) as f64 - 1000.0) / 7.0 * 2f64.powi(((state >> 40) % 31) as i32 - 15)
+        };
+        for components in [1usize, 3, 4, 5, 20, 33] {
+            for samples in [1usize, 63, 64, 65, 300] {
+                let variants = 37;
+                let block: Vec<f64> = (0..samples * variants).map(|_| value()).collect();
+                let loadings: Vec<f64> = (0..variants * components).map(|_| value()).collect();
+                let initial: Vec<f64> = (0..samples * components).map(|_| value()).collect();
+                let mut expected = initial.clone();
+                for sample in 0..samples {
+                    for variant in 0..variants {
+                        let call = block[variant * samples + sample];
+                        for k in 0..components {
+                            let sum = &mut expected[sample * components + k];
+                            *sum = call.mul_add(loadings[variant * components + k], *sum);
+                        }
+                    }
+                }
+                let width = components.div_ceil(4) * 4;
+                let pad = |rows: &[f64]| -> Vec<f64> {
+                    rows.chunks_exact(components)
+                        .flat_map(|row| row.iter().copied().chain((components..width).map(|_| 0.0)))
+                        .collect()
+                };
+                let padded_loadings = pad(&loadings);
+                let mut actual = pad(&initial);
+                for range in [0..5, 5..6, 6..37] {
+                    accumulate_dense_projection_window(
+                        &block,
+                        samples,
+                        range,
+                        &padded_loadings,
+                        width,
+                        &mut actual,
+                    );
+                }
+                assert!(
+                    actual
+                        .chunks_exact(width)
+                        .zip(expected.chunks_exact(components))
+                        .all(|(a, e)| a[..components]
+                            .iter()
+                            .zip(e)
+                            .all(|(a, e)| a.to_bits() == e.to_bits())),
+                    "{components} components, {samples} samples"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dense_projection_blocks_follow_the_tile_budget_alone() {
+        for samples in [0usize, 1, 3_200, 16_384, 16_385, 102_400, 10_000_000] {
+            for variants in [1usize, 7, 511, 512, 570_709] {
+                let block = projection_block_capacity(samples, variants);
+                assert!(block >= 1 && block <= DEFAULT_BLOCK_WIDTH.min(variants));
+                assert!(
+                    block == 1 || block * samples * size_of::<f64>() <= PROJECTION_BLOCK_BUDGET_BYTES
+                );
+            }
+        }
     }
 }
