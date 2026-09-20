@@ -9,12 +9,13 @@ use rayon::prelude::*;
 use std::path::Path;
 
 /// Lines this short are not worth a task of their own.
-const MIN_BLOCK_BYTES: usize = 1 << 20;
+pub(super) const MIN_BLOCK_BYTES: usize = 1 << 20;
 
 /// Every row of a list of local `.bim` files, in file order.
 pub(super) struct ParsedBim {
-    /// Rows that parsed.
-    pub records: Vec<KeyedBimRecord>,
+    /// Rows that parsed, block by block as they were parsed, each block where its
+    /// parse wrote it.
+    pub blocks: Vec<Vec<KeyedBimRecord>>,
     /// Rows that did not, as (number of parsed rows before it, error), ascending.
     pub errors: Vec<(usize, PrepError)>,
     pub boundaries: Vec<FilesetBoundary>,
@@ -28,7 +29,24 @@ pub(super) struct ParsedBim {
 /// `.pvar` gives the rows of the virtual `.bim` the streaming reader renders from it.
 pub(super) fn parse_local_bims(filesets: &[FilesetPaths]) -> Option<ParsedBim> {
     let (_, available) = crate::memory::memory_bytes();
-    parse_local_bims_within(filesets, available / 8, MIN_BLOCK_BYTES)
+    parse_local_bims_within(filesets, available / 8, min_block_bytes())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by tests to parse whole files in blocks of a line or so.
+    pub(super) static TEST_MIN_BLOCK_BYTES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(MIN_BLOCK_BYTES) };
+}
+
+#[cfg(test)]
+fn min_block_bytes() -> usize {
+    TEST_MIN_BLOCK_BYTES.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn min_block_bytes() -> usize {
+    MIN_BLOCK_BYTES
 }
 
 fn is_pvar(path: &Path) -> bool {
@@ -71,11 +89,13 @@ fn parse_local_bims_within(
     }
 
     let mut parsed = ParsedBim {
-        records: Vec::with_capacity(total_lines as usize),
+        blocks: Vec::new(),
         errors: Vec::new(),
         boundaries: Vec::with_capacity(filesets.len()),
         total_variants: 0,
     };
+    // Rows that parsed, before the block being added.
+    let mut yielded = 0;
     for ((fileset, file_blocks), lines) in filesets.iter().zip(&blocks).zip(&block_lines) {
         parsed.boundaries.push(FilesetBoundary {
             bed_path: fileset.bed.clone(),
@@ -83,51 +103,57 @@ fn parse_local_bims_within(
             fam_path: fileset.fam.clone(),
             starting_global_index: parsed.total_variants,
         });
-        if is_pvar(&fileset.bim) {
-            let pieces = crate::adapt_plink2::render_virtual_bim_pieces(
+        let block_rows: Vec<BlockRows> = if is_pvar(&fileset.bim) {
+            // A piece numbers its rows from its own first row, which is known only once
+            // the pieces before it have rendered theirs.
+            let mut pieces = crate::adapt_plink2::render_virtual_bim_pieces(
                 file_blocks,
                 |piece: &mut PvarPiece, line| piece.take(line, &fileset.bim),
             );
-            for piece in pieces {
-                let before = parsed.records.len();
-                parsed.errors.extend(
-                    piece
-                        .errors
-                        .into_iter()
-                        .map(|(i, error)| (before + i, error)),
-                );
-                let first_row = parsed.total_variants;
-                parsed
-                    .records
-                    .extend(piece.records.into_iter().map(|mut record| {
+            let first_rows: Vec<u64> = pieces
+                .iter()
+                .scan(parsed.total_variants, |next, piece| {
+                    let first = *next;
+                    *next += piece.rows;
+                    Some(first)
+                })
+                .collect();
+            pieces
+                .par_iter_mut()
+                .zip(first_rows)
+                .for_each(|(piece, first_row)| {
+                    for record in &mut piece.records {
                         record.bim_row_index.0 += first_row;
-                        record
-                    }));
-                parsed.total_variants += piece.rows;
-            }
-            continue;
-        }
-        let first_rows: Vec<u64> = lines
-            .iter()
-            .scan(parsed.total_variants, |next, &count| {
-                let first = *next;
-                *next += count;
-                Some(first)
-            })
-            .collect();
-        let block_rows: Vec<(Vec<KeyedBimRecord>, Vec<(usize, PrepError)>)> = file_blocks
-            .par_iter()
-            .zip(first_rows)
-            .map(|(block, first_row)| parse_block(block, first_row, &fileset.bim))
-            .collect();
+                    }
+                });
+            parsed.total_variants += pieces.iter().map(|piece| piece.rows).sum::<u64>();
+            pieces
+                .into_iter()
+                .map(|piece| (piece.records, piece.errors))
+                .collect()
+        } else {
+            let first_rows: Vec<u64> = lines
+                .iter()
+                .scan(parsed.total_variants, |next, &count| {
+                    let first = *next;
+                    *next += count;
+                    Some(first)
+                })
+                .collect();
+            parsed.total_variants += lines.iter().sum::<u64>();
+            file_blocks
+                .par_iter()
+                .zip(first_rows)
+                .map(|(block, first_row)| parse_block(block, first_row, &fileset.bim))
+                .collect()
+        };
         for (records, errors) in block_rows {
-            let before = parsed.records.len();
             parsed
                 .errors
-                .extend(errors.into_iter().map(|(i, error)| (before + i, error)));
-            parsed.records.extend(records);
+                .extend(errors.into_iter().map(|(i, error)| (yielded + i, error)));
+            yielded += records.len();
+            parsed.blocks.push(records);
         }
-        parsed.total_variants += lines.iter().sum::<u64>();
     }
     Some(parsed)
 }
@@ -197,11 +223,11 @@ fn line_count(block: &[u8]) -> u64 {
     newlines + u64::from(block.last().is_some_and(|&b| b != b'\n'))
 }
 
-fn parse_block(
-    block: &[u8],
-    first_row: u64,
-    path: &Path,
-) -> (Vec<KeyedBimRecord>, Vec<(usize, PrepError)>) {
+/// One block's rows that parsed, and those that did not as (rows parsed before it in the
+/// block, error).
+type BlockRows = (Vec<KeyedBimRecord>, Vec<(usize, PrepError)>);
+
+fn parse_block(block: &[u8], first_row: u64, path: &Path) -> BlockRows {
     let mut records = Vec::with_capacity(block.len() / 24);
     let mut errors = Vec::new();
     for (i, raw_line) in block.split_inclusive(|&b| b == b'\n').enumerate() {
@@ -440,7 +466,7 @@ mod tests {
             let parsed = parse_local_bims_within(&filesets, u64::MAX, block_bytes).unwrap();
             let mut actual = Vec::new();
             let mut errors = parsed.errors.iter().peekable();
-            for (i, record) in parsed.records.iter().enumerate() {
+            for (i, record) in parsed.blocks.iter().flatten().enumerate() {
                 while let Some((_, error)) = errors.next_if(|(before, _)| *before == i) {
                     actual.push(describe(Err(error)));
                 }
@@ -508,7 +534,7 @@ mod tests {
             let parsed = parse_local_bims_within(&filesets, u64::MAX, block_bytes).unwrap();
             let mut actual = Vec::new();
             let mut errors = parsed.errors.iter().peekable();
-            for (i, record) in parsed.records.iter().enumerate() {
+            for (i, record) in parsed.blocks.iter().flatten().enumerate() {
                 while let Some((_, error)) = errors.next_if(|(before, _)| *before == i) {
                     actual.push(describe(Err(error)));
                 }

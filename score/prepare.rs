@@ -881,15 +881,58 @@ where
 /// The merge-join over rows already in memory, each side sorted by key with no row
 /// errors between: the loci `join_streams` reconciles, in the same order, without
 /// stepping through non-matching rows one at a time or recording diagnostics.
+///
+/// `bim` comes in runs that follow one another. A key's rows can go on from the end of
+/// one run into the next, so the rows of the key that ends a run wait, with any that
+/// go on, and join as one group. Joining the rows between those groups one stretch at
+/// a time, from where the score records stopped, joins what the rows end to end join.
 fn join_sorted_slices(
-    bim: &[KeyedBimRecord],
+    bim: &[&[KeyedBimRecord]],
     scores: &[KeyedScoreRecord],
     outputs: &mut JoinOutputs,
     effect_only_matches: &mut EffectOnlyMatches,
 ) -> Result<(), PrepError> {
     // Records are borrowed; only a locus with a record to resolve is copied.
     let mut resolved = Vec::new();
-    let (mut b, mut s) = (0, 0);
+    let mut s = 0;
+    // The rows of the key that ended the last run, and those of it that go on.
+    let mut group: Vec<KeyedBimRecord> = Vec::new();
+    for run in bim {
+        let mut run: &[KeyedBimRecord] = run;
+        if let Some(key) = group.first().map(|row| row.key) {
+            let goes_on = run.iter().take_while(|row| row.key == key).count();
+            group.extend_from_slice(&run[..goes_on]);
+            run = &run[goes_on..];
+            if run.is_empty() {
+                continue;
+            }
+            s = join_sorted_rows(&group, scores, s, outputs, effect_only_matches, &mut resolved)?;
+            group.clear();
+        }
+        let Some(last) = run.last().map(|row| row.key) else {
+            continue;
+        };
+        let ends = run.iter().rev().take_while(|row| row.key == last).count();
+        let (rows, end) = run.split_at(run.len() - ends);
+        s = join_sorted_rows(rows, scores, s, outputs, effect_only_matches, &mut resolved)?;
+        group.extend_from_slice(end);
+    }
+    s = join_sorted_rows(&group, scores, s, outputs, effect_only_matches, &mut resolved)?;
+    outputs.report_absent(&scores[s..]);
+    Ok(())
+}
+
+/// Joins `bim`, whole groups of rows by key, with `scores` from `s` on, and returns
+/// where the score records stop.
+fn join_sorted_rows(
+    bim: &[KeyedBimRecord],
+    scores: &[KeyedScoreRecord],
+    mut s: usize,
+    outputs: &mut JoinOutputs,
+    effect_only_matches: &mut EffectOnlyMatches,
+    resolved: &mut Vec<KeyedScoreRecord>,
+) -> Result<usize, PrepError> {
+    let mut b = 0;
     while b < bim.len() && s < scores.len() {
         let (bim_key, score_key) = (bim[b].key, scores[s].key);
         match bim_key.cmp(&score_key) {
@@ -913,10 +956,10 @@ fn join_sorted_slices(
                     resolve_effect_only_records(
                         bim_key,
                         bim_group,
-                        &mut resolved,
+                        resolved,
                         effect_only_matches,
                     );
-                    outputs.reconcile_locus(bim_key, bim_group, &resolved)?;
+                    outputs.reconcile_locus(bim_key, bim_group, resolved)?;
                 } else {
                     outputs.reconcile_locus(bim_key, bim_group, score_group)?;
                 }
@@ -924,8 +967,7 @@ fn join_sorted_slices(
             }
         }
     }
-    outputs.report_absent(&scores[s..]);
-    Ok(())
+    Ok(s)
 }
 
 /// A record that names no single other allele becomes the pair of the one allele of its site
@@ -1381,12 +1423,12 @@ fn prepare_for_computation_with_retry(
     let mut parsed_layout = None;
     let mut bim_rows = match parse::parse_local_bims(&fileset_paths) {
         Some(parse::ParsedBim {
-            records,
+            blocks,
             errors,
             boundaries,
             total_variants,
         }) => {
-            let rows = BimRows::parsed(records, errors, &boundaries, &mut seen_invalid_bim_chrs)?;
+            let rows = BimRows::parsed(blocks, errors, &boundaries, &mut seen_invalid_bim_chrs)?;
             parsed_layout = Some((total_variants, boundaries));
             rows
         }
@@ -1455,7 +1497,7 @@ fn prepare_for_computation_with_retry(
         )
     };
     if let Some((bim, scores)) = plain_rows {
-        join_sorted_slices(bim, scores, &mut outputs, &mut effect_only_matches)?;
+        join_sorted_slices(&bim, scores, &mut outputs, &mut effect_only_matches)?;
         if outputs.required_bim_indices.is_empty() {
             // Only a join that matched nothing reports what it walked past, so
             // walk the same rows the streaming way to describe them, counting
@@ -1469,7 +1511,12 @@ fn prepare_for_computation_with_retry(
             }
             effect_only_matches = EffectOnlyMatches::default();
             join_streams(
-                &mut bim.iter().cloned().map(Ok::<_, PrepError>).peekable(),
+                &mut bim
+                    .iter()
+                    .flat_map(|run| run.iter())
+                    .cloned()
+                    .map(Ok::<_, PrepError>)
+                    .peekable(),
                 &mut scores.iter().cloned().map(Ok::<_, PrepError>).peekable(),
                 &mut outputs,
                 &mut diagnostics,
@@ -2179,9 +2226,12 @@ mod tests {
             write_bim_fileset(&prefix, rows, 4);
             let weights = dir.path().join(format!("{name}.tsv"));
             std::fs::write(&weights, weights_text).unwrap();
-            // The retry entry point compiles without the plan cache.
-            let describe = |forced: bool| {
+            // The retry entry point compiles without the plan cache. A block of about a
+            // line parses every row on its own, so the slice join takes one run per row
+            // and joins each split locus across the runs that hold it.
+            let describe = |forced: bool, block_bytes: usize| {
                 FORCE_STREAMING_JOIN.with(|force| force.set(forced));
+                parse::TEST_MIN_BLOCK_BYTES.with(|bytes| bytes.set(block_bytes));
                 let result = prepare_for_computation_with_retry(
                     std::slice::from_ref(&prefix),
                     std::slice::from_ref(&weights),
@@ -2193,13 +2243,15 @@ mod tests {
                     None,
                 );
                 FORCE_STREAMING_JOIN.with(|force| force.set(false));
+                parse::TEST_MIN_BLOCK_BYTES.with(|bytes| bytes.set(parse::MIN_BLOCK_BYTES));
                 match result {
                     Ok(prep) => format!("{prep:?}"),
                     Err(error) => format!("error {error}"),
                 }
             };
-            let sliced = describe(false);
-            assert_eq!(sliced, describe(true), "{name}");
+            let sliced = describe(false, parse::MIN_BLOCK_BYTES);
+            assert_eq!(sliced, describe(true, parse::MIN_BLOCK_BYTES), "{name}");
+            assert_eq!(sliced, describe(false, 1), "{name}: a block a line");
             let expect_plan = matches!(
                 name,
                 "mixed" | "unsorted_bim" | "descending_scores" | "effect_only"
@@ -3393,10 +3445,13 @@ enum BimRows<'i, 'a> {
         descended_in: Option<PathBuf>,
     },
     Sorted(std::vec::IntoIter<KeyedBimRecord>),
-    /// Rows parsed from whole local files, in file order, with each unparsable
-    /// row as its error at its place: `errors` holds (rows yielded before, error).
+    /// Rows parsed from whole local files, in file order, block by block as they were
+    /// parsed, with each unparsable row as its error at its place: `records` is the
+    /// block being yielded, `blocks` the ones after it, and `errors` holds (rows
+    /// yielded before, error).
     Parsed {
         records: std::vec::IntoIter<KeyedBimRecord>,
+        blocks: std::vec::IntoIter<Vec<KeyedBimRecord>>,
         errors: std::iter::Peekable<std::vec::IntoIter<(usize, PrepError)>>,
         yielded: usize,
     },
@@ -3442,22 +3497,26 @@ impl<'i, 'a> BimRows<'i, 'a> {
     /// `sorted` does, without reading the files again, and a row error that is
     /// not a parse error ends the run, as it ends `sorted`.
     fn parsed(
-        mut records: Vec<KeyedBimRecord>,
+        blocks: Vec<Vec<KeyedBimRecord>>,
         errors: Vec<(usize, PrepError)>,
         boundaries: &[FilesetBoundary],
         seen_invalid_bim_chrs: &mut AHashSet<String>,
     ) -> Result<Self, PrepError> {
-        let Some(descent) = records
-            .windows(2)
-            .position(|pair| pair[1].key < pair[0].key)
-        else {
+        let mut previous: Option<VariantKey> = None;
+        let descent = blocks.iter().flatten().find(|record| {
+            let descends = previous.is_some_and(|key| record.key < key);
+            previous = Some(record.key);
+            descends
+        });
+        let Some(descent) = descent else {
             return Ok(Self::Parsed {
-                records: records.into_iter(),
+                records: Vec::new().into_iter(),
+                blocks: blocks.into_iter(),
                 errors: errors.into_iter().peekable(),
                 yielded: 0,
             });
         };
-        let row = records[descent + 1].bim_row_index.0;
+        let row = descent.bim_row_index.0;
         let fileset = boundaries.partition_point(|b| b.starting_global_index <= row) - 1;
         eprintln!(
             "> Variants in {} are not sorted by chromosome and position. Matching them in sorted order...",
@@ -3475,18 +3534,29 @@ impl<'i, 'a> BimRows<'i, 'a> {
                 );
             }
         }
+        let mut records = Vec::with_capacity(blocks.iter().map(Vec::len).sum());
+        for block in blocks {
+            records.extend(block);
+        }
         records.par_sort_unstable_by_key(|record| (record.key, record.bim_row_index));
         Ok(Self::Sorted(records.into_iter()))
     }
 
-    /// Every row still to come, when all of them are in memory in key order with no
-    /// row error between them.
-    fn plain_records(&self) -> Option<&[KeyedBimRecord]> {
+    /// Every row still to come, in runs that follow one another, when all of them are
+    /// in memory in key order with no row error between them.
+    fn plain_records(&self) -> Option<Vec<&[KeyedBimRecord]>> {
         match self {
-            Self::Sorted(records) => Some(records.as_slice()),
+            Self::Sorted(records) => Some(vec![records.as_slice()]),
             Self::Parsed {
-                records, errors, ..
-            } if errors.len() == 0 => Some(records.as_slice()),
+                records,
+                blocks,
+                errors,
+                ..
+            } if errors.len() == 0 => Some(
+                std::iter::once(records.as_slice())
+                    .chain(blocks.as_slice().iter().map(Vec::as_slice))
+                    .collect(),
+            ),
             Self::Streamed { .. } | Self::Parsed { .. } => None,
         }
     }
@@ -3526,13 +3596,19 @@ impl Iterator for BimRows<'_, '_> {
             Self::Sorted(records) => records.next().map(Ok),
             Self::Parsed {
                 records,
+                blocks,
                 errors,
                 yielded,
             } => {
                 if let Some((_, error)) = errors.next_if(|(before, _)| *before == *yielded) {
                     return Some(Err(error));
                 }
-                let record = records.next()?;
+                let record = loop {
+                    if let Some(record) = records.next() {
+                        break record;
+                    }
+                    *records = blocks.next()?.into_iter();
+                };
                 *yielded += 1;
                 Some(Ok(record))
             }
