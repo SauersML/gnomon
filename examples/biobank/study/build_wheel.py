@@ -623,12 +623,44 @@ def fma_instructions(wheel, work):
     return int(counted.stdout.strip() or 0)
 
 
+def stamp_version(gam, sha, wheel):
+    """Rewrite the built wheel to the version gam derives from the pinned commit, and prove it names that engine.
+
+    maturin writes pyproject.toml's static release line into every wheel, so every gam commit between two releases
+    built under one version string (0.1.268 across saved-model payloads 17 to 29, gam#3157). Since be3b178b28 the
+    pinned tree's own ``scripts/gamfit_version.py stamp`` rewrites a built wheel to the version derived from its
+    commit (``MAJOR.MINOR.(PATCH+1).devD+g<commit>``; the bare release line only for the commit that set it). A pin
+    older than that has no such script and is refused, not built under the shared release string.
+    """
+    script = Path(gam) / "scripts" / "gamfit_version.py"
+    if not script.is_file():
+        raise SystemExit(f"gam {sha} has no scripts/gamfit_version.py (it predates be3b178b28), so its wheel cannot "
+                         "carry a version that names its engine; refusing the pin")
+    done = subprocess.run([sys.executable, script, "stamp", "--root", gam, wheel], capture_output=True, text=True)
+    if done.returncode:
+        raise SystemExit(f"gamfit_version.py stamp refused {wheel.name}: {done.stderr.strip()}")
+    stamped = Path(done.stdout.strip())
+    version = stamped.name.split("-")[1]
+    with zipfile.ZipFile(stamped) as archive:
+        metadata = archive.read(f"gamfit-{version}.dist-info/METADATA").decode()
+    declared = [line[len("Version: "):] for line in metadata.splitlines() if line.startswith("Version: ")]
+    # A development build names its commit; only the commit that set a release line may carry the bare release.
+    names_engine = f"+g{sha}" in version and not version.endswith(".dirty")
+    is_release = not names_engine and subprocess.run(
+        [sys.executable, script, "release", "--root", gam], capture_output=True, text=True).stdout.strip() == version
+    if declared != [version] or not (names_engine or is_release):
+        raise SystemExit(f"stamped wheel {stamped.name} (METADATA {declared}) does not name gam {sha}")
+    return stamped, version
+
+
 def verified_build(args, sha, stamp, lines, out, pip_python, pip_info):
     required = cpu_features(args.cpu) if args.cpu else None
     wheel, compiled = build(args.gam, args.target_dir, out, args.maturin, args.jobs, args.build_timeout, args.profile,
                             args.cpu)
     print(f"BUILT {wheel.name} in {compiled['seconds']} s: {compiled['rustc_calls']} rustc calls, "
           f"{compiled['fresh_units']} fresh units", flush=True)
+    wheel, version = stamp_version(args.gam, sha, wheel)
+    print(f"STAMPED {wheel.name}", flush=True)
     guard = add_cpu_guard(wheel, args.cpu, required) if args.cpu else None
     extension = inspect_extension(wheel, out, args.profile)
     if args.cpu:
@@ -643,7 +675,7 @@ def verified_build(args, sha, stamp, lines, out, pip_python, pip_info):
                   "wheel": str(wheel), "wheel_sha256": sha256(wheel), "engine_sha256": extension["engine_sha256"],
                   "rustc": run(["rustc", "--version"]).strip(), "maturin": run([args.maturin, "--version"]).strip(),
                   "build": compiled, "extension": extension, "dependencies": stamp, "cpu_guard": guard,
-                  "resolver": pip_info}
+                  "resolver": pip_info, "version": version}
     tar = resolve(wheel, args.deps, lines, out, provenance, archive=args.profile == "release-pypi",
                   pip_python=pip_python)
     if tar:
