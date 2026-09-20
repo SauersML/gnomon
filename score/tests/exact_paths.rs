@@ -948,13 +948,19 @@ fn the_unmatched_report_is_the_same_file_from_plink_and_vcf() -> TestResult {
         &score,
         "variant_id\teffect_allele\tother_allele\tS1\tS2\n\
          1:100\tG\tA\t0.5\t1\n1:100\tC\tA\t1\t\n1:100\tA\t.\t2\t\n\
-         1:200\tT\tC\t\t1\n1:200\tG\t.\t1\t1\n1:300\tA\tG\t1\t2\n",
+         1:200\tT\tC\t\t1\n1:200\tG\t.\t1\t1\n1:200\tT\tN\t3\t\n1:200\tT\tC\t\t4\n1:300\tA\tG\t1\t2\n",
     )?;
     let header = "#score\tvariant_id\teffect_allele\tother_allele\treason\talleles_seen\n";
+    // At 1:100, A beside no single other allele names the site's REF through its first variant,
+    // G, as the G/A row names G: S1 counts that variant once, by the row first in allele text.
+    // S2's two T/C rows at 1:200 are one variant too, and T/N pairs with nothing.
     let unscored = "S1\t1:100\tC\tA\tno_allele_pair\tA/G,A/T\n\
+                    S1\t1:100\tG\tA\tsame_variant\tA/G,A/T\n\
                     S1\t1:200\tG\t.\tno_allele_pair\tC/T\n\
+                    S1\t1:200\tT\tN\tno_other_allele\t.\n\
                     S1\t1:300\tA\tG\tno_variant_at_position\t.\n\
-                    S2\t1:200\tG\t.\tno_allele_pair\tC/T\n";
+                    S2\t1:200\tG\t.\tno_allele_pair\tC/T\n\
+                    S2\t1:200\tT\tC\tsame_variant\tC/T\n";
     for input in ["cohort", "cohort.vcf"] {
         let report = dir.path().join(format!("{}.unmatched.tsv", input.replace('.', "_")));
         let output = Command::new(SCORE_BIN)
@@ -962,17 +968,36 @@ fn the_unmatched_report_is_the_same_file_from_plink_and_vcf() -> TestResult {
             .env("GNOMON_CACHE_DIR", dir.path().join("cache"))
             .arg("--out")
             .arg(dir.path().join(input.replace('.', "_")))
+            .arg("--emit-components")
             .arg("--unmatched-report")
             .arg(&report)
             .arg(&score)
             .arg(dir.path().join(input))
             .output()?;
         assert_success(&output);
+        let lines = fs::read_to_string(&report)?;
         assert_eq!(
-            fs::read_to_string(&report)?,
+            lines,
             format!("{header}{unscored}S2\t1:300\tA\tG\tno_variant_at_position\t.\n"),
             "{input}"
         );
+        // Every weight a score's rows hold is one of its variants, which --emit-components counts, or
+        // one line of the report.
+        let sscore = fs::read_to_string(dir.path().join(format!("{}.sscore", input.replace('.', "_"))))?;
+        for (column, name) in [(3, "S1"), (4, "S2")] {
+            let rows = fs::read_to_string(&score)?
+                .lines()
+                .skip(1)
+                .filter(|row| row.split('\t').nth(column).is_some_and(|weight| !weight.is_empty()))
+                .count();
+            let counted: usize = sscore
+                .lines()
+                .find_map(|row| row.strip_prefix(&format!("#SCORE_VARIANT_COUNT\t{name}\t")))
+                .ok_or("no variant count")?
+                .parse()?;
+            let reported = lines.lines().filter(|line| line.starts_with(&format!("{name}\t"))).count();
+            assert_eq!(rows, counted + reported, "{input} {name}: {rows} rows, {counted} variants, {reported} lines");
+        }
     }
 
     // With S2 restricted to 1:100-250, its 1:300 row is outside the region instead.

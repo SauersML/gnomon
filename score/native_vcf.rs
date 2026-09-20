@@ -6,7 +6,7 @@ use crate::score::pipeline::MemoryBudget;
 use crate::score::prepare::EffectOnlyMatches;
 use crate::score::site::{RowMatch, Site, SiteAllele, names_no_single_other_allele, row_side};
 use crate::score::types::{GenomicRegion, parse_chromosome_label};
-use crate::score::unmatched::{Line, Unmatched, alleles_seen, write_report};
+use crate::score::unmatched::{Line, Unmatched, alleles_seen, same_variant, write_report};
 use crate::shared::files::open_variant_source;
 use ahash::{AHashMap, AHashSet};
 use flate2::read::MultiGzDecoder;
@@ -148,18 +148,20 @@ struct ScoreRules {
     most_runs: usize,
     most_per_score: usize,
     most_weights: usize,
-    /// With `--unmatched-report`, the weights a score's region leaves out; `None` without it.
-    unmatched: Option<Vec<RegionDrop>>,
+    /// With `--unmatched-report`, the weights the rules leave out as they load; `None` without it.
+    unmatched: Option<Vec<LoadDrop>>,
 }
 
-/// A weight a score's region leaves out: its row's position and alleles, as spans of
-/// `ScoreRules::alleles`, and its score.
+/// A weight the rules leave out as they load, because its score's region does not hold its row or
+/// its row's other allele is N: its row's position and alleles, as spans of `ScoreRules::alleles`,
+/// its score and why.
 #[derive(Debug, Clone, Copy)]
-struct RegionDrop {
+struct LoadDrop {
     key: VariantKey,
     effect_allele: (usize, usize),
     other_allele: (usize, usize),
     score_index: usize,
+    reason: Unmatched,
 }
 
 impl ScoreRules {
@@ -193,7 +195,7 @@ struct ScoreRulesBuilder {
     rows: Vec<(VariantKey, ScoreRule, (usize, usize))>,
     alleles: String,
     applications: Vec<ScoreApplication>,
-    unmatched: Option<Vec<RegionDrop>>,
+    unmatched: Option<Vec<LoadDrop>>,
 }
 
 impl ScoreRulesBuilder {
@@ -229,20 +231,21 @@ impl ScoreRulesBuilder {
         (start, self.alleles.len())
     }
 
-    /// Records, for `--unmatched-report`, a weight of the row at `key` that the region of score
-    /// `score_index` leaves out.
-    fn push_region_drop(&mut self, key: VariantKey, effect_allele: &str, other_allele: &str, score_index: usize) {
+    /// Records, for `--unmatched-report`, a weight of score `score_index` of the row at `key` that
+    /// the rules leave out for `reason`.
+    fn push_drop(&mut self, key: VariantKey, (effect_allele, other_allele): (&str, &str), score_index: usize, reason: Unmatched) {
         if self.unmatched.is_none() {
             return;
         }
         let effect_allele = self.push_allele(effect_allele);
         let other_allele = self.push_allele(other_allele);
         if let Some(drops) = self.unmatched.as_mut() {
-            drops.push(RegionDrop {
+            drops.push(LoadDrop {
                 key,
                 effect_allele,
                 other_allele,
                 score_index,
+                reason,
             });
         }
     }
@@ -473,8 +476,9 @@ impl<'a> RecordAccumulator<'a> {
     /// and, as it adds, a cursor a run and one score's weights of an allele; the same once more to
     /// take alleles; the smallest buffers of its queues; and the one column a position builds at a
     /// time, with its queue slots at the position with the most runs and weights; and with
-    /// `--unmatched-report`, a line for every weight and the first buffer of the alleles seen. Its
-    /// rules and weights are the plan's, held before the budget was read.
+    /// `--unmatched-report`, a line for every weight, the first buffer of the alleles seen and a
+    /// position's weights as their rows are compared. Its rules and weights are the plan's, held
+    /// before the budget was read.
     fn bytes(people: usize, scores: usize, rules_by_key: &ScoreRules) -> usize {
         let cells = people.saturating_mul(scores);
         let rules = rules_by_key.rules.len();
@@ -513,6 +517,10 @@ impl<'a> RecordAccumulator<'a> {
             grown_bytes(rules_by_key.merged.len(), std::mem::size_of::<NativeLine>())
                 .saturating_add(vec_base(std::mem::size_of::<Arc<str>>()))
                 .saturating_add(allocation_bytes(16))
+                .saturating_add(grown_bytes(
+                    rules_by_key.most_weights,
+                    std::mem::size_of::<(usize, usize, &str, &str, (usize, usize))>(),
+                ))
         }))
     }
 
@@ -2139,6 +2147,30 @@ impl PendingPosition {
             }
             named.push((allele.variant(), run));
         }
+        if let Some(report) = report.as_deref_mut() {
+            // Of the weights naming one variant for one score, every one after the first by allele text
+            // adds no variant to the score.
+            let mut weights: Vec<(usize, usize, &str, &str, (usize, usize))> = Vec::new();
+            for &(variant, (run, _)) in &named {
+                let (start, end) = rules_by_key.rules[run].merged;
+                weights.extend((start..end).map(|weight| {
+                    let (effect_allele, other_allele) = weight_alleles(rules_by_key, run, weight);
+                    (rules_by_key.merged[weight].score_index, variant, effect_allele, other_allele, (run, weight))
+                }));
+            }
+            for (run, weight) in same_variant(&mut weights) {
+                let seen = *seen.get_or_insert_with(|| {
+                    report.add_seen(alleles_seen(site_rows.iter().map(|&(_, reference, alternate)| (reference, alternate))))
+                });
+                report.lines.push(NativeLine {
+                    run,
+                    weight,
+                    key,
+                    reason: Unmatched::SameVariant,
+                    seen,
+                });
+            }
+        }
         if named.is_empty() {
             return Ok(());
         }
@@ -2219,6 +2251,19 @@ impl PendingPosition {
             conflicts.record(chromosome, position, &site, variant, doses);
         }
         Ok(())
+    }
+}
+
+/// The effect and other allele of the row a weight of the run starting at rule `run` comes from:
+/// the run's first rule's, or, for a weight of the run's other orientation, the same pair the
+/// other way.
+fn weight_alleles(rules_by_key: &ScoreRules, run: usize, weight: usize) -> (&str, &str) {
+    let rule = &rules_by_key.rules[run];
+    let (first, second) = (rules_by_key.allele(rule.effect_allele), rules_by_key.allele(rule.other_allele));
+    if rules_by_key.merged[weight].same_effect {
+        (first, second)
+    } else {
+        (second, first)
     }
 }
 
@@ -2584,13 +2629,9 @@ impl NativeReport {
     fn write(mut self, path: &Path, rules_by_key: &ScoreRules, score_names: &[String]) -> io::Result<()> {
         let seen = std::mem::take(&mut self.seen);
         let line_of = |line: &NativeLine| {
-            let weight = rules_by_key.merged[line.weight];
-            let rule = &rules_by_key.rules[line.run];
-            let (first, second) = (rules_by_key.allele(rule.effect_allele), rules_by_key.allele(rule.other_allele));
-            // A weight of its run's other orientation is a row naming the run's pair the other way.
-            let (effect_allele, other_allele) = if weight.same_effect { (first, second) } else { (second, first) };
+            let (effect_allele, other_allele) = weight_alleles(rules_by_key, line.run, line.weight);
             Line {
-                score: &score_names[weight.score_index],
+                score: &score_names[rules_by_key.merged[line.weight].score_index],
                 key: line.key,
                 effect_allele,
                 other_allele,
@@ -2598,12 +2639,12 @@ impl NativeReport {
                 seen: &seen[line.seen as usize],
             }
         };
-        let drop_of = |drop: &RegionDrop| Line {
+        let drop_of = |drop: &LoadDrop| Line {
             score: &score_names[drop.score_index],
             key: drop.key,
             effect_allele: rules_by_key.allele(drop.effect_allele),
             other_allele: rules_by_key.allele(drop.other_allele),
-            reason: Unmatched::OutsideRegion,
+            reason: drop.reason,
             seen: "",
         };
         self.lines.sort_unstable_by(|a, b| line_of(a).cmp(&line_of(b)));
@@ -3026,6 +3067,25 @@ fn load_score_rules(
             }
             if other_allele == "N" {
                 rejected.unknown_other_allele(path, line_number);
+                if rules.unmatched.is_some() {
+                    let mut key_parts = variant_id.splitn(2, ':');
+                    let chromosome = parse_chromosome_label(key_parts.next().unwrap_or_default());
+                    let position = key_parts.next().unwrap_or_default().trim().parse::<u32>();
+                    if let (Ok(chromosome), Ok(position)) = (chromosome, position) {
+                        for (column, weight_text) in fields.enumerate() {
+                            if let (false, Some(Some(score_index))) =
+                                (weight_text.trim().is_empty(), score_indices.get(column).copied())
+                            {
+                                rules.push_drop(
+                                    (chromosome, position),
+                                    (effect_allele, other_allele),
+                                    score_index,
+                                    Unmatched::NoOtherAllele,
+                                );
+                            }
+                        }
+                    }
+                }
                 line.clear();
                 continue;
             }
@@ -3073,7 +3133,7 @@ fn load_score_rules(
                 if let Some(Some(region)) = column_regions.get(column)
                     && !region.contains(key)
                 {
-                    rules.push_region_drop(key, effect_allele, other_allele, score_index);
+                    rules.push_drop(key, (effect_allele, other_allele), score_index, Unmatched::OutsideRegion);
                     continue;
                 }
 

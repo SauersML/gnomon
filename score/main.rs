@@ -115,8 +115,8 @@ struct Args {
     #[clap(long, value_name = "N", requires = "blocks")]
     blocks_max: Option<usize>,
 
-    /// Write each weight of a score row that adds to no score to PATH, with why and the alleles
-    /// the genotypes hold at its position.
+    /// Write each weight of a score row that adds no variant to its score to PATH, with why and the
+    /// alleles the genotypes hold at its position.
     #[clap(long, value_name = "PATH")]
     unmatched_report: Option<PathBuf>,
 }

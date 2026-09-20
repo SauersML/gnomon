@@ -89,10 +89,12 @@ struct ScoreArgs {
     #[arg(long, value_name = "N", requires = "blocks")]
     blocks_max: Option<usize>,
 
-    /// Write each weight of a score row that adds to no score to PATH, one line a weight, with
-    /// why (no variant at the position, no allele pair there, several alleles, outside the
-    /// score's region) and the alleles the genotypes hold there. Every genotype format gives the
-    /// same file where it declares, or its alleles read as, the same REF.
+    /// Write each weight of a score row that adds no variant to its score to PATH, one line a
+    /// weight, with why (no variant at the position, no allele pair there, several alleles, outside
+    /// the score's region, an N other allele, or a variant another row of the score names) and the
+    /// alleles the genotypes hold there. A score's rows are its variant count and its lines, and
+    /// every genotype format gives the same file where it declares, or its alleles read as, the same
+    /// REF.
     #[arg(long, value_name = "PATH")]
     unmatched_report: Option<PathBuf>,
 }

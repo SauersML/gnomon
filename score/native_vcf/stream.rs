@@ -1551,8 +1551,9 @@ mod tests {
             for path in cohort_files(&case, &format!("{}{body}", header(samples))) {
                 let (unbounded, unbounded_added) = counted_run(&path, &score_path, usize::MAX / 2, reported);
                 let unbounded = unbounded.unwrap_or_else(|err| panic!("{name} {path:?}: {err}"));
-                // Each C/A row's two weights, and the one weight at each position without a record.
-                let expected_lines = reported.then_some(300 * 2 + 300);
+                // Each C/A row's two weights, the one weight at each position without a record, and the
+                // G/A row's S1 weight, whose variant the A/G row there names first.
+                let expected_lines = reported.then_some(300 * 2 + 300 + 300);
                 assert_eq!(unbounded.report.as_ref().map(|report| report.lines.len()), expected_lines, "{name} {path:?}");
                 let (refused, added) = counted_run(&path, &score_path, 1 << 10, reported);
                 let refused = refused.expect_err("a budget below the sums");

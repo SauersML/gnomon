@@ -107,10 +107,11 @@ needs `--blocks-max <n>` to proceed. Without `--blocks` nothing changes.
 
 #### Unmatched score rows
 
-`--unmatched-report PATH` writes each weight of a score row that adds to no score, one
-line a weight: the score, the row's variant and alleles, why, and the alleles the
-genotypes hold at its position (each row's pair without the trailing bases it shares,
-in text order).
+`--unmatched-report PATH` writes each weight of a score row that adds no variant to its
+score, one line a weight: the score, the row's variant and alleles, why, and the
+alleles the genotypes hold at its position (each row's pair without the trailing bases
+it shares, in text order). For every score, the weights its rows hold are its
+`#SCORE_VARIANT_COUNT` and its lines here, exactly.
 
 ```
 #score	variant_id	effect_allele	other_allele	reason	alleles_seen
@@ -119,12 +120,14 @@ S1	1:300	A	G	no_variant_at_position	.
 ```
 
 The reasons are `no_variant_at_position`, `no_allele_pair`, `several_alleles` (a row
-naming no single other allele whose effect allele is more than one allele there) and
-`outside_region`. Every path decides a row by one site rule, so a joined or split
-VCF, a BCF and a PGEN of the same genotypes give the same file, and so does a `.bed`
-wherever its alleles read as the REF the others declare (a `.bim` declares none). Rows the
-score normalization drops (no position, an unsupported contig, a malformed line) are
-named with their lines in its warning instead.
+naming no single other allele whose effect allele is more than one allele there),
+`outside_region`, `no_other_allele` (an N other allele) and `same_variant`: a variant
+counts once in its score however many rows name it, every row's weight adding to its
+dose, and the rows after the first by allele text are listed here. Every path decides a
+row by one site rule, so a joined or split VCF, a BCF and a PGEN of the same genotypes
+give the same file, and so does a `.bed` wherever its alleles read as the REF the others
+declare (a `.bim` declares none). Rows the score normalization drops (no position, an
+unsupported contig, a malformed line) are named with their lines in its warning instead.
 
 #### Example:
 ```

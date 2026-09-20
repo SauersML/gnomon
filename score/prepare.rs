@@ -17,7 +17,7 @@ use crate::score::types::{
     PreparationResult, ScoreColumnIndex, ScoreInfo, parse_chromosome_label,
 };
 use crate::score::types::{OriginalPersonIndex, OutputPersonIndex};
-use crate::score::unmatched::{Unmatched, UnmatchedRows, alleles_seen};
+use crate::score::unmatched::{Unmatched, UnmatchedRows, alleles_seen, same_variant};
 use ahash::{AHashMap, AHashSet};
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -82,6 +82,24 @@ struct KeyedScoreRecord {
     other_allele: Allele,
     score_column_index: ScoreColumnIndex,
     weight: f64,
+}
+
+impl KeyedScoreRecord {
+    /// The record's effect and other allele, as its row writes them.
+    fn alleles(&self) -> (&str, &str) {
+        (self.effect_allele.as_str(), self.other_allele.as_str())
+    }
+}
+
+/// A score weight the score reader drops, for `--unmatched-report`: its score, its row's
+/// position and alleles, and why.
+#[derive(Debug, Clone)]
+struct ScoreDrop {
+    score: usize,
+    key: VariantKey,
+    effect_allele: Allele,
+    other_allele: Allele,
+    reason: Unmatched,
 }
 
 /// Most genome rows contain one of a handful of literal alleles. Borrow those
@@ -483,23 +501,36 @@ impl JoinOutputs {
         }
     }
 
-    /// Records each weight of `score_group` that the `.bim` rows sharing its position `key` do not
-    /// score, as the site rule decides it before any record is resolved.
+    /// Records each weight of `score_group` that adds no variant to its score, as the site rule
+    /// decides it over the `.bim` rows sharing its position `key` before any record is resolved:
+    /// a record the site does not score, and one naming a variant another record of its score
+    /// names, after the first of them by allele text.
     fn report_locus(&mut self, key: VariantKey, bim_group: &[KeyedBimRecord], score_group: &[KeyedScoreRecord]) {
         let Some(report) = self.report.as_mut() else {
             return;
         };
         let site = bim_site(bim_group);
         let mut seen = None;
-        for record in score_group {
-            let alleles = (record.effect_allele.as_str(), record.other_allele.as_str());
-            let Some(reason) = Unmatched::at_site(&site, alleles.0, alleles.1) else {
-                continue;
-            };
-            let seen = *seen.get_or_insert_with(|| {
+        let mut seen_at = |report: &mut UnmatchedRows| {
+            *seen.get_or_insert_with(|| {
                 report.add_seen(alleles_seen(bim_group.iter().map(|row| (row.allele2.as_str(), row.allele1.as_str()))))
-            });
-            report.add(record.score_column_index.0, key, alleles, reason, seen);
+            })
+        };
+        let mut named = Vec::new();
+        for (index, record) in score_group.iter().enumerate() {
+            let (effect, other) = record.alleles();
+            let decision = site.match_row(effect, other);
+            if let Some(reason) = Unmatched::of(decision, other) {
+                let seen = seen_at(report);
+                report.add(record.score_column_index.0, key, (effect, other), reason, seen);
+            } else if let RowMatch::Scores(allele) = decision {
+                named.push((record.score_column_index.0, allele.variant(), effect, other, index));
+            }
+        }
+        for index in same_variant(&mut named) {
+            let record = &score_group[index];
+            let seen = seen_at(report);
+            report.add(record.score_column_index.0, key, record.alleles(), Unmatched::SameVariant, seen);
         }
     }
 
@@ -1161,8 +1192,9 @@ struct KWayMergeIterator {
     pending_errors: std::collections::VecDeque<PrepError>,
     region_filters: Option<Vec<Option<GenomicRegion>>>,
     region_filter_hits: Option<Vec<bool>>,
-    /// With `--unmatched-report`, the weights a score's region leaves out.
-    region_drops: Option<Vec<KeyedScoreRecord>>,
+    /// With `--unmatched-report`, the weights the reader drops: those a score's region leaves out,
+    /// and those of rows whose other allele is N.
+    unmatched_drops: Option<Vec<ScoreDrop>>,
 }
 
 /// An iterator that streams over one or more `.bim` files.
@@ -1454,10 +1486,11 @@ fn prepare_for_computation_with_retry(
     });
 
     // Score files within the budget are parsed whole on the pool as well. Region
-    // filters, and files the streaming merge would refuse, stream as before.
-    let parsed_scores = match region_filters {
-        None => scores::parse_score_files(sorted_score_files, &score_name_to_col_index),
-        Some(_) => None,
+    // filters, a report of the rows the reader drops, and files the streaming merge
+    // would refuse, stream as before.
+    let parsed_scores = match (&region_filters, unmatched_report) {
+        (None, None) => scores::parse_score_files(sorted_score_files, &score_name_to_col_index),
+        _ => None,
     };
     let mut score_iterator = match parsed_scores {
         Some(parsed) => ScoreRows::Parsed(parsed),
@@ -1468,7 +1501,7 @@ fn prepare_for_computation_with_retry(
         )?),
     };
     if unmatched_report.is_some() {
-        score_iterator.record_region_drops();
+        score_iterator.record_unmatched_drops();
     }
 
     let rows_sorted_by_key = matches!(bim_rows, BimRows::Sorted(_));
@@ -1629,14 +1662,9 @@ fn prepare_for_computation_with_retry(
     rejected_score_rows.report();
     effect_only_matches.report();
     if let (Some(path), Some(mut report)) = (unmatched_report, report) {
-        for record in score_iterator.take_region_drops() {
-            report.add(
-                record.score_column_index.0,
-                record.key,
-                (record.effect_allele.as_str(), record.other_allele.as_str()),
-                Unmatched::OutsideRegion,
-                0,
-            );
+        for drop in score_iterator.take_unmatched_drops() {
+            let alleles = (drop.effect_allele.as_str(), drop.other_allele.as_str());
+            report.add(drop.score, drop.key, alleles, drop.reason, 0);
         }
         report
             .write(path, &score_names)
@@ -3687,7 +3715,7 @@ impl KWayMergeIterator {
             pending_errors: std::collections::VecDeque::new(),
             region_filters,
             region_filter_hits,
-            region_drops: None,
+            unmatched_drops: None,
         };
 
         for i in 0..iter.streams.len() {
@@ -3714,7 +3742,7 @@ impl KWayMergeIterator {
                         column_map,
                         None,
                         None,
-                        None,
+                        self.unmatched_drops.as_mut(),
                         &mut self.pending_errors,
                     )?
                 };
@@ -3750,7 +3778,7 @@ impl KWayMergeIterator {
                     column_map,
                     region_filters,
                     region_hits_slice,
-                    self.region_drops.as_mut(),
+                    self.unmatched_drops.as_mut(),
                     &mut self.pending_errors,
                 )?
             };
@@ -3776,7 +3804,7 @@ impl KWayMergeIterator {
         column_map: &[ScoreColumnIndex],
         region_filters: Option<&[Option<GenomicRegion>]>,
         mut region_hits: Option<&mut [bool]>,
-        mut region_drops: Option<&mut Vec<KeyedScoreRecord>>,
+        mut unmatched_drops: Option<&mut Vec<ScoreDrop>>,
         pending_errors: &mut std::collections::VecDeque<PrepError>,
     ) -> Result<LineReadOutcome, PrepError> {
         stream.line_buffer.clear();
@@ -3818,6 +3846,25 @@ impl KWayMergeIterator {
                 // No .bim record pairs with an unknown other allele. The row is
                 // skipped on its own and reported; the rest of the file still counts.
                 stream.rejected.record(&stream.path, line_number);
+                if let Some(drops) = unmatched_drops.as_deref_mut() {
+                    let mut key_parts = variant_id.splitn(2, ':');
+                    if let Ok(key) = parse_key(key_parts.next().unwrap_or(""), key_parts.next().unwrap_or("")) {
+                        for (i, weight_str) in parts.enumerate() {
+                            let Some(&score_column_index) = column_map.get(i) else {
+                                continue;
+                            };
+                            if !weight_str.trim().is_empty() {
+                                drops.push(ScoreDrop {
+                                    score: score_column_index.0,
+                                    key,
+                                    effect_allele: Allele::new(effect_allele),
+                                    other_allele: Allele::new(other_allele),
+                                    reason: Unmatched::NoOtherAllele,
+                                });
+                            }
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -3856,13 +3903,13 @@ impl KWayMergeIterator {
                     if let Some(Some(region)) = filters.get(score_column_index.0)
                         && !region.contains(key)
                     {
-                        if let Some(drops) = region_drops.as_deref_mut() {
-                            drops.push(KeyedScoreRecord {
+                        if let Some(drops) = unmatched_drops.as_deref_mut() {
+                            drops.push(ScoreDrop {
+                                score: score_column_index.0,
                                 key,
                                 effect_allele: Allele::new(effect_allele),
                                 other_allele: Allele::new(other_allele),
-                                score_column_index,
-                                weight,
+                                reason: Unmatched::OutsideRegion,
                             });
                         }
                         continue;
@@ -3914,13 +3961,13 @@ impl KWayMergeIterator {
         self.region_filter_hits.take()
     }
 
-    /// Keeps the weights a score's region leaves out, for `--unmatched-report`.
-    fn record_region_drops(&mut self) {
-        self.region_drops = Some(Vec::new());
+    /// Keeps the weights the reader drops, for `--unmatched-report`.
+    fn record_unmatched_drops(&mut self) {
+        self.unmatched_drops = Some(Vec::new());
     }
 
-    fn take_region_drops(&mut self) -> Vec<KeyedScoreRecord> {
-        self.region_drops.take().unwrap_or_default()
+    fn take_unmatched_drops(&mut self) -> Vec<ScoreDrop> {
+        self.unmatched_drops.take().unwrap_or_default()
     }
 }
 
@@ -3977,17 +4024,17 @@ impl ScoreRows {
         }
     }
 
-    /// Keeps the weights a score's region leaves out, for `--unmatched-report`. Rows are parsed
-    /// whole only without region filters, which leave none out.
-    fn record_region_drops(&mut self) {
+    /// Keeps the weights the reader drops, for `--unmatched-report`, which rows parsed whole do
+    /// not keep: a run with a report streams its rows.
+    fn record_unmatched_drops(&mut self) {
         if let Self::Streamed(merge) = self {
-            merge.record_region_drops();
+            merge.record_unmatched_drops();
         }
     }
 
-    fn take_region_drops(&mut self) -> Vec<KeyedScoreRecord> {
+    fn take_unmatched_drops(&mut self) -> Vec<ScoreDrop> {
         match self {
-            Self::Streamed(merge) => merge.take_region_drops(),
+            Self::Streamed(merge) => merge.take_unmatched_drops(),
             Self::Parsed(_) => Vec::new(),
         }
     }

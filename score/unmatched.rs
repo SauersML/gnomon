@@ -1,34 +1,41 @@
-//! The per-row account of the score rows a run does not score (#2383).
+//! The per-row account of the score rows that add no variant to their score (#2383).
 //!
-//! `--unmatched-report PATH` writes a line for each weight of a score row that adds to no score:
-//! the score, the row's variant and alleles as its normalized score file writes them, why it is
-//! not scored, and the alleles the genotypes hold at its position. Both scoring paths decide a row
-//! by the one site rule of [`crate::score::site`], so the report is the same file for a joined or
-//! split VCF, a BCF or a PGEN of the same genotypes, and for a `.bed` wherever its alleles read as
-//! the REF the others declare (a `.bim` declares none).
+//! `--unmatched-report PATH` writes a line for each weight of a score row that adds no variant to
+//! its score: the score, the row's variant and alleles as its normalized score file writes them,
+//! why, and the alleles the genotypes hold at its position. So for every score, the weights its
+//! rows hold are its #SCORE_VARIANT_COUNT and its lines in the report, exactly. Both scoring
+//! paths decide a row by the one site rule of [`crate::score::site`], so the report is the same
+//! file for a joined or split VCF, a BCF or a PGEN of the same genotypes, and for a `.bed`
+//! wherever its alleles read as the REF the others declare (a `.bim` declares none).
 //!
-//! Why a row is not scored:
+//! Why a row adds no variant:
 //! - `no_variant_at_position`: the genotypes hold no variant at its position.
 //! - `no_allele_pair`: they hold variants there, but none carries the row's alleles.
 //! - `several_alleles`: the row names no single other allele, and its effect allele is more than
 //!   one allele of the site.
 //! - `outside_region`: its score is restricted to a region the row lies outside.
+//! - `no_other_allele`: its other allele is N, which pairs with no variant.
+//! - `same_variant`: another row of the score names the variant this row names. A variant counts
+//!   once in its score however many rows name it, and each row's weight adds to its dose; of the
+//!   rows naming one variant, the first by effect and then other allele text is the one counted.
 //!
 //! A row the normalization drops before scoring, one without a position, on an unsupported
 //! contig or malformed, is named with its line in the normalization's warning instead.
 
-use crate::score::site::{RowMatch, Site, names_no_single_other_allele, trimmed};
+use crate::score::site::{RowMatch, names_no_single_other_allele, trimmed};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Why a weight of a score row adds to no score.
+/// Why a weight of a score row adds no variant to its score.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Unmatched {
     NoVariant,
     NoAllelePair,
     SeveralAlleles,
     OutsideRegion,
+    NoOtherAllele,
+    SameVariant,
 }
 
 impl Unmatched {
@@ -38,18 +45,14 @@ impl Unmatched {
             Self::NoAllelePair => "no_allele_pair",
             Self::SeveralAlleles => "several_alleles",
             Self::OutsideRegion => "outside_region",
+            Self::NoOtherAllele => "no_other_allele",
+            Self::SameVariant => "same_variant",
         }
     }
 
-    /// Why a row with `effect_allele` and `other_allele` at `site` is not scored, or `None` when
-    /// it is. A row two variants carry, or whose dose depends on how the site is read, is not in
-    /// the report: the run refuses it.
-    pub(crate) fn at_site(site: &Site<'_>, effect_allele: &str, other_allele: &str) -> Option<Self> {
-        Self::of(site.match_row(effect_allele, other_allele), other_allele)
-    }
-
     /// Why a row naming `other_allele` that meets its site as `decision` is not scored, or `None`
-    /// when it is scored or refused. A row naming no single other allele whose effect allele the
+    /// when it is scored or refused: a row two variants carry, or whose dose depends on how the site
+    /// is read, is not in the report, since the run refuses it. A row naming no single other allele whose effect allele the
     /// site's readings make different alleles is dropped as one that is several alleles is.
     pub(crate) fn of(decision: RowMatch, other_allele: &str) -> Option<Self> {
         match decision {
@@ -60,6 +63,19 @@ impl Unmatched {
             RowMatch::Several(..) | RowMatch::Unread(_) | RowMatch::Scores(_) => None,
         }
     }
+}
+
+/// The rows among `named` that add no variant to their score, each named by the handle `T` a
+/// caller keeps it by: of the rows naming one variant for one score, each entry `(score, variant,
+/// effect allele, other allele, handle)`, every row after the first by effect and then other
+/// allele text. Sorts `named`.
+pub(crate) fn same_variant<'n, T: Copy>(
+    named: &'n mut [(usize, usize, &str, &str, T)],
+) -> impl Iterator<Item = T> + 'n {
+    named.sort_unstable_by(|a, b| (a.0, a.1, a.2, a.3).cmp(&(b.0, b.1, b.2, b.3)));
+    named
+        .chunk_by(|a, b| (a.0, a.1) == (b.0, b.1))
+        .flat_map(|rows| rows[1..].iter().map(|row| row.4))
 }
 
 /// The alleles a site's rows hold, as the report writes them: each row's two alleles without the
@@ -211,6 +227,7 @@ pub(crate) fn write_report<'a>(path: &Path, lines: impl Iterator<Item = Line<'a>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::score::site::Site;
 
     #[test]
     fn a_joined_record_its_split_records_and_a_bim_row_see_the_same_alleles() {
@@ -224,15 +241,32 @@ mod tests {
     }
 
     #[test]
+    fn rows_naming_one_variant_for_one_score_count_once_first_by_allele_text() {
+        let rows = [("G", "A"), ("A", "."), ("G", "A"), ("T", "A"), ("A", ".")];
+        // (score, variant) of each row: score 0 names variant 0 three times and variant 1 once; score
+        // 1 names variant 0 once.
+        let at = [(0, 0), (0, 0), (1, 0), (0, 1), (0, 0)];
+        let mut named: Vec<_> = rows
+            .iter()
+            .zip(at)
+            .enumerate()
+            .map(|(row, (&(effect, other), (score, variant)))| (score, variant, effect, other, row))
+            .collect();
+        let mut extra: Vec<(&str, &str)> = same_variant(&mut named).map(|row| rows[row]).collect();
+        extra.sort_unstable();
+        assert_eq!(extra, [("A", "."), ("G", "A")]);
+    }
+
+    #[test]
     fn a_row_at_a_site_is_unscored_only_when_no_allele_or_several_alleles_carry_it() {
         let rows = [(0, "A", "G"), (1, "A", "T")];
         let site = Site::new(&rows, true);
-        assert_eq!(Unmatched::at_site(&site, "G", "A"), None);
-        assert_eq!(Unmatched::at_site(&site, "A", "T"), None);
-        assert_eq!(Unmatched::at_site(&site, "C", "A"), Some(Unmatched::NoAllelePair));
-        assert_eq!(Unmatched::at_site(&site, "A", "."), None);
+        assert_eq!(Unmatched::of(site.match_row("G", "A"), "A"), None);
+        assert_eq!(Unmatched::of(site.match_row("A", "T"), "T"), None);
+        assert_eq!(Unmatched::of(site.match_row("C", "A"), "A"), Some(Unmatched::NoAllelePair));
+        assert_eq!(Unmatched::of(site.match_row("A", "."), "."), None);
         let separate = [(0, "A", "G"), (1, "C", "G")];
         let site = Site::new(&separate, true);
-        assert_eq!(Unmatched::at_site(&site, "G", "."), Some(Unmatched::SeveralAlleles));
+        assert_eq!(Unmatched::of(site.match_row("G", "."), "."), Some(Unmatched::SeveralAlleles));
     }
 }
