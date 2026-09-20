@@ -12,7 +12,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use thiserror::Error;
 
-use crate::adapt_plink2::{GenomeBuild as PgenGenomeBuild, scan_local_pvar_rows};
+use crate::adapt_plink2::{GenomeBuild as PgenGenomeBuild, PvarRowRun};
 use crate::map::fit::VariantBlockSource;
 use crate::map::io::{
     DatasetBlockSource, GenotypeDataset, GenotypeIoError, PgenDataset, PlinkDataset, PlinkIoError,
@@ -185,17 +185,16 @@ impl VariantLoci {
         (loci.positions.len() == dataset.n_variants()).then_some(loci)
     }
 
-    /// The loci of a `.pgen`'s rows, read from its local `.pvar` without building
-    /// a key per row, or `None` where the virtual `.bim` must be read instead. A
-    /// label is classified as its normalized key would be, once per run of rows
-    /// that share it.
-    fn from_pvar(dataset: &PgenDataset) -> Option<Self> {
-        let runs = scan_local_pvar_rows(dataset.pvar_path(), BIM_SCAN_CHUNK_BYTES)?;
+    /// The loci of a `.pgen`'s rows, from the rows its variant plan read, without
+    /// building a key per row. A label is classified as its normalized key would be,
+    /// once per run of rows that share it.
+    fn from_pvar_rows(rows: &[PvarRowRun]) -> Self {
+        let n_rows = rows.iter().map(|run| run.positions.len()).sum();
         let mut loci = Self {
-            chroms: Vec::with_capacity(dataset.n_variants()),
-            positions: Vec::with_capacity(dataset.n_variants()),
+            chroms: Vec::with_capacity(n_rows),
+            positions: Vec::with_capacity(n_rows),
         };
-        for run in runs {
+        for run in rows {
             let class = run.positions.first().and_then(|&position| {
                 classify_chromosome(&VariantKey::new(&run.chrom, position).chromosome)
             });
@@ -203,7 +202,7 @@ impl VariantLoci {
                 .extend(std::iter::repeat_n(class, run.positions.len()));
             loci.positions.extend_from_slice(&run.positions);
         }
-        (loci.positions.len() == dataset.n_variants()).then_some(loci)
+        loci
     }
 }
 
@@ -443,9 +442,13 @@ fn infer_records(
 }
 
 /// What sex inference reads: one dataset, or a directory of PLINK 1 filesets,
-/// such as one per chromosome, read as one.
+/// such as one per chromosome, read as one. A PGEN comes with the loci of its rows,
+/// read from its `.pvar` with the variant plan.
 enum InferenceInput {
-    Dataset(GenotypeDataset),
+    Dataset {
+        dataset: GenotypeDataset,
+        pvar_rows: Vec<PvarRowRun>,
+    },
     PlinkDirectory {
         directory: PathBuf,
         filesets: Vec<PlinkDataset>,
@@ -457,7 +460,7 @@ impl InferenceInput {
     /// directory's table goes inside it.
     fn output_path(&self) -> PathBuf {
         match self {
-            Self::Dataset(dataset) => dataset.output_path("sex.tsv"),
+            Self::Dataset { dataset, .. } => dataset.output_path("sex.tsv"),
             Self::PlinkDirectory { directory, .. } => directory.join("sex.tsv"),
         }
     }
@@ -468,7 +471,9 @@ impl InferenceInput {
         show_progress: bool,
     ) -> Result<(GenomeBuild, Vec<SexInferenceRecord>), SexInferenceError> {
         match self {
-            Self::Dataset(dataset) => infer_dataset_records(dataset, force_build, show_progress),
+            Self::Dataset { dataset, pvar_rows } => {
+                infer_dataset_records(dataset, pvar_rows, force_build, show_progress)
+            }
             Self::PlinkDirectory { filesets, .. } => {
                 infer_directory_records(filesets, force_build, show_progress)
             }
@@ -496,14 +501,13 @@ fn open_inference_input(
         GenomeBuild::Build37 => PgenGenomeBuild::Grch37,
         GenomeBuild::Build38 => PgenGenomeBuild::Grch38,
     });
-    Ok(InferenceInput::Dataset(GenotypeDataset::open(
-        genotype_path,
-        pgen_build,
-    )?))
+    let (dataset, pvar_rows) = GenotypeDataset::open_with_pvar_rows(genotype_path, pgen_build)?;
+    Ok(InferenceInput::Dataset { dataset, pvar_rows })
 }
 
 fn infer_dataset_records(
     dataset: &GenotypeDataset,
+    pvar_rows: &[PvarRowRun],
     force_build: Option<GenomeBuild>,
     show_progress: bool,
 ) -> Result<(GenomeBuild, Vec<SexInferenceRecord>), SexInferenceError> {
@@ -519,13 +523,17 @@ fn infer_dataset_records(
             VariantLoci::from_bim(plink).map_err(GenotypeIoError::from)?,
             None,
         ),
-        (GenotypeDataset::Pgen(pgen), None) => match VariantLoci::from_pvar(pgen) {
-            Some(loci) => (loci, None),
-            None => (
-                VariantLoci::from_keys(&dataset.variant_keys_for_plan(&SelectionPlan::All)?),
-                None,
-            ),
-        },
+        (GenotypeDataset::Pgen(pgen), None) => {
+            let loci = VariantLoci::from_pvar_rows(pvar_rows);
+            let (expected, observed) = (pgen.n_variants(), loci.positions.len());
+            if observed < expected {
+                return Err(SexInferenceError::VariantUnderflow { expected, observed });
+            }
+            if observed > expected {
+                return Err(SexInferenceError::VariantOverflow { expected, observed });
+            }
+            (loci, None)
+        }
         (_, None) => (
             VariantLoci::from_keys(&dataset.variant_keys_for_plan(&SelectionPlan::All)?),
             None,
@@ -2052,6 +2060,20 @@ mod tests {
                 assert_eq!(calls, HashSet::from(["male", "female"]));
             }
         }
+        Ok(())
+    }
+
+    /// A `.pgen`'s loci read with its variant plan are the loci of its virtual `.bim`
+    /// keys, row for row.
+    #[test]
+    fn pgen_loci_read_with_the_plan_are_the_loci_of_its_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/testdata/xy_sex.pgen");
+        let (dataset, rows) =
+            GenotypeDataset::open_with_pvar_rows(&path, Some(PgenGenomeBuild::Grch38))?;
+        let keys = dataset.variant_keys_for_plan(&SelectionPlan::All)?;
+        assert!(!keys.is_empty());
+        assert_eq!(VariantLoci::from_pvar_rows(&rows), VariantLoci::from_keys(&keys));
         Ok(())
     }
 

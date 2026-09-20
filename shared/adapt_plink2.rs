@@ -154,24 +154,52 @@ pub fn open_virtual_plink19_from_paths(
     psam_path: &Path,
     build: GenomeBuild,
 ) -> Result<VirtualPlink19, PipelineError> {
+    open_paths_reading(pgen_path, pvar_path, psam_path, build, PlanBuilder::default())
+        .map(|(plink, _)| plink)
+}
+
+/// [`open_virtual_plink19_from_paths`], with the chromosome and position of every row
+/// of the virtual `.bim`, in row order, read from each `.pvar` line as the variant
+/// plan reads it, in the same pass.
+pub(crate) fn open_virtual_plink19_and_pvar_rows_from_paths(
+    pgen_path: &Path,
+    pvar_path: &Path,
+    psam_path: &Path,
+    build: GenomeBuild,
+) -> Result<(VirtualPlink19, Vec<PvarRowRun>), PipelineError> {
+    open_paths_reading(pgen_path, pvar_path, psam_path, build, PlanBuilder::reading_rows())
+}
+
+fn open_paths_reading(
+    pgen_path: &Path,
+    pvar_path: &Path,
+    psam_path: &Path,
+    build: GenomeBuild,
+    builder: PlanBuilder,
+) -> Result<(VirtualPlink19, Vec<PvarRowRun>), PipelineError> {
     let mut psam_for_plan = open_text_source(psam_path)?;
     let pgen = Arc::new(LocalFileByteRangeSource::open(pgen_path)?);
     let factory_path = pvar_path.to_path_buf();
     let pvar: PvarFactory = Arc::new(move || open_text_source(&factory_path));
 
-    open_virtual_plink19_with_local_pvar(pgen, pvar, Some(pvar_path), &mut *psam_for_plan, build)
+    open_reading(pgen, pvar, Some(pvar_path), &mut *psam_for_plan, build, builder)
 }
 
 /// Bytes of `.pvar` data one chunk of the parallel variant-plan scan takes.
 const PLAN_SCAN_CHUNK_BYTES: usize = 4 << 20;
 
 /// The variant plan of the `.pvar` that `pvar` opens, its lines read in pieces at
-/// once by one reader: the mapped file's pieces when `local_pvar` names it, and
-/// otherwise pieces of the lines the stream gives, a batch at a time.
-fn plan_for(pvar: &PvarFactory, local_pvar: Option<&Path>) -> Result<VariantPlan, PipelineError> {
+/// once by `builder`: the mapped file's pieces when `local_pvar` names it, and
+/// otherwise pieces of the lines the stream gives, a batch at a time. With it come
+/// the loci of the plan's rows when `builder` reads them.
+fn plan_for(
+    pvar: &PvarFactory,
+    local_pvar: Option<&Path>,
+    builder: PlanBuilder,
+) -> Result<(VariantPlan, Vec<PvarRowRun>), PipelineError> {
     match local_pvar {
-        Some(path) => VariantPlan::from_local_pvar(path, PLAN_SCAN_CHUNK_BYTES),
-        None => VariantPlan::from_pvar(&mut *pvar()?),
+        Some(path) => VariantPlan::read_local_pvar(path, PLAN_SCAN_CHUNK_BYTES, builder),
+        None => VariantPlan::read_pvar_in_pieces(&mut *pvar()?, PLAN_SCAN_CHUNK_BYTES, builder),
     }
 }
 
@@ -220,11 +248,25 @@ pub(crate) fn open_virtual_plink19_with_local_pvar(
     pvar: PvarFactory,
     local_pvar: Option<&Path>,
     psam_for_plan: &mut dyn TextSource,
-    _build: GenomeBuild,
+    build: GenomeBuild,
 ) -> Result<VirtualPlink19, PipelineError> {
+    open_reading(pgen, pvar, local_pvar, psam_for_plan, build, PlanBuilder::default())
+        .map(|(plink, _)| plink)
+}
+
+/// Opens the PGEN, its variant plan read by `builder`, with the loci of the plan's
+/// rows when `builder` reads them.
+fn open_reading(
+    pgen: Arc<dyn ByteRangeSource>,
+    pvar: PvarFactory,
+    local_pvar: Option<&Path>,
+    psam_for_plan: &mut dyn TextSource,
+    _build: GenomeBuild,
+    builder: PlanBuilder,
+) -> Result<(VirtualPlink19, Vec<PvarRowRun>), PipelineError> {
     let header = PgenHeader::parse(&*pgen)?;
     let psam_info = PsamInfo::from_psam(psam_for_plan)?;
-    let plan = plan_for(&pvar, local_pvar)?;
+    let (plan, rows) = plan_for(&pvar, local_pvar, builder)?;
 
     if header.m_variants != 0 && header.m_variants as usize != plan.in_variants {
         return Err(PipelineError::Io(format!(
@@ -271,14 +313,15 @@ pub(crate) fn open_virtual_plink19_with_local_pvar(
             }
         };
 
-    Ok(VirtualPlink19 {
+    let plink = VirtualPlink19 {
         bed: bed_source,
         pvar,
         fam_rows,
         n_samples: psam_info.n_samples,
         n_variants: plan.out_variants,
         dosage,
-    })
+    };
+    Ok((plink, rows))
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -594,18 +637,15 @@ impl PvarCols {
 }
 
 impl VariantPlan {
-    /// The plan of the `.pvar` that `pvar` streams, read in batches of pieces of
-    /// about [`PLAN_SCAN_CHUNK_BYTES`] of lines, a batch as wide as the rayon pool.
-    fn from_pvar(pvar: &mut dyn TextSource) -> Result<Self, PipelineError> {
-        Self::from_pvar_in_pieces(pvar, PLAN_SCAN_CHUNK_BYTES)
-    }
-
-    fn from_pvar_in_pieces(
+    /// The plan of the `.pvar` that `pvar` streams, read by `builder` in batches of
+    /// pieces of about `piece_bytes` of lines, a batch as wide as the rayon pool, and
+    /// the loci of its rows when `builder` reads them.
+    fn read_pvar_in_pieces(
         pvar: &mut dyn TextSource,
         piece_bytes: usize,
-    ) -> Result<Self, PipelineError> {
+        mut builder: PlanBuilder,
+    ) -> Result<(Self, Vec<PvarRowRun>), PipelineError> {
         let batch = rayon::current_num_threads().max(1);
-        let mut builder = PlanBuilder::default();
         loop {
             let mut pieces = Vec::with_capacity(batch);
             // A line the source fails to give ends the read, after the plan has read
@@ -637,16 +677,20 @@ impl VariantPlan {
         }
     }
 
-    /// The plan of the local `.pvar` at `pvar_path`, its lines read at once in
-    /// newline-aligned pieces of about `chunk_bytes` of the mapped file.
-    fn from_local_pvar(pvar_path: &Path, chunk_bytes: usize) -> Result<Self, PipelineError> {
+    /// The plan of the local `.pvar` at `pvar_path`, its lines read by `builder` at
+    /// once in newline-aligned pieces of about `chunk_bytes` of the mapped file, and
+    /// the loci of its rows when `builder` reads them.
+    fn read_local_pvar(
+        pvar_path: &Path,
+        chunk_bytes: usize,
+        mut builder: PlanBuilder,
+    ) -> Result<(Self, Vec<PvarRowRun>), PipelineError> {
         let file = File::open(pvar_path)
             .map_err(|e| PipelineError::Io(format!("Opening {}: {e}", pvar_path.display())))?;
         let len = file
             .metadata()
             .map_err(|e| PipelineError::Io(format!("Metadata for {}: {e}", pvar_path.display())))?
             .len();
-        let mut builder = PlanBuilder::default();
         if len > 0 {
             // SAFETY: the map is read-only and lives only as long as this read. The
             // file must not be truncated while it is mapped.
@@ -1250,12 +1294,14 @@ pub(crate) fn render_virtual_bim_pieces<S: Default + Send>(
 }
 
 /// One piece of a `.pvar` read for the variant plan: each record's ALT count, the
-/// chromosome runs the records form, and the line that ends the plan, if one does.
+/// chromosome runs the records form, the line that ends the plan, if one does, and,
+/// when the plan reads its rows' loci too, each record's position.
 #[derive(Default)]
 struct PlanPiece {
     alts: Vec<u16>,
     runs: Vec<PlanRun>,
     end: Option<PlanEnd>,
+    positions: Vec<u64>,
 }
 
 /// Records of one chromosome in a row, positions ascending: the first and last
@@ -1278,8 +1324,9 @@ enum PlanEnd {
 
 /// Reads one piece of a `.pvar` for the variant plan, line by line from `layout`, as
 /// [`VariantPlan`] requires of every record: its columns present, a positive
-/// integer position, and positions that do not descend on a chromosome.
-fn plan_piece(mut layout: PvarLayout, piece: &PvarPiece<'_>) -> PlanPiece {
+/// integer position, and positions that do not descend on a chromosome. With
+/// `positions`, each record's position is kept.
+fn plan_piece(mut layout: PvarLayout, piece: &PvarPiece<'_>, positions: bool) -> PlanPiece {
     let mut read = PlanPiece::default();
     // The last raw label, and the label it normalizes to.
     let mut label = None;
@@ -1316,6 +1363,9 @@ fn plan_piece(mut layout: PvarLayout, piece: &PvarPiece<'_>) -> PlanPiece {
             }),
         }
         read.alts.push(alt_count);
+        if positions {
+            read.positions.push(position);
+        }
     }
     read
 }
@@ -1365,16 +1415,30 @@ fn plan_record<'l>(
 /// in order applies the sort check to every record the pieces read, as a reader
 /// of one line after another applies it, and stops at the first record or line
 /// it refuses.
+///
+/// A builder made by [`PlanBuilder::reading_rows`] also keeps the loci of the virtual
+/// `.bim` rows the plan gives, from the same reading of each line.
 #[derive(Default)]
 struct PlanBuilder {
     layout: PvarLayout,
     sorted_positions: PvarPositionSortState,
     alts_per_in: Vec<u16>,
+    rows: Option<Vec<PvarRowRun>>,
 }
 
 impl PlanBuilder {
+    fn reading_rows() -> Self {
+        Self {
+            rows: Some(Vec::new()),
+            ..Self::default()
+        }
+    }
+
     fn add(&mut self, pieces: &[PvarPiece<'_>]) -> Result<(), PipelineError> {
-        let (read, layout) = for_each_pvar_piece(pieces, self.layout, plan_piece);
+        let positions = self.rows.is_some();
+        let (read, layout) = for_each_pvar_piece(pieces, self.layout, |layout, piece| {
+            plan_piece(layout, piece, positions)
+        });
         self.layout = layout;
         for piece in read {
             let before = self.alts_per_in.len();
@@ -1405,11 +1469,16 @@ impl PlanBuilder {
                 None => {}
             }
             self.alts_per_in.extend_from_slice(&piece.alts);
+            if let Some(rows) = &mut self.rows {
+                add_row_runs(rows, &piece.runs, &piece.alts, &piece.positions);
+            }
         }
         Ok(())
     }
 
-    fn finish(self) -> Result<VariantPlan, PipelineError> {
+    /// The plan, and the loci of its rows when the builder read them; otherwise no
+    /// rows.
+    fn finish(self) -> Result<(VariantPlan, Vec<PvarRowRun>), PipelineError> {
         if self.layout.cols.is_none() {
             return Err(PipelineError::Io(
                 "Missing .pvar header or inferable columns".to_string(),
@@ -1426,87 +1495,42 @@ impl PlanBuilder {
                 .map_err(|_| ioerr(".pvar holds more records than a plan can index"))?;
             out_to_in.extend((1..=count).map(|alt_ord| (in_idx, alt_ord)));
         }
-        Ok(VariantPlan {
+        let plan = VariantPlan {
             in_variants: self.alts_per_in.len(),
             out_variants: out_to_in.len(),
             out_to_in,
             alts_per_in: self.alts_per_in,
-        })
-    }
-}
-
-/// A local `.pvar`, mapped for a parallel scan: its column layout, where its data
-/// lines start, and the bounds of data chunks of about a given size, each ending
-/// on a line end.
-struct LocalPvar {
-    map: memmap2::Mmap,
-    cols: PvarCols,
-    data_start: usize,
-    bounds: Vec<usize>,
-}
-
-impl LocalPvar {
-    /// The header lines are read in order, as the streaming readers read them.
-    /// `None` when the file cannot be mapped, a header line is not UTF-8 or not a
-    /// header the readers accept, or no header or first data line sets the
-    /// columns.
-    fn open(pvar_path: &Path, chunk_bytes: usize) -> Option<Self> {
-        let file = File::open(pvar_path).ok()?;
-        // SAFETY: the map is read-only and lives only as long as the scan that
-        // opened it. The file must not be truncated while it is mapped.
-        let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
-        let text: &[u8] = &map;
-
-        let mut cols = None;
-        let mut data_start = 0;
-        while data_start < text.len() {
-            let end = memchr::memchr(b'\n', &text[data_start..])
-                .map_or(text.len(), |offset| data_start + offset + 1);
-            let trimmed = str::from_utf8(&text[data_start..end]).ok()?.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                break;
-            }
-            if trimmed.starts_with('#') && !trimmed.starts_with("##") {
-                cols = Some(PvarCols::from_header_line(trimmed).ok()?);
-            }
-            data_start = end;
-        }
-        let data = &text[data_start..];
-        let cols = match cols {
-            Some(cols) => cols,
-            None => {
-                let first_line = data.split(|&byte| byte == b'\n').next()?;
-                PvarCols::from_headerless(
-                    str::from_utf8(first_line).ok()?.split_whitespace().count(),
-                )
-                .ok()?
-            }
         };
-
-        let chunk_bytes = chunk_bytes.max(1);
-        let mut bounds = vec![0];
-        let mut search_from = chunk_bytes;
-        while search_from < data.len() {
-            let Some(offset) = memchr::memchr(b'\n', &data[search_from..]) else {
-                break;
-            };
-            let end = search_from + offset + 1;
-            bounds.push(end);
-            search_from = end + chunk_bytes;
-        }
-        if bounds.last() != Some(&data.len()) {
-            bounds.push(data.len());
-        }
-        Some(Self {
-            map,
-            cols,
-            data_start,
-            bounds,
-        })
+        Ok((plan, self.rows.unwrap_or_default()))
     }
+}
 
-    fn data(&self) -> &[u8] {
-        &self.map[self.data_start..]
+/// Appends the rows of one piece the plan accepted to `rows`: each record's position
+/// once per ALT, in runs of one chromosome, as the virtual `.bim` renders them.
+fn add_row_runs(
+    rows: &mut Vec<PvarRowRun>,
+    runs: &[PlanRun],
+    alts: &[u16],
+    positions: &[u64],
+) {
+    for run in runs {
+        let records = run.first_record..=run.last_record;
+        let positions = positions[records.clone()]
+            .iter()
+            .zip(&alts[records])
+            .flat_map(|(&position, &count)| std::iter::repeat_n(position, usize::from(count)));
+        match rows.last_mut() {
+            Some(last) if last.chrom == run.chrom => last.positions.extend(positions),
+            _ => {
+                let positions: Vec<u64> = positions.collect();
+                if !positions.is_empty() {
+                    rows.push(PvarRowRun {
+                        chrom: run.chrom.clone(),
+                        positions,
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -1515,161 +1539,6 @@ impl LocalPvar {
 pub(crate) struct PvarRowRun {
     pub(crate) chrom: String,
     pub(crate) positions: Vec<u64>,
-}
-
-/// The chromosome and position of every row of the virtual `.bim` over the local
-/// `.pvar` at `pvar_path`, in row order, without rendering the rows.
-///
-/// The file is mapped, its header lines are read in order, and its data lines are
-/// scanned in parallel chunks of about `chunk_bytes`, each extended to the end of
-/// its last line. A line is read as [`StreamingVirtualBim`] reads it. `None` when
-/// the file cannot be mapped, its text is not UTF-8, a `#` line follows the data,
-/// or a line lacks a column the `.bim` needs or an integer position; the caller
-/// then reads the `.bim` rows, which report whatever is wrong.
-pub(crate) fn scan_local_pvar_rows(
-    pvar_path: &Path,
-    chunk_bytes: usize,
-) -> Option<Vec<PvarRowRun>> {
-    use rayon::prelude::*;
-
-    let local = LocalPvar::open(pvar_path, chunk_bytes)?;
-    let data = local.data();
-    let chunks: Vec<Option<Vec<PvarRowRun>>> = local
-        .bounds
-        .par_windows(2)
-        .map(|chunk| scan_pvar_chunk(&data[chunk[0]..chunk[1]], local.cols))
-        .collect();
-    let mut runs: Vec<PvarRowRun> = Vec::new();
-    for chunk in chunks {
-        for run in chunk? {
-            if runs.last().is_some_and(|last| last.chrom == run.chrom) {
-                runs.last_mut()?.positions.extend_from_slice(&run.positions);
-            } else {
-                runs.push(run);
-            }
-        }
-    }
-    Some(runs)
-}
-
-/// The row runs of one chunk of `.pvar` data lines, or `None` where
-/// [`scan_local_pvar_rows`] refuses a line.
-///
-/// A chunk of ASCII without a vertical tab is split on its bytes, which there
-/// hold the same whitespace as the text: a vertical tab is whitespace to `trim`
-/// and `split_whitespace` but not to their byte counterparts. Other chunks are
-/// read as text.
-fn scan_pvar_chunk(chunk: &[u8], cols: PvarCols) -> Option<Vec<PvarRowRun>> {
-    if !chunk.is_ascii() || memchr::memchr(0x0b, chunk).is_some() {
-        return scan_pvar_text_chunk(str::from_utf8(chunk).ok()?, cols);
-    }
-    let last = cols
-        .chrom
-        .max(cols.id)
-        .max(cols.pos)
-        .max(cols.refa)
-        .max(cols.alt);
-    let mut runs: Vec<PvarRowRun> = Vec::new();
-    // The last raw label, and the label it normalizes to.
-    let mut label: &[u8] = &[];
-    let mut chrom = String::new();
-    for line in chunk.split(|&byte| byte == b'\n') {
-        let trimmed = line.trim_ascii();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed[0] == b'#' {
-            return None;
-        }
-        let (mut raw_chrom, mut id, mut pos, mut refa, mut alt) = (None, None, None, None, None);
-        for (column, field) in trimmed
-            .split(u8::is_ascii_whitespace)
-            .filter(|field| !field.is_empty())
-            .take(last + 1)
-            .enumerate()
-        {
-            if column == cols.chrom {
-                raw_chrom = Some(field);
-            }
-            if column == cols.id {
-                id = Some(field);
-            }
-            if column == cols.pos {
-                pos = Some(field);
-            }
-            if column == cols.refa {
-                refa = Some(field);
-            }
-            if column == cols.alt {
-                alt = Some(field);
-            }
-        }
-        id?;
-        refa?;
-        let raw_chrom = raw_chrom?;
-        if raw_chrom != label {
-            label = raw_chrom;
-            normalize_chrom_into(str::from_utf8(raw_chrom).ok()?, &mut chrom);
-        }
-        let pos = str::from_utf8(pos?).ok()?.parse::<u64>().ok()?;
-        let alts = alt?
-            .split(|&byte| byte == b',')
-            .map(<[u8]>::trim_ascii)
-            .filter(|alt| !alt.is_empty() && *alt != b".")
-            .count();
-        if alts == 0 {
-            continue;
-        }
-        if runs.last().is_none_or(|last| last.chrom != chrom) {
-            runs.push(PvarRowRun {
-                chrom: chrom.clone(),
-                positions: Vec::new(),
-            });
-        }
-        runs.last_mut()?
-            .positions
-            .extend(std::iter::repeat_n(pos, alts));
-    }
-    Some(runs)
-}
-
-/// [`scan_pvar_chunk`] for a chunk read as text.
-fn scan_pvar_text_chunk(text: &str, cols: PvarCols) -> Option<Vec<PvarRowRun>> {
-    let mut runs: Vec<PvarRowRun> = Vec::new();
-    let mut chrom = String::new();
-    for line in text.split('\n') {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with('#') {
-            return None;
-        }
-        let fields = PvarFields::split(trimmed, cols, trimmed.is_ascii());
-        fields.id?;
-        fields.refa?;
-        normalize_chrom_into(fields.chrom?, &mut chrom);
-        let pos = fields.pos?.parse::<u64>().ok()?;
-        let alts = fields
-            .alt?
-            .split(',')
-            .map(str::trim)
-            .filter(|alt| !alt.is_empty() && *alt != ".")
-            .count();
-        if alts == 0 {
-            continue;
-        }
-        if runs.last().is_none_or(|last| last.chrom != chrom) {
-            runs.push(PvarRowRun {
-                chrom: chrom.clone(),
-                positions: Vec::new(),
-            });
-        }
-        runs.last_mut()?
-            .positions
-            .extend(std::iter::repeat_n(pos, alts));
-    }
-    Some(runs)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -4445,12 +4314,14 @@ mod tests {
         }
     }
 
-    /// The `.pvar` scan must read the rows the streaming virtual `.bim` renders, on
-    /// any chunking and with or without a header, across multiallelic sites, sites
-    /// without an ALT, labels the `.bim` normalizes, blank lines and line endings,
-    /// and on the text path, which a non-ASCII label or a vertical tab takes.
+    /// The loci a variant plan reads with its rows are the rows the streaming virtual
+    /// `.bim` renders, and the plan is the plan read without them, on any piece size,
+    /// mapped or streamed, and with or without a header: across multiallelic sites,
+    /// sites without an ALT, labels the `.bim` normalizes, blank lines and line
+    /// endings, a non-ASCII label, a vertical tab, a chromosome entered again, and a
+    /// header among the data.
     #[test]
-    fn pvar_row_scan_reads_what_the_virtual_bim_renders() {
+    fn plan_rows_are_the_virtual_bim_rows() {
         let with_header = concat!(
             "##fileformat=PVARv1.0\n",
             "#CHROM\tPOS\tID\tREF\tALT\n",
@@ -4472,10 +4343,30 @@ mod tests {
             "Y rs4 0 4000000 A .\n",
             "Y rs5 0 5000000 A T\n",
         );
+        let late_header = format!("{headerless}#CHROM\tPOS\tID\tREF\tALT\nY\t6000000\trs9\tA\tG,C\n");
+        fn flat(rows: Vec<PvarRowRun>) -> Vec<(String, u64)> {
+            rows.into_iter()
+                .flat_map(|run| {
+                    run.positions
+                        .into_iter()
+                        .map(move |position| (run.chrom.clone(), position))
+                })
+                .collect()
+        }
+        fn parts(plan: &VariantPlan) -> (usize, usize, Vec<(u32, u16)>, Vec<u16>) {
+            let plan = plan.clone();
+            (
+                plan.in_variants,
+                plan.out_variants,
+                plan.out_to_in,
+                plan.alts_per_in,
+            )
+        }
         let dir = tempfile::tempdir().unwrap();
         for (name, text) in [
             ("header.pvar", with_header),
             ("headerless.pvar", headerless),
+            ("late_header.pvar", late_header.as_str()),
         ] {
             let path = dir.path().join(name);
             std::fs::write(&path, text).unwrap();
@@ -4486,28 +4377,25 @@ mod tests {
                 expected.push((fields[0].to_string(), fields[3].parse().unwrap()));
             }
             assert!(expected.len() >= 5, "{name}: {expected:?}");
-            for chunk_bytes in [1, 7, 64, 1 << 20] {
-                let rows: Vec<(String, u64)> = scan_local_pvar_rows(&path, chunk_bytes)
-                    .unwrap()
-                    .into_iter()
-                    .flat_map(|run| {
-                        run.positions
-                            .into_iter()
-                            .map(move |position| (run.chrom.clone(), position))
-                    })
-                    .collect();
-                assert_eq!(rows, expected, "{name}, {chunk_bytes}-byte chunks");
+            for piece_bytes in [1, 7, 64, 1 << 20] {
+                let (plan, none) =
+                    VariantPlan::read_local_pvar(&path, piece_bytes, PlanBuilder::default()).unwrap();
+                assert!(none.is_empty(), "{name}: rows read unasked");
+                let (mapped, rows) =
+                    VariantPlan::read_local_pvar(&path, piece_bytes, PlanBuilder::reading_rows())
+                        .unwrap();
+                assert_eq!(parts(&mapped), parts(&plan), "{name}: mapped, {piece_bytes}");
+                assert_eq!(flat(rows), expected, "{name}: mapped, {piece_bytes}");
+                let (streamed, rows) = VariantPlan::read_pvar_in_pieces(
+                    &mut *open_text_source(&path).unwrap(),
+                    piece_bytes,
+                    PlanBuilder::reading_rows(),
+                )
+                .unwrap();
+                assert_eq!(parts(&streamed), parts(&plan), "{name}: streamed, {piece_bytes}");
+                assert_eq!(flat(rows), expected, "{name}: streamed, {piece_bytes}");
             }
         }
-
-        // A header line after the data is left to the streaming `.bim`.
-        let path = dir.path().join("late_header.pvar");
-        std::fs::write(
-            &path,
-            format!("{headerless}#CHROM\tPOS\tID\tREF\tALT\n1\t10\trs9\tA\tG\n"),
-        )
-        .unwrap();
-        assert!(scan_local_pvar_rows(&path, 1 << 20).is_none());
     }
 
     /// A variant plan read in pieces, from a mapped `.pvar` or from the lines a
@@ -4535,7 +4423,7 @@ mod tests {
         fn opened(path: &Path) -> Result<Parts, String> {
             let factory_path = path.to_path_buf();
             let pvar: PvarFactory = Arc::new(move || open_text_source(&factory_path));
-            words(plan_for(&pvar, Some(path)))
+            words(plan_for(&pvar, Some(path), PlanBuilder::default()).map(|(plan, _)| plan))
         }
 
         let cases = [
@@ -4638,15 +4526,22 @@ mod tests {
             }
             for piece_bytes in [1, 7, 64, 1 << 20] {
                 assert_eq!(
-                    words(VariantPlan::from_local_pvar(&path, piece_bytes)),
+                    words(
+                        VariantPlan::read_local_pvar(&path, piece_bytes, PlanBuilder::default())
+                            .map(|(plan, _)| plan)
+                    ),
                     expected,
                     "{name}: mapped file in {piece_bytes}-byte pieces"
                 );
                 assert_eq!(
-                    words(VariantPlan::from_pvar_in_pieces(
-                        &mut *open_text_source(&path).unwrap(),
-                        piece_bytes
-                    )),
+                    words(
+                        VariantPlan::read_pvar_in_pieces(
+                            &mut *open_text_source(&path).unwrap(),
+                            piece_bytes,
+                            PlanBuilder::default()
+                        )
+                        .map(|(plan, _)| plan)
+                    ),
                     expected,
                     "{name}: streamed lines in {piece_bytes}-byte pieces"
                 );
@@ -4881,7 +4776,9 @@ mod tests {
             "1\t100\tv2\tC\tT",
         ]);
 
-        let err = match VariantPlan::from_pvar(&mut pvar) {
+        let read =
+            VariantPlan::read_pvar_in_pieces(&mut pvar, PLAN_SCAN_CHUNK_BYTES, PlanBuilder::default());
+        let err = match read {
             Ok(_) => panic!("expected unsorted .pvar to fail"),
             Err(err) => err,
         };
@@ -4907,8 +4804,12 @@ mod tests {
             "22\t10600000\tv2\tA\tG,*",
             "22\t10700000\tbnd1\tG\tG]22:10800000]",
         ];
-        let plan = VariantPlan::from_pvar(&mut LineSource::new(lines.clone()))
-            .expect("symbolic ALTs are allele codes");
+        let (plan, _) = VariantPlan::read_pvar_in_pieces(
+            &mut LineSource::new(lines.clone()),
+            PLAN_SCAN_CHUNK_BYTES,
+            PlanBuilder::default(),
+        )
+        .expect("symbolic ALTs are allele codes");
         assert_eq!(plan.in_variants, 3);
         assert_eq!(plan.out_variants, 4);
         let mappings: Vec<_> = (0..4).map(|out| plan.mapping(out).unwrap()).collect();

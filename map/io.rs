@@ -13,7 +13,10 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bcf_genotypes::{Allele, GenotypeSeries, MalformedSamples};
-use crate::adapt_plink2::{GenomeBuild, VirtualPlink19, open_virtual_plink19_from_paths};
+use crate::adapt_plink2::{
+    GenomeBuild, PvarRowRun, VirtualPlink19, open_virtual_plink19_and_pvar_rows_from_paths,
+    open_virtual_plink19_from_paths,
+};
 use crate::map::fit::{HwePcaModel, LdWeights, VariantBlockSource, for_each_packed_masked_code};
 use crate::map::project::ProjectionResult;
 use crate::map::variant_filter::{MatchKind, VariantFilter, VariantKey, VariantSelection};
@@ -192,9 +195,27 @@ impl GenotypeDataset {
         path: P,
         genome_build: Option<GenomeBuild>,
     ) -> Result<Self, GenotypeIoError> {
+        Self::open_reading(path.as_ref(), genome_build, false).map(|(dataset, _)| dataset)
+    }
+
+    /// [`GenotypeDataset::open`], with the chromosome and position of every row of a
+    /// PGEN's virtual `.bim`, read from its `.pvar` in the pass that reads the variant
+    /// plan. Other formats give no rows.
+    pub(crate) fn open_with_pvar_rows<P: AsRef<Path>>(
+        path: P,
+        genome_build: Option<GenomeBuild>,
+    ) -> Result<(Self, Vec<PvarRowRun>), GenotypeIoError> {
+        Self::open_reading(path.as_ref(), genome_build, true)
+    }
+
+    fn open_reading(
+        path: &Path,
+        genome_build: Option<GenomeBuild>,
+        pvar_rows: bool,
+    ) -> Result<(Self, Vec<PvarRowRun>), GenotypeIoError> {
         // A bare prefix names the fileset whose member exists, PLINK 1 or PLINK 2.
-        let resolved = resolve_fileset_prefix(path.as_ref());
-        let path = resolved.as_deref().unwrap_or(path.as_ref());
+        let resolved = resolve_fileset_prefix(path);
+        let path = resolved.as_deref().unwrap_or(path);
         if is_pgen_path(path) {
             let genome_build = genome_build.ok_or_else(|| {
                 PlinkIoError::Pipeline(PipelineError::Io(
@@ -202,13 +223,15 @@ impl GenotypeDataset {
                         .to_string(),
                 ))
             })?;
-            return Ok(Self::Pgen(PgenDataset::open(path, genome_build)?));
+            let (dataset, rows) = PgenDataset::open_reading(path, genome_build, pvar_rows)?;
+            return Ok((Self::Pgen(dataset), rows));
         }
-        if guess_is_variant_dataset(path) {
-            Ok(Self::Variants(VcfLikeDataset::open(path)?))
+        let dataset = if guess_is_variant_dataset(path) {
+            Self::Variants(VcfLikeDataset::open(path)?)
         } else {
-            Ok(Self::Plink(PlinkDataset::open(path)?))
-        }
+            Self::Plink(PlinkDataset::open(path)?)
+        };
+        Ok((dataset, Vec::new()))
     }
 
     pub fn samples(&self) -> &[SampleRecord] {
@@ -2192,9 +2215,29 @@ pub struct PgenDataset {
 
 impl PgenDataset {
     pub fn open(path: &Path, genome_build: GenomeBuild) -> Result<Self, PlinkIoError> {
+        Self::open_reading(path, genome_build, false).map(|(dataset, _)| dataset)
+    }
+
+    /// The dataset, and when `pvar_rows` is set the loci of its virtual `.bim` rows,
+    /// read with the variant plan; otherwise no rows.
+    fn open_reading(
+        path: &Path,
+        genome_build: GenomeBuild,
+        pvar_rows: bool,
+    ) -> Result<(Self, Vec<PvarRowRun>), PlinkIoError> {
         let (pgen_path, pvar_path, psam_path) = normalize_pgen_paths(path);
-        let virtual_plink =
-            open_virtual_plink19_from_paths(&pgen_path, &pvar_path, &psam_path, genome_build)?;
+        let (virtual_plink, rows) = if pvar_rows {
+            open_virtual_plink19_and_pvar_rows_from_paths(
+                &pgen_path,
+                &pvar_path,
+                &psam_path,
+                genome_build,
+            )?
+        } else {
+            let plink =
+                open_virtual_plink19_from_paths(&pgen_path, &pvar_path, &psam_path, genome_build)?;
+            (plink, Vec::new())
+        };
 
         let mut fam_source = virtual_plink.fam_source();
         let samples = read_fam_records_from_source(&psam_path, &mut *fam_source)?;
@@ -2210,14 +2253,15 @@ impl PgenDataset {
         let bytes_per_variant = n_samples.div_ceil(4).max(1);
         let n_variants = virtual_plink.n_variants();
 
-        Ok(Self {
+        let dataset = Self {
             pgen_path,
             pvar_path,
             virtual_plink,
             samples,
             n_variants,
             bytes_per_variant,
-        })
+        };
+        Ok((dataset, rows))
     }
 
     pub fn samples(&self) -> &[SampleRecord] {
