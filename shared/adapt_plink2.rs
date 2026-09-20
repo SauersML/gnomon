@@ -845,10 +845,10 @@ fn is_ascii_text_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
 
-/// `text.trim()`, by bytes when `text` is ASCII.
-fn trim_text(text: &str) -> &str {
+/// `text.trim()`, by bytes when `text` is ASCII, and whether it is.
+fn trim_text(text: &str) -> (&str, bool) {
     if !text.is_ascii() {
-        return text.trim();
+        return (text.trim(), false);
     }
     let bytes = text.as_bytes();
     let start = bytes
@@ -859,7 +859,13 @@ fn trim_text(text: &str) -> &str {
         .iter()
         .rposition(|&byte| !is_ascii_text_whitespace(byte))
         .map_or(start, |last| last + 1);
-    &text[start..end]
+    (&text[start..end], true)
+}
+
+/// The ALT alleles of a `.pvar` ALT field, in order: its comma-separated parts but
+/// the empty ones and `.`. A field holds no whitespace, so no part needs trimming.
+fn alt_alleles(alt: &str) -> impl Iterator<Item = &str> {
+    alt.split(',').filter(|a| !a.is_empty() && *a != ".")
 }
 
 /// The columns of one `.pvar` data line that a plan or a virtual `.bim` row
@@ -873,7 +879,9 @@ struct PvarFields<'a> {
 }
 
 impl<'a> PvarFields<'a> {
-    fn split(line: &'a str, cols: PvarCols) -> Self {
+    /// `line`'s fields, split as `split_whitespace` splits it; `ascii` says `line` is
+    /// known to be ASCII, which lets it be split on bytes.
+    fn split(line: &'a str, cols: PvarCols, ascii: bool) -> Self {
         let mut fields = Self {
             chrom: None,
             id: None,
@@ -904,7 +912,7 @@ impl<'a> PvarFields<'a> {
                 fields.alt = Some(field);
             }
         };
-        if line.is_ascii() {
+        if ascii {
             // The fields `split_whitespace` gives, split on the same bytes.
             let bytes = line.as_bytes();
             let mut at = 0;
@@ -987,8 +995,9 @@ pub(crate) struct PvarLayout {
 
 /// A `.pvar` line as every reader of the file reads it.
 enum PvarLine<'l> {
-    /// A data line, trimmed, with the columns that read it.
-    Data(&'l str, PvarCols),
+    /// A data line, trimmed, with the columns that read it and whether it is known to
+    /// be ASCII.
+    Data(&'l str, PvarCols, bool),
     /// A header line, which sets the layout of the lines after it.
     Header,
     /// A comment or blank line.
@@ -1001,7 +1010,7 @@ impl PvarLayout {
     fn read<'l>(&mut self, line: &'l [u8]) -> Result<PvarLine<'l>, PipelineError> {
         let s = str::from_utf8(line)
             .map_err(|e| PipelineError::Io(format!("Invalid UTF-8 in .pvar: {e}")))?;
-        let trimmed = trim_text(s);
+        let (trimmed, ascii) = trim_text(s);
         if trimmed.is_empty() || trimmed.starts_with("##") {
             return Ok(PvarLine::Other);
         }
@@ -1017,7 +1026,7 @@ impl PvarLayout {
                 derived
             }
         };
-        Ok(PvarLine::Data(trimmed, cols))
+        Ok(PvarLine::Data(trimmed, cols, ascii))
     }
 
     /// The layout after a piece of lines that [`piece_layouts`] summarized, read from
@@ -1173,10 +1182,10 @@ impl VirtualBimLines {
     pub(crate) fn render(&mut self, line: &[u8]) -> Result<(), PipelineError> {
         self.rows.clear();
         self.row_ends.clear();
-        let PvarLine::Data(trimmed, cols) = self.layout.read(line)? else {
+        let PvarLine::Data(trimmed, cols, ascii) = self.layout.read(line)? else {
             return Ok(());
         };
-        let fields = PvarFields::split(trimmed, cols);
+        let fields = PvarFields::split(trimmed, cols, ascii);
 
         normalize_chrom_into(
             fields
@@ -1197,12 +1206,7 @@ impl VirtualBimLines {
             .alt
             .ok_or_else(|| ioerr(".pvar missing ALT column"))?;
 
-        let alts = || {
-            alt_raw
-                .split(',')
-                .map(str::trim)
-                .filter(|a| !a.is_empty() && *a != ".")
-        };
+        let alts = || alt_alleles(alt_raw);
         let split = alts().nth(1).is_some();
         // Rows in ALT order, matching the variant order the plan assigned
         // during the indexing pass.
@@ -1322,10 +1326,10 @@ fn plan_record<'l>(
     layout: &mut PvarLayout,
     line: &'l [u8],
 ) -> Result<Option<(&'l str, u64, u16)>, PipelineError> {
-    let PvarLine::Data(trimmed, cols) = layout.read(line)? else {
+    let PvarLine::Data(trimmed, cols, ascii) = layout.read(line)? else {
         return Ok(None);
     };
-    let fields = PvarFields::split(trimmed, cols);
+    let fields = PvarFields::split(trimmed, cols, ascii);
     let chrom_raw = fields
         .chrom
         .ok_or_else(|| ioerr(".pvar missing CHROM column"))?;
@@ -1352,11 +1356,7 @@ fn plan_record<'l>(
     // ordinary allele codes, as plink2's own .bim export and the VCF
     // readers keep them: dropping or rejecting them would make a PGEN
     // disagree with the same data read as BED or VCF.
-    let alt_count = alt_raw
-        .split(',')
-        .map(|a| a.trim())
-        .filter(|a| !a.is_empty() && *a != ".")
-        .count();
+    let alt_count = alt_alleles(alt_raw).count();
     Ok(Some((chrom_raw, pos, alt_count as u16)))
 }
 
@@ -1645,7 +1645,7 @@ fn scan_pvar_text_chunk(text: &str, cols: PvarCols) -> Option<Vec<PvarRowRun>> {
         if trimmed.starts_with('#') {
             return None;
         }
-        let fields = PvarFields::split(trimmed, cols);
+        let fields = PvarFields::split(trimmed, cols, trimmed.is_ascii());
         fields.id?;
         fields.refa?;
         normalize_chrom_into(fields.chrom?, &mut chrom);
@@ -4692,7 +4692,7 @@ mod tests {
                 header_cols = Some(derived);
                 derived
             };
-            let fields = PvarFields::split(trimmed, cols);
+            let fields = PvarFields::split(trimmed, cols, trimmed.is_ascii());
 
             let chrom_raw = fields
                 .chrom
@@ -4740,6 +4740,40 @@ mod tests {
             out_to_in,
             alts_per_in,
         })
+    }
+
+    /// A line known to be ASCII is split on its bytes into the fields `split_whitespace`
+    /// gives. The lines are random ASCII of up to 47 bytes, with whitespace bytes common
+    /// and with control bytes that are not whitespace, which belong to a field.
+    #[test]
+    fn ascii_fields_split_as_split_whitespace_splits_them() {
+        let cols = PvarCols::from_header_line("#CHROM\tPOS\tID\tREF\tALT\tQUAL").unwrap();
+        let pool: Vec<u8> = b" \t\n\x0b\x0c\r \t"
+            .iter()
+            .copied()
+            .chain([0x00, 0x01, 0x08, 0x0e, 0x1f, b'!', b'~', 0x7f])
+            .chain(b'A'..=b'Z')
+            .collect();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        fn fields<'a>(f: &PvarFields<'a>) -> [Option<&'a str>; 5] {
+            [f.chrom, f.pos, f.id, f.refa, f.alt]
+        }
+        for _ in 0..50_000 {
+            let len = (next() % 48) as usize;
+            let line: Vec<u8> = (0..len)
+                .map(|_| pool[(next() % pool.len() as u64) as usize])
+                .collect();
+            let line = str::from_utf8(&line).unwrap();
+            let by_bytes = PvarFields::split(line, cols, true);
+            let by_text = PvarFields::split(line, cols, false);
+            assert_eq!(fields(&by_bytes), fields(&by_text), "{line:?}");
+        }
     }
 
     #[test]
