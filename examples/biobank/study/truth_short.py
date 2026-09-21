@@ -51,7 +51,9 @@ def _groups(sim, root: Path, scenario: str, sizes):
 
 
 def _refuse_foreign(sim, root: Path, groups, reference: str):
-    script, diseases, ref_sha = _sha(sim.__file__), _sha(sim.DEFAULT_DISEASES), _sha(reference)
+    script, diseases = _sha(sim.__file__), _sha(sim.DEFAULT_DISEASES)
+    # No reference path: the set must have used the synthetic mixture (sim.load_reference).
+    ref_sha = _sha(reference) if reference else "synthetic mixture"
     for group in groups:
         for entry in group.values():
             meta = json.loads((root / entry["dir"] / "manifest.json").read_text())["simulator"]

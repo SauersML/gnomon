@@ -538,10 +538,11 @@ def test_publish_records_each_size_seed(tmp_path):
 def test_truth_short_exits_non_zero_on_a_refused_set(tmp_path):
     """truth_short refuses a set whose own 1-y truth disagrees with the recomputed one, writes nothing for it, and
     exits non-zero (it used to print REFUSED and exit 0)."""
-    reference = REFERENCE or "/scratch.global/sauer354/aou-study/study-sim/reference_pcs.parquet"
+    # The reference PCs the module was given, else the synthetic mixture on both sides (an
+    # empty STUDY_SIM_REFERENCE is no path to truth_short too).
     out = tmp_path / "g"
     sim.main(["generate", "--out", str(out), "--n", "600", "--seed", "5", "--workers", "1", "--git-sha", "test",
-              "--reference", reference])
+              *(["--reference", REFERENCE] if REFERENCE else [])])
     bad = out / "realistic_lastcontact" / "truth.parquet"
     table = pq.read_table(bad)
     column = table.schema.get_field_index("cif_1y")
@@ -550,7 +551,7 @@ def test_truth_short_exits_non_zero_on_a_refused_set(tmp_path):
     pq.write_table(table, bad, compression="zstd")
     src = Path(__file__).resolve().parents[3]
     done = subprocess.run([sys.executable, str(src / "examples" / "biobank" / "study" / "truth_short.py"), str(src),
-                           str(out), "realistic"], env={**os.environ, "STUDY_SIM_REFERENCE": reference},
+                           str(out), "realistic"], env={**os.environ, "STUDY_SIM_REFERENCE": REFERENCE or ""},
                           capture_output=True, text=True, timeout=300)
     assert done.returncode != 0 and "REFUSED: realistic_lastcontact" in done.stderr, (done.returncode,
                                                                                        done.stderr[-500:])
