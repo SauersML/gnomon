@@ -694,15 +694,14 @@ mod tests {
             .predict(data.p.view(), data.sex.view(), data.pcs.view())
             .expect("predict training rows");
         assert!(predicted.iter().all(|risk| risk.is_finite() && *risk > 0.0 && *risk < 1.0));
-        // The binary table writes η as a probit index: the model's mean is Φ(η). gam's Φ and libm's erfc route
-        // differ by up to about 2e-13 relative in the tails.
+        // The point is gam's posterior mean, so it is not Φ of the probit index η at the fitted
+        // coefficients; the index comes with its posterior SD.
         let detailed = model
             .predict_detailed(data.p.view(), data.sex.view(), data.pcs.view())
             .expect("predict training rows in detail");
-        for (eta, mean) in detailed.eta.iter().zip(detailed.mean.iter()) {
-            let phi = gam::probability::normal_cdf(*eta);
-            assert!((mean - phi).abs() <= 1e-12 * phi, "mean {mean} against Φ(η) {phi} at η {eta}");
-        }
+        assert_eq!(detailed.mean, predicted);
+        let se_eta = detailed.se_eta.expect("a binary prediction carries the index's posterior SD");
+        assert!(se_eta.iter().all(|se| se.is_finite() && *se > 0.0));
         let directory = tempfile::tempdir().expect("model directory");
         let path = directory.path().join("model.json");
         model.save(path.to_str().expect("path")).expect("save model");

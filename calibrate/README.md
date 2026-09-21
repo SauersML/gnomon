@@ -185,15 +185,10 @@ use, a measure of proximity to training support (e.g. the peeled-hull distance
 implemented in `gam::terms::hull` — not yet wired through this adapter) may be
 more informative than the SE magnitude.
 
-**Point estimate choice (mode vs. mean)**: The current implementation returns the
-posterior mode (MAP estimate from PIRLS). For risk predictions ("you have 13%
-chance of X"), the posterior mean is theoretically preferable because it minimizes
-Brier score / squared prediction error. If MCMC sampling were added post-BFGS,
-the posterior mean of the risk (averaging f(patient, β) over β samples) would
-give more accurate calibrated probabilities than the mode. The mode answers "what's
-the single most probable β?" while the mean answers "what risk should I report to
-minimize prediction error on average?" For patient-facing risk estimates, the mean
-is the Bayes-optimal choice.
+**Point estimate**: a binary prediction is gam's posterior mean of the risk,
+`E[Φ(η(β))]` over `β ~ Normal(β̂, H⁻¹)` with the anchor re-solved at every
+posterior node, the same point `gam predict` and `gamfit` report. The probit
+index beside it is `η(β̂)`, with its posterior SD.
 
 See Ruppert, Wand, Carroll "Semiparametric Regression" Ch. 6.6-6.9 for theoretical
 background on confidence intervals for penalized splines.
@@ -246,30 +241,11 @@ predictor for the saved model:
 - **Identity** — evaluates `μ(x)` and `log σ(x)` from the mean and noise
   term collections, applies the stored link wiggle, and reports the mean.
 - **Binary** — evaluates `q(x)` and `b(x)`, solves the anchor on the saved
-  latent law, applies the stored deviation blocks, and maps to probabilities
-  via `Φ(·)`.
+  latent law, applies the stored deviation blocks, and averages `Φ(·)` over
+  the coefficient posterior.
 - **Survival** — evaluates the plug-in cumulative hazard at each row's entry
   and exit ages on one coefficient vector, and reports the conditional risk
   `1 − exp(−(H(exit) − H(entry)))`.
-
-### Posterior-predictive uncertainty (sketch)
-
-The stored penalized Hessian already encodes local curvature around the fitted
-coefficients. Treating the coefficients as approximately
-`β ~ Normal(β̂, H⁻¹)` yields a lightweight posterior predictive routine:
-
-1. Compute a Cholesky factor of `H⁻¹` after training (or factor `H` and solve
-   for draws on demand).
-2. At inference, draw `β⁽¹⁾…β⁽M⁾` from that multivariate normal.
-3. For a new design vector `x`, evaluate `η⁽ᵐ⁾ = x'β⁽ᵐ⁾` and transform with
-   the link (e.g., `p⁽ᵐ⁾ = sigmoid(η⁽ᵐ⁾)` for logistic fits).
-4. Use the empirical quantiles of `{p⁽ᵐ⁾}` as credible intervals; the samples
-   themselves represent the full distribution of the individual's risk.
-
-This adds on the order of 50–100 lines of inference code (sampling, linkage,
-quantiles) and requires no access to the training data—only the fitted
-coefficients and Hessian. It inherits the standard large-sample assumptions of a
-Gaussian posterior around the optimum and ignores higher-order asymmetry.
 
 ## Expected data format
 

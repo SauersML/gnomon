@@ -4,7 +4,8 @@ use gam::families::survival::{
     predict_survival,
 };
 use gam::inference::model::{FittedModel, FittedModelPayload};
-use gam::predict::FittedModelPredictExt;
+use gam::families::survival::predict::fit_result_from_saved_model_for_prediction;
+use gam::predict::{FittedModelPredictExt, PosteriorMeanOptions};
 
 use crate::calibrate::runtime::on_gam_pool;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -350,19 +351,47 @@ fn predict_from_data(
     payload: &FittedModelPayload,
     data: &Array2<f64>,
     col_map: &HashMap<String, usize>,
-) -> Result<gam::predict::PredictResult, ModelError> {
+) -> Result<PointPrediction, ModelError> {
     on_gam_pool(|| predict_from_data_on_pool(payload, data, col_map)).map_err(ModelError::Predict)?
+}
+
+/// gam's point prediction: the linear predictor at the fitted coefficients, the
+/// response-scale point, and the linear predictor's posterior SD where the
+/// point integrates the coefficient posterior.
+struct PointPrediction {
+    eta: Array1<f64>,
+    mean: Array1<f64>,
+    se_eta: Option<Array1<f64>>,
 }
 
 fn predict_from_data_on_pool(
     payload: &FittedModelPayload,
     data: &Array2<f64>,
     col_map: &HashMap<String, usize>,
-) -> Result<gam::predict::PredictResult, ModelError> {
-    with_predictor(payload, data, col_map, |predictor, pred_input| {
-        predictor
-            .predict_plugin_response(pred_input)
-            .map_err(|e| ModelError::Predict(format!("predict_plugin_response failed: {e}")))
+) -> Result<PointPrediction, ModelError> {
+    with_predictor(payload, data, col_map, |model, predictor, pred_input| {
+        // gam's own default point, as `gam predict` and gamfit report it: the
+        // posterior mean wherever the inverse link is curved, where it differs
+        // from the response at the fitted coefficients.
+        if !model.prediction_uses_posterior_mean() {
+            let plugin = predictor
+                .predict_plugin_response(pred_input)
+                .map_err(|e| ModelError::Predict(format!("predict_plugin_response failed: {e}")))?;
+            return Ok(PointPrediction {
+                eta: plugin.eta,
+                mean: plugin.mean,
+                se_eta: None,
+            });
+        }
+        let fit = fit_result_from_saved_model_for_prediction(model).map_err(ModelError::Predict)?;
+        let posterior = predictor
+            .predict_posterior_mean(pred_input, &fit, &PosteriorMeanOptions::point_only())
+            .map_err(|e| ModelError::Predict(format!("predict_posterior_mean failed: {e}")))?;
+        Ok(PointPrediction {
+            eta: posterior.eta,
+            mean: posterior.mean,
+            se_eta: Some(posterior.eta_standard_error),
+        })
     })
 }
 
@@ -372,7 +401,7 @@ fn noise_scale_from_data(
     col_map: &HashMap<String, usize>,
 ) -> Result<Option<Array1<f64>>, ModelError> {
     on_gam_pool(|| {
-        with_predictor(payload, data, col_map, |predictor, pred_input| {
+        with_predictor(payload, data, col_map, |_, predictor, pred_input| {
             predictor
                 .predict_noise_scale(pred_input)
                 .map_err(|e| ModelError::Predict(format!("predict_noise_scale failed: {e}")))
@@ -381,12 +410,16 @@ fn noise_scale_from_data(
     .map_err(ModelError::Predict)?
 }
 
-/// Runs `work` on the saved model's predictor and its prediction input for `data`.
+/// Runs `work` on the saved model, its predictor and its prediction input for `data`.
 fn with_predictor<R>(
     payload: &FittedModelPayload,
     data: &Array2<f64>,
     col_map: &HashMap<String, usize>,
-    work: impl FnOnce(&dyn gam::predict::PredictableModel, &gam::predict::PredictInput) -> Result<R, ModelError>,
+    work: impl FnOnce(
+        &FittedModel,
+        &dyn gam::predict::PredictableModel,
+        &gam::predict::PredictInput,
+    ) -> Result<R, ModelError>,
 ) -> Result<R, ModelError> {
     let model = FittedModel::from_payload(payload.clone());
     let n = data.nrows();
@@ -405,7 +438,7 @@ fn with_predictor<R>(
     let predictor = model
         .predictor()
         .ok_or_else(|| ModelError::Predict("saved model could not construct a predictor".into()))?;
-    work(predictor.as_ref(), &pred_input)
+    work(&model, predictor.as_ref(), &pred_input)
 }
 
 impl TrainedModel {
@@ -431,7 +464,7 @@ impl TrainedModel {
         p: ArrayView1<f64>,
         sex: ArrayView1<f64>,
         pcs: ArrayView2<f64>,
-    ) -> Result<gam::predict::PredictResult, ModelError> {
+    ) -> Result<PointPrediction, ModelError> {
         let (data, col_map) = build_predict_data(&self.saved, p, sex, pcs)?;
         predict_from_data(&self.saved, &data, &col_map)
     }
@@ -494,14 +527,11 @@ impl TrainedModel {
         pcs_new: ArrayView2<f64>,
     ) -> Result<PredictDetailed, ModelError> {
         let res = self.predict_result(p_new, sex_new, pcs_new)?;
-        // SE on eta requires posterior covariance; v1 returns None and leaves
-        // the uncertainty pipeline (predict_full_uncertainty / posterior_mean)
-        // to a future iteration that wires fit_result_from_saved_model_for_prediction.
         Ok(PredictDetailed {
             eta: res.eta,
             mean: res.mean,
             signed_dist: None,
-            se_eta: None,
+            se_eta: res.se_eta,
         })
     }
 
