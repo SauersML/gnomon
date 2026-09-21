@@ -362,14 +362,17 @@ class Study:
             if not self.parquet or self.config["label"] != "production":
                 raise ValueError("a claim run is a simulator run of the production config")
             check_claims(self.config, claim_run=True)
-        self.kinds = tuple(kind for kind in KINDS if kind in (args.kinds or KINDS))
+        from study import models
+        self.models = models
+        unfitted = set(args.kinds or ()) - set(models.KINDS)
+        if unfitted:
+            raise ValueError(f"study/models has no module for {sorted(unfitted)}; it fits {list(models.KINDS)}")
+        self.kinds = tuple(kind for kind in models.KINDS if kind in (args.kinds or models.KINDS))
         if args.diseases:
             unknown = set(args.diseases) - {disease.slug for disease in self.diseases}
             if unknown:
                 raise ValueError(f"--diseases names no study disease: {sorted(unknown)}")
             self.diseases = [disease for disease in self.diseases if disease.slug in args.diseases]
-        from study import models
-        self.models = models
         check_single_sex([definition(disease) for disease in self.diseases],
                          {kind: [("shared", c) for c in self.shared_components(kind)]
                           + [(v, c) for v in self.variants(kind) for c in self.own_components(kind, v)]

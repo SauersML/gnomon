@@ -1,6 +1,10 @@
 """The study's models, one module per outcome kind behind the one interface study.py calls.
 
-binary.py (study-model-bin) and survival.py (study-model-surv) each export:
+KINDS names the kinds that have a module. The driver builds survival frames and
+evaluates survival predictions, but there is no survival.py yet, so a run fits
+the binary kind only and refuses --kinds survival by name.
+
+A kind's module exports:
 
     VARIANTS                                    ours first, then the competitors
     components(variant, settings)               the fits a variant makes, e.g. ["disease"]
@@ -28,7 +32,7 @@ from __future__ import annotations
 
 from importlib import import_module
 
-KINDS = ("binary", "survival")
+KINDS = ("binary",)
 
 
 def _module(kind):
@@ -38,8 +42,7 @@ def _module(kind):
 
 
 class _Variants(dict):
-    """VARIANTS[kind], read from the kind's module when first asked for, so the
-    package imports even before both kind modules exist."""
+    """VARIANTS[kind], read from the kind's module when first asked for."""
     def __missing__(self, kind):
         declared = _module(kind).VARIANTS
         self[kind] = tuple(declared[kind] if isinstance(declared, dict) else declared)
