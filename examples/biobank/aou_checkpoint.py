@@ -5,10 +5,9 @@ import hashlib
 from pathlib import Path
 
 
-# Settings that bound cost, not results. Tuning a wall, query or byte budget
-# must never discard checkpointed scoring or partially fitted models.
-COMPUTE_BOUNDS = frozenset({"fit_timeout_seconds", "query_timeout_seconds",
-                            "maximum_bytes_billed", "timeout_seconds", "fit_budget"})
+# Settings that bound cost, not results. Tuning a query or byte budget must
+# never discard checkpointed scoring or fitted models.
+COMPUTE_BOUNDS = frozenset({"query_timeout_seconds", "maximum_bytes_billed"})
 
 
 def result_identity(settings):

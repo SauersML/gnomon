@@ -673,7 +673,8 @@ class Study:
             raise ValueError(f"the scorer's output for {pgs} is not one score")
         frame = pd.read_csv(produced[0], sep="\t", skiprows=skipped, usecols=[iid, averages[0], missing[0]],
                             dtype={iid: str})
-        frame.columns = ["#IID", f"{pgs}_AVG", f"{pgs}_MISSING_PCT"]
+        frame = frame.rename(columns={iid: "#IID", averages[0]: f"{pgs}_AVG", missing[0]: f"{pgs}_MISSING_PCT"})
+        frame = frame[["#IID", f"{pgs}_AVG", f"{pgs}_MISSING_PCT"]]
         frame.to_csv(directory / f"{pgs}.sscore", sep="\t", index=False, float_format="%.17g")
         shutil.rmtree(raw)
         self.checkpoint.complete(step, info={"seconds": round(time.monotonic() - started, 1)})
