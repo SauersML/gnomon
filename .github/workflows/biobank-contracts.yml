@@ -1,4 +1,4 @@
-name: Biobank workflow contracts
+name: Biobank study contracts
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ permissions:
 jobs:
   contracts:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 30
     env:
       OPENBLAS_NUM_THREADS: '1'
       OMP_NUM_THREADS: '1'
@@ -31,16 +31,17 @@ jobs:
           python-version: '3.12'
       - name: Install workflow validation dependencies
         run: >-
-          pip install --only-binary=:all: numpy pandas scipy scikit-learn pyarrow
+          pip install --only-binary=:all: numpy pandas scipy scikit-learn pyarrow duckdb sqlglot
           google-cloud-bigquery google-cloud-storage miniwdl pytest
-      # Every test module and every WDL: a stale test outside test_aou_survival
-      # once sent SIGKILL to every process its account owned on a shared node.
-      # examples/biobank/tests/ is not collected: the study's tests run on MSI
-      # only (SPEC section 1), against the simulator tables and the study venv.
-      - name: Validate prospective workflow contracts
+      # The study's own tests: imports, score parsing, schemas, SQL, disclosure,
+      # evaluation and the simulator. The fits in test_study_models_binary.py
+      # need the study's gamfit wheel and test_study_evaluate_reference.py needs
+      # R with the survival packages, so those two run on MSI.
+      - name: Validate study contracts
         working-directory: examples/biobank
         run: |
-          timeout 180 python -m pytest -q -p no:cacheprovider test_*.py
+          python -m pytest -q -p no:cacheprovider test_*.py tests \
+            --ignore=tests/test_study_models_binary.py --ignore=tests/test_study_evaluate_reference.py
           for wdl in *.wdl; do timeout 45 python -m WDL check "$wdl"; done
       - name: Validate simulation completion contracts
         working-directory: sims/ancestry_calibration
