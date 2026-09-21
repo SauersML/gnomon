@@ -400,7 +400,7 @@ model = gamfit.fit(data, formula=f"y ~ s(age, k=6) + sex + {surface}", family="b
 seconds = time.monotonic() - start
 risk = np.asarray(model.predict(data), dtype=float)
 model.save(sys.argv[1])
-law = (json.loads(Path(sys.argv[1]).read_text())["payload"].get("latent_measure") or {}).get("kind")
+law = (json.loads(Path(sys.argv[1]).read_text())["model"].get("latent_measure") or {}).get("kind")
 ok = risk.shape == (n,) and bool(np.isfinite(risk).all()) and law == "global-empirical"
 print(json.dumps({"ok": ok, "fit_seconds": round(seconds, 2), "risk_range": [float(risk.min()), float(risk.max())],
                   "latent_measure": law, "version": gamfit.build_info().get("version")}))

@@ -71,17 +71,22 @@ def fitted(frames, tmp_path_factory):
 
 # shipped carries gam's link wiggles, the slowest fit, so its cases run last.
 LAST_SHIPPED = [v for v in binary.VARIANTS if v != "shipped"] + ["shipped"]
+NO_SLOPE = ("shipped", "calpred")
 
 
 @pytest.mark.parametrize("variant", LAST_SHIPPED)
 def test_variant_fits_and_replays(frames, fitted, variant):
     _, test = frames
     directory, info, first = fitted(variant)
-    assert info["variant"] == variant and info["rows"] == 3000 and isinstance(info["converged"], bool)
+    assert info["variant"] == variant and info["rows"] == 3000
+    assert info["converged"] is True and info["convergence"]["certified"] is True
     assert first["risk"].shape == (len(test),) and first["slope"].shape == (len(test),)
-    assert np.all((first["risk"] > 0) & (first["risk"] < 1)) and np.isfinite(first["slope"]).all()
+    assert np.all((first["risk"] > 0) & (first["risk"] < 1))
+    # gam reports no score derivative through shipped's wiggles or for calpred's location-scale fit.
+    assert np.isnan(first["slope"]).all() if variant in NO_SLOPE else np.isfinite(first["slope"]).all()
     again = binary.predict(variant, {"disease": directory}, test, SETTINGS, None, disease=DISEASE)
-    assert np.array_equal(first["risk"], again["risk"]) and np.array_equal(first["slope"], again["slope"])
+    assert np.array_equal(first["risk"], again["risk"])
+    assert np.array_equal(first["slope"], again["slope"], equal_nan=True)
     # Row order does not change a row's prediction.
     reversed_rows = binary.predict(variant, {"disease": directory}, test.iloc[::-1], SETTINGS, None,
                                    disease=DISEASE)
@@ -90,7 +95,7 @@ def test_variant_fits_and_replays(frames, fitted, variant):
 
 @pytest.mark.parametrize("variant", [v for v in LAST_SHIPPED if v in binary.MARGINAL_SLOPE])
 def test_marginal_slope_fits_anchor_on_the_empirical_law(fitted, variant):
-    payload = json.loads((fitted(variant)[0] / "model.gamfit").read_text())["payload"]
+    payload = json.loads((fitted(variant)[0] / "model.gamfit").read_text())["model"]
     assert payload["latent_measure"]["kind"] == "global-empirical"
     assert payload["latent_z_rank_int_calibration"] is None and payload["latent_z_conditional_calibration"] is None
 
@@ -107,19 +112,27 @@ def test_standard_slope_is_constant(frames, fitted):
     assert abs(np.mean(standard) - test.true_slope.mean()) < 0.12
 
 
-@pytest.mark.parametrize("variant", ["ours", "z_pc", "calpred", "shipped"])
+@pytest.mark.parametrize("variant", ["ours", "z_pc"])
 def test_slope_recovers_the_true_mean_slope(frames, fitted, variant):
     _, test = frames
     assert abs(np.mean(fitted(variant)[2]["slope"]) - test.true_slope.mean()) < 0.12
 
 
-def test_shifted_design_moves_only_z(frames):
+@pytest.mark.parametrize("variant", ["ours", "standard", "z_pc"])
+def test_slope_is_the_derivative_of_the_reported_risk(frames, fitted, variant):
+    """gam's analytic probit slope against the reported risks themselves, z moved a step either way."""
     _, test = frames
-    s = binary.settings_of(SETTINGS)
-    base, moved = binary.design("z_pc", test, s), binary.design("z_pc", test, s, shift=0.25)
-    assert np.array_equal(moved["z"], base["z"] + 0.25)
-    assert all(np.array_equal(moved[c], base[c]) for c in base if c != "z")
-    assert "z" not in binary.design("covariates", test, s)
+    directory, _, first = fitted(variant)
+    probit = np.vectorize(NormalDist().inv_cdf)
+    step = 0.05
+    up, down = (binary.predict(variant, {"disease": directory}, test.assign(z=test.z + shift), SETTINGS, None,
+                               disease=DISEASE)["risk"] for shift in (step, -step))
+    assert np.allclose(first["slope"], (probit(up) - probit(down)) / (2 * step), rtol=1e-3, atol=1e-5)
+
+
+def test_covariates_design_has_no_z(frames):
+    _, test = frames
+    assert "z" not in binary.design("covariates", test, binary.settings_of(SETTINGS))
 
 
 def test_competitors_differ_from_ours_only_in_how_z_enters():
@@ -139,14 +152,14 @@ def test_shipped_is_calibrate_as_shipped():
     formula, keywords = binary.formulas("shipped", s)
     # calibrate/model.rs PcSmoothConfig::for_pcs(6) = (9, 8); for_pcs(16) = (24, 20).
     assert binary.shipped_centers(6) == (9, 8) and binary.shipped_centers(16) == (24, 20)
-    assert formula == "y ~ sex + s(PC1, PC2, PC3, PC4, PC5, PC6, type=duchon, centers=9) + linkwiggle()"
-    assert keywords["slope_formula"] == "1 + s(PC1, PC2, PC3, PC4, PC5, PC6, type=duchon, centers=8) + linkwiggle()"
+    assert formula == "y ~ sex + duchon(PC1, PC2, PC3, PC4, PC5, PC6, centers=9) + linkwiggle()"
+    assert keywords["slope_formula"] == "1 + duchon(PC1, PC2, PC3, PC4, PC5, PC6, centers=8) + linkwiggle()"
     assert binary.columns("shipped", s) == ["z", "sex", "PC1", "PC2", "PC3", "PC4", "PC5", "PC6"]
 
 
 def test_refusals(frames, tmp_path):
     train, _ = frames
-    for law in ("standard-normal", "auto"):
+    for law in ("standard-normal", "auto", "conditional-location-scale"):
         with pytest.raises(ValueError, match="unsupported binary latent law"):
             binary.settings_of({**SETTINGS, "latent_law": law})
     with pytest.raises(ValueError, match="unknown \\['length_scale'\\]"):

@@ -9,12 +9,11 @@ probit link (SPEC section 4):
 no sex term in any fit), and differ only in how z enters:
 - ours: Bernoulli marginal slope. The covariate part is the marginal index
   q(x), the slope is 1 + duchon(PCs) (+ s(age) where the simulator shows it
-  helps), and the anchor integrates an empirical latent law of the training z,
+  helps), and the anchor integrates the empirical law of the training z,
   never the Gaussian one.
 - covariates: z does not enter (a probit GAM).
-- standard: z linear, as a marginal-slope fit with a constant slope.
-- z_pc: z linear and z times each PC, as a marginal-slope fit with the slope
-  1 + PC1 + ... + PCk.
+- standard: ours with a constant slope.
+- z_pc: ours with the slope 1 + PC1 + ... + PCk.
 - calpred: + z, with the log SD of the liability linear in the PCs (a binomial
   location-scale GAM), CalPred-style.
 - shipped: gnomon calibrate's binary model exactly as shipped (calibrate/
@@ -22,20 +21,21 @@ no sex term in any fit), and differ only in how z enters:
   joint PC smooth in q with calibrate's center counts, no age or windows, and
   gam's link deviation and score warp (`linkwiggle()` in both formulas).
 
-standard and z_pc are the probit GAMs "covariate part + z" and "+ z + z x PC",
-reparametrized: with a constant or PC-linear slope, the anchored index a(q, b) + b z
-spans the same risks as alpha(x) + b z, and only the penalty sits on q rather than
-on alpha. On study-sim v1 small, hypertension (8k rows), the constant-slope fit and
-the probit GAM "+ z" differ by at most 0.008 in risk (mean 0.0013), less than the
-GAM moves when its double penalty is dropped (0.027), while gamfit's standard-REML
-path timed out at 900 s on two of three diseases at 8k rows (gam#2817, comment
-5737819338). gamfit at gam 6fc5ad9c1c refuses the calpred fit at every startup seed
-("dense Hessian shape mismatch") and a smooth log SD by design, so calpred fails
-until gam fixes it.
+standard and z_pc are restricted-slope ablations of ours, not the probit GAMs
+"covariate part + z" and "+ z + z x PC": the anchored intercept a(q, b) of a
+finite-basis q and b is not itself in q's basis, so the two families span
+different risks. On study-sim v1 small, hypertension (8k rows), the
+constant-slope fit and the probit GAM "+ z" differ by at most 0.008 in risk
+(mean 0.0013). gamfit at gam 6fc5ad9c1c refuses the calpred fit at every
+startup seed ("dense Hessian shape mismatch") and a smooth log SD by design, so
+calpred fails until gam fixes it.
 
-Besides the risk, every variant reports its local score slope on the probit
-scale, d probit(p) / dz at each row's own z, as a central difference of its own
-predictions, so slope recovery is scored on one scale for every method.
+Every prediction is gam's posterior mean. Besides the risk, a marginal-slope
+variant reports its score slope on the probit scale, d probit(risk) / dz at
+each row's own z: gam's analytic `probit_score_derivative`, integrated at the
+posterior nodes that give the risk. shipped's link deviation and score warp
+leave gam no such derivative and calpred is not a marginal-slope fit, so their
+slope is NaN; covariates' is 0.
 """
 from __future__ import annotations
 
@@ -43,7 +43,6 @@ import json
 import math
 import time
 from pathlib import Path
-from statistics import NormalDist
 
 import numpy as np
 
@@ -56,30 +55,26 @@ AGE = "age_baseline"
 # slope of ours (a linear null space in k dimensions needs more than k + 1, and
 # gam's own default grows with n, gam#2993), the window covariates, the latent
 # law, and the basis size of the age term in ours' slope (null: no age term).
+# Everything else is gam's own behaviour.
 REQUIRED = ("num_pcs", "q_centers", "slope_centers", "windows", "latent_law", "slope_age_k")
 
-# Everything else is gam's own behaviour, or a numerical setting of prediction.
-DEFAULTS = {
-    # z step of the central-difference slope.
-    "slope_step": 0.05,
-}
-
-# latent_law: the training rows' own z law, or gam's estimated law of z given
-# the context (gam#2926). Never "auto": it takes the Gaussian closed form after
-# a fixed screen (SPEC section 4).
-LATENT_LAWS = ("global-empirical", "conditional-location-scale")
+# The anchor integrates the training rows' own z law, on the score's own axis.
+# Never "auto": it takes the Gaussian closed form after a fixed screen (SPEC
+# section 4). gam's "conditional-location-scale" anchors a transformed residual
+# score instead, which this study's raw-axis slope is not defined on.
+LATENT_LAW = "global-empirical"
 MARGINAL_SLOPE = ("ours", "shipped", "standard", "z_pc")
 
 
 def settings_of(settings):
     settings = settings or {}
-    unknown = set(settings) - set(DEFAULTS) - set(REQUIRED)
+    unknown = set(settings) - set(REQUIRED)
     missing = set(REQUIRED) - set(settings)
     if unknown or missing:
         raise ValueError(f"binary settings: unknown {sorted(unknown)}, missing {sorted(missing)}")
-    s = {**DEFAULTS, **settings}
-    if s["latent_law"] not in LATENT_LAWS:
-        raise ValueError(f"unsupported binary latent law {s['latent_law']!r}; use one of {LATENT_LAWS}")
+    s = dict(settings)
+    if s["latent_law"] != LATENT_LAW:
+        raise ValueError(f"unsupported binary latent law {s['latent_law']!r}; the study anchors on {LATENT_LAW!r}")
     for key in ("q_centers", "slope_centers"):
         if s[key] <= s["num_pcs"] + 1:
             raise ValueError(f"{key} must exceed the Duchon null space ({s['num_pcs'] + 1} columns)")
@@ -136,10 +131,9 @@ def formulas(variant, s, sex=True):
     disease declared for one sex: no fit then has a sex term."""
     if variant == "shipped":
         context, slope = shipped_centers(s["num_pcs"])
-        pcs = ", ".join(pc_columns(s))
-        return (f"y ~ {'sex + ' if sex else ''}s({pcs}, type=duchon, centers={context}) + linkwiggle()",
+        return (f"y ~ {'sex + ' if sex else ''}{duchon(s, context)} + linkwiggle()",
                 {"family": "bernoulli-marginal-slope", "z_column": "z",
-                 "slope_formula": f"1 + s({pcs}, type=duchon, centers={slope}) + linkwiggle()",
+                 "slope_formula": f"1 + {duchon(s, slope)} + linkwiggle()",
                  "config": {"latent_measure": s["latent_law"]}})
     main = f"y ~ {covariate_part(s, sex)}"
     probit = {"family": "binomial", "link": "probit"}
@@ -169,12 +163,9 @@ def columns(variant, s, sex=True):
     return ([] if variant == "covariates" else ["z"]) + [*sexes, AGE, *s["windows"], *pc_columns(s)]
 
 
-def design(variant, frame, s, sex=True, shift=0.0):
-    """A variant's input columns, with z moved by `shift`."""
-    data = {c: frame[c].to_numpy(float) for c in columns(variant, s, sex)}
-    if "z" in data:
-        data["z"] = data["z"] + shift
-    return data
+def design(variant, frame, s, sex=True):
+    """A variant's input columns."""
+    return {c: frame[c].to_numpy(float) for c in columns(variant, s, sex)}
 
 
 def check_frame(frame, s, with_response):
@@ -186,21 +177,6 @@ def check_frame(frame, s, with_response):
         raise ValueError("binary frame has non-finite inputs")
     if with_response and not set(np.unique(frame.y)) <= {0, 1}:
         raise ValueError("the binary response must be 0/1")
-
-
-def convergence_summary(payload):
-    """gam's own convergence and certificate verdict, reported, never overridden.
-
-    A fit gam keeps without certifying carries that word in its convergence
-    record; `certified` is then False and the driver's convergence gate must not
-    count the fit as converged."""
-    result = payload.get("fit_result") or {}
-    record = result.get("convergence") or {}
-    certificate = (result.get("artifacts") or {}).get("criterion_certificate") or {}
-    gradient = next(iter((certificate.get("stationarity") or {}).values()), {})
-    return {"inner_status": record.get("inner_status"), "outer_iterations": record.get("outer_iterations"),
-            "projected_grad_norm": gradient.get("projected_grad_norm"), "bound": gradient.get("bound"),
-            "certified": record.get("inner_status") == "Converged" and "ncertified" not in json.dumps(record)}
 
 
 def fit(variant, component, train, settings, out_dir, reference=None, *, disease):
@@ -222,7 +198,8 @@ def fit(variant, component, train, settings, out_dir, reference=None, *, disease
     model = gamfit.fit(data, formula, **keywords)
     seconds = time.perf_counter() - started
     model.save(out / "model.gamfit")
-    payload = json.loads((out / "model.gamfit").read_text())["payload"]
+    # gam's saved document is {"kind", "version", "model"}.
+    payload = json.loads((out / "model.gamfit").read_text())["model"]
     if variant in MARGINAL_SLOPE:
         # No CTN: the score enters as the driver standardized it, and the
         # anchor is the requested empirical law, never the standard normal.
@@ -232,23 +209,13 @@ def fit(variant, component, train, settings, out_dir, reference=None, *, disease
         measure = (payload.get("latent_measure") or {}).get("kind")
         if measure != s["latent_law"]:
             raise ValueError(f"the marginal-slope fit anchored on {measure!r}, not {s['latent_law']!r}")
-    convergence = convergence_summary(payload)
+    # gam's own typed verdict on the optimization, recorded as gam reports it.
+    convergence = model.convergence
     info = {"variant": variant, "rows": len(train), "events": int(train.y.sum()), "seconds": seconds,
             "sex_term": sex, "converged": convergence["certified"], "convergence": convergence,
             "lambdas": [float(v) for v in model.smoothing_parameters().values()]}
     write_json(out / "spec.json", {"formula": formula, **keywords, **info, "settings": s})
     return info
-
-
-_INV_CDF = np.frompyfunc(NormalDist().inv_cdf, 1, 1)
-
-
-def ndtri(p):
-    """Standard normal quantile, to double precision (Wichura AS241 in the stdlib)."""
-    p = np.asarray(p, float)
-    if np.any((p <= 0.0) | (p >= 1.0)):
-        raise ValueError("ndtri needs probabilities strictly inside (0, 1)")
-    return _INV_CDF(p).astype(float)
 
 
 def predict(variant, model_dirs, frame, settings, horizons=None, *, disease):
@@ -262,14 +229,12 @@ def predict(variant, model_dirs, frame, settings, horizons=None, *, disease):
                          f"for a disease declared for sex {disease['sex']!r}")
     model = gamfit.load(out / "model.gamfit")
 
-    def risk_at(shift):
-        p = np.asarray(model.predict(design(variant, frame, s, spec["sex_term"], shift)), dtype=float)
-        if p.shape != (len(frame),) or not np.all((p > 0) & (p < 1)):
-            raise ValueError(f"{variant} predictions are invalid")
-        return p
-
-    risk = risk_at(0.0)
+    table = model.predict(design(variant, frame, s, spec["sex_term"]), return_type="dict")
+    risk = np.asarray(table["mean" if variant in MARGINAL_SLOPE else "posterior_mean"], dtype=float)
+    if risk.shape != (len(frame),) or not np.all((risk > 0) & (risk < 1)):
+        raise ValueError(f"{variant} predictions are invalid")
     if variant == "covariates":
         return {"risk": risk, "slope": np.zeros(len(frame))}
-    h = s["slope_step"]
-    return {"risk": risk, "slope": (ndtri(risk_at(h)) - ndtri(risk_at(-h))) / (2 * h)}
+    if "probit_score_derivative" not in table:
+        return {"risk": risk, "slope": np.full(len(frame), np.nan)}
+    return {"risk": risk, "slope": np.asarray(table["probit_score_derivative"], dtype=float)}
