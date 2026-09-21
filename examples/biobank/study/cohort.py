@@ -776,7 +776,9 @@ def read_scores(score_cache, pgs_ids):
         with opener() as handle:
             frame = pd.read_csv(handle, sep="\t", skiprows=skipped, usecols=columns, dtype={iid: str},
                                 float_precision="round_trip")  # the exact double each value spells
-        frame.columns = ["person_id"] + [c for pgs in present for c in (pgs, f"{pgs}_missing_pct")]
+        # By name: read_csv returns usecols in the file's column order, not the requested one.
+        frame = frame.rename(columns={iid: "person_id", **{f"{pgs}_AVG": pgs for pgs in present},
+                                      **{f"{pgs}_MISSING_PCT": f"{pgs}_missing_pct" for pgs in present}})
         frame["person_id"] = _person_ids(frame.person_id, name)
         if frame.person_id.duplicated().any():
             raise SchemaError(f"{name} repeats participants")

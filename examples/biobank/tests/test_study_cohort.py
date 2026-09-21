@@ -222,6 +222,19 @@ def test_score_cache_directory_and_tar(tmp_path):
         cohort.read_scores(directory, ["PGS000044"])
 
 
+def test_scores_are_read_by_name_whatever_the_file_order(tmp_path):
+    """One file holding two scores in the opposite order to the request, its missingness
+    columns apart from their scores: every value lands under its own name."""
+    (tmp_path / "ab.sscore").write_text(
+        "#IID\tPGS000022_MISSING_PCT\tPGS000022_AVG\tPGS000011_AVG\tPGS000099_AVG\tPGS000011_MISSING_PCT\n"
+        "101\t3\t8\t2\t7\t1\n")
+    for wanted in (["PGS000011", "PGS000022"], ["PGS000022", "PGS000011"]):
+        row = cohort.read_scores(tmp_path, wanted).to_pylist()[0]
+        assert row == {"person_id": 101, "PGS000011": 2.0, "PGS000011_missing_pct": 1.0,
+                       "PGS000022": 8.0, "PGS000022_missing_pct": 3.0}
+        assert list(row)[1::2] == wanted
+
+
 # --------------------------------------------------------------------------- #
 # the AoU source against a recording fake client
 # --------------------------------------------------------------------------- #
