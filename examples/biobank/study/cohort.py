@@ -262,8 +262,8 @@ def validate(tables, manifest):
         # column null: then a null says "not reported", not "not scored".
         if not missing_null.all():
             _require(value_null[missing_null].all(), f"scores.{pgs} is present where the person was not scored")
-        _require((value_null == (missing_null | (missing == 100))).all(),
-                 f"scores.{pgs} must be null exactly when unscored or 100% missing")
+            _require((value_null == (missing_null | (missing == 100))).all(),
+                     f"scores.{pgs} must be null exactly when unscored or 100% missing")
 
     for name in TABLES:
         recorded = manifest.get("tables", {}).get(name, {}).get("rows")
