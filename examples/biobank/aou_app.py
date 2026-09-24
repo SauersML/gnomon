@@ -89,7 +89,7 @@ class App:
 
     def status(self):
         for row in wb_json("app", "list"):
-            if row.get("id") == self.app_id:
+            if row.get("name") == self.app_id:
                 return row.get("status")
         raise RuntimeError(f"{self.app_id} is not listed")
 
@@ -123,13 +123,16 @@ def stage_orchestrator(bucket, project):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["install", "describe"])
+    parser.add_argument("command", choices=["install", "describe", "restart"])
     parser.add_argument("--app", default=DEFAULT_APP)
     parser.add_argument("--bucket", default="aou-train-work-wb-amiable-carrot-1173")
     args = parser.parse_args()
     app = App(args.app)
     if args.command == "describe":
         print(json.dumps(app.describe(), indent=1)[:3000])
+        return
+    if args.command == "restart":
+        print("app", app.restart(), flush=True)
         return
     staged = stage_orchestrator(args.bucket, app.project)
     script = (HERE / ORCHESTRATOR / "startup.sh").read_text()
