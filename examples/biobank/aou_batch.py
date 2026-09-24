@@ -114,7 +114,7 @@ def localize_script(plan, project, wait_for=()):
     return "\n".join(lines) + "\n"
 
 
-def analyze_script(wdl_path, inputs, paths, shard=None, keep_store=False, variants=None):
+def analyze_script(wdl_path, inputs, paths, shard=None, keep_store=False, variants=None, provisioning="SPOT"):
     """study.wdl's `analyze` command with its WDL placeholders filled in; a shard
     runs study.py on its one disease with --shard (see study.py)."""
     text = Path(wdl_path).read_text()
@@ -143,6 +143,14 @@ def analyze_script(wdl_path, inputs, paths, shard=None, keep_store=False, varian
              + (f"--variants {' '.join(json.dumps(v) for v in variants)} " if variants else "")
              + ("--keep-checkpoint " if keep_store else ""))
     body = body.replace("study.py run ", "study.py run " + flags)
+    if provisioning != "SPOT":
+        # An on-demand rescue of a preempted run keeps the sources (and so the store key)
+        # untouched: the task's Spot check is relaxed here, in the job, to the AMD check alone.
+        if body.count("    require_spot_amd()\n") != 1:
+            raise ValueError("the task command must call require_spot_amd once")
+        body = body.replace("    require_spot_amd()\n",
+                            "    import pathlib\n    if 'AuthenticAMD' not in pathlib.Path('/proc/cpuinfo').read_text():\n"
+                            "        raise RuntimeError('this task requires an AMD VM')\n")
     return f"set -euo pipefail\ncd {WORK}/task\nexec > >(tee -a {WORK}/task.log) 2>&1\n" + body
 
 
@@ -154,7 +162,7 @@ def logs_script(checkpoint_uri, project):
 
 
 def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeout_minutes, shard=None,
-        keep_store=False, wait_for=(), variants=None):
+        keep_store=False, wait_for=(), variants=None, provisioning="SPOT"):
     """The Batch job document for one study run, or for one disease shard of it
     (the schema `gcloud batch jobs submit --config` reads)."""
     if not JOB_ID.fullmatch(name):
@@ -180,7 +188,7 @@ def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeou
                 "lifecyclePolicies": [{"action": "RETRY_TASK", "actionCondition": {"exitCodes": RETRY_EXIT_CODES}}],
                 "runnables": [
                     container(CLI_IMAGE, localize_script(plan, project, wait_for)),
-                    container(inputs["runtime_image"], analyze_script(wdl_path, inputs, paths, shard, keep_store, variants)),
+                    container(inputs["runtime_image"], analyze_script(wdl_path, inputs, paths, shard, keep_store, variants, provisioning)),
                     dict(container(CLI_IMAGE, logs_script(inputs["checkpoint_uri"], project)), alwaysRun=True),
                 ],
             },
@@ -188,7 +196,7 @@ def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeou
         "allocationPolicy": {
             "location": {"allowedLocations": [f"regions/{REGION}"]},
             "instances": [{"policy": {
-                "machineType": machine, "provisioningModel": "SPOT",
+                "machineType": machine, "provisioningModel": provisioning,
                 "bootDisk": {"type": "hyperdisk-balanced", "sizeGb": str(BOOT_DISK_GB), "image": "batch-debian"},
             }}],
             "network": {"networkInterfaces": [{

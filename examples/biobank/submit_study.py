@@ -219,13 +219,14 @@ def stage_batch_job(wb, name, wdl, inputs, folder, args, diseases):
             own = dict(fields, status_uri=f"{fields['status_uri']}-{suffix}")
             documents[shard] = aou_batch.job(shard, wdl, own, wb.project, account, args.shard_cpu,
                                              min(args.memory_gb, aou_batch.machine_type(args.shard_cpu, 1)[1]),
-                                             args.timeout_minutes, shard=slug,
+                                             args.timeout_minutes, shard=slug, provisioning=args.provisioning,
                                              variants=[variant] if variant else None)  # a shard keeps the store
             shard_status[(own["status_uri"], "study_predict_complete" if variant else "study_evaluate_complete")] = \
                 documents[shard]
     documents[name] = aou_batch.job(name, wdl, fields, wb.project, account, args.cpu, args.memory_gb,
                                     args.timeout_minutes, keep_store=args.keep_store,
-                                    wait_for=list(shard_status) if args.split else ())
+                                    wait_for=list(shard_status) if args.split else (),
+                                    provisioning=args.provisioning)
     uris = {}
     for job_name, document in documents.items():
         path = folder / f"batch-{job_name}.json"
@@ -305,6 +306,10 @@ def main():
                        help="keep the bucket checkpoint after the run, so the next run of the same code and config "
                             "restores its cohort and features instead of querying them (SPEC 7a asks for deletion; "
                             "time is the deliverable, user 2026-09-24; --no-keep-store deletes)")
+    child.add_argument("--provisioning", choices=["SPOT", "STANDARD"], default="SPOT",
+                       help="STANDARD rescues a run Spot keeps preempting: on-demand VMs resuming from the same "
+                            "store (the sources are untouched, so the store key is), the task's Spot check relaxed "
+                            "to the AMD check")
     child.add_argument("--allow-scoring", action="store_true",
                        help="score uncached PGS in the task (default: refuse; the study runs on the score bank)")
     child.add_argument("--split", action="store_true",
