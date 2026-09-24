@@ -204,6 +204,7 @@ def stage_batch_job(wb, name, wdl, inputs, folder, args, diseases):
         # code and config must never delete the store its shards are writing.
         fields = dict(fields, checkpoint_uri=fields["checkpoint_uri"].rstrip("/") + "-split/",
                       status_uri=fields["status_uri"] + "-split")
+        shard_status = {}
         for entry in diseases:
             slug = entry["slug"]
             shard = f"{name}-{slug.replace('_', '-')}"[:63].rstrip("-")
@@ -211,8 +212,10 @@ def stage_batch_job(wb, name, wdl, inputs, folder, args, diseases):
             documents[shard] = aou_batch.job(shard, wdl, own, wb.project, account, args.shard_cpu,
                                              min(args.memory_gb, aou_batch.machine_type(args.shard_cpu, 1)[1]),
                                              args.timeout_minutes, shard=slug)  # a shard always keeps the store
+            shard_status[own["status_uri"]] = documents[shard]
     documents[name] = aou_batch.job(name, wdl, fields, wb.project, account, args.cpu, args.memory_gb,
-                                    args.timeout_minutes, keep_store=args.keep_store)
+                                    args.timeout_minutes, keep_store=args.keep_store,
+                                    wait_for=list(shard_status) if args.split else ())
     uris = {}
     for job_name, document in documents.items():
         path = folder / f"batch-{job_name}.json"

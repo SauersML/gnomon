@@ -76,11 +76,27 @@ def localized(inputs):
     return paths, plan
 
 
-def localize_script(plan, project):
+def wait_script(status_uris, project):
+    """The gather job boots beside the shards and waits for every shard's
+    study_evaluate_complete label, so only the digest remains once they finish."""
+    lines = ['echo "[gather] waiting for $(date -u +%FT%TZ)"']
+    for uri in status_uris:
+        lines.append(f"until gcloud storage ls --billing-project {json.dumps(project)} "
+                     f"{json.dumps(uri + '.status/study_evaluate_complete.txt')} >/dev/null 2>&1; do "
+                     "for f in " + " ".join(json.dumps(u + ".status/failed_study_" + s + ".txt") for u in [uri]
+                                            for s in ("scores", "cohort", "features", "fits", "predict", "evaluate", "unexpected_errors"))
+                     + f"; do gcloud storage ls --billing-project {json.dumps(project)} \"$f\" >/dev/null 2>&1 && "
+                     '{ echo "[gather] a shard failed: $f"; exit 1; }; done; sleep 20; done')
+    lines.append('echo "[gather] every shard evaluated $(date -u +%FT%TZ)"')
+    return "\n".join(lines) + "\n"
+
+
+def localize_script(plan, project, wait_for=()):
     # Everything the localizer prints goes to the task log too: the task's own log is
     # the only log the pet account can read (Cloud Logging is closed to it).
     lines = ["set -euo pipefail", f"rm -rf {WORK}/in {WORK}/task", f"mkdir -p {WORK}/task",
              f"exec > >(tee -a {WORK}/task.log) 2>&1", 'echo "[localize] $(date -u +%FT%TZ) start on $(hostname)"',
+             *([wait_script(wait_for, project)] if wait_for else []),
              # no pipes here: under pipefail a `head` closing early kills the script (it did)
              f"id; ls -ld {WORK}; gcloud auth list 2>&1; gcloud config list account 2>&1"]
     for uri, local in plan:
@@ -131,7 +147,7 @@ def logs_script(checkpoint_uri, project):
 
 
 def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeout_minutes, shard=None,
-        keep_store=False):
+        keep_store=False, wait_for=()):
     """The Batch job document for one study run, or for one disease shard of it
     (the schema `gcloud batch jobs submit --config` reads)."""
     if not JOB_ID.fullmatch(name):
@@ -151,11 +167,11 @@ def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeou
             "taskSpec": {
                 "computeResource": {"cpuMilli": str(cpu * 1000), "memoryMib": str(memory_gb * 1024)},
                 # study.py's own timeout ends the analysis; the job allows its setup and log copy on top.
-                "maxRunDuration": f"{(timeout_minutes + 30) * 60}s",
+                "maxRunDuration": f"{(timeout_minutes + 30 + (60 if wait_for else 0)) * 60}s",
                 "maxRetryCount": MAX_RETRIES,
                 "lifecyclePolicies": [{"action": "RETRY_TASK", "actionCondition": {"exitCodes": RETRY_EXIT_CODES}}],
                 "runnables": [
-                    container(CLI_IMAGE, localize_script(plan, project)),
+                    container(CLI_IMAGE, localize_script(plan, project, wait_for)),
                     container(inputs["runtime_image"], analyze_script(wdl_path, inputs, paths, shard, keep_store)),
                     dict(container(CLI_IMAGE, logs_script(inputs["checkpoint_uri"], project)), alwaysRun=True),
                 ],
@@ -191,12 +207,13 @@ def split_command(run, shard_jobs, gather_job, project):
              "state() { gcloud batch jobs describe \"$1\" --project $P --location $L --format='value(status.state)' 2>/dev/null; }"]
     for job_name, uri in shard_jobs:
         lines.append(f"submit {job_name} {uri} || echo \"[split] {job_name} not submitted\"")
+    # The gather boots now and waits for the shards' evaluate labels itself (aou_batch.wait_script).
+    lines.append(f"submit {gather_job[0]} {gather_job[1]}")
     names = " ".join(job_name for job_name, _ in shard_jobs)
     lines += [f"shards=({names})", "while true; do done=0; bad=0; for j in \"${shards[@]}\"; do s=$(state $j); case \"$s\" in "
               "SUCCEEDED) done=$((done+1));; FAILED|DELETION_IN_PROGRESS|CANCELLED) bad=$((bad+1));; esac; done; "
               "note succeeded=$done failed=$bad of=${#shards[@]}; "
-              "[ $bad -gt 0 ] && exit 1; [ $done -eq ${#shards[@]} ] && break; sleep 60; done",
-              f"submit {gather_job[0]} {gather_job[1]}"]
+              "[ $bad -gt 0 ] && exit 1; [ $done -eq ${#shards[@]} ] && break; sleep 60; done"]
     return "\n".join(lines) + "\n"
 
 

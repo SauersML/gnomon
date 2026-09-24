@@ -963,8 +963,9 @@ def test_split_run_is_one_shard_job_per_disease_then_the_gather():
     command = aou_batch.split_command("study-x", [("study-x-a", "gs://b/a.json"), ("study-x-b", "gs://b/b.json")],
                                       ("study-x", "gs://b/g.json"), "wb-p")
     lines = command.splitlines()
+    # the gather is submitted right after the shards: it boots beside them and waits for their evaluate labels
     assert lines.index("submit study-x-a gs://b/a.json || echo \"[split] study-x-a not submitted\"") < \
-        lines.index("shards=(study-x-a study-x-b)") < lines.index("submit study-x gs://b/g.json")
+        lines.index("submit study-x gs://b/g.json") < lines.index("shards=(study-x-a study-x-b)")
     assert "SUCCEEDED) done=$((done+1))" in command and "[ $bad -gt 0 ] && exit 1" in command
 
 
