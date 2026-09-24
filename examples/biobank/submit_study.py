@@ -210,9 +210,9 @@ def stage_batch_job(wb, name, wdl, inputs, folder, args, diseases):
             own = dict(fields, status_uri=f"{fields['status_uri']}-{slug}")
             documents[shard] = aou_batch.job(shard, wdl, own, wb.project, account, args.shard_cpu,
                                              min(args.memory_gb, aou_batch.machine_type(args.shard_cpu, 1)[1]),
-                                             args.timeout_minutes, shard=slug)
+                                             args.timeout_minutes, shard=slug)  # a shard always keeps the store
     documents[name] = aou_batch.job(name, wdl, fields, wb.project, account, args.cpu, args.memory_gb,
-                                    args.timeout_minutes)
+                                    args.timeout_minutes, keep_store=args.keep_store)
     uris = {}
     for job_name, document in documents.items():
         path = folder / f"batch-{job_name}.json"
@@ -288,6 +288,10 @@ def main():
     child.add_argument("--memory-limit-gb", type=int, default=128,
                        help="raise only with a measured need (SPEC 7a)")
     child.add_argument("--timeout-minutes", type=int, default=180)
+    child.add_argument("--keep-store", action=argparse.BooleanOptionalAction, default=True,
+                       help="keep the bucket checkpoint after the run, so the next run of the same code and config "
+                            "restores its cohort and features instead of querying them (SPEC 7a asks for deletion; "
+                            "time is the deliverable, user 2026-09-24; --no-keep-store deletes)")
     child.add_argument("--allow-scoring", action="store_true",
                        help="score uncached PGS in the task (default: refuse; the study runs on the score bank)")
     child.add_argument("--split", action="store_true",

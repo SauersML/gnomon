@@ -90,7 +90,7 @@ def localize_script(plan, project):
     return "\n".join(lines) + "\n"
 
 
-def analyze_script(wdl_path, inputs, paths, shard=None):
+def analyze_script(wdl_path, inputs, paths, shard=None, keep_store=False):
     """study.wdl's `analyze` command with its WDL placeholders filled in; a shard
     runs study.py on its one disease with --shard (see study.py)."""
     text = Path(wdl_path).read_text()
@@ -111,10 +111,10 @@ def analyze_script(wdl_path, inputs, paths, shard=None):
     body = re.sub(r"~\{([^}]*)\}", fill, body)
     if "~{" in body:
         raise ValueError("an unfilled WDL placeholder remains in the task command")
-    if shard:
-        if body.count("study.py run ") != 1:
-            raise ValueError("the task command must run study.py once")
-        body = body.replace("study.py run ", f"study.py run --shard --diseases {json.dumps(shard)} ")
+    if body.count("study.py run ") != 1:
+        raise ValueError("the task command must run study.py once")
+    flags = (f"--shard --diseases {json.dumps(shard)} " if shard else "") + ("--keep-checkpoint " if keep_store else "")
+    body = body.replace("study.py run ", "study.py run " + flags)
     return f"set -euo pipefail\ncd {WORK}/task\nexec > >(tee -a {WORK}/task.log) 2>&1\n" + body
 
 
@@ -125,7 +125,8 @@ def logs_script(checkpoint_uri, project):
             f">/dev/null 2>&1 || echo '[logs] upload failed'\nexit 0\n")
 
 
-def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeout_minutes, shard=None):
+def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeout_minutes, shard=None,
+        keep_store=False):
     """The Batch job document for one study run, or for one disease shard of it
     (the schema `gcloud batch jobs submit --config` reads)."""
     if not JOB_ID.fullmatch(name):
@@ -150,7 +151,7 @@ def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeou
                 "lifecyclePolicies": [{"action": "RETRY_TASK", "actionCondition": {"exitCodes": RETRY_EXIT_CODES}}],
                 "runnables": [
                     container(CLI_IMAGE, localize_script(plan, project)),
-                    container(inputs["runtime_image"], analyze_script(wdl_path, inputs, paths, shard)),
+                    container(inputs["runtime_image"], analyze_script(wdl_path, inputs, paths, shard, keep_store)),
                     dict(container(CLI_IMAGE, logs_script(inputs["checkpoint_uri"], project)), alwaysRun=True),
                 ],
             },
