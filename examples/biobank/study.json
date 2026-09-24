@@ -5,7 +5,7 @@
   "frozen_config_sha256": null,
   "primary_censoring_rule": "ehr_end",
   "sensitivity_censoring_rules": ["min_death_cutoff"],
-  "variants": ["ours", "shipped", "covariates", "standard", "z_pc", "calpred"],
+  "variants": ["ours", "covariates", "standard", "z_pc", "calpred"],
   "data": {
     "source": "bigquery",
     "google_project": null,
@@ -37,7 +37,7 @@
      "reason": "a certified survival location-scale calpred fit is refused at predict, its hazard derivative non-positive or non-finite (study-model-surv, cross-linked with gam#3037); reported as refused until gam#3038 is fixed"}
   ],
   "convergence": {
-    "variants": ["ours", "shipped"],
+    "variants": ["ours"],
     "start": "permuted_rows",
     "max_delta_sd": 0.01
   },
