@@ -369,13 +369,17 @@ class Study:
         # an AoU run is always the whole study.
         if args.shard and (not args.diseases or args.kinds):
             raise ValueError("--shard names its diseases with --diseases and fits every study kind")
+        if args.variants and not args.shard:
+            raise ValueError("--variants scopes a shard (--shard) to some of the study's methods")
         if (args.kinds or args.diseases) and not self.parquet and not args.shard:
             raise ValueError("--kinds and --diseases scope a simulator validation run; an AoU run is the whole study")
         if args.shard:
             # A shard of the whole study (one Batch job per disease): it shares the checkpoint
             # with the other shards and with the whole-study run that gathers them, so it stops
             # before the digest and never deletes the store.
-            args.stop_after, args.keep_checkpoint = "evaluate", True
+            # A shard of some methods only (one Batch job per disease and method) stops before
+            # evaluation, which compares every method's predictions; the gathering run evaluates.
+            args.stop_after, args.keep_checkpoint = ("predict" if args.variants else "evaluate"), True
         if not self.parquet:
             check_frozen(self.config)
         if args.claim:
@@ -395,6 +399,11 @@ class Study:
         if not self.kinds:
             raise ValueError(f"--kinds {args.kinds} names none of the study's kinds {configured}")
         whole_study = [disease.slug for disease in self.diseases]
+        unknown_variants = set(args.variants or ()) - set(self.config["variants"])
+        if unknown_variants:
+            raise ValueError(f"--variants names no study method: {sorted(unknown_variants)}")
+        # The methods this run fits and predicts: a shard's --variants, else every configured one.
+        self.shard_variants = list(args.variants) if args.variants else None
         if args.diseases:
             unknown = set(args.diseases) - {disease.slug for disease in self.diseases}
             if unknown:
@@ -435,7 +444,8 @@ class Study:
         store = self.store(args.checkpoint, self.work / "store")
         self.checkpoint = Checkpoint(self.root, store, self.signature,
                                      min_interval=self.config["compute"].get("checkpoint_interval_seconds", 20),
-                                     tag="-".join(sorted(args.diseases)) if args.shard else "")
+                                     tag="-".join(sorted(args.diseases) + sorted(args.variants or ()))
+                                     if args.shard else "")
         # Outer-test looks (SPEC section 8, S8): one marker per checkpoint that
         # reached evaluation, counted over every run of this config.
         self.looks = self.store(args.looks, self.work / "looks")
@@ -471,6 +481,10 @@ class Study:
         if missing:
             raise ValueError(f"study/models/{kind}.py does not offer the configured variants {missing}")
         return list(self.config["variants"])
+
+    def fitted_variants(self, kind):
+        """The methods this run fits and predicts: every configured one, or a shard's --variants."""
+        return [v for v in self.variants(kind) if self.shard_variants is None or v in self.shard_variants]
 
     def own_components(self, kind, variant):
         return list(self.models.components(kind, variant, self.settings(kind)))
@@ -877,7 +891,7 @@ class Study:
                 rows = read_json(self.path(f"features/{slug}") / "plan.json")[kind]["rows"]
                 frame = None
                 plan = [("shared", c) for c in self.shared_components(kind)]
-                plan += [(v, c) for v in self.variants(kind) for c in self.own_components(kind, v)]
+                plan += [(v, c) for v in self.fitted_variants(kind) for c in self.own_components(kind, v)]
                 for variant, component in plan:
                     threads = self.budget("fit", kind, variant)
                     for fit in self.fits(slug, kind, None if variant == "shared" else variant):
@@ -982,7 +996,7 @@ class Study:
         for disease in self.diseases:
             for kind in self.kinds:
                 rows = read_json(self.path(f"features/{disease.slug}") / "plan.json")[kind]["test_rows"]
-                for variant in self.variants(kind):
+                for variant in self.fitted_variants(kind):
                     threads = self.budget("predict", kind, variant)
                     restart = self.restarted(disease.slug, kind, variant)
                     for fit in self.fits(disease.slug, kind, variant) + restart:
@@ -1727,6 +1741,8 @@ def main():
     run.add_argument("--shard", action="store_true",
                      help="one shard of the whole study (its --diseases), sharing the checkpoint with the "
                           "other shards and the whole-study run that gathers them; stops after evaluate")
+    run.add_argument("--variants", nargs="+", metavar="METHOD",
+                     help="a shard's methods (default: every configured one); such a shard stops after predict")
     sub.add_parser("worker", help="serve pool jobs from stdin (internal)")
     frozen = sub.add_parser("hash", help="print the config hash to freeze as frozen_config_sha256")
     frozen.add_argument("--config", type=Path, default=HERE / "study.json")

@@ -77,17 +77,20 @@ def localized(inputs):
 
 
 def wait_script(status_uris, project):
-    """The gather job boots beside the shards and waits for every shard's
-    study_evaluate_complete label, so only the digest remains once they finish."""
+    """The gather job boots beside the shards and waits for every shard's last
+    label (study_evaluate_complete for a disease shard, study_predict_complete for a
+    method shard), so only what the shards left remains once they finish. An entry
+    is a status URI, or (status URI, last label)."""
     lines = ['echo "[gather] waiting for $(date -u +%FT%TZ)"']
-    for uri in status_uris:
+    for entry in status_uris:
+        uri, label = entry if isinstance(entry, tuple) else (entry, "study_evaluate_complete")
         lines.append(f"until gcloud storage ls --billing-project {json.dumps(project)} "
-                     f"{json.dumps(uri + '.status/study_evaluate_complete.txt')} >/dev/null 2>&1; do "
+                     f"{json.dumps(uri + '.status/' + label + '.txt')} >/dev/null 2>&1; do "
                      "for f in " + " ".join(json.dumps(u + ".status/failed_study_" + s + ".txt") for u in [uri]
                                             for s in ("scores", "cohort", "features", "fits", "predict", "evaluate", "unexpected_errors"))
                      + f"; do gcloud storage ls --billing-project {json.dumps(project)} \"$f\" >/dev/null 2>&1 && "
                      '{ echo "[gather] a shard failed: $f"; exit 1; }; done; sleep 20; done')
-    lines.append('echo "[gather] every shard evaluated $(date -u +%FT%TZ)"')
+    lines.append('echo "[gather] every shard finished $(date -u +%FT%TZ)"')
     return "\n".join(lines) + "\n"
 
 
@@ -111,7 +114,7 @@ def localize_script(plan, project, wait_for=()):
     return "\n".join(lines) + "\n"
 
 
-def analyze_script(wdl_path, inputs, paths, shard=None, keep_store=False):
+def analyze_script(wdl_path, inputs, paths, shard=None, keep_store=False, variants=None):
     """study.wdl's `analyze` command with its WDL placeholders filled in; a shard
     runs study.py on its one disease with --shard (see study.py)."""
     text = Path(wdl_path).read_text()
@@ -134,7 +137,11 @@ def analyze_script(wdl_path, inputs, paths, shard=None, keep_store=False):
         raise ValueError("an unfilled WDL placeholder remains in the task command")
     if body.count("study.py run ") != 1:
         raise ValueError("the task command must run study.py once")
-    flags = (f"--shard --diseases {json.dumps(shard)} " if shard else "") + ("--keep-checkpoint " if keep_store else "")
+    if variants and not shard:
+        raise ValueError("variants scope a shard")
+    flags = ((f"--shard --diseases {json.dumps(shard)} " if shard else "")
+             + (f"--variants {' '.join(json.dumps(v) for v in variants)} " if variants else "")
+             + ("--keep-checkpoint " if keep_store else ""))
     body = body.replace("study.py run ", "study.py run " + flags)
     return f"set -euo pipefail\ncd {WORK}/task\nexec > >(tee -a {WORK}/task.log) 2>&1\n" + body
 
@@ -147,7 +154,7 @@ def logs_script(checkpoint_uri, project):
 
 
 def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeout_minutes, shard=None,
-        keep_store=False, wait_for=()):
+        keep_store=False, wait_for=(), variants=None):
     """The Batch job document for one study run, or for one disease shard of it
     (the schema `gcloud batch jobs submit --config` reads)."""
     if not JOB_ID.fullmatch(name):
@@ -161,7 +168,8 @@ def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeou
                               "commands": ["-c", script]}}
 
     return {
-        "labels": {"submitter": "gnomon-study", "run": name, **({"shard": shard} if shard else {})},
+        "labels": {"submitter": "gnomon-study", "run": name, **({"shard": shard} if shard else {}),
+                   **({"variant": variants[0]} if variants and len(variants) == 1 else {})},
         "taskGroups": [{
             "taskCount": "1", "parallelism": "1", "taskCountPerNode": "1",
             "taskSpec": {
@@ -172,7 +180,7 @@ def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeou
                 "lifecyclePolicies": [{"action": "RETRY_TASK", "actionCondition": {"exitCodes": RETRY_EXIT_CODES}}],
                 "runnables": [
                     container(CLI_IMAGE, localize_script(plan, project, wait_for)),
-                    container(inputs["runtime_image"], analyze_script(wdl_path, inputs, paths, shard, keep_store)),
+                    container(inputs["runtime_image"], analyze_script(wdl_path, inputs, paths, shard, keep_store, variants)),
                     dict(container(CLI_IMAGE, logs_script(inputs["checkpoint_uri"], project)), alwaysRun=True),
                 ],
             },

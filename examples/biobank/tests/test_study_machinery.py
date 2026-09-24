@@ -989,3 +989,25 @@ def test_checkpoint_shards_write_their_own_batches_and_restore_each_others(tmp_p
     with pytest.raises(ValueError):
         Checkpoint(tmp_path / "bad", LocalStore(store), signature, tag="Bad Tag")
     gather.close()
+
+
+def test_variant_shard_fits_and_predicts_one_method_and_stops_before_evaluate():
+    """submit_study --split-by variant: a shard job runs study.py --shard on one disease and one method;
+    the driver refuses --variants without --shard and names unknown methods."""
+    import aou_batch
+    bucket = "gs://aou-train-work-p"
+    inputs = dict(sources=f"{bucket}/w/study-sources.tar", config=f"{bucket}/w/config.json",
+                  wheelhouse_archive=f"{bucket}/a/wheelhouse.tar", scorer_archive=f"{bucket}/a/scorer.tar.gz",
+                  score_files=[], score_weights=[], ancestry_predictions="gs://d/ancestry.tsv",
+                  relatedness_prune="gs://d/prune.tsv", features_uri=f"{bucket}/f/shared_features.tar.gz",
+                  runtime_image="mirror.gcr.io/library/python:3.12-slim", checkpoint_uri=f"{bucket}/c/study-k-split/",
+                  status_uri=f"{bucket}/c/study-k-split-hypertension-ours", digest_uri=f"{bucket}/study-digest/r/",
+                  looks_uri=f"{bucket}/looks/c/", cpu=180, memory_gb=128, timeout_minutes=180, caveats=[])
+    job = aou_batch.job("study-x-hypertension-ours", HERE / "study.wdl", inputs, "wb-p",
+                        "pet-1@wb-p.iam.gserviceaccount.com", 180, 128, 180, shard="hypertension", variants=["ours"])
+    assert job["labels"]["shard"] == "hypertension" and job["labels"]["variant"] == "ours"
+    script = job["taskGroups"][0]["taskSpec"]["runnables"][1]["container"]["commands"][1]
+    assert 'study.py run --shard --diseases "hypertension" --variants "ours" --config' in script
+    with pytest.raises(ValueError):
+        aou_batch.job("study-x", HERE / "study.wdl", inputs, "wb-p", "pet-1@wb-p.iam.gserviceaccount.com",
+                      180, 128, 180, variants=["ours"])

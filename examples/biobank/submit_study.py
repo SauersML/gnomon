@@ -209,14 +209,20 @@ def stage_batch_job(wb, name, wdl, inputs, folder, args, diseases):
         fields = dict(fields, checkpoint_uri=fields["checkpoint_uri"].rstrip("/") + "-split/",
                       status_uri=fields["status_uri"] + "-split")
         shard_status = {}
-        for entry in diseases:
-            slug = entry["slug"]
-            shard = f"{name}-{slug.replace('_', '-')}"[:63].rstrip("-")
-            own = dict(fields, status_uri=f"{fields['status_uri']}-{slug}")
+        config = json.loads((folder / "config.json").read_text())
+        # --split-by variant: one job per (disease, method), each stopping after predict.
+        scopes = [(entry["slug"], None) for entry in diseases] if args.split_by == "disease" else \
+            [(entry["slug"], variant) for entry in diseases for variant in config["variants"]]
+        for slug, variant in scopes:
+            suffix = slug + (f"-{variant}" if variant else "")
+            shard = re.sub(r"[^a-z0-9-]", "-", f"{name}-{suffix}".lower())[:63].rstrip("-")
+            own = dict(fields, status_uri=f"{fields['status_uri']}-{suffix}")
             documents[shard] = aou_batch.job(shard, wdl, own, wb.project, account, args.shard_cpu,
                                              min(args.memory_gb, aou_batch.machine_type(args.shard_cpu, 1)[1]),
-                                             args.timeout_minutes, shard=slug)  # a shard always keeps the store
-            shard_status[own["status_uri"]] = documents[shard]
+                                             args.timeout_minutes, shard=slug,
+                                             variants=[variant] if variant else None)  # a shard keeps the store
+            shard_status[(own["status_uri"], "study_predict_complete" if variant else "study_evaluate_complete")] = \
+                documents[shard]
     documents[name] = aou_batch.job(name, wdl, fields, wb.project, account, args.cpu, args.memory_gb,
                                     args.timeout_minutes, keep_store=args.keep_store,
                                     wait_for=list(shard_status) if args.split else ())
@@ -304,7 +310,10 @@ def main():
     child.add_argument("--split", action="store_true",
                        help="one Spot Batch job per disease (--shard-cpu vCPUs each), then the whole-study "
                             "job gathers them: the fits are the cost, and the diseases are independent")
-    child.add_argument("--shard-cpu", type=int, default=60, help="vCPUs of each disease shard (C3D high-CPU shape)")
+    child.add_argument("--shard-cpu", type=int, default=60, help="vCPUs of each shard (C3D high-CPU shape)")
+    child.add_argument("--split-by", choices=["disease", "variant"], default="disease",
+                       help="a shard per disease, or per disease and method (fits and predictions; the "
+                            "gathering job evaluates)")
     child.add_argument("--engine", choices=["batch", "cromwell"], default="batch",
                        help="batch: one C3D Spot Batch job, submitted from the workspace terminal (the "
                             "managed Cromwell has no C3D); cromwell: the study.wdl run as before")
