@@ -6,7 +6,9 @@ code, config and the workspace's cached scores, and its only outputs are the
 digest's aggregate token names.
 
   submit_study.py submit [--config study.json] [--cpu 180 --memory-gb 128 --timeout-minutes 180]
-                                                 stage and start one study run
+                                                 stage one study run as a C3D Spot Batch job
+                                                 (--engine cromwell: run study.wdl instead)
+  submit_study.py status KEY                     the status labels a run has published
   submit_study.py tokens RUN                     print a finished run's token names
                                                  (pipe into a file for tabulate_study.py)
   submit_study.py finish FOLDER                  start a staged submission whose run did not start
@@ -21,6 +23,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import tarfile
@@ -29,6 +32,7 @@ import urllib.request
 
 from study import digest
 from study.checkpoint import config_hash
+import aou_batch
 from submit_aou import HERE, Workbench, required_env
 
 STAGING = HERE / ".aou-workflow"
@@ -149,13 +153,56 @@ def submit(wb, args):
         checkpoint_uri=checkpoint + "/", status_uri=checkpoint,
         digest_uri=f"{wb.bucket}/{DIGEST}/{name}/", looks_uri=f"{wb.bucket}/{LOOKS_PREFIX}/{config_sha[:20]}/",
         cpu=args.cpu, memory_gb=args.memory_gb, timeout_minutes=args.timeout_minutes, caveats=args.caveat).items()}
-    record = wb.run_workflow(name, f"{uri}/{wdl.name}", "AoU single study", inputs, folder, storage_capacity=100)
+    if args.engine == "batch":
+        record = stage_batch_job(wb, name, wdl, inputs, folder, args)
+    else:
+        record = wb.run_workflow(name, f"{uri}/{wdl.name}", "AoU single study", inputs, folder,
+                                 storage_capacity=100)
     with LOOKS.open("a") as ledger:
         ledger.write(json.dumps({"run": name, "run_id": record.get("runId"), "config_sha256": config_sha,
                                  "checkpoint_key": key, "look": look,
                                  "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}) + "\n")
     print(f"outer-test look {look} for config {config_sha[:12]}; status labels under {checkpoint}.status/",
           flush=True)
+
+
+def task_service_account(wb):
+    """The workspace pet service account the task runs as: AOU_TASK_SERVICE_ACCOUNT,
+    or the one `wb auth status` reports for the current workspace."""
+    email = os.environ.get("AOU_TASK_SERVICE_ACCOUNT", "").strip()
+    if not email:
+        for line in wb.wb("auth", "status").splitlines():
+            if line.startswith("Service account email for current workspace:"):
+                email = line.split(":", 1)[1].strip()
+    if not re.fullmatch(r"pet-[0-9a-f]+@" + re.escape(wb.project) + r"\.iam\.gserviceaccount\.com", email):
+        raise RuntimeError(f"the task service account must be the workspace pet account, not {email!r}")
+    return email
+
+
+def stage_batch_job(wb, name, wdl, inputs, folder, args):
+    """Write the study's Batch job beside its staged inputs and print the one command
+    that submits it from the workspace terminal (see aou_batch)."""
+    fields = {key.split(".", 1)[1]: value for key, value in inputs.items()}
+    document = aou_batch.job(name, wdl, fields, wb.project, task_service_account(wb), args.cpu,
+                             args.memory_gb, args.timeout_minutes)
+    (folder / "inputs.json").write_text(json.dumps(inputs, indent=2))
+    (folder / "batch-job.json").write_text(json.dumps(document, indent=1) + "\n")
+    job_uri = wb.stage([folder / "batch-job.json"], f"{wb.bucket}/workflows/{name}")[0]
+    command = aou_batch.paste_command(name, job_uri, wb.project)
+    (folder / "paste.txt").write_text(command + "\n")
+    record = {"runId": name, "engine": "batch", "job_uri": job_uri, "paste": command,
+              "machine": document["allocationPolicy"]["instances"][0]["policy"]["machineType"]}
+    (folder / "submission.json").write_text(json.dumps(record, indent=2))
+    print(f"Batch job staged at {job_uri} ({record['machine']}, Spot). Paste into the workspace "
+          f"JupyterLab terminal:\n{command}", flush=True)
+    return record
+
+
+def status(wb, args):
+    """The status labels a run's task has published (listing is allowed from outside the perimeter)."""
+    prefix = f"{wb.bucket}/workflow-checkpoints/study-{args.key}.status/"
+    for item in sorted(wb.list_objects(prefix), key=lambda item: item["updated"]):
+        print(item["updated"], item["name"].rsplit("/", 1)[-1].removesuffix(".txt"))
 
 
 def tokens(wb, args):
@@ -189,9 +236,15 @@ def main():
     child.add_argument("--memory-limit-gb", type=int, default=128,
                        help="raise only with a measured need (SPEC 7a)")
     child.add_argument("--timeout-minutes", type=int, default=180)
+    child.add_argument("--engine", choices=["batch", "cromwell"], default="batch",
+                       help="batch: one C3D Spot Batch job, submitted from the workspace terminal (the "
+                            "managed Cromwell has no C3D); cromwell: the study.wdl run as before")
     child.add_argument("--caveat", action="append", default=[], metavar="LABEL",
                        help="a fixed label the run's digest carries, e.g. shipped_survival_refused_gam2945 (repeatable)")
     child.set_defaults(handler=submit)
+    child = sub.add_parser("status")
+    child.add_argument("key", help="the checkpoint key the submission printed (study-<key>)")
+    child.set_defaults(handler=status)
     child = sub.add_parser("tokens")
     child.add_argument("run", help="the submission name, e.g. study-20260918-230000")
     child.set_defaults(handler=tokens)

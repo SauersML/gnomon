@@ -893,3 +893,46 @@ def test_binary_outer_start_levels_reach_gam_only_when_chosen():
             assert "outer_start_levels" in str(error)
         else:
             raise AssertionError(f"{bad!r} was accepted as outer_start_levels")
+
+
+def test_batch_job_is_one_c3d_spot_task_running_the_wdl_command(tmp_path):
+    """submit_study --engine batch: the job document is the study.wdl task, localized, on a C3D Spot VM."""
+    import aou_batch
+    bucket = "gs://aou-train-work-p"
+    inputs = dict(sources=f"{bucket}/workflows/r/study-sources.tar", config=f"{bucket}/workflows/r/config.json",
+                  wheelhouse_archive=f"{bucket}/artifacts/wheelhouse-abc.tar",
+                  scorer_archive=f"{bucket}/artifacts/gnomon-score-1.tar.gz",
+                  score_files=[f"{bucket}/cache/k/PGS000001.sscore", f"{bucket}/cache/k/PGS000002.sscore"],
+                  score_weights=[f"{bucket}/scoring-files/PGS000003_hmPOS_GRCh38.txt.gz"],
+                  ancestry_predictions="gs://vwb-aou-datasets-controlled/aux/ancestry.tsv",
+                  relatedness_prune="gs://vwb-aou-datasets-controlled/aux/prune.tsv",
+                  features_uri=f"{bucket}/features/shared_features.tar.gz", runtime_image="python:3.12-slim@sha256:0",
+                  checkpoint_uri=f"{bucket}/workflow-checkpoints/study-k/", status_uri=f"{bucket}/workflow-checkpoints/study-k",
+                  digest_uri=f"{bucket}/study-digest/r/", looks_uri=f"{bucket}/looks/c/", cpu=180, memory_gb=128,
+                  timeout_minutes=180, caveats=["shipped_dropped"])
+    job = aou_batch.job("study-20260924-000000", HERE / "study.wdl", inputs, "wb-p", "pet-1a@wb-p.iam.gserviceaccount.com",
+                        180, 128, 180)
+    policy = job["allocationPolicy"]["instances"][0]["policy"]
+    assert policy["machineType"] == "c3d-highcpu-180" and policy["provisioningModel"] == "SPOT"
+    assert "minCpuPlatform" not in policy and policy["bootDisk"]["type"] == "hyperdisk-balanced"
+    assert job["allocationPolicy"]["network"]["networkInterfaces"][0]["noExternalIpAddress"] is True
+    assert job["allocationPolicy"]["serviceAccount"]["email"].startswith("pet-")
+    task = job["taskGroups"][0]["taskSpec"]
+    assert task["computeResource"] == {"cpuMilli": "180000", "memoryMib": str(128 * 1024)}
+    assert task["maxRunDuration"] == f"{210 * 60}s" and 50001 in task["lifecyclePolicies"][0]["actionCondition"]["exitCodes"]
+    localize, analyze, logs = task["runnables"]
+    assert localize["container"]["imageUri"] == aou_batch.CLI_IMAGE and logs["alwaysRun"] is True
+    assert analyze["container"]["imageUri"] == inputs["runtime_image"]
+    fetch, script = localize["container"]["commands"][1], analyze["container"]["commands"][1]
+    for uri in [inputs["sources"], *inputs["score_files"], *inputs["score_weights"], inputs["ancestry_predictions"]]:
+        assert uri in fetch
+    assert "~{" not in script and "study.py run" in script and "require_spot_amd" in script
+    assert f'--config "{aou_batch.WORK}/in/config/config.json"' in script
+    assert f"{aou_batch.WORK}/in/score_files/PGS000001.sscore {aou_batch.WORK}/in/score_files/PGS000002.sscore" in script
+    assert 'ancestry="/mnt/disks/work/in/ancestry_predictions/ancestry.tsv"' in script
+    assert "timeout --kill-after=30s 180m" in script and '--caveat "shipped_dropped"' in script
+    assert f'--checkpoint "{inputs["checkpoint_uri"]}"' in script and f'--digest-uri "{inputs["digest_uri"]}"' in script
+    with pytest.raises(ValueError):
+        aou_batch.machine_type(180, 400)
+    assert aou_batch.machine_type(96, 128) == ("c3d-highcpu-180", 354)
+    assert aou_batch.paste_command("study-x", f"{bucket}/workflows/study-x/batch-job.json", "wb-p").startswith("gcloud storage cp")

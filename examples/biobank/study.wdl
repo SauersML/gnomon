@@ -130,9 +130,9 @@ task analyze {
     docker: runtime_image
     cpu: cpu
     memory: "~{memory_gb} GiB"
-    # c3d (AMD Genoa): half the Spot price per vCPU of n2d (Rome) in us-central1 and faster cores;
-    # the task's identity check only needs AMD + preemptible (aou_identity.py).
-    cpuPlatform: "AMD Genoa"
+    # The managed Cromwell places no C3D (Genoa) VM; the C3D Spot run is the Batch job
+    # aou_batch builds from this same command (submit_study.py --engine batch).
+    cpuPlatform: "AMD Rome"
     zones: "us-central1-a us-central1-b us-central1-c us-central1-f"
     disks: "local-disk 100 SSD"
     preemptible: 3
