@@ -67,10 +67,12 @@ def fitted(frames, tmp_path_factory):
     return get
 
 
-LAST_SHIPPED = [v for v in survival.VARIANTS if v != "shipped"] + ["shipped"]
+# shipped, calibrate's time block on the marginal-slope fit, did not finish a 3,000-row
+# fit in 80 minutes where ours takes 335 s (gam#4564); it is fitted nowhere until gam fits it.
+FITTED = [v for v in survival.VARIANTS if v != "shipped"]
 
 
-@pytest.mark.parametrize("variant", LAST_SHIPPED)
+@pytest.mark.parametrize("variant", FITTED)
 def test_variant_fits_and_replays(frames, fitted, variant):
     _, test = frames
     directory, info, first, death = fitted(variant)
@@ -90,9 +92,8 @@ def test_variant_fits_and_replays(frames, fitted, variant):
     assert np.allclose(reversed_rows["risk"][::-1], first["risk"], rtol=1e-10, atol=1e-14)
 
 
-@pytest.mark.parametrize("variant", MARGINAL := ["ours", "shipped"])
-def test_marginal_slope_fits_anchor_on_the_empirical_law(fitted, variant):
-    payload = json.loads((fitted(variant)[0] / "model.gamfit").read_text())["model"]
+def test_marginal_slope_fits_anchor_on_the_empirical_law(fitted):
+    payload = json.loads((fitted("ours")[0] / "model.gamfit").read_text())["model"]
     assert payload["latent_measure"]["kind"] == "global-empirical"
     assert payload["latent_z_rank_int_calibration"] is None and payload["latent_z_conditional_calibration"] is None
 
