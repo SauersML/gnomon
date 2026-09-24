@@ -122,7 +122,11 @@ def submit(wb, args):
             archive.add(HERE / relative, arcname=relative)
     config_sha = config_hash(config)
     # One checkpoint per code and config: a resubmission of both resumes it.
-    key = hashlib.sha256(sources.read_bytes() + config_sha.encode()).hexdigest()[:20]
+    # ...and per deployment (project, CDR): a store's manifest signs the deployment too,
+    # so a run against another CDR must not restore, and be refused by, this one's store.
+    from study.checkpoint import deployment_identity
+    key = hashlib.sha256(sources.read_bytes() + config_sha.encode()
+                         + json.dumps(deployment_identity(config), sort_keys=True).encode()).hexdigest()[:20]
     pgs_ids = {entry["pgs"] for entry in diseases}
     objects = newest_cached_scores(wb.list_objects(f"{wb.bucket}/{SCORE_CACHE}/"), SCORE_CACHE, pgs_ids)
     uncached = sorted(pgs_ids - set(objects))
