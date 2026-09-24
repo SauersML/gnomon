@@ -6,6 +6,7 @@
   "primary_censoring_rule": "ehr_end",
   "sensitivity_censoring_rules": ["min_death_cutoff"],
   "variants": ["ours", "covariates", "standard", "z_pc", "calpred"],
+  "kinds": ["binary"],
   "data": {
     "source": "bigquery",
     "google_project": null,

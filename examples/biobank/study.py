@@ -139,6 +139,8 @@ def load_config(path, source=None):
     check_reasons(config)
     if config["report"]["small_cell_max"] != digest.LIMIT:
         raise ValueError(f"the small-cell maximum is AoU policy's {digest.LIMIT}, one constant everywhere")
+    if "kinds" in config and (not config["kinds"] or not set(config["kinds"]) <= set(KINDS)):
+        raise ValueError(f"study.json kinds is a non-empty subset of {list(KINDS)}")
     if not config.get("variants") or not set(config["logo"]["variants"]) <= set(config["variants"]):
         raise ValueError("study.json lists its variants, and the LOGO variants are among them")
     convergence = config.get("convergence") or {}
@@ -376,10 +378,15 @@ class Study:
             check_claims(self.config, claim_run=True)
         from study import models
         self.models = models
-        unfitted = set(args.kinds or ()) - set(models.KINDS)
+        # The study's own kinds (study.json "kinds", part of the frozen identity; every
+        # model kind when absent), a validation run's --kinds within them.
+        configured = self.config.get("kinds") or list(models.KINDS)
+        unfitted = (set(configured) | set(args.kinds or ())) - set(models.KINDS)
         if unfitted:
             raise ValueError(f"study/models has no module for {sorted(unfitted)}; it fits {list(models.KINDS)}")
-        self.kinds = tuple(kind for kind in models.KINDS if kind in (args.kinds or models.KINDS))
+        self.kinds = tuple(kind for kind in models.KINDS if kind in configured and kind in (args.kinds or configured))
+        if not self.kinds:
+            raise ValueError(f"--kinds {args.kinds} names none of the study's kinds {configured}")
         if args.diseases:
             unknown = set(args.diseases) - {disease.slug for disease in self.diseases}
             if unknown:
