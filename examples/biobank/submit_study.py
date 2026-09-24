@@ -54,7 +54,8 @@ def newest_cached_scores(objects, prefix, pgs_ids):
     """{pgs: newest cached .sscore object} for the scores the workspace has cached;
     cache keys change with the scorer binary."""
     newest = {}
-    pattern = re.compile(re.escape(prefix) + r"/[^/]+/(PGS\d+)\.sscore")
+    # <prefix>/<key>/<PGS>.sscore, or <prefix>/<PGS>.sscore when the prefix names the key itself.
+    pattern = re.compile(re.escape(prefix) + r"/(?:[^/]+/)?(PGS\d+)\.sscore")
     for item in objects:
         match = pattern.fullmatch(item["name"])
         if match and match.group(1) in pgs_ids:

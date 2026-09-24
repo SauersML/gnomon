@@ -41,10 +41,24 @@ def wb_json(*args):
 
 
 def token():
+    """The Workbench token, for the Workbench API."""
     value = wb("auth", "print-access-token").strip()
     if not value:
         raise RuntimeError("wb gave no access token")
     return value
+
+
+def google_token():
+    """A Google token for Cloud Storage, as the account wb is logged in as (the
+    Workbench token is not a Google token)."""
+    account = next((line.split(":", 1)[1].strip() for line in wb("auth", "status").splitlines()
+                    if line.startswith("User email:")), "")
+    if not account:
+        raise RuntimeError("wb auth status names no user")
+    done = subprocess.run(["gcloud", "auth", "print-access-token", account], capture_output=True, text=True, timeout=120)
+    if done.returncode != 0 or not done.stdout.strip():
+        raise RuntimeError(f"gcloud has no token for {account}")
+    return done.stdout.strip()
 
 
 def request(method, url, body=None):
@@ -99,7 +113,7 @@ def stage_orchestrator(bucket, project):
     url = (f"https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o?uploadType=media"
            f"&name={urllib.parse.quote(name, safe='')}&userProject={project}")
     req = urllib.request.Request(url, data=body, method="POST", headers={
-        "Authorization": f"Bearer {token()}", "Content-Type": "application/octet-stream"})
+        "Authorization": f"Bearer {google_token()}", "Content-Type": "application/octet-stream"})
     with urllib.request.urlopen(req, timeout=120) as response:
         meta = json.load(response)
     if meta.get("md5Hash") != base64.b64encode(hashlib.md5(body).digest()).decode():
