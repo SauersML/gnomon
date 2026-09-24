@@ -258,7 +258,10 @@ def validate(tables, manifest):
         missing, missing_null = _numbers(scores.column(f"{pgs}_missing_pct"))
         _require(((missing[~missing_null] >= 0) & (missing[~missing_null] <= 100)).all(),
                  f"scores.{pgs}_missing_pct is outside [0, 100]")
-        _require(value_null[missing_null].all(), f"scores.{pgs} is present where the person was not scored")
+        # A score file that reports no missingness at all (the WGS score bank) leaves the whole
+        # column null: then a null says "not reported", not "not scored".
+        if not missing_null.all():
+            _require(value_null[missing_null].all(), f"scores.{pgs} is present where the person was not scored")
         _require((value_null == (missing_null | (missing == 100))).all(),
                  f"scores.{pgs} must be null exactly when unscored or 100% missing")
 
