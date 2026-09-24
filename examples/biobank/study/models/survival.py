@@ -326,12 +326,13 @@ def predict(variant, model_dirs, frame, settings, horizons, *, disease):
     grid, at = follow_up_grid(horizons, s["cif_step_years"])
     disease_h, beyond = cumulative_hazard_increments(dirs["disease"], variant, "disease", frame, s, sex, grid)
     death_h, beyond_death = cumulative_hazard_increments(dirs["death"], "shared", "death", frame, s, sex, grid)
-    increments = [disease_h, death_h]
-    # From entry, each cause's cumulative hazard starts at zero, so the CIF from
-    # entry is gam's competing-risks composition on the follow-up grid.
-    times = np.concatenate([[0.0], grid])
-    hazards = [np.concatenate([np.zeros((len(frame), 1)), h], axis=1) for h in increments]
-    cif, _ = rust_module().competing_risks_cif_from_predictions(times, hazards, ["disease", "death"])
+    # The follow-up grid starts at entry (time 0, where each cause's cumulative
+    # hazard from entry is zero), so the CIF from entry is gam's competing-risks
+    # composition of the increments on that grid; gam refuses a grid that is not
+    # strictly increasing, which a second zero would make it.
+    if grid[0] != 0.0:
+        raise ValueError("the follow-up grid starts at entry")
+    cif, _ = rust_module().competing_risks_cif_from_predictions(grid, [disease_h, death_h], ["disease", "death"])
     cif = np.asarray(cif, dtype=float)
-    return {"risk": cif[0][:, 1 + at], "death": cif[1][:, 1 + at],
+    return {"risk": cif[0][:, at], "death": cif[1][:, at],
             "beyond_fit": (beyond | beyond_death).astype(float)}
