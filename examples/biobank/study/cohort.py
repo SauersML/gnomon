@@ -768,17 +768,21 @@ def read_scores(score_cache, pgs_ids):
         for pgs in present:
             if pgs in found:
                 raise SchemaError(f"{pgs} appears in both {found[pgs]} and {name}")
-            if f"{pgs}_MISSING_PCT" not in header:
-                raise SchemaError(f"{pgs} in {name} lacks per-participant missingness")
             found[pgs] = name
+        # The workspace's WGS score bank writes each score's average without its per-participant
+        # missingness: that column is then null (unknown), never a number the file did not carry.
+        with_missing = [pgs for pgs in present if f"{pgs}_MISSING_PCT" in header]
         iid = next(field for field in header[:2] if field.lstrip("#") == "IID")
-        columns = [iid] + [c for pgs in present for c in (f"{pgs}_AVG", f"{pgs}_MISSING_PCT")]
+        columns = [iid] + [f"{pgs}_AVG" for pgs in present] + [f"{pgs}_MISSING_PCT" for pgs in with_missing]
         with opener() as handle:
             frame = pd.read_csv(handle, sep="\t", skiprows=skipped, usecols=columns, dtype={iid: str},
                                 float_precision="round_trip")  # the exact double each value spells
         # By name: read_csv returns usecols in the file's column order, not the requested one.
         frame = frame.rename(columns={iid: "person_id", **{f"{pgs}_AVG": pgs for pgs in present},
                                       **{f"{pgs}_MISSING_PCT": f"{pgs}_missing_pct" for pgs in present}})
+        for pgs in present:
+            if pgs not in with_missing:
+                frame[f"{pgs}_missing_pct"] = np.nan
         frame["person_id"] = _person_ids(frame.person_id, name)
         if frame.person_id.duplicated().any():
             raise SchemaError(f"{name} repeats participants")
