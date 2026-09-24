@@ -17,7 +17,7 @@ while true; do
   run "cd /w && printf '' > empty && ( [ \$(( $n % 6 )) -eq 1 ] && gcloud storage cp empty \$B/orchestrator/hb/\${H}__\$(date +%s) -q || true ) && gcloud storage ls \$B/orchestrator/cmd/ 2>/dev/null | sed 's#.*/##' > cmds.txt" || true
   for c in $(cat $W/cmds.txt 2>/dev/null | grep '\.sh$'); do
     id=${c%.sh}; [ -e $W/done/$id ] && continue; touch $W/done/$id
-    ( run "cd /w && gcloud storage cp \$B/orchestrator/cmd/$c run/$c -q && bash run/$c > run/$id.log 2>&1; echo \"[orch] rc=\$? \$(date -u +%FT%TZ)\" >> run/$id.log; gcloud storage cp run/$id.log \$B/orchestrator/out/$id/log -q; i=0; base64 -w0 run/$id.log | tr '+/' '-_' | tr -d '=' | fold -w 900 | while read -r chunk; do i=\$((i+1)); gcloud storage cp empty \$B/orchestrator/out/$id/t/\$(printf %04d \$i)__\$chunk -q; done; gcloud storage cp empty \$B/orchestrator/out/$id/DONE -q" || true ) &
+    ( run "cd /w && gcloud storage cp \$B/orchestrator/cmd/$c run/$c -q && bash run/$c > run/$id.log 2>&1; echo \"[orch] rc=\$? \$(date -u +%FT%TZ)\" >> run/$id.log; gcloud storage cp run/$id.log \$B/orchestrator/out/$id/log -q; i=0; { base64 -w0 run/$id.log | tr '+/' '-_' | tr -d '='; echo; } | fold -w 900 | while read -r chunk; do [ -n "\$chunk" ] || continue; i=\$((i+1)); gcloud storage cp empty \$B/orchestrator/out/$id/t/\$(printf %04d \$i)__\$chunk -q; done; gcloud storage cp empty \$B/orchestrator/out/$id/DONE -q" || true ) &
   done
   sleep 20
 done
