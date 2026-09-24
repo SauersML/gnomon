@@ -73,7 +73,7 @@ DEFAULTS = {
 # section 4). gam's "conditional-location-scale" anchors a transformed residual
 # score instead, which this study's raw-axis slope is not defined on.
 LATENT_LAW = "global-empirical"
-MARGINAL_SLOPE = ("ours", "shipped", "standard", "z_pc")
+MARGINAL_SLOPE = ("ours", "shipped")  # the anchored family; every comparator is a probit now
 
 
 def settings_of(settings):
