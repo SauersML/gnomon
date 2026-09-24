@@ -40,7 +40,7 @@ VCPU_HOUR_BUDGET = 32
 SOURCES = ["study.py", "aou_checkpoint.py", "aou_identity.py", "aou_projection.py", "aou_status.py",
            "study/__init__.py", "study/checkpoint.py", "study/cohort.py", "study/digest.py", "study/disclosure.py",
            "study/evaluate.py",
-           "study/models/__init__.py", "study/models/binary.py", "study/phenotypes.py",
+           "study/models/__init__.py", "study/models/binary.py", "study/models/survival.py", "study/phenotypes.py",
            "study/pool.py", "study/requirements.txt"]
 
 

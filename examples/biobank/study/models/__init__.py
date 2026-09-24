@@ -1,9 +1,5 @@
 """The study's models, one module per outcome kind behind the one interface study.py calls.
 
-KINDS names the kinds that have a module. The driver builds survival frames and
-evaluates survival predictions, but there is no survival.py yet, so a run fits
-the binary kind only and refuses --kinds survival by name.
-
 A kind's module exports:
 
     VARIANTS                                    ours first, then the competitors
@@ -32,7 +28,7 @@ from __future__ import annotations
 
 from importlib import import_module
 
-KINDS = ("binary",)
+KINDS = ("binary", "survival")
 
 
 def _module(kind):
