@@ -68,6 +68,13 @@ UNKNOWN = "unknown"
 RESTART = "restart"
 # SPEC section 8, minimum events: a fit below the bar is this result, not a failure.
 INSUFFICIENT_EVENTS = "insufficient_events"
+# SPEC section 8 (gam#3003): a survival marginal-slope fit the data do not identify, gam's own
+# typed frozen-time refusal (NOT_IDENTIFIED_VARIANTS), is this result for any method, ours included.
+TIME_SCALE_NOT_IDENTIFIED = "time_scale_not_identified"
+NOT_IDENTIFIED_VARIANTS = frozenset({"FrozenTimeLimit", "NotIdentified", "MarginalLevelWithSlope"})
+# The fit outcomes that are results, never failures: nothing was fitted, so nothing is restarted,
+# predicted or compared, and the table names them.
+FIT_OUTCOMES = (INSUFFICIENT_EVENTS, TIME_SCALE_NOT_IDENTIFIED)
 # Our own model, in both arms: its failures can never be declared refusals (lead, 09-19).
 PRIMARY = ("ours", "shipped")
 # The event code each survival component models.
@@ -511,11 +518,13 @@ class Study:
         if outcome.status == "ok" and written.get("status") != "ok":
             raise ValueError(f"{job.key} exited 0 without its {record_name}")
         if outcome.status != "ok":
+            error = read_json(directory / "error.json") if (directory / "error.json").is_file() else None
             # A failed step keeps only its log and its record: never a partial model.
             for stale in directory.iterdir():
                 if stale.name != "job.log":
                     shutil.rmtree(stale) if stale.is_dir() else stale.unlink()
-            written = {"status": outcome.status, "category": failure_category(log)}
+            written = {"status": fit_status(outcome.status, error), "category": failure_category(log),
+                       **({"error": error} if error else {})}
             if "invalid_output" in outcome.extra:
                 written["category"] = "invalid_output"
             issue = declared_refusal(self.config, job.spec, log)
@@ -594,6 +603,15 @@ class Study:
             self.status("failed_study_unexpected_errors")
             raise SystemExit(3)
         self.status("study_completed")
+
+    def not_identified(self):
+        """(variant, disease, kind) of every pooled fit that is time_scale_not_identified."""
+        found = set()
+        for step, record in self.step_records().items():
+            parts = step.split("/")
+            if parts[0] == "fits" and parts[4] == "pooled" and record["status"] == TIME_SCALE_NOT_IDENTIFIED:
+                found.add((parts[3], parts[1], parts[2]))
+        return sorted(found)
 
     def step_records(self):
         """Every sealed fit, predict and evaluate record of this run, by step."""
@@ -899,7 +917,7 @@ class Study:
         start = self.config["convergence"]["start"]
         pooled = self.fit_step(slug, kind, variant, "pooled", component)
         record = self.path(pooled) / "fit.json"
-        if record.is_file() and read_json(record).get("status") == INSUFFICIENT_EVENTS:
+        if record.is_file() and read_json(record).get("status") in FIT_OUTCOMES:
             return []  # nothing was fitted, so there is nothing to restart
         self.checkpoint.begin(step)
         scheduled.add(step)
@@ -973,8 +991,10 @@ class Study:
                     outcomes = [read_json(s / "predict.json") if (s / "predict.json").is_file() else {"status": "missing"}
                                 for s in steps]
                     pooled_fits = [self.path(s) / "fit.json" for s in self.model_dirs(disease.slug, kind, variant, "pooled").values()]
-                    if any(f.is_file() and read_json(f)["status"] == INSUFFICIENT_EVENTS for f in pooled_fits):
-                        record["status"] = INSUFFICIENT_EVENTS
+                    # A pooled fit that is a data outcome (FIT_OUTCOMES) has no second start to compare.
+                    results = [s for s in (read_json(f)["status"] for f in pooled_fits if f.is_file()) if s in FIT_OUTCOMES]
+                    if results:
+                        record["status"] = results[0]
                     elif any(o["status"] != "ok" for o in outcomes):
                         record["status"] = "unchecked"
                     else:
@@ -1105,9 +1125,11 @@ class Study:
                 failed = [read_json(self.path(step) / "fit.json")["status"] for step in dirs.values()
                           if read_json(self.path(step) / "fit.json")["status"] != "ok"]
                 predict = self.path(self.predict_step(slug, kind, variant, fit)) / "predict.json"
-                status = (INSUFFICIENT_EVENTS if INSUFFICIENT_EVENTS in failed else f"fit_{failed[0]}" if failed else
-                          f"predict_{read_json(predict)['status']}" if predict.is_file()
-                          and read_json(predict)["status"] != "ok" else None)
+                # A data outcome (below the events gate, time scale not identified) is named as itself.
+                outcome = next((s for s in FIT_OUTCOMES if s in failed), None)
+                status = outcome or (f"fit_{failed[0]}" if failed else
+                                     f"predict_{read_json(predict)['status']}" if predict.is_file()
+                                     and read_json(predict)["status"] != "ok" else None)
                 if status:
                     rows.append({"disease": slug, "model": kind, "variant": variant, "fit": fit,
                                  "stratum": "overall", "horizon": None, "outcome": status})
@@ -1125,6 +1147,8 @@ class Study:
                  "gam_commit_12": "g" + str(self.signature["engine"].get("gam_commit") or "none")[:12],
                  "scope_kinds": "_".join(self.kinds), "scope_diseases": len(self.diseases),
                  "unexpected_errors": len(unexpected_failures(self.step_records())),
+                 # The headline limitation (gam#3003): diseases whose data do not identify ours' time scale.
+                 "ours_not_identified": len({d for v, d, _ in self.not_identified() if v == "ours"}),
                  "declared_refusals": sum(bool(r.get("declared_refusal")) for r in self.step_records().values()),
                  **({"caveats": "_and_".join(self.args.caveat)} if self.args.caveat else {}),
                  "vcpus": self.vcpus, "threads": self.threads, "memory_budget_gb": round(self.memory / 2**30, 2),
@@ -1148,6 +1172,10 @@ class Study:
                     rows.append({"scope": "convergence", "item": f"{disease.slug}.{kind}.{variant}",
                                  "status": record["status"], "start": record["start"],
                                  **({"max_delta_sd": record["max_delta_sd"]} if "max_delta_sd" in record else {})})
+        # Every method's not-identified diseases by name (tabulate's headline limitation): an
+        # operation fact, so no cell suppression can hide it; it carries no count.
+        rows += [{"scope": "not_identified", "item": f"{variant}.{disease}.{kind}", "variant": variant,
+                  "disease": disease, "kind": kind} for variant, disease, kind in self.not_identified()]
         rows += [{"scope": "timing", "item": stage, "wall_seconds": round(seconds, 1)}
                  for stage, seconds in self.timings.items()]
         # What the pool held at once against its memory budget, per stage (this attempt's).
@@ -1165,10 +1193,12 @@ class Study:
                     seconds = sorted(r.get("fit_seconds", r["wall_seconds"]) for r in records)
                     ok = [r for r in records if r["status"] == "ok"]
                     skipped = [r for r in records if r["status"] == INSUFFICIENT_EVENTS]
+                    unidentified = [r for r in records if r["status"] == TIME_SCALE_NOT_IDENTIFIED]
                     certificates = [certification([r]) for r in ok]
                     rows.append({"scope": "fits", "item": f"{disease.slug}.{kind}.{variant}.{component}",
                                  "fits": len(records), "ok": len(ok), "insufficient_events": len(skipped),
-                                 "failed": len(records) - len(ok) - len(skipped),
+                                 "time_scale_not_identified": len(unidentified),
+                                 "failed": len(records) - len(ok) - len(skipped) - len(unidentified),
                                  "not_certified": certificates.count("not_certified"),
                                  "no_certificate": certificates.count("no_certificate"),
                                  "median_seconds": seconds[len(seconds) // 2], "max_seconds": seconds[-1],
@@ -1178,7 +1208,7 @@ class Study:
                                  "over_budget": sum(bool(r.get("over_budget")) for r in records)})
                     categories = {}
                     for record in records:
-                        if record["status"] not in ("ok", INSUFFICIENT_EVENTS):
+                        if record["status"] not in ("ok", *FIT_OUTCOMES):
                             label = f"{record['status']}_{record.get('category', 'unclassified')}"
                             categories[label] = categories.get(label, 0) + 1
                     if categories:
@@ -1378,7 +1408,25 @@ def unexpected_failures(records):
     """The failed steps a run may not pass over, as {step: category}: every
     record neither ok, nor below the events gate, nor a declared refusal."""
     return {step: record.get("category", "unclassified") for step, record in records.items()
-            if record["status"] not in ("ok", INSUFFICIENT_EVENTS) and not record.get("declared_refusal")}
+            if record["status"] not in ("ok", *FIT_OUTCOMES) and not record.get("declared_refusal")}
+
+
+def typed_error(error):
+    """What a fit's exception says about itself by type: its class and module, and a
+    gamfit fit failure's variant and category (gam#2937). Never its message."""
+    fields = {name: getattr(error, name, None) for name in ("variant", "category")}
+    return {"type": type(error).__name__, "module": type(error).__module__,
+            **{name: value for name, value in fields.items() if isinstance(value, str)}}
+
+
+def fit_status(outcome_status, error):
+    """A failed fit step's recorded status: time_scale_not_identified when a gamfit
+    error names a frozen-time identification variant (NOT_IDENTIFIED_VARIANTS), its
+    own status otherwise."""
+    if (error and str(error.get("module", "")).split(".")[0] == "gamfit"
+            and error.get("variant") in NOT_IDENTIFIED_VARIANTS):
+        return TIME_SCALE_NOT_IDENTIFIED
+    return outcome_status
 
 
 def uncertified_primaries(certifications):
@@ -1502,8 +1550,13 @@ def run_fit(spec, config, models):
         data = data.iloc[order].reset_index(drop=True)
     print("study_fit_started", flush=True)
     started = time.perf_counter()
-    info = models.fit(kind, spec["variant"], spec["component"], data, config["models"].get(kind, {}), out, reference,
-                      disease=spec["disease_definition"])
+    try:
+        info = models.fit(kind, spec["variant"], spec["component"], data, config["models"].get(kind, {}), out,
+                          reference, disease=spec["disease_definition"])
+    except Exception as error:
+        # The driver seals a failed fit by its error's type (fit_status), so the type goes beside the log.
+        write_json(out / "error.json", typed_error(error))
+        raise
     seconds = time.perf_counter() - started
     print("study_fit_saved", flush=True)
     # Provenance (SPEC section 8, LOGO): the person set this fit saw, checked at predict.

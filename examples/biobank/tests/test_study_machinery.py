@@ -481,6 +481,47 @@ def test_an_undeclared_fit_error_fails_the_run_and_a_declared_refusal_does_not()
 INSUFFICIENT = "insufficient_events"
 
 
+def test_only_a_typed_frozen_time_refusal_is_the_time_scale_not_identified_outcome():
+    study = driver()
+
+    def gamfit_error(name, variant=None, category=None):
+        """A class raised from gamfit's engine module, carrying gam#2937's typed attributes."""
+        attributes = {name_: value for name_, value in (("variant", variant), ("category", category)) if value}
+        return type(name, (ValueError,), {"__module__": "gamfit._rust", **attributes})("the message is never read")
+    allowed = study.typed_error(gamfit_error("FitError", "FrozenTimeLimit", "identification"))
+    assert allowed == {"type": "FitError", "module": "gamfit._rust", "variant": "FrozenTimeLimit",
+                       "category": "identification"}
+    # One allowlisted variant is the outcome; another typed variant, an untyped gamfit error, the same
+    # words in a message, and the same variant name from outside gamfit all stay failures.
+    assert study.fit_status("error", allowed) == study.TIME_SCALE_NOT_IDENTIFIED
+    other = study.typed_error(gamfit_error("FitSeedError", "StartupSeedsRefused", "seed"))
+    untyped = study.typed_error(gamfit_error("GamError"))
+    worded = study.typed_error(ValueError("FrozenTimeLimit: NotIdentified"))
+    foreign = study.typed_error(type("FitError", (ValueError,), {"variant": "FrozenTimeLimit"})())
+    for error in (other, untyped, worded, foreign, None):
+        assert study.fit_status("error", error) == "error"
+    assert study.fit_status("timeout", None) == "timeout"
+    # The outcome never fails a run, for ours as for any method; the other failures do.
+    records = {"fits/htn/survival/ours/pooled/disease": {"status": study.TIME_SCALE_NOT_IDENTIFIED, "error": allowed},
+               "fits/htn/survival/calpred/pooled/disease": {"status": study.TIME_SCALE_NOT_IDENTIFIED},
+               "fits/htn/survival/ours/restart/disease": {"status": "error", "category": "fitseederror"}}
+    assert study.unexpected_failures(records) == {"fits/htn/survival/ours/restart/disease": "fitseederror"}
+
+
+def test_the_not_identified_diseases_are_a_headline_limitation():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tabulate_study", HERE / "tabulate_study.py")
+    tabulate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tabulate)
+    rows = [{"scope": "not_identified", "item": f"{v}.{d}.survival", "variant": v, "disease": d, "kind": "survival"}
+            for v, d in (("ours", "coronary_artery_disease"), ("calpred", "chronic_kidney_disease"),
+                         ("ours", "chronic_kidney_disease"))]
+    assert tabulate.not_identified_limitations(rows) == [
+        "LIMITATION survival: the time scale of ours is not identified in 2 diseases "
+        "(chronic_kidney_disease, coronary_artery_disease)",
+        "LIMITATION survival: the time scale of calpred is not identified in 1 disease (chronic_kidney_disease)"]
+
+
 def test_an_uncertified_fit_is_never_counted_as_converged():
     certification = driver().certification
     fit = lambda converged="absent", status="ok": {"status": status, "info": {} if converged == "absent"

@@ -266,17 +266,18 @@ def follow_up_grid(horizons, step):
 
 
 def cumulative_hazard_increments(directory, variant, component, frame, s, sex, grid):
-    """H(entry + grid) - H(entry) of each row from the saved fit: gam's posterior-mean
-    cumulative hazard surface on its 64-point age grid, read at each row's own ages
-    on gam's own piecewise-linear interpolant of that surface."""
+    """(H(entry + grid) - H(entry) of each row, which rows reach past the fitted ages) from
+    the saved fit: gam's posterior-mean cumulative hazard surface on its 64-point age grid,
+    read at each row's own ages on gam's own piecewise-linear interpolant of that surface."""
     import gamfit
     spec = json.loads((directory / "spec.json").read_text())
     if spec["zero_hazard"]:
-        return np.zeros((len(frame), len(grid)))
+        return np.zeros((len(frame), len(grid))), np.zeros(len(frame), dtype=bool)
     model = gamfit.load(directory / "model.gamfit")
     entry = frame.entry_age.to_numpy(float)
     bands = np.floor(entry / s["predict_band_years"])
     out = np.empty((len(frame), len(grid)))
+    beyond = np.zeros(len(frame), dtype=bool)
     for band in np.unique(bands):
         rows = np.flatnonzero(bands == band)
         edge = band * s["predict_band_years"]
@@ -293,13 +294,12 @@ def cumulative_hazard_increments(directory, variant, component, frame, s, sex, g
             if surface.shape != (len(chunk), len(knots)) or not np.isfinite(surface).all() or abs(knots[0] - edge) > 1e-9:
                 raise ValueError(f"gam returned an invalid cumulative hazard surface for {directory}")
             ages = entry[chunk, None] + np.concatenate([[0.0], grid])[None, :]
-            beyond = ages > knots[-1]
-            if beyond.any():
-                raise ValueError(f"{int(beyond.any(axis=1).sum())} row(s) reach ages beyond the fitted range at "
-                                 f"{knots[-1]:.2f}; a horizon past the training follow-up is not predicted")
+            # Past the last training age the surface is read at its end: no hazard is
+            # fitted there, and the rows are counted (`beyond_fit` in the prediction).
+            beyond[chunk] = ages[:, -1] > knots[-1]
             at = np.vstack([np.interp(ages[i], knots, surface[i]) for i in range(len(chunk))])
             out[chunk] = at[:, 1:] - at[:, :1]
-    return out
+    return out, beyond
 
 
 def predict(variant, model_dirs, frame, settings, horizons, *, disease):
@@ -315,12 +315,14 @@ def predict(variant, model_dirs, frame, settings, horizons, *, disease):
         raise ValueError(f"{dirs['disease']} holds {spec['variant']!r} with sex_term {spec['sex_term']}, not "
                          f"{variant!r} for a disease declared for sex {disease['sex']!r}")
     grid, at = follow_up_grid(horizons, s["cif_step_years"])
-    increments = [cumulative_hazard_increments(dirs["disease"], variant, "disease", frame, s, sex, grid),
-                  cumulative_hazard_increments(dirs["death"], "shared", "death", frame, s, sex, grid)]
+    disease_h, beyond = cumulative_hazard_increments(dirs["disease"], variant, "disease", frame, s, sex, grid)
+    death_h, beyond_death = cumulative_hazard_increments(dirs["death"], "shared", "death", frame, s, sex, grid)
+    increments = [disease_h, death_h]
     # From entry, each cause's cumulative hazard starts at zero, so the CIF from
     # entry is gam's competing-risks composition on the follow-up grid.
     times = np.concatenate([[0.0], grid])
     hazards = [np.concatenate([np.zeros((len(frame), 1)), h], axis=1) for h in increments]
     cif, _ = rust_module().competing_risks_cif_from_predictions(times, hazards, ["disease", "death"])
     cif = np.asarray(cif, dtype=float)
-    return {"risk": cif[0][:, 1 + at], "death": cif[1][:, 1 + at]}
+    return {"risk": cif[0][:, 1 + at], "death": cif[1][:, 1 + at],
+            "beyond_fit": (beyond | beyond_death).astype(float)}

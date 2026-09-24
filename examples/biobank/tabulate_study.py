@@ -70,6 +70,21 @@ def exclusion_caveats(results):
     return lines
 
 
+def not_identified_limitations(rows):
+    """The headline limitation (gam#3003), from the run's not_identified operation rows: for each
+    kind and method, the diseases whose pooled fit is time_scale_not_identified (the data do not
+    identify its time scale), ours first."""
+    diseases = defaultdict(set)
+    for row in rows:
+        diseases[row["kind"], row["variant"]].add(row["disease"])
+    lines = []
+    for kind, variant in sorted(diseases, key=lambda key: (key[1] != "ours", key)):
+        named = sorted(diseases[kind, variant])
+        lines.append(f"LIMITATION {kind}: the time scale of {variant} is not identified in {len(named)} "
+                     f"disease{'' if len(named) == 1 else 's'} ({', '.join(named)})")
+    return lines
+
+
 def compared(rows):
     """(rows a table compares, the "excluded" lines of the rest): a cell whose engines did not
     certify a fit behind it (certification not_certified, a competitor's; ours uncertified
@@ -112,6 +127,8 @@ def main():
         defaultdict(lambda: "?", run)))
     if run.get("caveats"):
         print("CAVEATS: " + str(run["caveats"]).replace("_and_", "; "))
+    for line in not_identified_limitations(ops.get("not_identified", {}).values()):
+        print(line)
     for line in exclusion_caveats(results):
         print(line)
     for row in results:
