@@ -1030,7 +1030,7 @@ def evaluate(kind, test, predictions, horizons, config, train, truth=None, slope
     settings = config.get("evaluate", {})
     minimum = int(config.get("report", {}).get("small_cell_max", SMALL_CELL_MAX)) + 1
     fits = _fits(predictions)
-    variants = [v for v in ("ours", "covariates", "standard", "z_pc", "calpred") if v in fits]
+    variants = [v for v in ("ours", "covariates", "standard", "znorm2", "z_pc", "calpred") if v in fits]
     variants += sorted(set(fits) - set(variants))
     fit_names = sorted({f for fs in fits.values() for f in fs}, key=lambda fit: (fit != "pooled", fit))
     if truth is not None and len(truth) != len(test):

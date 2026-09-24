@@ -46,7 +46,11 @@ from pathlib import Path
 
 import numpy as np
 
-VARIANTS = ("ours", "shipped", "covariates", "standard", "z_pc", "calpred", "no_pc")
+VARIANTS = ("ours", "shipped", "covariates", "standard", "znorm2", "z_pc", "calpred")
+# Only the marginal-slope models see the PCs (user, 2026-09-24): every comparator is PC-blind,
+# and znorm2 is the score with its PC-dependent mean and log-variance regressed out on the
+# training rows, then used with a constant slope.
+PC_BLIND = ("covariates", "standard", "znorm2")
 
 AGE = "age_baseline"
 
@@ -123,8 +127,8 @@ def duchon(s, centers):
     return f"duchon({', '.join(pc_columns(s))}, centers={centers})"
 
 
-def covariate_part(s, sex=True):
-    return " + ".join([f"s({AGE})", *(["sex"] if sex else []), duchon(s, s["q_centers"]),
+def covariate_part(s, sex=True, pcs=True):
+    return " + ".join([f"s({AGE})", *(["sex"] if sex else []), *([duchon(s, s["q_centers"])] if pcs else []),
                        *(f"s({w})" for w in s["windows"])])
 
 
@@ -144,20 +148,14 @@ def formulas(variant, s, sex=True):
                 {"family": "bernoulli-marginal-slope", "z_column": "z",
                  "slope_formula": f"1 + {duchon(s, slope)} + linkwiggle()",
                  "config": marginal_slope_config(s)})
-    main = f"y ~ {covariate_part(s, sex)}"
     probit = {"family": "binomial", "link": "probit"}
-    if variant == "covariates":
-        return main, probit
-    if variant == "no_pc":
-        # The PC-free baseline: the score with age, sex and the observation windows, no
-        # ancestry information anywhere (user, 2026-09-24: what do PCs as predictors buy).
-        terms = [f"s({AGE})", *(["sex"] if sex else []), *(f"s({w})" for w in s["windows"]), "z"]
-        return "y ~ " + " + ".join(terms), probit
+    if variant in PC_BLIND:
+        blind = f"y ~ {covariate_part(s, sex, pcs=False)}"
+        return (blind if variant == "covariates" else f"{blind} + z"), probit
+    main = f"y ~ {covariate_part(s, sex)}"
     if variant == "calpred":
         return f"{main} + z", {**probit, "noise_formula": " + ".join(pc_columns(s))}
-    if variant == "standard":
-        slope = "1"
-    elif variant == "z_pc":
+    if variant == "z_pc":
         slope = " + ".join(["1", *pc_columns(s)])
     elif variant == "ours":
         slope = f"1 + {duchon(s, s['slope_centers'])}"
@@ -183,14 +181,44 @@ def columns(variant, s, sex=True):
     sexes = ["sex"] if sex else []
     if variant == "shipped":
         return ["z", *sexes, *pc_columns(s)]
-    if variant == "no_pc":
-        return ["z", *sexes, AGE, *s["windows"]]
-    return ([] if variant == "covariates" else ["z"]) + [*sexes, AGE, *s["windows"], *pc_columns(s)]
+    if variant in PC_BLIND:
+        return ([] if variant == "covariates" else ["z"]) + [*sexes, AGE, *s["windows"]]
+    return ["z", *sexes, AGE, *s["windows"], *pc_columns(s)]
 
 
-def design(variant, frame, s, sex=True):
-    """A variant's input columns."""
-    return {c: frame[c].to_numpy(float) for c in columns(variant, s, sex)}
+def design(variant, frame, s, sex=True, znorm=None):
+    """A variant's input columns; znorm2 reads the regressed-out score in place of z."""
+    data = {c: frame[c].to_numpy(float) for c in columns(variant, s, sex)}
+    if variant == "znorm2":
+        data["z"] = regress_out(frame, s, znorm)
+    return data
+
+
+def fit_znorm(train, s):
+    """znorm2's transform, from the training rows only: the score's mean and log-variance
+    each linear in the (train-standardised) PCs, the residual scaled by the fitted SD and
+    then standardised. The fitted coefficients travel with the model (znorm2.json)."""
+    pcs = train[pc_columns(s)].to_numpy(float)
+    pc_mean, pc_sd = pcs.mean(axis=0), pcs.std(axis=0)
+    pc_sd = np.where(pc_sd > 0, pc_sd, 1.0)
+    P = np.column_stack([np.ones(len(train)), (pcs - pc_mean) / pc_sd])
+    z = train.z.to_numpy(float)
+    mean_coef = np.linalg.lstsq(P, z, rcond=None)[0]
+    residual = z - P @ mean_coef
+    log_var_coef = np.linalg.lstsq(P, np.log(residual ** 2 + 1e-300), rcond=None)[0]
+    scaled = residual / np.exp(0.5 * (P @ log_var_coef))
+    return {"pc_mean": pc_mean.tolist(), "pc_sd": pc_sd.tolist(), "mean_coef": mean_coef.tolist(),
+            "log_var_coef": log_var_coef.tolist(), "center": float(scaled.mean()), "scale": float(scaled.std() or 1.0)}
+
+
+def regress_out(frame, s, znorm):
+    if znorm is None:
+        raise ValueError("znorm2 needs its fitted transform")
+    pcs = frame[pc_columns(s)].to_numpy(float)
+    P = np.column_stack([np.ones(len(frame)), (pcs - np.asarray(znorm["pc_mean"])) / np.asarray(znorm["pc_sd"])])
+    residual = frame.z.to_numpy(float) - P @ np.asarray(znorm["mean_coef"])
+    scaled = residual / np.exp(0.5 * (P @ np.asarray(znorm["log_var_coef"])))
+    return (scaled - znorm["center"]) / znorm["scale"]
 
 
 def check_frame(frame, s, with_response):
@@ -217,7 +245,10 @@ def fit(variant, component, train, settings, out_dir, reference=None, *, disease
     out.mkdir(parents=True, exist_ok=True)
     sex = has_sex_term(disease)
     formula, keywords = formulas(variant, s, sex)
-    data = design(variant, train, s, sex)
+    znorm = fit_znorm(train, s) if variant == "znorm2" else None
+    if znorm is not None:
+        write_json(out / "znorm2.json", znorm)
+    data = design(variant, train, s, sex, znorm)
     data["y"] = train.y.to_numpy(float)
     started = time.perf_counter()
     model = gamfit.fit(data, formula, **keywords)
@@ -254,7 +285,8 @@ def predict(variant, model_dirs, frame, settings, horizons=None, *, disease):
                          f"for a disease declared for sex {disease['sex']!r}")
     model = gamfit.load(out / "model.gamfit")
 
-    table = model.predict(design(variant, frame, s, spec["sex_term"]), return_type="dict")
+    znorm = json.loads((out / "znorm2.json").read_text()) if variant == "znorm2" else None
+    table = model.predict(design(variant, frame, s, spec["sex_term"], znorm), return_type="dict")
     risk = np.asarray(table["mean" if variant in MARGINAL_SLOPE else "posterior_mean"], dtype=float)
     if risk.shape != (len(frame),) or not np.all((risk > 0) & (risk < 1)):
         raise ValueError(f"{variant} predictions are invalid")
