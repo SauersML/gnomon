@@ -2,7 +2,7 @@
   "study": "aou-single-study-v1",
   "label": "production",
   "diseases_file": "study/diseases.json",
-  "frozen_config_sha256": "aeb9223cc108c53f0fb7711e393d7c02877e52084a70b0fda5133ff8056c5bf7",
+  "frozen_config_sha256": "afc20eaed11707fe91f333278bbfcdfdd48f675137edda8aa32ffc11d466f59d",
   "primary_censoring_rule": "ehr_end",
   "sensitivity_censoring_rules": ["min_death_cutoff"],
   "variants": ["ours", "covariates", "standard", "z_pc", "calpred"],
