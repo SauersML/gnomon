@@ -442,10 +442,12 @@ class Study:
             "inputs": {name: input_identity(path) for name, path in sorted(self.inputs.items())},
         }
         store = self.store(args.checkpoint, self.work / "store")
+        # A shard's scores and cohort steps cover only its own diseases, so they are named after
+        # the shard: a shard must never restore another's (the gather builds the whole study's).
+        self.scope_tag = "-".join(sorted(args.diseases) + sorted(args.variants or ())) if args.shard else ""
         self.checkpoint = Checkpoint(self.root, store, self.signature,
                                      min_interval=self.config["compute"].get("checkpoint_interval_seconds", 20),
-                                     tag="-".join(sorted(args.diseases) + sorted(args.variants or ()))
-                                     if args.shard else "")
+                                     tag=self.scope_tag)
         # Outer-test looks (SPEC section 8, S8): one marker per checkpoint that
         # reached evaluation, counted over every run of this config.
         self.looks = self.store(args.looks, self.work / "looks")
@@ -676,9 +678,9 @@ class Study:
 
     def stage_scores(self):
         """Every study score in the cache; in AoU, the uncached ones are scored here."""
-        if self.checkpoint.done("scores"):
+        if self.checkpoint.done(self.shared_step("scores")):
             return
-        directory = self.checkpoint.begin("scores")
+        directory = self.checkpoint.begin(self.shared_step("scores"))
         if self.parquet:
             manifest = read_json(self.inputs["tables"] / "manifest.json")
             absent = sorted(set(self.pgs_ids()) - set(manifest["scores"]))
@@ -696,7 +698,7 @@ class Study:
             for pgs in sorted(set(self.pgs_ids()) - cached):
                 self.score(pgs)
         write_json(directory / "scores.json", record)
-        self.checkpoint.complete("scores")
+        self.checkpoint.complete(self.shared_step("scores"))
 
     def score(self, pgs):
         """Score one uncached PGS on every array sample with the pinned gnomon
@@ -735,17 +737,21 @@ class Study:
         shutil.rmtree(raw)
         self.checkpoint.complete(step, info={"seconds": round(time.monotonic() - started, 1)})
 
+    def shared_step(self, name):
+        """A study-wide step's name, per shard when sharded (see scope_tag)."""
+        return f"{name}-{self.scope_tag}" if self.scope_tag else name
+
     def source(self):
         if self.source_handle is None:
             from study import cohort
-            tables = self.inputs["tables"] if self.parquet else self.path("cohort") / "tables"
+            tables = self.inputs["tables"] if self.parquet else self.path(self.shared_step("cohort")) / "tables"
             self.source_handle = cohort.ParquetSource(tables)
         return self.source_handle
 
     def stage_cohort(self):
         """The SCHEMA.md tables: the simulator's as given, or exported from AoU."""
-        if not self.checkpoint.done("cohort"):
-            directory = self.checkpoint.begin("cohort")
+        if not self.checkpoint.done(self.shared_step("cohort")):
+            directory = self.checkpoint.begin(self.shared_step("cohort"))
             if not self.parquet:
                 self.export_tables(directory / "tables")
             manifest = dict(self.source().manifest)
@@ -753,7 +759,7 @@ class Study:
             manifest["tables_sha256"] = hashlib.sha256(
                 json.dumps(manifest.pop("tables", {}), sort_keys=True).encode()).hexdigest()
             write_json(directory / "manifest.json", manifest)
-            self.checkpoint.complete("cohort")
+            self.checkpoint.complete(self.shared_step("cohort"))
         self.source()
 
     def export_tables(self, directory):
@@ -1131,7 +1137,7 @@ class Study:
         rows += digest.pc_scale_rows(base["pc_sd"])
         if "ehr" in base["followup"]:
             rows += digest.ehr_rows(base["followup"]["ehr"], digest.LIMIT)
-        rows += digest.ehr_domain_rows(read_json(self.path("cohort") / "manifest.json"), digest.LIMIT)
+        rows += digest.ehr_domain_rows(read_json(self.path(self.shared_step("cohort")) / "manifest.json"), digest.LIMIT)
         descendants = self.source().directory / "descendants.parquet"
         if descendants.is_file():
             rows += digest.descendant_rows(pd.read_parquet(descendants), digest.LIMIT)
@@ -1176,7 +1182,7 @@ class Study:
     def operation_rows(self, base):
         """Aggregates of how the run went: no participant data, so not audited."""
         attempts = self.attempts()
-        manifest = read_json(self.path("cohort") / "manifest.json")
+        manifest = read_json(self.path(self.shared_step("cohort")) / "manifest.json")
         study = {"scope": "study", "item": "run", "config_sha256_12": config_hash(self.config)[:12],
                  "label": self.config["label"], "run_kind": self.run_kind,
                  # The survival tables' censoring caveats key on these (tabulate_study.py).
