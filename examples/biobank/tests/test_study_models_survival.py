@@ -147,7 +147,7 @@ def test_refusals(frames, tmp_path):
     with pytest.raises(ValueError, match="shared by every variant"):
         survival.formulas("ours", "death", survival.settings_of(SETTINGS))
     bad = train.copy()
-    bad.loc[0, "exit_age"] = bad.loc[0, "entry_age"]
+    bad.loc[0, ["exit_age", "event"]] = [bad.loc[0, "entry_age"], 0]
     with pytest.raises(ValueError, match="zero-length"):
         survival.fit("standard", "disease", bad, SETTINGS, tmp_path / "a", disease=DISEASE)
     bad = train.copy()
