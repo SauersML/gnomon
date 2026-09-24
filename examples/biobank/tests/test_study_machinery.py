@@ -897,6 +897,7 @@ def test_binary_outer_start_levels_reach_gam_only_when_chosen():
 
 def test_batch_job_is_one_c3d_spot_task_running_the_wdl_command(tmp_path):
     """submit_study --engine batch: the job document is the study.wdl task, localized, on a C3D Spot VM."""
+    import pytest
     import aou_batch
     bucket = "gs://aou-train-work-p"
     inputs = dict(sources=f"{bucket}/workflows/r/study-sources.tar", config=f"{bucket}/workflows/r/config.json",
