@@ -97,8 +97,8 @@ def localize_script(plan, project, wait_for=()):
     lines = ["set -euo pipefail", f"rm -rf {WORK}/in {WORK}/task", f"mkdir -p {WORK}/task",
              f"exec > >(tee -a {WORK}/task.log) 2>&1", 'echo "[localize] $(date -u +%FT%TZ) start on $(hostname)"',
              *([wait_script(wait_for, project)] if wait_for else []),
-             # no pipes here: under pipefail a `head` closing early kills the script (it did)
-             f"id; ls -ld {WORK}; gcloud auth list 2>&1; gcloud config list account 2>&1"]
+             # no probe commands here: under set -e any one that exits nonzero kills the localizer (two did)
+             f"id; ls -ld {WORK}"]
     for uri, local in plan:
         if not uri.startswith("gs://"):
             raise ValueError(f"input {uri} is not a workspace object")
