@@ -69,9 +69,13 @@ RESTART = "restart"
 # SPEC section 8, minimum events: a fit below the bar is this result, not a failure.
 INSUFFICIENT_EVENTS = "insufficient_events"
 # SPEC section 8 (gam#3003): a survival marginal-slope fit the data do not identify, gam's own
-# typed frozen-time refusal (NOT_IDENTIFIED_VARIANTS), is this result for any method, ours included.
+# frozen-time refusal, is this result for any method, ours included. gam names it by a typed
+# variant (NOT_IDENTIFIED_VARIANTS) where the refusal reaches the caller as itself; through the
+# startup-seed screen it reaches gamfit as StartupSeedsRefused carrying the certificate's own
+# sentence (FROZEN_TIME_CERTIFICATE), which typed_error records as the identification verdict.
 TIME_SCALE_NOT_IDENTIFIED = "time_scale_not_identified"
 NOT_IDENTIFIED_VARIANTS = frozenset({"FrozenTimeLimit", "NotIdentified", "MarginalLevelWithSlope"})
+FROZEN_TIME_CERTIFICATE = "is not below the frozen-time limit"
 # The fit outcomes that are results, never failures: nothing was fitted, so nothing is restarted,
 # predicted or compared, and the table names them.
 FIT_OUTCOMES = (INSUFFICIENT_EVENTS, TIME_SCALE_NOT_IDENTIFIED)
@@ -1412,20 +1416,25 @@ def unexpected_failures(records):
 
 
 def typed_error(error):
-    """What a fit's exception says about itself by type: its class and module, and a
-    gamfit fit failure's variant and category (gam#2937). Never its message."""
+    """What a fit's exception says about itself by type: its class and module, a gamfit
+    fit failure's variant and category (gam#2937), and whether gam's frozen-time
+    certificate refused the fit (`identification`). Never its message."""
     fields = {name: getattr(error, name, None) for name in ("variant", "category")}
-    return {"type": type(error).__name__, "module": type(error).__module__,
-            **{name: value for name, value in fields.items() if isinstance(value, str)}}
+    record = {"type": type(error).__name__, "module": type(error).__module__,
+              **{name: value for name, value in fields.items() if isinstance(value, str)}}
+    if record["module"].split(".")[0] == "gamfit" and FROZEN_TIME_CERTIFICATE in str(error):
+        record["identification"] = "frozen_time_limit"
+    return record
 
 
 def fit_status(outcome_status, error):
     """A failed fit step's recorded status: time_scale_not_identified when a gamfit
-    error names a frozen-time identification variant (NOT_IDENTIFIED_VARIANTS), its
-    own status otherwise."""
-    if (error and str(error.get("module", "")).split(".")[0] == "gamfit"
-            and error.get("variant") in NOT_IDENTIFIED_VARIANTS):
-        return TIME_SCALE_NOT_IDENTIFIED
+    error names a frozen-time identification variant (NOT_IDENTIFIED_VARIANTS) or
+    carries the frozen-time certificate's verdict, its own status otherwise."""
+    if error and str(error.get("module", "")).split(".")[0] == "gamfit":
+        variant = str(error.get("variant") or "").rsplit("::", 1)[-1]
+        if variant in NOT_IDENTIFIED_VARIANTS or error.get("identification") == "frozen_time_limit":
+            return TIME_SCALE_NOT_IDENTIFIED
     return outcome_status
 
 

@@ -501,6 +501,17 @@ def test_only_a_typed_frozen_time_refusal_is_the_time_scale_not_identified_outco
     for error in (other, untyped, worded, foreign, None):
         assert study.fit_status("error", error) == "error"
     assert study.fit_status("timeout", None) == "timeout"
+    # The refusal through gam's startup-seed screen: a gamfit error of another type whose
+    # message carries the frozen-time certificate's verdict is the outcome; the same words from
+    # outside gamfit are not, and a prefixed typed variant is.
+    screened = type("FitSeedError", (ValueError,), {"__module__": "gamfit._rust", "variant":
+                    "EstimationError::StartupSeedsRefused"})(
+        "no candidate seeds passed: the fitted objective 7.0957e2 is not below the frozen-time limit 7.0955e2")
+    assert study.typed_error(screened)["identification"] == "frozen_time_limit"
+    assert study.fit_status("error", study.typed_error(screened)) == study.TIME_SCALE_NOT_IDENTIFIED
+    assert study.fit_status("error", study.typed_error(ValueError("is not below the frozen-time limit"))) == "error"
+    prefixed = study.typed_error(gamfit_error("FitError", "SurvivalError::FrozenTimeLimit"))
+    assert study.fit_status("error", prefixed) == study.TIME_SCALE_NOT_IDENTIFIED
     # The outcome never fails a run, for ours as for any method; the other failures do.
     records = {"fits/htn/survival/ours/pooled/disease": {"status": study.TIME_SCALE_NOT_IDENTIFIED, "error": allowed},
                "fits/htn/survival/calpred/pooled/disease": {"status": study.TIME_SCALE_NOT_IDENTIFIED},
