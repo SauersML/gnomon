@@ -2,10 +2,10 @@
   "study": "aou-single-study-v1",
   "label": "production",
   "diseases_file": "study/diseases.json",
-  "frozen_config_sha256": "0d1cbdd929217a8257a4115a5e24086d3617d8a91a3ba3f70817ad4d4477dc38",
+  "frozen_config_sha256": "b0d4914d4f3ea0324e217a23b1af0d9a052e19525d02d6660f56f5911c22fb0f",
   "primary_censoring_rule": "ehr_end",
   "sensitivity_censoring_rules": ["min_death_cutoff"],
-  "variants": ["ours", "covariates", "standard", "z_pc", "calpred"],
+  "variants": ["ours", "covariates", "standard", "z_pc", "calpred", "no_pc"],
   "kinds": ["binary"],
   "data": {
     "source": "bigquery",
@@ -49,7 +49,7 @@
     "max_sites": 10,
     "sites": 5,
     "reuse_pooled": false,
-    "variants": ["ours", "covariates", "standard"]
+    "variants": ["ours", "covariates", "standard", "no_pc"]
   },
   "models": {
     "binary": {

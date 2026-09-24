@@ -46,7 +46,7 @@ from pathlib import Path
 
 import numpy as np
 
-VARIANTS = ("ours", "shipped", "covariates", "standard", "z_pc", "calpred")
+VARIANTS = ("ours", "shipped", "covariates", "standard", "z_pc", "calpred", "no_pc")
 
 AGE = "age_baseline"
 
@@ -148,6 +148,11 @@ def formulas(variant, s, sex=True):
     probit = {"family": "binomial", "link": "probit"}
     if variant == "covariates":
         return main, probit
+    if variant == "no_pc":
+        # The PC-free baseline: the score with age, sex and the observation windows, no
+        # ancestry information anywhere (user, 2026-09-24: what do PCs as predictors buy).
+        terms = [f"s({AGE})", *(["sex"] if sex else []), *(f"s({w})" for w in s["windows"]), "z"]
+        return "y ~ " + " + ".join(terms), probit
     if variant == "calpred":
         return f"{main} + z", {**probit, "noise_formula": " + ".join(pc_columns(s))}
     if variant == "standard":
@@ -178,6 +183,8 @@ def columns(variant, s, sex=True):
     sexes = ["sex"] if sex else []
     if variant == "shipped":
         return ["z", *sexes, *pc_columns(s)]
+    if variant == "no_pc":
+        return ["z", *sexes, AGE, *s["windows"]]
     return ([] if variant == "covariates" else ["z"]) + [*sexes, AGE, *s["windows"], *pc_columns(s)]
 
 
