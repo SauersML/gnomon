@@ -130,7 +130,9 @@ task analyze {
     docker: runtime_image
     cpu: cpu
     memory: "~{memory_gb} GiB"
-    cpuPlatform: "AMD Rome"
+    # c3d (AMD Genoa): half the Spot price per vCPU of n2d (Rome) in us-central1 and faster cores;
+    # the task's identity check only needs AMD + preemptible (aou_identity.py).
+    cpuPlatform: "AMD Genoa"
     zones: "us-central1-a us-central1-b us-central1-c us-central1-f"
     disks: "local-disk 100 SSD"
     preemptible: 3
