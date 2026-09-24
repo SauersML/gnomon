@@ -57,6 +57,12 @@ AGE = "age_baseline"
 # law, and the basis size of the age term in ours' slope (null: no age term).
 # Everything else is gam's own behaviour.
 REQUIRED = ("num_pcs", "q_centers", "slope_centers", "windows", "latent_law", "slope_age_k")
+DEFAULTS = {
+    # The log-smoothing levels gam's marginal-slope multistart searches from beside
+    # its derived start (gnomon#2359); null keeps gam's five. Each level is one
+    # certified outer search, so the set is most of a fit's cost.
+    "outer_start_levels": None,
+}
 
 # The anchor integrates the training rows' own z law, on the score's own axis.
 # Never "auto": it takes the Gaussian closed form after a fixed screen (SPEC
@@ -68,11 +74,14 @@ MARGINAL_SLOPE = ("ours", "shipped", "standard", "z_pc")
 
 def settings_of(settings):
     settings = settings or {}
-    unknown = set(settings) - set(REQUIRED)
+    unknown = set(settings) - set(REQUIRED) - set(DEFAULTS)
     missing = set(REQUIRED) - set(settings)
     if unknown or missing:
         raise ValueError(f"binary settings: unknown {sorted(unknown)}, missing {sorted(missing)}")
-    s = dict(settings)
+    s = {**DEFAULTS, **settings}
+    levels = s["outer_start_levels"]
+    if levels is not None and (not levels or any(not isinstance(v, (int, float)) or v != v for v in levels)):
+        raise ValueError("outer_start_levels is null or a non-empty list of log-smoothing levels")
     if s["latent_law"] != LATENT_LAW:
         raise ValueError(f"unsupported binary latent law {s['latent_law']!r}; the study anchors on {LATENT_LAW!r}")
     for key in ("q_centers", "slope_centers"):
@@ -134,7 +143,7 @@ def formulas(variant, s, sex=True):
         return (f"y ~ {'sex + ' if sex else ''}{duchon(s, context)} + linkwiggle()",
                 {"family": "bernoulli-marginal-slope", "z_column": "z",
                  "slope_formula": f"1 + {duchon(s, slope)} + linkwiggle()",
-                 "config": {"latent_measure": s["latent_law"]}})
+                 "config": marginal_slope_config(s)})
     main = f"y ~ {covariate_part(s, sex)}"
     probit = {"family": "binomial", "link": "probit"}
     if variant == "covariates":
@@ -152,7 +161,16 @@ def formulas(variant, s, sex=True):
     else:
         raise ValueError(f"unknown binary variant {variant!r}")
     return main, {"family": "bernoulli-marginal-slope", "z_column": "z", "slope_formula": slope,
-                  "config": {"latent_measure": s["latent_law"]}}
+                  "config": marginal_slope_config(s)}
+
+
+def marginal_slope_config(s):
+    """gam's fit config for a marginal-slope variant: the anchor's law, and the
+    multistart's levels where the study chose them."""
+    config = {"latent_measure": s["latent_law"]}
+    if s["outer_start_levels"] is not None:
+        config["outer_start_levels"] = [float(v) for v in s["outer_start_levels"]]
+    return config
 
 
 def columns(variant, s, sex=True):

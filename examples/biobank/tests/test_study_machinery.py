@@ -871,3 +871,21 @@ if __name__ == "__main__":
                     print(f"FAIL {name}: {type(error).__name__}: {error}")
     print(f"EXIT rc={failures}")
     sys.exit(1 if failures else 0)
+
+
+def test_binary_outer_start_levels_reach_gam_only_when_chosen():
+    """The multistart levels are a study setting with a reason (gnomon#2359): null keeps
+    gam's own set and sends nothing; a chosen list travels in every marginal-slope fit's
+    config as floats; the probit GAM competitors carry no config at all."""
+    from study.models import binary
+    base = {"num_pcs": 2, "q_centers": 5, "slope_centers": 5, "windows": ["admin_years"],
+            "latent_law": "global-empirical", "slope_age_k": None}
+    assert "outer_start_levels" not in binary.formulas("ours", binary.settings_of(base))[1]["config"]
+    chosen = binary.settings_of({**base, "outer_start_levels": [2, 4.0]})
+    for variant in ("ours", "standard", "z_pc", "shipped"):
+        config = binary.formulas(variant, chosen)[1]["config"]
+        assert config["outer_start_levels"] == [2.0, 4.0] and config["latent_measure"] == "global-empirical"
+    assert "config" not in binary.formulas("covariates", chosen)[1]
+    for bad in ([], [float("nan")], ["2"]):
+        with pytest.raises(ValueError, match="outer_start_levels"):
+            binary.settings_of({**base, "outer_start_levels": bad})
