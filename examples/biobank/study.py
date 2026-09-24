@@ -367,8 +367,15 @@ class Study:
         self.parquet = self.config["data"]["source"] == "parquet"
         # A validation run may scope itself to some kinds and diseases (lead, 09-19);
         # an AoU run is always the whole study.
-        if (args.kinds or args.diseases) and not self.parquet:
+        if args.shard and (not args.diseases or args.kinds):
+            raise ValueError("--shard names its diseases with --diseases and fits every study kind")
+        if (args.kinds or args.diseases) and not self.parquet and not args.shard:
             raise ValueError("--kinds and --diseases scope a simulator validation run; an AoU run is the whole study")
+        if args.shard:
+            # A shard of the whole study (one Batch job per disease): it shares the checkpoint
+            # with the other shards and with the whole-study run that gathers them, so it stops
+            # before the digest and never deletes the store.
+            args.stop_after, args.keep_checkpoint = "evaluate", True
         if not self.parquet:
             check_frozen(self.config)
         if args.claim:
@@ -387,6 +394,7 @@ class Study:
         self.kinds = tuple(kind for kind in models.KINDS if kind in configured and kind in (args.kinds or configured))
         if not self.kinds:
             raise ValueError(f"--kinds {args.kinds} names none of the study's kinds {configured}")
+        whole_study = [disease.slug for disease in self.diseases]
         if args.diseases:
             unknown = set(args.diseases) - {disease.slug for disease in self.diseases}
             if unknown:
@@ -418,12 +426,16 @@ class Study:
             "deployment": deployment_identity(self.config),
             "code": code_identity(),
             "engine": engine_identity(),
-            "scope": {"kinds": list(self.kinds), "diseases": [disease.slug for disease in self.diseases]},
+            # A shard signs as the whole study it belongs to, so every shard and the gathering
+            # run share one store; a validation run signs its own scope.
+            "scope": {"kinds": list(self.kinds),
+                      "diseases": whole_study if args.shard else [disease.slug for disease in self.diseases]},
             "inputs": {name: input_identity(path) for name, path in sorted(self.inputs.items())},
         }
         store = self.store(args.checkpoint, self.work / "store")
         self.checkpoint = Checkpoint(self.root, store, self.signature,
-                                     min_interval=self.config["compute"].get("checkpoint_interval_seconds", 20))
+                                     min_interval=self.config["compute"].get("checkpoint_interval_seconds", 20),
+                                     tag="-".join(sorted(args.diseases)) if args.shard else "")
         # Outer-test looks (SPEC section 8, S8): one marker per checkpoint that
         # reached evaluation, counted over every run of this config.
         self.looks = self.store(args.looks, self.work / "looks")
@@ -1712,6 +1724,9 @@ def main():
     run.add_argument("--diseases", nargs="+", metavar="SLUG",
                      help="a validation run's diseases (simulator only; recorded in the signature and run row)")
     run.add_argument("--stop-after", choices=STAGES)
+    run.add_argument("--shard", action="store_true",
+                     help="one shard of the whole study (its --diseases), sharing the checkpoint with the "
+                          "other shards and the whole-study run that gathers them; stops after evaluate")
     sub.add_parser("worker", help="serve pool jobs from stdin (internal)")
     frozen = sub.add_parser("hash", help="print the config hash to freeze as frozen_config_sha256")
     frozen.add_argument("--config", type=Path, default=HERE / "study.json")

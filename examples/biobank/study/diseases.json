@@ -1,510 +1,406 @@
 {
-  "locked": "2026-09-18",
-  "locked_by": "study-diseases",
-  "spec_section": "SPEC section 2 (amended 20:45Z): case = at least 2 distinct qualifying dates, event date = the second; single-record people kept",
-  "phenotype_rule": "Qualifying record = a condition_occurrence whose condition_concept_id descends from snomed_code in concept_ancestor (root included), unless it also descends from one of the disease's excluded_branches (branch included); such records are not qualifying records. Sex restriction is applied on sex at birth. An exclusion is met when a person has at least 2 distinct qualifying dates for the exclusion root. When it counts depends on the model (SPEC section 2, audit C3). Survival: it counts only if met with records dated on or before the landmark; if it is met later, follow-up is censored at the date it is met (the second distinct exclusion-root date), not removed. Binary: it counts if met by the CDR cutoff.",
-  "selection_rule": "Disease and score chosen from AoU Data Browser counts and published provenance only; no AUC or other result from any earlier AoU run was used (audit S8).",
-  "aou_audit_rule": "A score is ineligible if All of Us participants contributed to its discovery GWAS, to any component score, or to its tuning or weight fitting (PGS004787-style). AoU used only as a later evaluation sample is allowed. Checked in the PGS Catalog record (samples_variants, samples_training cohorts) and in the full text of the development paper.",
-  "cross_enrollment_caveat": "Several discovery or tuning sets include US health-system biobanks or programs whose institutions or members can also be AoU participants (for example BioVU at Vanderbilt, Mass General Brigham Biobank, the Million Veteran Program). Individual overlap with AoU test participants cannot be ruled out from public cohort names. This is not AoU involvement in development, and it is recorded per score.",
-  "expected_cases_method": {
-    "source": "AoU Public Data Browser API, https://public.api.researchallofus.org/v1/databrowser (searchConcepts, getCriteriaRolledCounts, concept-analysis-results), queried 2026-09-18",
-    "browser_cdr": "v0-6-rc5 Release version of 2025q4r5_combined, 747,040 participants, 436,280 with condition data",
-    "browser_count_meaning": "Participants with at least 1 record of the concept or a descendant (rolled count, rounded to 20), all participants with EHR, not restricted to v8 or to array data.",
-    "array_projection_factor": 0.5987,
-    "array_projection_basis": "447,278 v8 array participants / 747,040 browser participants; assumes the same prevalence in both. It is an upper bound for confirmed cases: the at-least-2-dates rule, the 365-day lookback, the consent baseline and the relatedness prune all reduce it. study-cohort measures the real counts.",
-    "array_count_source": "https://support.researchallofus.org/hc/en-us/articles/29475228181908-How-the-All-of-Us-Genomic-data-are-organized-CDRv8"
+ "locked": "2026-09-18",
+ "locked_by": "study-diseases",
+ "spec_section": "SPEC section 2 (amended 20:45Z): case = at least 2 distinct qualifying dates, event date = the second; single-record people kept",
+ "phenotype_rule": "Qualifying record = a condition_occurrence whose condition_concept_id descends from snomed_code in concept_ancestor (root included), unless it also descends from one of the disease's excluded_branches (branch included); such records are not qualifying records. Sex restriction is applied on sex at birth. An exclusion is met when a person has at least 2 distinct qualifying dates for the exclusion root. When it counts depends on the model (SPEC section 2, audit C3). Survival: it counts only if met with records dated on or before the landmark; if it is met later, follow-up is censored at the date it is met (the second distinct exclusion-root date), not removed. Binary: it counts if met by the CDR cutoff.",
+ "selection_rule": "Disease and score chosen from AoU Data Browser counts and published provenance only; no AUC or other result from any earlier AoU run was used (audit S8).",
+ "aou_audit_rule": "A score is ineligible if All of Us participants contributed to its discovery GWAS, to any component score, or to its tuning or weight fitting (PGS004787-style). AoU used only as a later evaluation sample is allowed. Checked in the PGS Catalog record (samples_variants, samples_training cohorts) and in the full text of the development paper.",
+ "cross_enrollment_caveat": "Several discovery or tuning sets include US health-system biobanks or programs whose institutions or members can also be AoU participants (for example BioVU at Vanderbilt, Mass General Brigham Biobank, the Million Veteran Program). Individual overlap with AoU test participants cannot be ruled out from public cohort names. This is not AoU involvement in development, and it is recorded per score.",
+ "expected_cases_method": {
+  "source": "AoU Public Data Browser API, https://public.api.researchallofus.org/v1/databrowser (searchConcepts, getCriteriaRolledCounts, concept-analysis-results), queried 2026-09-18",
+  "browser_cdr": "v0-6-rc5 Release version of 2025q4r5_combined, 747,040 participants, 436,280 with condition data",
+  "browser_count_meaning": "Participants with at least 1 record of the concept or a descendant (rolled count, rounded to 20), all participants with EHR, not restricted to v8 or to array data.",
+  "array_projection_factor": 0.5987,
+  "array_projection_basis": "447,278 v8 array participants / 747,040 browser participants; assumes the same prevalence in both. It is an upper bound for confirmed cases: the at-least-2-dates rule, the 365-day lookback, the consent baseline and the relatedness prune all reduce it. study-cohort measures the real counts.",
+  "array_count_source": "https://support.researchallofus.org/hc/en-us/articles/29475228181908-How-the-All-of-Us-Genomic-data-are-organized-CDRv8"
+ },
+ "diseases": [
+  {
+   "slug": "hypertension",
+   "snomed_code": "59621000",
+   "concept_name": "Essential hypertension",
+   "omop_concept_id": 320128,
+   "root_note": "SPEC candidate 38341003 (Hypertensive disorder, 211,140) also pulls in hypertension in the obstetric context (8,440), maternal hypertension (7,920) and secondary hypertension (9,740). Essential hypertension (ICD-10 I10) keeps 203,060 of 211,140 and matches the score's primary-hypertension trait.",
+   "sex": null,
+   "exclusions": [],
+   "pgs": "PGS004236",
+   "pgs_name": "HTN_Unweighted_PRSsum",
+   "pgs_trait": "Hypertension",
+   "variants_number": 398805,
+   "genome_build": "GRCh38",
+   "multi_ancestry": true,
+   "cached": true,
+   "audit": {
+    "aou_involvement": "none found",
+    "discovery": "Million Veteran Program SBP, DBP and hypertension GWAS (Giri 2019, GCST007270/GCST007271; European, African, Hispanic, Asian and Native American participants) plus Pan-UK Biobank multi-ancestry GWAS.",
+    "components": "Three trait-specific clump-and-threshold PRSs (SBP, DBP, hypertension), each built from the MVP and UKB summary statistics, combined by an unweighted sum of standardized scores (PRSsum).",
+    "tuning": "Clump-and-threshold parameters chosen by minimizing the coefficient of variation of effect estimates over five independent subsets of multi-ethnic TOPMed training data (Catalog training sample: BioMe, n = 10,314; AFR 27%, AMR 41%, EUR 24%). Incident outcomes were assessed in MGB Biobank.",
+    "aou_check": "Full text PMC9213527: 0 mentions of All of Us. Catalog development cohorts: MVP, UKB, BioMe.",
+    "cross_enrollment": "MVP and BioMe participants could also be AoU participants.",
+    "sources": [
+     "https://www.pgscatalog.org/score/PGS004236/",
+     "https://doi.org/10.1038/s41467-022-31080-2",
+     "https://europepmc.org/article/PMC/PMC9213527",
+     "https://www.ebi.ac.uk/gwas/studies/GCST007270",
+     "https://pan.ukbb.broadinstitute.org/"
+    ]
+   },
+   "expected_cases": {
+    "browser_any_record": 203060,
+    "browser_female": 112420,
+    "browser_male": 88240,
+    "array_projection_upper": 121572
+   }
   },
-  "diseases": [
+  {
+   "slug": "type_2_diabetes",
+   "snomed_code": "44054006",
+   "concept_name": "Type 2 diabetes mellitus",
+   "omop_concept_id": 201826,
+   "root_note": "Descendants are all type 2 diabetes (without complication 88,800; with ulcer; insulin-treated; in pregnancy). Gestational and secondary diabetes are not descendants.",
+   "sex": null,
+   "exclusions": [
     {
-      "slug": "hypertension",
-      "snomed_code": "59621000",
-      "concept_name": "Essential hypertension",
-      "omop_concept_id": 320128,
-      "root_note": "SPEC candidate 38341003 (Hypertensive disorder, 211,140) also pulls in hypertension in the obstetric context (8,440), maternal hypertension (7,920) and secondary hypertension (9,740). Essential hypertension (ICD-10 I10) keeps 203,060 of 211,140 and matches the score's primary-hypertension trait.",
-      "sex": null,
-      "exclusions": [],
-      "pgs": "PGS004236",
-      "pgs_name": "HTN_Unweighted_PRSsum",
-      "pgs_trait": "Hypertension",
-      "variants_number": 398805,
-      "genome_build": "GRCh38",
-      "multi_ancestry": true,
-      "cached": true,
-      "audit": {
-        "aou_involvement": "none found",
-        "discovery": "Million Veteran Program SBP, DBP and hypertension GWAS (Giri 2019, GCST007270/GCST007271; European, African, Hispanic, Asian and Native American participants) plus Pan-UK Biobank multi-ancestry GWAS.",
-        "components": "Three trait-specific clump-and-threshold PRSs (SBP, DBP, hypertension), each built from the MVP and UKB summary statistics, combined by an unweighted sum of standardized scores (PRSsum).",
-        "tuning": "Clump-and-threshold parameters chosen by minimizing the coefficient of variation of effect estimates over five independent subsets of multi-ethnic TOPMed training data (Catalog training sample: BioMe, n = 10,314; AFR 27%, AMR 41%, EUR 24%). Incident outcomes were assessed in MGB Biobank.",
-        "aou_check": "Full text PMC9213527: 0 mentions of All of Us. Catalog development cohorts: MVP, UKB, BioMe.",
-        "cross_enrollment": "MVP and BioMe participants could also be AoU participants.",
-        "sources": [
-          "https://www.pgscatalog.org/score/PGS004236/",
-          "https://doi.org/10.1038/s41467-022-31080-2",
-          "https://europepmc.org/article/PMC/PMC9213527",
-          "https://www.ebi.ac.uk/gwas/studies/GCST007270",
-          "https://pan.ukbb.broadinstitute.org/"
-        ]
-      },
-      "expected_cases": {
-        "browser_any_record": 203060,
-        "browser_female": 112420,
-        "browser_male": 88240,
-        "array_projection_upper": 121572
-      }
-    },
-    {
-      "slug": "type_2_diabetes",
-      "snomed_code": "44054006",
-      "concept_name": "Type 2 diabetes mellitus",
-      "omop_concept_id": 201826,
-      "root_note": "Descendants are all type 2 diabetes (without complication 88,800; with ulcer; insulin-treated; in pregnancy). Gestational and secondary diabetes are not descendants.",
-      "sex": null,
-      "exclusions": [
-        {
-          "snomed_code": "46635009",
-          "concept_name": "Type 1 diabetes mellitus",
-          "omop_concept_id": 201254,
-          "browser_any_record": 10160,
-          "reason": "Type 1 patients are often coded as type 2 in the EHR, so they would be false cases. The score targets type 2 diabetes, and type 1 is a different disease with different genetics (HLA).",
-          "bias_note": "The exclusion also removes insulin-treated type 2 patients whose charts carry type 1 (E10-type) codes on 2 or more dates. Those are long-duration, likely earlier-onset and higher-PGS type 2 cases, so in the binary model the rule depletes them. That biases the PGS association toward the null and undercounts cases. The prespecified rule stands. Written sensitivity analysis: exclude only people with more distinct type 1 dates than type 2 dates."
-        }
-      ],
-      "pgs": "PGS002308",
-      "pgs_name": "PRScsx_T2D",
-      "pgs_trait": "Type 2 diabetes",
-      "variants_number": 1259754,
-      "genome_build": "GRCh37",
-      "multi_ancestry": true,
-      "cached": true,
-      "audit": {
-        "aou_involvement": "none found",
-        "discovery": "European DIAGRAM (Mahajan 2018, GCST009379, n = 898,130), East Asian Biobank Japan (Sakaue 2021, GCST90018706, n = 177,415) and African American MEDIA (Ng 2014, GCST002560, n = 23,827).",
-        "components": "none (one PRS-CSx meta score)",
-        "tuning": "none: PRS-CSx --auto --meta, so no validation-sample parameter search. Evaluated afterwards in multi-ethnic eMERGE I-III, four Black cohorts and Taiwan Biobank.",
-        "aou_check": "Full text PMC9241245: 0 mentions of All of Us. The Catalog lists no AoU development samples.",
-        "cross_enrollment": "none in development (eMERGE sites were evaluation only)",
-        "sources": [
-          "https://www.pgscatalog.org/score/PGS002308/",
-          "https://doi.org/10.1186/s13073-022-01074-2",
-          "https://europepmc.org/article/PMC/PMC9241245",
-          "https://www.ebi.ac.uk/gwas/studies/GCST009379",
-          "https://www.ebi.ac.uk/gwas/studies/GCST90018706",
-          "https://www.ebi.ac.uk/gwas/studies/GCST002560"
-        ]
-      },
-      "expected_cases": {
-        "browser_any_record": 94080,
-        "browser_female": 52380,
-        "browser_male": 40600,
-        "array_projection_upper": 56326
-      }
-    },
-    {
-      "slug": "atrial_fibrillation",
-      "snomed_code": "49436004",
-      "concept_name": "Atrial fibrillation",
-      "omop_concept_id": 313217,
-      "root_note": "Descendants are paroxysmal, chronic, persistent, permanent and rapid-response AF. Atrial flutter is a separate concept and is not included.",
-      "sex": null,
-      "exclusions": [],
-      "pgs": "PGS005168",
-      "pgs_name": "PRSAF",
-      "pgs_trait": "Atrial fibrillation",
-      "variants_number": 1113668,
-      "genome_build": "GRCh38",
-      "multi_ancestry": true,
-      "cached": true,
-      "audit": {
-        "aou_involvement": "none in development. AoU appears in the Catalog only in evaluation: 5 of 55 performance records (PPM030616, PPM030619, PPM030622, PPM030625, PPM030628) from a later external evaluation, Haydarlou 2026 (PGP000788, doi 10.1038/s41467-026-72708-x)",
-        "discovery": "Roselli 2025 multi-ancestry AF GWAS meta-analysis of more than 180,000 cases (European 700,518, East Asian 148,865, African American 11,138, Hispanic 9,439, South Asian 631), with HUNT and UK Biobank left out so they could be test sets.",
-        "components": "none",
-        "tuning": "none: PRS-CS with the 1000 Genomes European LD reference and one weight set, tested in HUNT (2,474 incident cases) and UK Biobank (10,416 incident cases).",
-        "aou_check": "Full text PMC12094172: 0 mentions of All of Us. Catalog samples_variants cohorts: no AllofUs. The Catalog's 5 AoU performance rows all come from the later Haydarlou 2026 evaluation paper, not the Roselli development paper (PGP000712).",
-        "cross_enrollment": "BioMe and Vanderbilt are among the discovery cohorts.",
-        "sources": [
-          "https://www.pgscatalog.org/score/PGS005168/",
-          "https://doi.org/10.1038/s41588-024-02072-3",
-          "https://pmc.ncbi.nlm.nih.gov/articles/PMC12094172/"
-        ]
-      },
-      "expected_cases": {
-        "browser_any_record": 34920,
-        "browser_female": 15080,
-        "browser_male": 19360,
-        "array_projection_upper": 20907
-      }
-    },
-    {
-      "slug": "coronary_artery_disease",
-      "snomed_code": "53741008",
-      "concept_name": "Coronary arteriosclerosis",
-      "omop_concept_id": 317576,
-      "root_note": "Descendants are coronary atherosclerosis (58,560), angina due to coronary arteriosclerosis, bypass-graft and post-angioplasty atherosclerosis, and multi-vessel disease, all CAD. It is not the broader 'heart disease' root. Ischemic heart disease (414545008) has fewer participants in the browser tree (46,880) and does not contain this root there.",
-      "sex": null,
-      "exclusions": [],
-      "pgs": "PGS003725",
-      "pgs_name": "GPS_Mult",
-      "pgs_trait": "Coronary artery disease",
-      "variants_number": 1296172,
-      "genome_build": "GRCh37",
-      "multi_ancestry": true,
-      "cached": false,
-      "audit": {
-        "aou_involvement": "none found",
-        "discovery": "Multi-ancestry GWAS of CAD and 10 risk factors, n = 1,443,386 (African, East Asian, European, Hispanic, South Asian). Catalog cohorts: CARDIoGRAMplusC4D, MVP, BBJ, FinnGen, Genes & Health, GBMI, GLGC, GIANT, DIAMANTE, AGEN-T2D, MEGASTROKE.",
-        "components": "Ancestry- and trait-specific LDpred2 scores for CAD and its risk factors, integrated into one score.",
-        "tuning": "LDpred2 parameters and the integration weights were fitted in UK Biobank European training data (n = 116,649). Tested in UK Biobank, MVP, MCPS, Genes & Health and REPRIEVE.",
-        "aou_check": "Full text PMC10353935: 2 mentions of All of Us, both in the Discussion (future diverse recruitment) and the consortium reference, none in the methods. No AoU cohort in the Catalog development samples.",
-        "cross_enrollment": "MVP (discovery) participants could also be AoU participants.",
-        "sources": [
-          "https://www.pgscatalog.org/score/PGS003725/",
-          "https://doi.org/10.1038/s41591-023-02429-x",
-          "https://europepmc.org/article/PMC/PMC10353935"
-        ]
-      },
-      "expected_cases": {
-        "browser_any_record": 62020,
-        "browser_female": 26580,
-        "browser_male": 34640,
-        "array_projection_upper": 37131
-      }
-    },
-    {
-      "slug": "breast_cancer",
-      "snomed_code": "254837009",
-      "concept_name": "Malignant tumor of breast",
-      "omop_concept_id": 4112853,
-      "root_note": "Descendants are invasive breast malignancy by site, and female and primary malignant neoplasm of breast. None of the 19 browser-tree children is carcinoma in situ.",
-      "sex": "female",
-      "sex_reason": "Female-specific cancer (SPEC section 2). The score was developed in women.",
-      "exclusions": [],
-      "pgs": "PGS000004",
-      "pgs_name": "PRS313_BC",
-      "pgs_trait": "Breast cancer",
-      "variants_number": 313,
-      "genome_build": "GRCh37",
-      "multi_ancestry": false,
-      "multi_ancestry_note": "The Catalog has no genome-wide multi-ancestry breast-cancer score for all women whose development is not limited to one ancestry. The alternatives are African-ancestry-specific (PGS004893, PGS005396 from a medRxiv preprint) or small known-SNP scores. PRS313 is the reference score and has been validated in several ancestries.",
-      "cached": true,
-      "audit": {
-        "aou_involvement": "none found",
-        "discovery": "Breast Cancer Association Consortium (BCAC) European GWAS, about 158,648 women across BCAC studies.",
-        "components": "none",
-        "tuning": "Variants selected by hard-thresholding stepwise forward regression (p < 1e-5) in a BCAC European validation set (n = 10,444). Tested in prospective BCAC studies and UK Biobank.",
-        "aou_check": "Full text PMC6323553: 0 mentions of All of Us. Catalog development cohorts: BCAC studies only.",
-        "cross_enrollment": "BCAC includes US cohorts (for example CPS-II, MEC, WHI) whose members could also be AoU participants.",
-        "sources": [
-          "https://www.pgscatalog.org/score/PGS000004/",
-          "https://doi.org/10.1016/j.ajhg.2018.11.002",
-          "https://europepmc.org/article/PMC/PMC6323553"
-        ]
-      },
-      "expected_cases": {
-        "browser_any_record": 15820,
-        "browser_female": 15420,
-        "browser_male": 260,
-        "array_projection_upper": 9232
-      }
-    },
-    {
-      "slug": "prostate_cancer",
-      "snomed_code": "399068003",
-      "concept_name": "Malignant tumor of prostate",
-      "omop_concept_id": 4163261,
-      "root_note": "Descendants are primary malignant neoplasm of prostate (11,620), adenocarcinoma and carcinoma of prostate, and hormone-refractory or hormone-sensitive disease.",
-      "sex": "male",
-      "sex_reason": "Male-specific cancer (SPEC section 2).",
-      "exclusions": [],
-      "pgs": "PGS003766",
-      "pgs_name": "GRS.PCa.451.TOPMed",
-      "pgs_trait": "Prostate cancer",
-      "variants_number": 451,
-      "genome_build": "GRCh38",
-      "multi_ancestry": true,
-      "cached": true,
-      "audit": {
-        "aou_involvement": "none found",
-        "discovery": "Wang 2023 multi-ancestry prostate-cancer GWAS meta-analysis (GCST90274713, n = 944,762; European, African, East Asian, Hispanic): the earlier multi-ancestry meta-analysis (107,247 cases; PRACTICAL/ELLIPSE and others) plus UK Biobank, FinnGen, eMERGE, BioVU, BioMe, PLCO, MD Anderson, CA UG, MVP and NCI-MD.",
-        "components": "none",
-        "tuning": "none: 451 independent fine-mapped variants weighted by their multi-ancestry meta-analysis effects. This entry is the GRCh38 build with TOPMed proxies where an exact variant was missing.",
-        "aou_check": "Full text PMC10841479: 0 mentions of All of Us. The Catalog lists no AoU development samples.",
-        "cross_enrollment": "MVP, eMERGE, BioVU and BioMe participants could also be AoU participants.",
-        "sources": [
-          "https://www.pgscatalog.org/score/PGS003766/",
-          "https://doi.org/10.1038/s41588-023-01534-4",
-          "https://pmc.ncbi.nlm.nih.gov/articles/PMC10841479/",
-          "https://www.ebi.ac.uk/gwas/studies/GCST90274713"
-        ]
-      },
-      "expected_cases": {
-        "browser_any_record": 11960,
-        "browser_female": 140,
-        "browser_male": 11680,
-        "array_projection_upper": 6993
-      }
-    },
-    {
-      "slug": "asthma",
-      "snomed_code": "195967001",
-      "concept_name": "Asthma",
-      "omop_concept_id": 317009,
-      "root_note": "Descendants are asthma subtypes by severity or type (uncomplicated, mild, intermittent, acute, moderate, allergic, severe, intrinsic).",
-      "sex": null,
-      "exclusions": [],
-      "pgs": "PGS001782",
-      "pgs_name": "1kgeur_gbmi_Asthma_pst_eff_a1_b0.5_phiauto",
-      "pgs_trait": "Asthma",
-      "variants_number": 884043,
-      "genome_build": "GRCh37",
-      "multi_ancestry": true,
-      "cached": false,
-      "audit": {
-        "aou_involvement": "none found",
-        "discovery": "Global Biobank Meta-analysis Initiative (GBMI) multi-ancestry asthma meta-analysis over all GBMI biobanks. Catalog cohorts include UKB, FinnGen, BBJ, CKB, TWB, HUNT, MGB, MGI, BioVU, BioMe, CCPM, UCLA, Estonian Biobank and GS:SFHS. GBMI has no AoU member.",
-        "components": "none",
-        "tuning": "none: PRS-CS-auto (phi auto, 1000 Genomes European LD reference).",
-        "aou_check": "Full text PMC9903818 (Wang 2023): 0 mentions of All of Us. Catalog cohorts: no AllofUs.",
-        "cross_enrollment": "BioVU, MGB, BioMe, MGI, UCLA and CCPM are US health-system biobanks.",
-        "sources": [
-          "https://www.pgscatalog.org/score/PGS001782/",
-          "https://doi.org/10.1016/j.xgen.2022.100241",
-          "https://europepmc.org/article/PMC/PMC9903818"
-        ]
-      },
-      "expected_cases": {
-        "browser_any_record": 84840,
-        "browser_female": 60700,
-        "browser_male": 23280,
-        "array_projection_upper": 50794
-      }
-    },
-    {
-      "slug": "copd",
-      "snomed_code": "13645005",
-      "concept_name": "Chronic obstructive pulmonary disease",
-      "omop_concept_id": 255573,
-      "root_note": "Descendants are emphysema (14,940), acute exacerbation of COPD, COPD by severity, and asthma-COPD overlap (400).",
-      "sex": null,
-      "exclusions": [],
-      "pgs": "PGS001783",
-      "pgs_name": "1kgeur_gbmi_COPD_pst_eff_a1_b0.5_phiauto",
-      "pgs_trait": "Chronic obstructive pulmonary disease",
-      "variants_number": 884139,
-      "genome_build": "GRCh37",
-      "multi_ancestry": true,
-      "cached": true,
-      "audit": {
-        "aou_involvement": "none found",
-        "discovery": "GBMI multi-ancestry COPD meta-analysis over all GBMI biobanks (Catalog cohorts include UKB, FinnGen, BBJ, CKB, TWB, HUNT, MGB, MGI, BioVU, BioMe, CCPM, UCLA, Lifelines, QSKIN, deCODE, Genes & Health). GBMI has no AoU member.",
-        "components": "none",
-        "tuning": "none: PRS-CS-auto (phi auto, 1000 Genomes European LD reference).",
-        "aou_check": "Full text PMC9903818: 0 mentions of All of Us. Catalog cohorts: no AllofUs.",
-        "cross_enrollment": "US health-system biobanks, as for asthma.",
-        "sources": [
-          "https://www.pgscatalog.org/score/PGS001783/",
-          "https://doi.org/10.1016/j.xgen.2022.100241",
-          "https://europepmc.org/article/PMC/PMC9903818"
-        ]
-      },
-      "expected_cases": {
-        "browser_any_record": 40820,
-        "browser_female": 22000,
-        "browser_male": 18120,
-        "array_projection_upper": 24439
-      }
-    },
-    {
-      "slug": "major_depressive_disorder",
-      "snomed_code": "370143000",
-      "concept_name": "Major depressive disorder",
-      "omop_concept_id": 4152280,
-      "root_note": "Descendants are single-episode, recurrent, and mild, moderate, severe, psychotic and in-remission major depression. The broader 'Depressive disorder' (35489007) is not used.",
-      "sex": null,
-      "exclusions": [
-        {
-          "snomed_code": "13746004",
-          "concept_name": "Bipolar disorder",
-          "omop_concept_id": 436665,
-          "browser_any_record": 25860,
-          "reason": "Depressive episodes of bipolar disorder are often coded as major depression, and MDD GWAS case definitions (PGC) exclude bipolar disorder. Keeping them would put bipolar depression among the MDD cases."
-        }
-      ],
-      "pgs": "PGS004885",
-      "pgs_name": "INTERVENE_MegaPRS_MDD",
-      "pgs_trait": "Major depressive disorder",
-      "variants_number": 801544,
-      "genome_build": "GRCh37",
-      "multi_ancestry": false,
-      "multi_ancestry_note": "Every genome-wide MDD score in the Catalog (MONDO_0002009) was developed in Europeans, except PGS004759/PGS004760 (PRSmix), which were trained in AoU and are excluded.",
-      "cached": true,
-      "audit": {
-        "aou_involvement": "none found",
-        "discovery": "Wray 2018 PGC major depression GWAS (GCST005839, n = 480,359, European).",
-        "components": "none",
-        "tuning": "none at the individual level: MegaPRS auto (lasso-shrink) with the 1000 Genomes European reference (n = 404).",
-        "aou_check": "Full text PMC11169548 (Jermy 2024): 0 mentions of All of Us. GWAS published 2018.",
-        "cross_enrollment": "none identified",
-        "sources": [
-          "https://www.pgscatalog.org/score/PGS004885/",
-          "https://doi.org/10.1038/s41467-024-48938-2",
-          "https://europepmc.org/article/PMC/PMC11169548",
-          "https://www.ebi.ac.uk/gwas/studies/GCST005839"
-        ]
-      },
-      "expected_cases": {
-        "browser_any_record": 111380,
-        "browser_female": 75060,
-        "browser_male": 35100,
-        "array_projection_upper": 66683
-      }
-    },
-    {
-      "slug": "chronic_kidney_disease",
-      "snomed_code": "709044004",
-      "concept_name": "Chronic kidney disease",
-      "omop_concept_id": 46271022,
-      "root_note": "Descendants are CKD stages 1-5, CKD due to hypertension or diabetes, and chronic renal failure. Acute kidney injury is not a descendant. The stage 1 and stage 2 branches are excluded_branches: records under them are not qualifying records, because the score's case definition is stage 3 or worse.",
-      "sex": null,
-      "exclusions": [],
-      "excluded_branches": [
-        {
-          "snomed_code": "431855005",
-          "concept_name": "Chronic kidney disease stage 1",
-          "omop_concept_id": 443614,
-          "browser_any_record": 3020,
-          "reason": "PGS002237 is a stage ≥3 case score"
-        },
-        {
-          "snomed_code": "431856006",
-          "concept_name": "Chronic kidney disease stage 2",
-          "omop_concept_id": 443601,
-          "browser_any_record": 12300,
-          "reason": "PGS002237 is a stage ≥3 case score"
-        }
-      ],
-      "pgs": "PGS002237",
-      "pgs_name": "GPS_CKD",
-      "pgs_trait": "Chronic kidney disease (stage 3 or greater)",
-      "variants_number": 471316,
-      "genome_build": "GRCh37",
-      "multi_ancestry": true,
-      "multi_ancestry_note": "Discovery is the trans-ethnic eGFR GWAS and validation covered 15 cohorts of diverse ancestry, but tuning used European UK Biobank. The published GPS adds APOL1 recessive risk genotypes, and the Catalog scoring file contains only the genome-wide polygenic part (no APOL1 term). We score exactly the Catalog file.",
-      "interpretation_note": "APOL1 G1/G2 is not in this score. It lowers African-ancestry discrimination; its effect on the z slope is ≤ ~2% for coded CKD, and its mean effect is absorbed by the PC surface, so slope and calibration heterogeneity remain interpretable.",
-      "sensitivity_analyses": [
-        "Optional, AoU only: add an APOL1 high-risk indicator (two G1/G2 risk alleles) to the marginal index q, if G1 and G2 are typed in the AoU genotype data."
-      ],
-      "cached": true,
-      "audit": {
-        "aou_involvement": "none found",
-        "discovery": "Wuttke 2019 CKDGen plus UK Biobank trans-ethnic serum-creatinine eGFR GWAS (about 1 million individuals).",
-        "components": "The polygenic eGFR score only. The paper's APOL1 genotype term is not part of the Catalog file.",
-        "tuning": "19 candidate P+T scores (1000 Genomes all-population LD reference). The best was chosen in an optimization set of 70% of European UK Biobank participants (Catalog: n = 279,819; R2 = 0.2, P = 0.03).",
-        "aou_check": "Full text PMC9329233: 0 mentions of All of Us. The Catalog lists UKB as the only development cohort.",
-        "cross_enrollment": "unverified for the CKDGen trans-ethnic eGFR discovery cohorts",
-        "sources": [
-          "https://www.pgscatalog.org/score/PGS002237/",
-          "https://doi.org/10.1038/s41591-022-01869-1",
-          "https://pmc.ncbi.nlm.nih.gov/articles/PMC9329233/"
-        ]
-      },
-      "expected_cases": {
-        "browser_any_record": 50740,
-        "browser_female": 25080,
-        "browser_male": 25000,
-        "array_projection_upper": 30378,
-        "excluded_branches_note": "These counts include people whose only CKD records are stage 1 or 2 (3,020 and 12,300 participants have at least 1 such record). The count with the stage 1-2 branches excluded is between 35,420 and 50,740 in the browser, so the array projection overstates CKD cases."
-      }
-    },
-    {
-      "slug": "gout",
-      "snomed_code": "90560007",
-      "concept_name": "Gout",
-      "omop_concept_id": 440674,
-      "root_note": "Descendants are primary gout, chronic gout, articular gout and tophi, plus secondary gout (1,560), which is a small subset.",
-      "sex": null,
-      "exclusions": [],
-      "pgs": "PGS001789",
-      "pgs_name": "1kgeur_gbmi_leaveUKBBout_Gout_pst_eff_a1_b0.5_phiauto",
-      "pgs_trait": "Gout",
-      "variants_number": 910151,
-      "genome_build": "GRCh37",
-      "multi_ancestry": true,
-      "multi_ancestry_note": "The Catalog carries the GBMI gout score only in its leave-UK-Biobank-out form. It is AoU-free either way.",
-      "cached": false,
-      "audit": {
-        "aou_involvement": "none found",
-        "discovery": "GBMI multi-ancestry gout meta-analysis without UK Biobank. GBMI has no AoU member.",
-        "components": "none",
-        "tuning": "none: PRS-CS-auto (phi auto, 1000 Genomes European LD reference).",
-        "aou_check": "Full text PMC9903818: 0 mentions of All of Us. Catalog cohorts: no AllofUs. The only AoU-trained gout scores (PGS004767/PGS004768, PRSmix) are excluded.",
-        "cross_enrollment": "US health-system biobanks, as for asthma.",
-        "sources": [
-          "https://www.pgscatalog.org/score/PGS001789/",
-          "https://doi.org/10.1016/j.xgen.2022.100241",
-          "https://europepmc.org/article/PMC/PMC9903818"
-        ]
-      },
-      "expected_cases": {
-        "browser_any_record": 18320,
-        "browser_female": 6060,
-        "browser_male": 12060,
-        "array_projection_upper": 10968
-      }
-    },
-    {
-      "slug": "primary_open_angle_glaucoma",
-      "snomed_code": "77075001",
-      "concept_name": "Primary open angle glaucoma",
-      "omop_concept_id": 435262,
-      "root_note": "SPEC candidate 23986001 (Glaucoma, 22,680) also pulls in chronic angle-closure (4,280), angle-closure (1,020) and secondary glaucoma (1,740). These have different causes from the score's POAG trait. The POAG root matches the trait.",
-      "sex": null,
-      "exclusions": [],
-      "pgs": "PGS001797",
-      "pgs_name": "1kgeur_gbmi_POAG_pst_eff_a1_b0.5_phiauto",
-      "pgs_trait": "Primary open-angle glaucoma",
-      "variants_number": 885417,
-      "genome_build": "GRCh37",
-      "multi_ancestry": true,
-      "cached": false,
-      "audit": {
-        "aou_involvement": "none found",
-        "discovery": "GBMI multi-ancestry POAG meta-analysis over all GBMI biobanks. GBMI has no AoU member.",
-        "components": "none",
-        "tuning": "none: PRS-CS-auto (phi auto, 1000 Genomes European LD reference).",
-        "aou_check": "Full text PMC9903818: 0 mentions of All of Us. Catalog cohorts: no AllofUs. The AoU-trained glaucoma scores (PGS004765/PGS004766, PRSmix) are excluded.",
-        "cross_enrollment": "GBMI discovery cohorts whose participants can also be AoU participants: MGB, BioVU, BioMe, UCLA, CCPM and MGI.",
-        "sources": [
-          "https://www.pgscatalog.org/score/PGS001797/",
-          "https://doi.org/10.1016/j.xgen.2022.100241",
-          "https://europepmc.org/article/PMC/PMC9903818"
-        ]
-      },
-      "expected_cases": {
-        "browser_any_record": 8040,
-        "browser_female": 3700,
-        "browser_male": 4200,
-        "array_projection_upper": 4814
-      }
+     "snomed_code": "46635009",
+     "concept_name": "Type 1 diabetes mellitus",
+     "omop_concept_id": 201254,
+     "browser_any_record": 10160,
+     "reason": "Type 1 patients are often coded as type 2 in the EHR, so they would be false cases. The score targets type 2 diabetes, and type 1 is a different disease with different genetics (HLA).",
+     "bias_note": "The exclusion also removes insulin-treated type 2 patients whose charts carry type 1 (E10-type) codes on 2 or more dates. Those are long-duration, likely earlier-onset and higher-PGS type 2 cases, so in the binary model the rule depletes them. That biases the PGS association toward the null and undercounts cases. The prespecified rule stands. Written sensitivity analysis: exclude only people with more distinct type 1 dates than type 2 dates."
     }
-  ],
-  "rejected": [
+   ],
+   "pgs": "PGS002308",
+   "pgs_name": "PRScsx_T2D",
+   "pgs_trait": "Type 2 diabetes",
+   "variants_number": 1259754,
+   "genome_build": "GRCh37",
+   "multi_ancestry": true,
+   "cached": true,
+   "audit": {
+    "aou_involvement": "none found",
+    "discovery": "European DIAGRAM (Mahajan 2018, GCST009379, n = 898,130), East Asian Biobank Japan (Sakaue 2021, GCST90018706, n = 177,415) and African American MEDIA (Ng 2014, GCST002560, n = 23,827).",
+    "components": "none (one PRS-CSx meta score)",
+    "tuning": "none: PRS-CSx --auto --meta, so no validation-sample parameter search. Evaluated afterwards in multi-ethnic eMERGE I-III, four Black cohorts and Taiwan Biobank.",
+    "aou_check": "Full text PMC9241245: 0 mentions of All of Us. The Catalog lists no AoU development samples.",
+    "cross_enrollment": "none in development (eMERGE sites were evaluation only)",
+    "sources": [
+     "https://www.pgscatalog.org/score/PGS002308/",
+     "https://doi.org/10.1186/s13073-022-01074-2",
+     "https://europepmc.org/article/PMC/PMC9241245",
+     "https://www.ebi.ac.uk/gwas/studies/GCST009379",
+     "https://www.ebi.ac.uk/gwas/studies/GCST90018706",
+     "https://www.ebi.ac.uk/gwas/studies/GCST002560"
+    ]
+   },
+   "expected_cases": {
+    "browser_any_record": 94080,
+    "browser_female": 52380,
+    "browser_male": 40600,
+    "array_projection_upper": 56326
+   }
+  },
+  {
+   "slug": "atrial_fibrillation",
+   "snomed_code": "49436004",
+   "concept_name": "Atrial fibrillation",
+   "omop_concept_id": 313217,
+   "root_note": "Descendants are paroxysmal, chronic, persistent, permanent and rapid-response AF. Atrial flutter is a separate concept and is not included.",
+   "sex": null,
+   "exclusions": [],
+   "pgs": "PGS005168",
+   "pgs_name": "PRSAF",
+   "pgs_trait": "Atrial fibrillation",
+   "variants_number": 1113668,
+   "genome_build": "GRCh38",
+   "multi_ancestry": true,
+   "cached": true,
+   "audit": {
+    "aou_involvement": "none in development. AoU appears in the Catalog only in evaluation: 5 of 55 performance records (PPM030616, PPM030619, PPM030622, PPM030625, PPM030628) from a later external evaluation, Haydarlou 2026 (PGP000788, doi 10.1038/s41467-026-72708-x)",
+    "discovery": "Roselli 2025 multi-ancestry AF GWAS meta-analysis of more than 180,000 cases (European 700,518, East Asian 148,865, African American 11,138, Hispanic 9,439, South Asian 631), with HUNT and UK Biobank left out so they could be test sets.",
+    "components": "none",
+    "tuning": "none: PRS-CS with the 1000 Genomes European LD reference and one weight set, tested in HUNT (2,474 incident cases) and UK Biobank (10,416 incident cases).",
+    "aou_check": "Full text PMC12094172: 0 mentions of All of Us. Catalog samples_variants cohorts: no AllofUs. The Catalog's 5 AoU performance rows all come from the later Haydarlou 2026 evaluation paper, not the Roselli development paper (PGP000712).",
+    "cross_enrollment": "BioMe and Vanderbilt are among the discovery cohorts.",
+    "sources": [
+     "https://www.pgscatalog.org/score/PGS005168/",
+     "https://doi.org/10.1038/s41588-024-02072-3",
+     "https://pmc.ncbi.nlm.nih.gov/articles/PMC12094172/"
+    ]
+   },
+   "expected_cases": {
+    "browser_any_record": 34920,
+    "browser_female": 15080,
+    "browser_male": 19360,
+    "array_projection_upper": 20907
+   }
+  },
+  {
+   "slug": "coronary_artery_disease",
+   "snomed_code": "53741008",
+   "concept_name": "Coronary arteriosclerosis",
+   "omop_concept_id": 317576,
+   "root_note": "Descendants are coronary atherosclerosis (58,560), angina due to coronary arteriosclerosis, bypass-graft and post-angioplasty atherosclerosis, and multi-vessel disease, all CAD. It is not the broader 'heart disease' root. Ischemic heart disease (414545008) has fewer participants in the browser tree (46,880) and does not contain this root there.",
+   "sex": null,
+   "exclusions": [],
+   "pgs": "PGS000013",
+   "pgs_name": "metaGRS_CAD",
+   "pgs_trait": "Coronary artery disease",
+   "variants_number": 6630150,
+   "genome_build": "GRCh37",
+   "multi_ancestry": true,
+   "cached": true,
+   "audit": {
+    "aou_involvement": "none found",
+    "discovery": "Multi-ancestry GWAS of CAD and 10 risk factors, n = 1,443,386 (African, East Asian, European, Hispanic, South Asian). Catalog cohorts: CARDIoGRAMplusC4D, MVP, BBJ, FinnGen, Genes & Health, GBMI, GLGC, GIANT, DIAMANTE, AGEN-T2D, MEGASTROKE.",
+    "components": "Ancestry- and trait-specific LDpred2 scores for CAD and its risk factors, integrated into one score.",
+    "tuning": "LDpred2 parameters and the integration weights were fitted in UK Biobank European training data (n = 116,649). Tested in UK Biobank, MVP, MCPS, Genes & Health and REPRIEVE.",
+    "aou_check": "Full text PMC10353935: 2 mentions of All of Us, both in the Discussion (future diverse recruitment) and the consortium reference, none in the methods. No AoU cohort in the Catalog development samples.",
+    "cross_enrollment": "MVP (discovery) participants could also be AoU participants.",
+    "sources": [
+     "https://www.pgscatalog.org/score/PGS003725/",
+     "https://doi.org/10.1038/s41591-023-02429-x",
+     "https://europepmc.org/article/PMC/PMC10353935"
+    ],
+    "score_switch_2026_09_24": "PGS003725 (GPS_Mult) has no cached score in the workspace; PGS000013 (Inouye 2018 metaGRS) is the cached CAD score the WGS score bank holds. The study scores nothing in the task."
+   },
+   "expected_cases": {
+    "browser_any_record": 62020,
+    "browser_female": 26580,
+    "browser_male": 34640,
+    "array_projection_upper": 37131
+   }
+  },
+  {
+   "slug": "breast_cancer",
+   "snomed_code": "254837009",
+   "concept_name": "Malignant tumor of breast",
+   "omop_concept_id": 4112853,
+   "root_note": "Descendants are invasive breast malignancy by site, and female and primary malignant neoplasm of breast. None of the 19 browser-tree children is carcinoma in situ.",
+   "sex": "female",
+   "sex_reason": "Female-specific cancer (SPEC section 2). The score was developed in women.",
+   "exclusions": [],
+   "pgs": "PGS000004",
+   "pgs_name": "PRS313_BC",
+   "pgs_trait": "Breast cancer",
+   "variants_number": 313,
+   "genome_build": "GRCh37",
+   "multi_ancestry": false,
+   "multi_ancestry_note": "The Catalog has no genome-wide multi-ancestry breast-cancer score for all women whose development is not limited to one ancestry. The alternatives are African-ancestry-specific (PGS004893, PGS005396 from a medRxiv preprint) or small known-SNP scores. PRS313 is the reference score and has been validated in several ancestries.",
+   "cached": true,
+   "audit": {
+    "aou_involvement": "none found",
+    "discovery": "Breast Cancer Association Consortium (BCAC) European GWAS, about 158,648 women across BCAC studies.",
+    "components": "none",
+    "tuning": "Variants selected by hard-thresholding stepwise forward regression (p < 1e-5) in a BCAC European validation set (n = 10,444). Tested in prospective BCAC studies and UK Biobank.",
+    "aou_check": "Full text PMC6323553: 0 mentions of All of Us. Catalog development cohorts: BCAC studies only.",
+    "cross_enrollment": "BCAC includes US cohorts (for example CPS-II, MEC, WHI) whose members could also be AoU participants.",
+    "sources": [
+     "https://www.pgscatalog.org/score/PGS000004/",
+     "https://doi.org/10.1016/j.ajhg.2018.11.002",
+     "https://europepmc.org/article/PMC/PMC6323553"
+    ]
+   },
+   "expected_cases": {
+    "browser_any_record": 15820,
+    "browser_female": 15420,
+    "browser_male": 260,
+    "array_projection_upper": 9232
+   }
+  },
+  {
+   "slug": "prostate_cancer",
+   "snomed_code": "399068003",
+   "concept_name": "Malignant tumor of prostate",
+   "omop_concept_id": 4163261,
+   "root_note": "Descendants are primary malignant neoplasm of prostate (11,620), adenocarcinoma and carcinoma of prostate, and hormone-refractory or hormone-sensitive disease.",
+   "sex": "male",
+   "sex_reason": "Male-specific cancer (SPEC section 2).",
+   "exclusions": [],
+   "pgs": "PGS003766",
+   "pgs_name": "GRS.PCa.451.TOPMed",
+   "pgs_trait": "Prostate cancer",
+   "variants_number": 451,
+   "genome_build": "GRCh38",
+   "multi_ancestry": true,
+   "cached": true,
+   "audit": {
+    "aou_involvement": "none found",
+    "discovery": "Wang 2023 multi-ancestry prostate-cancer GWAS meta-analysis (GCST90274713, n = 944,762; European, African, East Asian, Hispanic): the earlier multi-ancestry meta-analysis (107,247 cases; PRACTICAL/ELLIPSE and others) plus UK Biobank, FinnGen, eMERGE, BioVU, BioMe, PLCO, MD Anderson, CA UG, MVP and NCI-MD.",
+    "components": "none",
+    "tuning": "none: 451 independent fine-mapped variants weighted by their multi-ancestry meta-analysis effects. This entry is the GRCh38 build with TOPMed proxies where an exact variant was missing.",
+    "aou_check": "Full text PMC10841479: 0 mentions of All of Us. The Catalog lists no AoU development samples.",
+    "cross_enrollment": "MVP, eMERGE, BioVU and BioMe participants could also be AoU participants.",
+    "sources": [
+     "https://www.pgscatalog.org/score/PGS003766/",
+     "https://doi.org/10.1038/s41588-023-01534-4",
+     "https://pmc.ncbi.nlm.nih.gov/articles/PMC10841479/",
+     "https://www.ebi.ac.uk/gwas/studies/GCST90274713"
+    ]
+   },
+   "expected_cases": {
+    "browser_any_record": 11960,
+    "browser_female": 140,
+    "browser_male": 11680,
+    "array_projection_upper": 6993
+   }
+  },
+  {
+   "slug": "copd",
+   "snomed_code": "13645005",
+   "concept_name": "Chronic obstructive pulmonary disease",
+   "omop_concept_id": 255573,
+   "root_note": "Descendants are emphysema (14,940), acute exacerbation of COPD, COPD by severity, and asthma-COPD overlap (400).",
+   "sex": null,
+   "exclusions": [],
+   "pgs": "PGS001783",
+   "pgs_name": "1kgeur_gbmi_COPD_pst_eff_a1_b0.5_phiauto",
+   "pgs_trait": "Chronic obstructive pulmonary disease",
+   "variants_number": 884139,
+   "genome_build": "GRCh37",
+   "multi_ancestry": true,
+   "cached": true,
+   "audit": {
+    "aou_involvement": "none found",
+    "discovery": "GBMI multi-ancestry COPD meta-analysis over all GBMI biobanks (Catalog cohorts include UKB, FinnGen, BBJ, CKB, TWB, HUNT, MGB, MGI, BioVU, BioMe, CCPM, UCLA, Lifelines, QSKIN, deCODE, Genes & Health). GBMI has no AoU member.",
+    "components": "none",
+    "tuning": "none: PRS-CS-auto (phi auto, 1000 Genomes European LD reference).",
+    "aou_check": "Full text PMC9903818: 0 mentions of All of Us. Catalog cohorts: no AllofUs.",
+    "cross_enrollment": "US health-system biobanks, as for asthma.",
+    "sources": [
+     "https://www.pgscatalog.org/score/PGS001783/",
+     "https://doi.org/10.1016/j.xgen.2022.100241",
+     "https://europepmc.org/article/PMC/PMC9903818"
+    ]
+   },
+   "expected_cases": {
+    "browser_any_record": 40820,
+    "browser_female": 22000,
+    "browser_male": 18120,
+    "array_projection_upper": 24439
+   }
+  },
+  {
+   "slug": "major_depressive_disorder",
+   "snomed_code": "370143000",
+   "concept_name": "Major depressive disorder",
+   "omop_concept_id": 4152280,
+   "root_note": "Descendants are single-episode, recurrent, and mild, moderate, severe, psychotic and in-remission major depression. The broader 'Depressive disorder' (35489007) is not used.",
+   "sex": null,
+   "exclusions": [
     {
-      "slug": "obesity",
-      "snomed_code": "414916001",
-      "browser_any_record": 143860,
-      "reason": "The code-based phenotype is badly invalid. Obesity diagnosis codes are recorded for only part of the people whose measured BMI is 30 or more, and how often depends on billing context and site, so the 'zero records' controls would contain many obese people. The valid phenotype is measured BMI, which the uniform condition-code rule cannot express. The scores are also a poor fit: the multi-ancestry ones are BMI scores (a trait mismatch), and the obesity-code scores are European UK Biobank (PGS004517) or Biobank Japan (PGS005145) only."
-    },
-    {
-      "slug": "hypercholesterolemia",
-      "snomed_code": "13644009",
-      "browser_any_record": 79340,
-      "reason": "The code-based phenotype is badly invalid on the control side. The same lipid picture is coded as hypercholesterolemia (E78.0, 79,340 participants) or as hyperlipidemia (E78.5 or 55822004, 207,520 participants), depending on the clinician and site, and statin treatment removes the lab signal. Well over 100,000 hyperlipidemia-coded people would count as controls. No multi-ancestry hypercholesterolemia score exists (all are European UKB self-report 'high cholesterol' scores or East Asian TPMI scores), and none is cached."
-    },
-    {
-      "slug": "osteoarthritis",
-      "snomed_code": "396275006",
-      "browser_any_record": 172760,
-      "reason": "The root pulls in a different condition: spondylosis (95,000 participants, degenerative spine disease) is a descendant, as is every joint site. All-site osteoarthritis scores are European UKB only (PGS001290, PGS001882, PGS002094) and none is cached. A knee-OA root (239873007) would need a knee-OA score, and those are all European-only with weak effects. Dropped to keep the list at 12, with POAG taking the slot."
+     "snomed_code": "13746004",
+     "concept_name": "Bipolar disorder",
+     "omop_concept_id": 436665,
+     "browser_any_record": 25860,
+     "reason": "Depressive episodes of bipolar disorder are often coded as major depression, and MDD GWAS case definitions (PGC) exclude bipolar disorder. Keeping them would put bipolar depression among the MDD cases."
     }
-  ]
+   ],
+   "pgs": "PGS004885",
+   "pgs_name": "INTERVENE_MegaPRS_MDD",
+   "pgs_trait": "Major depressive disorder",
+   "variants_number": 801544,
+   "genome_build": "GRCh37",
+   "multi_ancestry": false,
+   "multi_ancestry_note": "Every genome-wide MDD score in the Catalog (MONDO_0002009) was developed in Europeans, except PGS004759/PGS004760 (PRSmix), which were trained in AoU and are excluded.",
+   "cached": true,
+   "audit": {
+    "aou_involvement": "none found",
+    "discovery": "Wray 2018 PGC major depression GWAS (GCST005839, n = 480,359, European).",
+    "components": "none",
+    "tuning": "none at the individual level: MegaPRS auto (lasso-shrink) with the 1000 Genomes European reference (n = 404).",
+    "aou_check": "Full text PMC11169548 (Jermy 2024): 0 mentions of All of Us. GWAS published 2018.",
+    "cross_enrollment": "none identified",
+    "sources": [
+     "https://www.pgscatalog.org/score/PGS004885/",
+     "https://doi.org/10.1038/s41467-024-48938-2",
+     "https://europepmc.org/article/PMC/PMC11169548",
+     "https://www.ebi.ac.uk/gwas/studies/GCST005839"
+    ]
+   },
+   "expected_cases": {
+    "browser_any_record": 111380,
+    "browser_female": 75060,
+    "browser_male": 35100,
+    "array_projection_upper": 66683
+   }
+  },
+  {
+   "slug": "chronic_kidney_disease",
+   "snomed_code": "709044004",
+   "concept_name": "Chronic kidney disease",
+   "omop_concept_id": 46271022,
+   "root_note": "Descendants are CKD stages 1-5, CKD due to hypertension or diabetes, and chronic renal failure. Acute kidney injury is not a descendant. The stage 1 and stage 2 branches are excluded_branches: records under them are not qualifying records, because the score's case definition is stage 3 or worse.",
+   "sex": null,
+   "exclusions": [],
+   "excluded_branches": [
+    {
+     "snomed_code": "431855005",
+     "concept_name": "Chronic kidney disease stage 1",
+     "omop_concept_id": 443614,
+     "browser_any_record": 3020,
+     "reason": "PGS002237 is a stage \u22653 case score"
+    },
+    {
+     "snomed_code": "431856006",
+     "concept_name": "Chronic kidney disease stage 2",
+     "omop_concept_id": 443601,
+     "browser_any_record": 12300,
+     "reason": "PGS002237 is a stage \u22653 case score"
+    }
+   ],
+   "pgs": "PGS002237",
+   "pgs_name": "GPS_CKD",
+   "pgs_trait": "Chronic kidney disease (stage 3 or greater)",
+   "variants_number": 471316,
+   "genome_build": "GRCh37",
+   "multi_ancestry": true,
+   "multi_ancestry_note": "Discovery is the trans-ethnic eGFR GWAS and validation covered 15 cohorts of diverse ancestry, but tuning used European UK Biobank. The published GPS adds APOL1 recessive risk genotypes, and the Catalog scoring file contains only the genome-wide polygenic part (no APOL1 term). We score exactly the Catalog file.",
+   "interpretation_note": "APOL1 G1/G2 is not in this score. It lowers African-ancestry discrimination; its effect on the z slope is \u2264 ~2% for coded CKD, and its mean effect is absorbed by the PC surface, so slope and calibration heterogeneity remain interpretable.",
+   "sensitivity_analyses": [
+    "Optional, AoU only: add an APOL1 high-risk indicator (two G1/G2 risk alleles) to the marginal index q, if G1 and G2 are typed in the AoU genotype data."
+   ],
+   "cached": true,
+   "audit": {
+    "aou_involvement": "none found",
+    "discovery": "Wuttke 2019 CKDGen plus UK Biobank trans-ethnic serum-creatinine eGFR GWAS (about 1 million individuals).",
+    "components": "The polygenic eGFR score only. The paper's APOL1 genotype term is not part of the Catalog file.",
+    "tuning": "19 candidate P+T scores (1000 Genomes all-population LD reference). The best was chosen in an optimization set of 70% of European UK Biobank participants (Catalog: n = 279,819; R2 = 0.2, P = 0.03).",
+    "aou_check": "Full text PMC9329233: 0 mentions of All of Us. The Catalog lists UKB as the only development cohort.",
+    "cross_enrollment": "unverified for the CKDGen trans-ethnic eGFR discovery cohorts",
+    "sources": [
+     "https://www.pgscatalog.org/score/PGS002237/",
+     "https://doi.org/10.1038/s41591-022-01869-1",
+     "https://pmc.ncbi.nlm.nih.gov/articles/PMC9329233/"
+    ]
+   },
+   "expected_cases": {
+    "browser_any_record": 50740,
+    "browser_female": 25080,
+    "browser_male": 25000,
+    "array_projection_upper": 30378,
+    "excluded_branches_note": "These counts include people whose only CKD records are stage 1 or 2 (3,020 and 12,300 participants have at least 1 such record). The count with the stage 1-2 branches excluded is between 35,420 and 50,740 in the browser, so the array projection overstates CKD cases."
+   }
+  }
+ ],
+ "rejected": [
+  {
+   "slug": "obesity",
+   "snomed_code": "414916001",
+   "browser_any_record": 143860,
+   "reason": "The code-based phenotype is badly invalid. Obesity diagnosis codes are recorded for only part of the people whose measured BMI is 30 or more, and how often depends on billing context and site, so the 'zero records' controls would contain many obese people. The valid phenotype is measured BMI, which the uniform condition-code rule cannot express. The scores are also a poor fit: the multi-ancestry ones are BMI scores (a trait mismatch), and the obesity-code scores are European UK Biobank (PGS004517) or Biobank Japan (PGS005145) only."
+  },
+  {
+   "slug": "hypercholesterolemia",
+   "snomed_code": "13644009",
+   "browser_any_record": 79340,
+   "reason": "The code-based phenotype is badly invalid on the control side. The same lipid picture is coded as hypercholesterolemia (E78.0, 79,340 participants) or as hyperlipidemia (E78.5 or 55822004, 207,520 participants), depending on the clinician and site, and statin treatment removes the lab signal. Well over 100,000 hyperlipidemia-coded people would count as controls. No multi-ancestry hypercholesterolemia score exists (all are European UKB self-report 'high cholesterol' scores or East Asian TPMI scores), and none is cached."
+  },
+  {
+   "slug": "osteoarthritis",
+   "snomed_code": "396275006",
+   "browser_any_record": 172760,
+   "reason": "The root pulls in a different condition: spondylosis (95,000 participants, degenerative spine disease) is a descendant, as is every joint site. All-site osteoarthritis scores are European UKB only (PGS001290, PGS001882, PGS002094) and none is cached. A knee-OA root (239873007) would need a knee-OA score, and those are all European-only with weak effects. Dropped to keep the list at 12, with POAG taking the slot."
+  }
+ ],
+ "notes": {}
 }

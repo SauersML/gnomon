@@ -937,3 +937,54 @@ def test_batch_job_is_one_c3d_spot_task_running_the_wdl_command(tmp_path):
         aou_batch.machine_type(180, 400)
     assert aou_batch.machine_type(96, 128) == ("c3d-highcpu-180", 354)
     assert aou_batch.paste_command("study-x", f"{bucket}/workflows/study-x/batch-job.json", "wb-p").startswith("gcloud storage cp")
+
+
+def test_split_run_is_one_shard_job_per_disease_then_the_gather():
+    """submit_study --split: a shard job runs study.py --shard on its disease with its own status
+    prefix, and the orchestrator command submits every shard, waits for all, then the gather."""
+    import aou_batch
+    bucket = "gs://aou-train-work-p"
+    inputs = dict(sources=f"{bucket}/w/study-sources.tar", config=f"{bucket}/w/config.json",
+                  wheelhouse_archive=f"{bucket}/a/wheelhouse.tar", scorer_archive=f"{bucket}/a/scorer.tar.gz",
+                  score_files=[], score_weights=[], ancestry_predictions="gs://d/ancestry.tsv",
+                  relatedness_prune="gs://d/prune.tsv", features_uri=f"{bucket}/f/shared_features.tar.gz",
+                  runtime_image="python:3.12-slim@sha256:0", checkpoint_uri=f"{bucket}/workflow-checkpoints/study-k/",
+                  status_uri=f"{bucket}/workflow-checkpoints/study-k-hypertension", digest_uri=f"{bucket}/study-digest/r/",
+                  looks_uri=f"{bucket}/looks/c/", cpu=60, memory_gb=100, timeout_minutes=180, caveats=[])
+    job = aou_batch.job("study-x-hypertension", HERE / "study.wdl", inputs, "wb-p", "pet-1@wb-p.iam.gserviceaccount.com",
+                        60, 100, 180, shard="hypertension")
+    assert job["allocationPolicy"]["instances"][0]["policy"]["machineType"] == "c3d-highcpu-60"
+    assert job["labels"]["shard"] == "hypertension"
+    script = job["taskGroups"][0]["taskSpec"]["runnables"][1]["container"]["commands"][1]
+    assert 'study.py run --shard --diseases "hypertension" --config' in script and script.count("study.py run") == 1
+    assert '--status-uri "gs://aou-train-work-p/workflow-checkpoints/study-k-hypertension"' in script
+    whole = aou_batch.job("study-x", HERE / "study.wdl", inputs, "wb-p", "pet-1@wb-p.iam.gserviceaccount.com", 180, 128, 180)
+    assert "--shard" not in whole["taskGroups"][0]["taskSpec"]["runnables"][1]["container"]["commands"][1]
+    command = aou_batch.split_command("study-x", [("study-x-a", "gs://b/a.json"), ("study-x-b", "gs://b/b.json")],
+                                      ("study-x", "gs://b/g.json"), "wb-p")
+    lines = command.splitlines()
+    assert lines.index("submit study-x-a gs://b/a.json || echo \"[split] study-x-a not submitted\"") < \
+        lines.index("shards=(study-x-a study-x-b)") < lines.index("submit study-x gs://b/g.json")
+    assert "SUCCEEDED) done=$((done+1))" in command and "[ $bad -gt 0 ] && exit 1" in command
+
+
+def test_checkpoint_shards_write_their_own_batches_and_restore_each_others(tmp_path):
+    """study.py --shard: shards of one study tag their batches, so two writers of one store never
+    overwrite each other, and a later run restores every shard's steps."""
+    from study.checkpoint import Checkpoint, LocalStore
+    store = tmp_path / "store"
+    signature = {"study": "s"}
+    for tag in ("hypertension", "type_2_diabetes"):
+        point = Checkpoint(tmp_path / tag, LocalStore(store), signature, min_interval=0, tag=tag)
+        directory = point.begin(f"fits/{tag}")
+        (directory / "fit.json").write_text("{}")
+        point.complete(f"fits/{tag}")
+        point.close()
+    names = sorted(path.name for path in store.iterdir())
+    assert "batch-hypertension-000000.tar" in names and "batch-type_2_diabetes-000000.tar" in names
+    gather = Checkpoint(tmp_path / "gather", LocalStore(store), signature, min_interval=0)
+    assert gather.restored_batches == 2 and gather.done("fits/hypertension") and gather.done("fits/type_2_diabetes")
+    assert gather.sequence == 0 and gather.batch_prefix() == "batch-"
+    with pytest.raises(ValueError):
+        Checkpoint(tmp_path / "bad", LocalStore(store), signature, tag="Bad Tag")
+    gather.close()

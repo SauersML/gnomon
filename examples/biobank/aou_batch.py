@@ -90,8 +90,9 @@ def localize_script(plan, project):
     return "\n".join(lines) + "\n"
 
 
-def analyze_script(wdl_path, inputs, paths):
-    """study.wdl's `analyze` command with its WDL placeholders filled in."""
+def analyze_script(wdl_path, inputs, paths, shard=None):
+    """study.wdl's `analyze` command with its WDL placeholders filled in; a shard
+    runs study.py on its one disease with --shard (see study.py)."""
     text = Path(wdl_path).read_text()
     start = text.index("  command <<<") + len("  command <<<\n")
     body = text[start:text.index("  >>>", start)]
@@ -110,6 +111,10 @@ def analyze_script(wdl_path, inputs, paths):
     body = re.sub(r"~\{([^}]*)\}", fill, body)
     if "~{" in body:
         raise ValueError("an unfilled WDL placeholder remains in the task command")
+    if shard:
+        if body.count("study.py run ") != 1:
+            raise ValueError("the task command must run study.py once")
+        body = body.replace("study.py run ", f"study.py run --shard --diseases {json.dumps(shard)} ")
     return f"set -euo pipefail\ncd {WORK}/task\nexec > >(tee -a {WORK}/task.log) 2>&1\n" + body
 
 
@@ -120,8 +125,9 @@ def logs_script(checkpoint_uri, project):
             f">/dev/null 2>&1 || echo '[logs] upload failed'\nexit 0\n")
 
 
-def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeout_minutes):
-    """The Batch job document for one study run (the schema `gcloud batch jobs submit --config` reads)."""
+def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeout_minutes, shard=None):
+    """The Batch job document for one study run, or for one disease shard of it
+    (the schema `gcloud batch jobs submit --config` reads)."""
     if not JOB_ID.fullmatch(name):
         raise ValueError(f"{name} is not a Batch job id")
     machine, _ = machine_type(cpu, memory_gb)
@@ -133,7 +139,7 @@ def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeou
                               "commands": ["-c", script]}}
 
     return {
-        "labels": {"submitter": "gnomon-study", "run": name},
+        "labels": {"submitter": "gnomon-study", "run": name, **({"shard": shard} if shard else {})},
         "taskGroups": [{
             "taskCount": "1", "parallelism": "1", "taskCountPerNode": "1",
             "taskSpec": {
@@ -144,7 +150,7 @@ def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeou
                 "lifecyclePolicies": [{"action": "RETRY_TASK", "actionCondition": {"exitCodes": RETRY_EXIT_CODES}}],
                 "runnables": [
                     container(CLI_IMAGE, localize_script(plan, project)),
-                    container(inputs["runtime_image"], analyze_script(wdl_path, inputs, paths)),
+                    container(inputs["runtime_image"], analyze_script(wdl_path, inputs, paths, shard)),
                     dict(container(CLI_IMAGE, logs_script(inputs["checkpoint_uri"], project)), alwaysRun=True),
                 ],
             },
@@ -164,6 +170,23 @@ def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeou
         },
         "logsPolicy": {"destination": "CLOUD_LOGGING"},
     }
+
+
+def split_command(run, shard_jobs, gather_job, project):
+    """The orchestrator command for a split run: submit every shard job, wait for all of
+    them to succeed, then submit the whole-study job that gathers them (see aou_batch)."""
+    lines = ["set -uo pipefail", f"P={json.dumps(project)}; L={REGION}", "submit() { gcloud storage cp \"$2\" /w/$1.json -q && "
+             "gcloud batch jobs submit \"$1\" --project $P --location $L --config /w/$1.json --format='value(name,status.state)'; }",
+             "state() { gcloud batch jobs describe \"$1\" --project $P --location $L --format='value(status.state)' 2>/dev/null; }"]
+    for job_name, uri in shard_jobs:
+        lines.append(f"submit {job_name} {uri} || echo \"[split] {job_name} not submitted\"")
+    names = " ".join(job_name for job_name, _ in shard_jobs)
+    lines += [f"shards=({names})", "while true; do done=0; bad=0; for j in \"${shards[@]}\"; do s=$(state $j); case \"$s\" in "
+              "SUCCEEDED) done=$((done+1));; FAILED|DELETION_IN_PROGRESS|CANCELLED) bad=$((bad+1));; esac; done; "
+              "echo \"[split] $(date -u +%FT%TZ) succeeded=$done failed=$bad of ${#shards[@]}\"; "
+              "[ $bad -gt 0 ] && exit 1; [ $done -eq ${#shards[@]} ] && break; sleep 60; done",
+              f"submit {gather_job[0]} {gather_job[1]}"]
+    return "\n".join(lines) + "\n"
 
 
 def paste_command(name, job_uri, project):

@@ -37,7 +37,9 @@ from submit_aou import HERE, Workbench, required_env
 
 STAGING = HERE / ".aou-workflow"
 LOOKS = STAGING / "study-looks.jsonl"
-SCORE_CACHE = "artifacts/aou-training/sscore_cache"
+# The workspace's WGS score bank (one gnomon .sscore per PGS over the whole short-read
+# callset), under one callset fingerprint; the study scores nothing in the task.
+SCORE_CACHE = os.environ.get("AOU_SCORE_CACHE_PREFIX", "wgs_scores/2ab675e0fe9f7382af2e980285bab338")
 DIGEST = "study-digest"
 LOOKS_PREFIX = "workflow-checkpoints/study-looks"
 VCPU_HOUR_BUDGET = 540
@@ -123,6 +125,9 @@ def submit(wb, args):
     pgs_ids = {entry["pgs"] for entry in diseases}
     objects = newest_cached_scores(wb.list_objects(f"{wb.bucket}/{SCORE_CACHE}/"), SCORE_CACHE, pgs_ids)
     uncached = sorted(pgs_ids - set(objects))
+    if uncached and not args.allow_scoring:
+        raise ValueError(f"no cached score under {SCORE_CACHE} for {uncached}: the study runs on cached scores "
+                         f"only (switch the disease's score in diseases.json, or pass --allow-scoring)")
     print(f"Using {len(objects)} cached scores; scoring {uncached or 'none'} in the workspace", flush=True)
     # Content-addressed artifacts: a staged copy with the same MD5 is reused.
     portable = STAGING / "portable-scorer"
@@ -154,7 +159,7 @@ def submit(wb, args):
         digest_uri=f"{wb.bucket}/{DIGEST}/{name}/", looks_uri=f"{wb.bucket}/{LOOKS_PREFIX}/{config_sha[:20]}/",
         cpu=args.cpu, memory_gb=args.memory_gb, timeout_minutes=args.timeout_minutes, caveats=args.caveat).items()}
     if args.engine == "batch":
-        record = stage_batch_job(wb, name, wdl, inputs, folder, args)
+        record = stage_batch_job(wb, name, wdl, inputs, folder, args, diseases)
     else:
         record = wb.run_workflow(name, f"{uri}/{wdl.name}", "AoU single study", inputs, folder,
                                  storage_capacity=100)
@@ -179,23 +184,65 @@ def task_service_account(wb):
     return email
 
 
-def stage_batch_job(wb, name, wdl, inputs, folder, args):
-    """Write the study's Batch job beside its staged inputs and print the one command
-    that submits it from the workspace terminal (see aou_batch)."""
+ORCHESTRATOR = "orchestrator"
+
+
+def stage_batch_job(wb, name, wdl, inputs, folder, args, diseases):
+    """Write the study's Batch job(s) beside its staged inputs and hand the submit
+    command to the in-perimeter orchestrator (the app VM's loop reads
+    orchestrator/cmd/<id>.sh from the bucket and runs it as the pet account).
+    --split: one shard job per disease on --shard-cpu vCPUs, then the whole-study
+    job that gathers them (study.py --shard); otherwise one job for the whole study."""
     fields = {key.split(".", 1)[1]: value for key, value in inputs.items()}
-    document = aou_batch.job(name, wdl, fields, wb.project, task_service_account(wb), args.cpu,
-                             args.memory_gb, args.timeout_minutes)
+    account = task_service_account(wb)
     (folder / "inputs.json").write_text(json.dumps(inputs, indent=2))
-    (folder / "batch-job.json").write_text(json.dumps(document, indent=1) + "\n")
-    job_uri = wb.stage([folder / "batch-job.json"], f"{wb.bucket}/workflows/{name}")[0]
-    command = aou_batch.paste_command(name, job_uri, wb.project)
-    (folder / "paste.txt").write_text(command + "\n")
-    record = {"runId": name, "engine": "batch", "job_uri": job_uri, "paste": command,
-              "machine": document["allocationPolicy"]["instances"][0]["policy"]["machineType"]}
+    prefix = f"{wb.bucket}/workflows/{name}"
+    documents = {}
+    if args.split:
+        for entry in diseases:
+            slug = entry["slug"]
+            shard = f"{name}-{slug.replace('_', '-')}"[:63].rstrip("-")
+            own = dict(fields, status_uri=f"{fields['status_uri']}-{slug}")
+            documents[shard] = aou_batch.job(shard, wdl, own, wb.project, account, args.shard_cpu,
+                                             min(args.memory_gb, aou_batch.machine_type(args.shard_cpu, 1)[1]),
+                                             args.timeout_minutes, shard=slug)
+    documents[name] = aou_batch.job(name, wdl, fields, wb.project, account, args.cpu, args.memory_gb,
+                                    args.timeout_minutes)
+    uris = {}
+    for job_name, document in documents.items():
+        path = folder / f"batch-{job_name}.json"
+        path.write_text(json.dumps(document, indent=1) + "\n")
+        uris[job_name] = wb.stage([path], prefix)[0]
+    if args.split:
+        shards = [(job_name, uris[job_name]) for job_name in documents if job_name != name]
+        command = aou_batch.split_command(name, shards, (name, uris[name]), wb.project)
+    else:
+        command = aou_batch.paste_command(name, uris[name], wb.project).replace("/tmp/", "/w/")
+    (folder / "orchestrator-cmd.sh").write_text(command if command.endswith("\n") else command + "\n")
+    command_uri = wb.stage_as(folder / "orchestrator-cmd.sh", f"{wb.bucket}/{ORCHESTRATOR}/cmd/{name}.sh")
+    record = {"runId": name, "engine": "batch", "job_uris": uris, "orchestrator_command": command_uri,
+              "machines": {job_name: d["allocationPolicy"]["instances"][0]["policy"]["machineType"]
+                           for job_name, d in documents.items()}}
     (folder / "submission.json").write_text(json.dumps(record, indent=2))
-    print(f"Batch job staged at {job_uri} ({record['machine']}, Spot). Paste into the workspace "
-          f"JupyterLab terminal:\n{command}", flush=True)
+    print(f"{len(documents)} Batch job(s) staged under {prefix}; the orchestrator runs {command_uri} "
+          f"(machines: {sorted(set(record['machines'].values()))}). Read its reply with: "
+          f"submit_study.py orch {name}", flush=True)
     return record
+
+
+def orch(wb, args):
+    """Decode an orchestrator command's reply, which it emits as object names
+    (orchestrator/out/<id>/t/<seq>__<base64url chunk>) because objects cannot be read
+    from outside the perimeter; a DONE name marks the end."""
+    import base64
+    prefix = f"{wb.bucket}/{ORCHESTRATOR}/out/{args.id}/"
+    names = sorted(item["name"].rsplit("/", 1)[-1] for item in wb.list_objects(prefix + "t/"))
+    text = "".join(name.split("__", 1)[1] for name in names if "__" in name)
+    print(base64.urlsafe_b64decode(text + "=" * (-len(text) % 4)).decode("utf-8", "replace"), end="")
+    done = any(item["name"].endswith("/DONE") for item in wb.list_objects(prefix))
+    print(f"[{args.id}: {'finished' if done else 'still running or not started'}]")
+    beats = sorted(item["name"].rsplit("/", 1)[-1] for item in wb.list_objects(f"{wb.bucket}/{ORCHESTRATOR}/hb/"))
+    print(f"[orchestrator heartbeat: {beats[-1] if beats else 'none yet'}]")
 
 
 def status(wb, args):
@@ -236,12 +283,21 @@ def main():
     child.add_argument("--memory-limit-gb", type=int, default=128,
                        help="raise only with a measured need (SPEC 7a)")
     child.add_argument("--timeout-minutes", type=int, default=180)
+    child.add_argument("--allow-scoring", action="store_true",
+                       help="score uncached PGS in the task (default: refuse; the study runs on the score bank)")
+    child.add_argument("--split", action="store_true",
+                       help="one Spot Batch job per disease (--shard-cpu vCPUs each), then the whole-study "
+                            "job gathers them: the fits are the cost, and the diseases are independent")
+    child.add_argument("--shard-cpu", type=int, default=60, help="vCPUs of each disease shard (C3D high-CPU shape)")
     child.add_argument("--engine", choices=["batch", "cromwell"], default="batch",
                        help="batch: one C3D Spot Batch job, submitted from the workspace terminal (the "
                             "managed Cromwell has no C3D); cromwell: the study.wdl run as before")
     child.add_argument("--caveat", action="append", default=[], metavar="LABEL",
                        help="a fixed label the run's digest carries, e.g. shipped_survival_refused_gam2945 (repeatable)")
     child.set_defaults(handler=submit)
+    child = sub.add_parser("orch")
+    child.add_argument("id", help="the orchestrator command id (the run name)")
+    child.set_defaults(handler=orch)
     child = sub.add_parser("status")
     child.add_argument("key", help="the checkpoint key the submission printed (study-<key>)")
     child.set_defaults(handler=status)

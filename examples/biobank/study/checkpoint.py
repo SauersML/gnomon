@@ -14,6 +14,8 @@ import hashlib
 import io
 import json
 from pathlib import Path, PurePosixPath
+import os
+import re
 import shutil
 import tarfile
 import threading
@@ -43,12 +45,12 @@ class LocalStore:
         shutil.copyfile(self.directory / name, target)
 
     def put(self, name, source):
-        partial = self.directory / (name + ".partial")
+        partial = self.directory / f"{name}.partial-{os.getpid()}"
         shutil.copyfile(source, partial)
         partial.replace(self.directory / name)
 
     def put_bytes(self, name, body):
-        partial = self.directory / (name + ".partial")
+        partial = self.directory / f"{name}.partial-{os.getpid()}"
         partial.write_bytes(body)
         partial.replace(self.directory / name)
 
@@ -176,7 +178,12 @@ class Checkpoint:
     signature is refused rather than mixed in. Uploads are batched: at most one
     per `min_interval` seconds unless `sync` asks for one now.
     """
-    def __init__(self, root, store, signature, *, min_interval=20.0):
+    def __init__(self, root, store, signature, *, min_interval=20.0, tag=""):
+        # `tag` names this writer's batches (batch-<tag>-NNNNNN.tar) so that shards of one
+        # study writing the same store never overwrite each other's; every batch is restored.
+        if tag and not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", tag):
+            raise ValueError(f"checkpoint tag {tag!r} must be lowercase letters, digits, - and _")
+        self.tag = tag
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.store = store
@@ -217,7 +224,9 @@ class Checkpoint:
                 raise ValueError("checkpoint exceeds its restore budget")
             self.extract(local)
             local.unlink()
-            self.sequence = max(self.sequence, int(name[len(BATCH_PREFIX):-len(".tar")]) + 1)
+            own = re.fullmatch(re.escape(self.batch_prefix()) + r"(\d{6})\.tar", name)
+            if own:
+                self.sequence = max(self.sequence, int(own.group(1)) + 1)
         shutil.rmtree(staging)
         return len(batches)
 
@@ -322,6 +331,9 @@ class Checkpoint:
                 self.uploading = False
                 self.condition.notify_all()
 
+    def batch_prefix(self):
+        return BATCH_PREFIX + (self.tag + "-" if self.tag else "")
+
     def snapshot(self, step):
         """{relative path: bytes} of a sealed step exactly as its receipt names
         it, or None when the step has changed or gone since it was sealed (it is
@@ -342,7 +354,7 @@ class Checkpoint:
         snapshots = {step: files for step, files in snapshots.items() if files is not None}
         if not snapshots:
             return
-        name = f"{BATCH_PREFIX}{sequence:06d}.tar"
+        name = f"{self.batch_prefix()}{sequence:06d}.tar"
         archive = self.root.parent / (self.root.name + "-" + name)
         with tarfile.open(archive, "w") as target:
             for member_name, body in [("index.json", json.dumps(sorted(snapshots)).encode()),
