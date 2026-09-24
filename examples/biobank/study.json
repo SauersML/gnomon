@@ -34,7 +34,9 @@
     {"kind": "survival", "variant": "calpred", "phrase": "estimationerror::remldidnotconverge", "issue": "gam#3037",
      "reason": "the survival location-scale calpred fit ends outer smoothing uncertified: its ARC stalls at an indefinite Hessian while one smoothing parameter runs to its tail (study-model-surv, synthetic repro); reported as refused until gam#3037 is fixed"},
     {"kind": "survival", "variant": "calpred", "phrase": "survival location-scale hazard derivative must be finite and positive", "issue": "gam#3038",
-     "reason": "a certified survival location-scale calpred fit is refused at predict, its hazard derivative non-positive or non-finite (study-model-surv, cross-linked with gam#3037); reported as refused until gam#3038 is fixed"}
+     "reason": "a certified survival location-scale calpred fit is refused at predict, its hazard derivative non-positive or non-finite (study-model-surv, cross-linked with gam#3037); reported as refused until gam#3038 is fixed"},
+    {"kind": "binary", "variant": "covariates", "phrase": "identifiedranknotlocallyconstant", "issue": "gam#4578",
+     "reason": "REML refuses the plain probit GAM on the most common simulated outcome: one unidentified Hessian direction is not certified constant over the certificate's Newton step, while the marginal-slope fits sharing the covariate part certify (study-sim v7 small, hypertension); reported as refused until gam#4578 is fixed"}
   ],
   "convergence": {
     "variants": ["ours"],
