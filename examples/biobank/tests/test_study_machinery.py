@@ -488,16 +488,16 @@ def test_only_a_typed_frozen_time_refusal_is_the_time_scale_not_identified_outco
         """A class raised from gamfit's engine module, carrying gam#2937's typed attributes."""
         attributes = {name_: value for name_, value in (("variant", variant), ("category", category)) if value}
         return type(name, (ValueError,), {"__module__": "gamfit._rust", **attributes})("the message is never read")
-    allowed = study.typed_error(gamfit_error("FitError", "FrozenTimeLimit", "identification"))
-    assert allowed == {"type": "FitError", "module": "gamfit._rust", "variant": "FrozenTimeLimit",
-                       "category": "identification"}
+    allowed = study.typed_error(gamfit_error("FitError", "ModeNotIdentified", "convergence"))
+    assert allowed == {"type": "FitError", "module": "gamfit._rust", "variant": "ModeNotIdentified",
+                       "category": "convergence"}
     # One allowlisted variant is the outcome; another typed variant, an untyped gamfit error, the same
     # words in a message, and the same variant name from outside gamfit all stay failures.
     assert study.fit_status("error", allowed) == study.TIME_SCALE_NOT_IDENTIFIED
     other = study.typed_error(gamfit_error("FitSeedError", "StartupSeedsRefused", "seed"))
     untyped = study.typed_error(gamfit_error("GamError"))
-    worded = study.typed_error(ValueError("FrozenTimeLimit: NotIdentified"))
-    foreign = study.typed_error(type("FitError", (ValueError,), {"variant": "FrozenTimeLimit"})())
+    worded = study.typed_error(ValueError("ModeNotIdentified: not identified"))
+    foreign = study.typed_error(type("FitError", (ValueError,), {"variant": "ModeNotIdentified"})())
     for error in (other, untyped, worded, foreign, None):
         assert study.fit_status("error", error) == "error"
     assert study.fit_status("timeout", None) == "timeout"
@@ -510,7 +510,7 @@ def test_only_a_typed_frozen_time_refusal_is_the_time_scale_not_identified_outco
     assert study.typed_error(screened)["identification"] == "frozen_time_limit"
     assert study.fit_status("error", study.typed_error(screened)) == study.TIME_SCALE_NOT_IDENTIFIED
     assert study.fit_status("error", study.typed_error(ValueError("is not below the frozen-time limit"))) == "error"
-    prefixed = study.typed_error(gamfit_error("FitError", "SurvivalError::FrozenTimeLimit"))
+    prefixed = study.typed_error(gamfit_error("FitError", "CustomFamilyError::ModeNotIdentified"))
     assert study.fit_status("error", prefixed) == study.TIME_SCALE_NOT_IDENTIFIED
     # The outcome never fails a run, for ours as for any method; the other failures do.
     records = {"fits/htn/survival/ours/pooled/disease": {"status": study.TIME_SCALE_NOT_IDENTIFIED, "error": allowed},

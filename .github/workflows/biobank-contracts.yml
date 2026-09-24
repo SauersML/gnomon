@@ -34,14 +34,16 @@ jobs:
           pip install --only-binary=:all: numpy pandas scipy scikit-learn pyarrow duckdb sqlglot
           google-cloud-bigquery google-cloud-storage miniwdl pytest
       # The study's own tests: imports, score parsing, schemas, SQL, disclosure,
-      # evaluation and the simulator. The fits in test_study_models_binary.py
-      # need the study's gamfit wheel and test_study_evaluate_reference.py needs
-      # R with the survival packages, so those two run on MSI.
+      # evaluation and the simulator. The fits in test_study_models_binary.py and
+      # test_study_models_survival.py need the study's gamfit wheel and
+      # test_study_evaluate_reference.py needs R with the survival packages, so
+      # those three run on MSI.
       - name: Validate study contracts
         working-directory: examples/biobank
         run: |
           python -m pytest -q -p no:cacheprovider test_*.py tests \
-            --ignore=tests/test_study_models_binary.py --ignore=tests/test_study_evaluate_reference.py
+            --ignore=tests/test_study_models_binary.py --ignore=tests/test_study_models_survival.py \
+            --ignore=tests/test_study_evaluate_reference.py
           for wdl in *.wdl; do timeout 45 python -m WDL check "$wdl"; done
       - name: Validate simulation completion contracts
         working-directory: sims/ancestry_calibration

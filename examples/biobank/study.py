@@ -69,12 +69,13 @@ RESTART = "restart"
 # SPEC section 8, minimum events: a fit below the bar is this result, not a failure.
 INSUFFICIENT_EVENTS = "insufficient_events"
 # SPEC section 8 (gam#3003): a survival marginal-slope fit the data do not identify, gam's own
-# frozen-time refusal, is this result for any method, ours included. gam names it by a typed
-# variant (NOT_IDENTIFIED_VARIANTS) where the refusal reaches the caller as itself; through the
-# startup-seed screen it reaches gamfit as StartupSeedsRefused carrying the certificate's own
-# sentence (FROZEN_TIME_CERTIFICATE), which typed_error records as the identification verdict.
+# frozen-time refusal, is this result for any method, ours included. gam names it by its typed
+# variant (NOT_IDENTIFIED_VARIANTS, gam#4577), from a fit that ended on the certificate and from
+# the startup-seed screen alike; a gamfit older than that types the screen's refusal as
+# StartupSeedsRefused carrying the certificate's own sentence (FROZEN_TIME_CERTIFICATE), which
+# typed_error records as the identification verdict.
 TIME_SCALE_NOT_IDENTIFIED = "time_scale_not_identified"
-NOT_IDENTIFIED_VARIANTS = frozenset({"FrozenTimeLimit", "NotIdentified", "MarginalLevelWithSlope"})
+NOT_IDENTIFIED_VARIANTS = frozenset({"ModeNotIdentified"})
 FROZEN_TIME_CERTIFICATE = "is not below the frozen-time limit"
 # The fit outcomes that are results, never failures: nothing was fitted, so nothing is restarted,
 # predicted or compared, and the table names them.
