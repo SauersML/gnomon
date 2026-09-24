@@ -53,6 +53,9 @@ DEFAULTS = {
     "predict_band_years": 5.0,
     # Rows per prediction call, bounding the (rows x grid) surfaces held at once.
     "predict_rows": 20000,
+    # Spacing, in years, of the ages a band's cumulative hazard is read at; H is
+    # linear between them (the hazard is constant within a step).
+    "predict_knot_years": 1.0,
 }
 LATENT_LAW = "global-empirical"
 DEATH_MODELS = ("location-scale", "marginal-slope")
@@ -249,8 +252,13 @@ def fit(variant, component, train, settings, out_dir, reference=None, *, disease
                 raise ValueError("the marginal-slope fit carries a time-varying slope basis")
         # gam's own typed verdict on the optimization, recorded as gam reports it.
         convergence = model.convergence
+        # gam's time basis ends at its last knot (log age): past it no hazard is fitted.
+        knots = [float(k) for k in (payload.get("survival_time_knots") or []) if np.isfinite(k)]
+        if not knots:
+            raise ValueError("the survival fit saved no time knots")
         spec = {"zero_hazard": False, "formula": formula, **keywords,
                 "survival_time_anchor": payload.get("survival_time_anchor"),
+                "time_upper": float(np.exp(max(knots))),
                 "lambdas": [float(v) for v in model.smoothing_parameters().values()]}
         info.update(converged=convergence["certified"], convergence=convergence)
     write_json(out / "spec.json", {**spec, **info, "settings": s})
@@ -267,8 +275,9 @@ def follow_up_grid(horizons, step):
 
 def cumulative_hazard_increments(directory, variant, component, frame, s, sex, grid):
     """(H(entry + grid) - H(entry) of each row, which rows reach past the fitted ages) from
-    the saved fit: gam's posterior-mean cumulative hazard surface on its 64-point age grid,
-    read at each row's own ages on gam's own piecewise-linear interpolant of that surface."""
+    the saved fit: gam's posterior-mean cumulative hazard at the ages of each entry-age
+    band, `predict_knot_years` apart from the band's edge to its last follow-up age, read
+    at each row's own ages on the piecewise-linear interpolant between them."""
     import gamfit
     spec = json.loads((directory / "spec.json").read_text())
     if spec["zero_hazard"]:
@@ -281,22 +290,22 @@ def cumulative_hazard_increments(directory, variant, component, frame, s, sex, g
     for band in np.unique(bands):
         rows = np.flatnonzero(bands == band)
         edge = band * s["predict_band_years"]
+        # Past the last training age the surface is read at its end: no hazard is
+        # fitted there, and the rows are counted (`beyond_fit` in the prediction).
+        last = min(edge + s["predict_band_years"] + grid[-1], spec["time_upper"])
+        knots = np.unique(np.append(np.arange(edge, last, s["predict_knot_years"]), last))
         for start in range(0, len(rows), s["predict_rows"]):
             chunk = rows[start:start + s["predict_rows"]]
             part = pd.DataFrame(design(variant, component, frame.iloc[chunk], s, sex))
-            part = pd.concat([part.iloc[:1].assign(entry_age=edge), part], ignore_index=True)
-            # Placeholders: prediction reads no outcome, and the grid's end is the training's.
-            part["exit_age"] = part.entry_age + grid[-1]
+            # Placeholders: prediction reads no outcome, and the exit is the last age read.
+            part["exit_age"] = np.maximum(last, part.entry_age.to_numpy(float))
             part["event"] = 0.0
-            prediction = model.predict(part)
-            knots = np.asarray(prediction.times, dtype=float)
-            surface = np.asarray(prediction.cumulative_hazard_at(knots), dtype=float)[1:]
-            if surface.shape != (len(chunk), len(knots)) or not np.isfinite(surface).all() or abs(knots[0] - edge) > 1e-9:
+            prediction = model.predict(part, time_grid=knots)
+            surface = np.asarray(prediction.cumulative_hazard_at(knots), dtype=float)
+            if surface.shape != (len(chunk), len(knots)) or not np.isfinite(surface).all():
                 raise ValueError(f"gam returned an invalid cumulative hazard surface for {directory}")
             ages = entry[chunk, None] + np.concatenate([[0.0], grid])[None, :]
-            # Past the last training age the surface is read at its end: no hazard is
-            # fitted there, and the rows are counted (`beyond_fit` in the prediction).
-            beyond[chunk] = ages[:, -1] > knots[-1]
+            beyond[chunk] = ages[:, -1] > spec["time_upper"]
             at = np.vstack([np.interp(ages[i], knots, surface[i]) for i in range(len(chunk))])
             out[chunk] = at[:, 1:] - at[:, :1]
     return out, beyond
