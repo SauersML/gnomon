@@ -887,5 +887,9 @@ def test_binary_outer_start_levels_reach_gam_only_when_chosen():
         assert config["outer_start_levels"] == [2.0, 4.0] and config["latent_measure"] == "global-empirical"
     assert "config" not in binary.formulas("covariates", chosen)[1]
     for bad in ([], [float("nan")], ["2"]):
-        with pytest.raises(ValueError, match="outer_start_levels"):
+        try:
             binary.settings_of({**base, "outer_start_levels": bad})
+        except ValueError as error:
+            assert "outer_start_levels" in str(error)
+        else:
+            raise AssertionError(f"{bad!r} was accepted as outer_start_levels")
