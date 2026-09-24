@@ -59,7 +59,7 @@
       "windows": ["admin_years", "lookback_years"],
       "latent_law": "global-empirical",
       "slope_age_k": 4,
-      "outer_start_levels": [2.0, 4.0]
+      "outer_start_levels": null
     },
     "survival": {
       "num_pcs": 6,
@@ -88,7 +88,7 @@
     "models.binary.windows": "SPEC section 4 / audit N3: both window covariates in q for every method, as gam's default smooths",
     "models.binary.latent_law": "SPEC section 4: an empirical latent law, never standard-normal or auto",
     "models.binary.slope_age_k": "SPEC section 4 lets ours add age to the slope where the simulator shows it helps: on study-sim v1 medium dev seeds s(age, k=4) raised slope recovery from 0.30-0.60 to 0.67-0.88 and lowered risk RMSE for hypertension, T2D and AF; k=6 was no better",
-    "models.binary.outer_start_levels": "gam searches every level as its own certified outer run and publishes the lowest (gnomon#2359); its five levels cost 3 to 4 times these two, which formed the certifying quorum with the derived start on the 3k and 40k simulator fits (MSI, 2026-09-24), and the derived start still runs",
+    "models.binary.outer_start_levels": "null keeps gam's five levels (gnomon#2359): on the 16k-row simulator fit a set of [4] certified no optimum at all and [2, 4] cost 3x the five (MSI fit-ab, 2026-09-24), so the quorum needs the seeds gam chose",
     "models.survival.num_pcs": "user decision 2026-09-18 23:40Z: K = 6 (K = 16 cycles in gam's constrained QP; filed as a gam bug)",
     "models.survival.q_centers": "a joint 6-D Duchon with a linear null space needs more than 7 centers, and gam's default grows with n; 24 is interim until study-pcs sweeps it",
     "models.survival.slope_centers": "as q_centers: more than 7 needed; 20 for the slope surface, interim until study-pcs",
