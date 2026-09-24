@@ -80,7 +80,8 @@ def localize_script(plan, project):
     # Everything the localizer prints goes to the task log too: the task's own log is
     # the only log the pet account can read (Cloud Logging is closed to it).
     lines = ["set -euo pipefail", f"rm -rf {WORK}/in {WORK}/task", f"mkdir -p {WORK}/task",
-             f"exec > >(tee -a {WORK}/task.log) 2>&1", 'echo "[localize] $(date -u +%FT%TZ) start on $(hostname)"']
+             f"exec > >(tee -a {WORK}/task.log) 2>&1", 'echo "[localize] $(date -u +%FT%TZ) start on $(hostname)"',
+             f"id; ls -ld {WORK}; df -h {WORK} | tail -1; gcloud auth list 2>&1 | head -3; gcloud config list 2>&1 | head -4"]
     for uri, local in plan:
         if not uri.startswith("gs://"):
             raise ValueError(f"input {uri} is not a workspace object")
