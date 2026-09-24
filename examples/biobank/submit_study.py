@@ -200,6 +200,10 @@ def stage_batch_job(wb, name, wdl, inputs, folder, args, diseases):
     prefix = f"{wb.bucket}/workflows/{name}"
     documents = {}
     if args.split:
+        # A split run keeps its own store and status prefix: a whole-study run of the same
+        # code and config must never delete the store its shards are writing.
+        fields = dict(fields, checkpoint_uri=fields["checkpoint_uri"].rstrip("/") + "-split/",
+                      status_uri=fields["status_uri"] + "-split")
         for entry in diseases:
             slug = entry["slug"]
             shard = f"{name}-{slug.replace('_', '-')}"[:63].rstrip("-")
