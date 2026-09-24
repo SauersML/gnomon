@@ -36,7 +36,7 @@ LOOKS = STAGING / "study-looks.jsonl"
 SCORE_CACHE = "artifacts/aou-training/sscore_cache"
 DIGEST = "study-digest"
 LOOKS_PREFIX = "workflow-checkpoints/study-looks"
-VCPU_HOUR_BUDGET = 32
+VCPU_HOUR_BUDGET = 192
 SOURCES = ["study.py", "aou_checkpoint.py", "aou_identity.py", "aou_projection.py", "aou_status.py",
            "study/__init__.py", "study/checkpoint.py", "study/cohort.py", "study/digest.py", "study/disclosure.py",
            "study/evaluate.py",
@@ -180,11 +180,13 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     child = sub.add_parser("submit")
     child.add_argument("--config", type=Path, default=HERE / "study.json")
-    child.add_argument("--cpu", type=int, default=16, help="task vCPUs (size from the MSI end-to-end run)")
-    child.add_argument("--memory-gb", type=int, default=64)
-    child.add_argument("--memory-limit-gb", type=int, default=64,
+    child.add_argument("--cpu", type=int, default=64,
+                       help="task vCPUs: the 40k simulator run measured 2.4 CPU-hours of fits per disease at 16k "
+                            "training rows, ~7.5x that at 300k participants (MSI, 2026-09-24)")
+    child.add_argument("--memory-gb", type=int, default=128)
+    child.add_argument("--memory-limit-gb", type=int, default=128,
                        help="raise only with a measured need (SPEC 7a)")
-    child.add_argument("--timeout-minutes", type=int, default=110)
+    child.add_argument("--timeout-minutes", type=int, default=180)
     child.add_argument("--caveat", action="append", default=[], metavar="LABEL",
                        help="a fixed label the run's digest carries, e.g. shipped_survival_refused_gam2945 (repeatable)")
     child.set_defaults(handler=submit)
