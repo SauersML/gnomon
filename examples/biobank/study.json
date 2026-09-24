@@ -30,8 +30,6 @@
     "min_events": 100
   },
   "declared_refusals": [
-    {"kind": "binary", "variant": "calpred", "phrase": "dense hessian shape mismatch", "issue": "gam#3015",
-     "reason": "a binomial location-scale fit is refused at every seed when a noise-formula linear term lies in the location Duchon's null space (study-model-bin, 1-core repro); the calpred competitor is reported as refused until gam#3015 is fixed"},
     {"kind": "survival", "variant": "calpred", "phrase": "estimationerror::remldidnotconverge", "issue": "gam#3037",
      "reason": "the survival location-scale calpred fit ends outer smoothing uncertified: its ARC stalls at an indefinite Hessian while one smoothing parameter runs to its tail (study-model-surv, synthetic repro); reported as refused until gam#3037 is fixed"},
     {"kind": "survival", "variant": "calpred", "phrase": "survival location-scale hazard derivative must be finite and positive", "issue": "gam#3038",
