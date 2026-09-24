@@ -86,10 +86,15 @@ class Workbench:
                                or f"Workbench command exited {process.returncode}")
         return stdout
 
-    def assert_identity(self):
+    def assert_identity(self, workbench=False):
+        """The gcloud account every upload and listing uses must be the expected one;
+        the Workbench login is checked only for an action that goes through wb (the
+        Batch engine never does, and the wb login on a shared machine changes hands)."""
         active = self.command(["gcloud", f"--configuration={self.profile}", "auth", "list",
                                "--filter=status:ACTIVE", "--format=value(account)"]).strip()
         check_account(active, expected=self.expected_account)
+        if not workbench:
+            return
         status = json.loads(self.command(["wb", "status", "--format=JSON"]))
         check_account(status.get("user", {}).get("email"), expected=self.expected_account)
         workspace = status.get("workspace", {})
@@ -97,7 +102,7 @@ class Workbench:
             raise RuntimeError("Workbench workspace/project do not match the requested environment")
 
     def wb(self, *args):
-        self.assert_identity()  # includes every create and submission
+        self.assert_identity(workbench=True)  # includes every create and submission
         if args[0] == "gsutil":
             args = ("gsutil", "-u", self.project, *args[1:])
         return self.command(["wb", *args])
