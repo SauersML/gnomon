@@ -176,7 +176,12 @@ def job(name, wdl_path, inputs, project, service_account, cpu, memory_gb, timeou
 def split_command(run, shard_jobs, gather_job, project):
     """The orchestrator command for a split run: submit every shard job, wait for all of
     them to succeed, then submit the whole-study job that gathers them (see aou_batch)."""
-    lines = ["set -uo pipefail", f"P={json.dumps(project)}; L={REGION}", "submit() { gcloud storage cp \"$2\" /w/$1.json -q && "
+    bucket = "/".join(gather_job[1].split("/")[:3])
+    lines = ["set -uo pipefail", f"P={json.dumps(project)}; L={REGION}",
+             # progress as object names under the run's reply prefix, readable while the command runs
+             f"note() {{ echo \"[split] $(date -u +%FT%TZ) $*\"; printf '' > /w/empty; gcloud storage cp /w/empty "
+             f"\"{bucket}/orchestrator/out/{run}/p/$(date -u +%H%M%S)__$(echo \"$*\" | tr -c 'A-Za-z0-9=_' '_')\" -q 2>/dev/null || true; }}",
+             "submit() { gcloud storage cp \"$2\" /w/$1.json -q && "
              "gcloud batch jobs submit \"$1\" --project $P --location $L --config /w/$1.json --format='value(name,status.state)'; }",
              "state() { gcloud batch jobs describe \"$1\" --project $P --location $L --format='value(status.state)' 2>/dev/null; }"]
     for job_name, uri in shard_jobs:
@@ -184,7 +189,7 @@ def split_command(run, shard_jobs, gather_job, project):
     names = " ".join(job_name for job_name, _ in shard_jobs)
     lines += [f"shards=({names})", "while true; do done=0; bad=0; for j in \"${shards[@]}\"; do s=$(state $j); case \"$s\" in "
               "SUCCEEDED) done=$((done+1));; FAILED|DELETION_IN_PROGRESS|CANCELLED) bad=$((bad+1));; esac; done; "
-              "echo \"[split] $(date -u +%FT%TZ) succeeded=$done failed=$bad of ${#shards[@]}\"; "
+              "note succeeded=$done failed=$bad of=${#shards[@]}; "
               "[ $bad -gt 0 ] && exit 1; [ $done -eq ${#shards[@]} ] && break; sleep 60; done",
               f"submit {gather_job[0]} {gather_job[1]}"]
     return "\n".join(lines) + "\n"
