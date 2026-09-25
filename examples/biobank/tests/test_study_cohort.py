@@ -219,7 +219,7 @@ def test_score_cache_directory_and_tar(tmp_path):
         cohort.read_scores(directory, ["PGS000022"])
     (directory / "c.sscore").write_text("#IID\tPGS000044_AVG\n5\t1\n")
     # The WGS score bank writes no per-participant missingness: the column is then null.
-    bare = read_scores(directory, ["PGS000044"]).to_pandas().set_index("person_id")
+    bare = cohort.read_scores(directory, ["PGS000044"]).to_pandas().set_index("person_id")
     assert bare["PGS000011_missing_pct"].isna().all() and bare["PGS000011"].notna().any()
 
 
