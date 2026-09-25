@@ -1031,3 +1031,19 @@ def test_a_fit_with_every_smoothing_parameter_railed_is_not_certified():
     assert driver.certification([railed]) == "not_certified"
     assert driver.certification([sane]) == "certified"
     assert driver.certification([sane, railed]) == "not_certified"
+
+
+def test_a_sealed_evaluation_is_reused_only_over_the_same_predictions():
+    """A per-method shard seals a disease's evaluate step over its own method; a later run with
+    more predictions (another shard's, the gather's) must evaluate again, not reuse the step.
+    On 2026-09-25 the prostate standard and znorm2 arms were fitted and predicted, and no
+    digest ever held them, because the evaluate step had been sealed by an earlier shard."""
+    driver = driver_module()
+    ours_only = {"ours": {"pooled": "predict/p/binary/ours/pooled", "logo:ancestry:afr": "predict/p/binary/ours/logo"}}
+    both = {**ours_only, "standard": {"pooled": "predict/p/binary/standard/pooled"}}
+    sealed = {"status": "ok", "rows": [], "predictions": driver.prediction_manifest(ours_only)}
+    assert driver.prediction_manifest(both) == {"ours": ["logo:ancestry:afr", "pooled"], "standard": ["pooled"]}
+    assert driver.evaluation_covers(sealed, driver.prediction_manifest(ours_only))
+    assert not driver.evaluation_covers(sealed, driver.prediction_manifest(both))
+    assert not driver.evaluation_covers({"status": "ok", "rows": []}, driver.prediction_manifest(ours_only))
+    assert not driver.evaluation_covers({"status": "failed"}, {})

@@ -1080,7 +1080,8 @@ class Study:
                 models = [kind, *(self.sensitivity_models() if kind == "survival" else ())]
                 for model in models:
                     step = f"evaluate/{disease.slug}/{model}"
-                    if self.checkpoint.done(step):
+                    if self.checkpoint.done(step) and evaluation_covers(
+                            read_json(self.path(step) / "evaluate.json"), prediction_manifest(predictions)):
                         continue
                     self.checkpoint.begin(step)
                     jobs.append(self.job(step, {"type": "evaluate", "disease": disease.slug, "kind": kind,
@@ -1718,7 +1719,25 @@ def run_evaluate(spec, config, models):
             row["model"] = model  # evaluate writes its kind
         else:
             row.setdefault("model", kind)
-    write_json(out / "evaluate.json", {"status": "ok", "rows": rows})
+    write_json(out / "evaluate.json", {"status": "ok", "rows": rows,
+                                       "predictions": prediction_manifest(spec["predictions"])})
+
+
+def prediction_manifest(predictions):
+    """The models an evaluation covers, {variant: sorted fits}, from stage_evaluate's
+    {variant: {fit: predict step}}."""
+    return {variant: sorted(fits) for variant, fits in predictions.items()}
+
+
+def evaluation_covers(record, manifest):
+    """Whether a sealed evaluate step evaluated exactly these predictions. A per-method
+    shard seals a disease's evaluate step over its own method alone, and a disease shard
+    over whatever had been fitted when it ran; a later run that finds more predictions
+    (another shard's, or the gather's) evaluates again instead of reusing the sealed
+    step, which would leave those methods out of every digest and comparison (the
+    prostate standard and znorm2 arms of the 2026-09-25 run). A failed evaluation
+    covers nothing."""
+    return record.get("status") == "ok" and record.get("predictions") == manifest
 
 
 def run_job(spec):
