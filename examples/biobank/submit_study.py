@@ -42,7 +42,7 @@ LOOKS = STAGING / "study-looks.jsonl"
 SCORE_CACHE = os.environ.get("AOU_SCORE_CACHE_PREFIX", "wgs_scores/2ab675e0fe9f7382af2e980285bab338")
 DIGEST = "study-digest"
 LOOKS_PREFIX = "workflow-checkpoints/study-looks"
-VCPU_HOUR_BUDGET = 540
+VCPU_HOUR_BUDGET = 1500
 SOURCES = ["study.py", "aou_checkpoint.py", "aou_identity.py", "aou_projection.py", "aou_status.py",
            "study/__init__.py", "study/checkpoint.py", "study/cohort.py", "study/digest.py", "study/disclosure.py",
            "study/evaluate.py",
