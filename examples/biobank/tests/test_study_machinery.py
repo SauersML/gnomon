@@ -10,6 +10,7 @@ import time
 
 import numpy as np
 import pandas as pd
+import pytest
 
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE))
@@ -882,10 +883,11 @@ def test_binary_outer_start_levels_reach_gam_only_when_chosen():
             "latent_law": "global-empirical", "slope_age_k": None}
     assert "outer_start_levels" not in binary.formulas("ours", binary.settings_of(base))[1]["config"]
     chosen = binary.settings_of({**base, "outer_start_levels": [2, 4.0]})
-    for variant in ("ours", "standard", "z_pc", "shipped"):
+    for variant in ("ours", "z_pc", "shipped"):
         config = binary.formulas(variant, chosen)[1]["config"]
         assert config["outer_start_levels"] == [2.0, 4.0] and config["latent_measure"] == "global-empirical"
-    assert "config" not in binary.formulas("covariates", chosen)[1]
+    for variant in ("covariates", "standard", "znorm2"):  # PC-blind probits carry no engine config
+        assert "config" not in binary.formulas(variant, chosen)[1]
     for bad in ([], [float("nan")], ["2"]):
         try:
             binary.settings_of({**base, "outer_start_levels": bad})

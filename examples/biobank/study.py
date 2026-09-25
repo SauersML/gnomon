@@ -367,6 +367,7 @@ class Study:
         self.parquet = self.config["data"]["source"] == "parquet"
         # A validation run may scope itself to some kinds and diseases (lead, 09-19);
         # an AoU run is always the whole study.
+        args.shard, args.variants = getattr(args, "shard", False), getattr(args, "variants", None)
         if args.shard and (not args.diseases or args.kinds):
             raise ValueError("--shard names its diseases with --diseases and fits every study kind")
         if args.variants and not args.shard:
