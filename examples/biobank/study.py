@@ -1297,6 +1297,10 @@ def check_single_sex(definitions, plans, covariates):
                                      f"its {kind} {variant} {component} fit")
 
 
+# A smoothing parameter below this is on the zero rail (gam's interior optima sit at 1e-5 and above).
+ALL_RAILS_LAMBDA = 1e-7
+
+
 def certification(records):
     """Whether the engines certified every fitted component behind one model
     (its fit.json records): "certified", "not_certified" when any reports
@@ -1312,7 +1316,13 @@ def certification(records):
         flag = (record.get("info") or {}).get("converged")
         if flag is not None and not isinstance(flag, bool):
             raise ValueError(f"a fit reports converged={flag!r}, not a bool")
-        flags.append(False if "gaussian-uncertified" in json.dumps(record.get("info") or {}) else flag)
+        info = record.get("info") or {}
+        # Every smoothing parameter on the zero rail is an unpenalised GAM the engine still
+        # certifies (gam#4581: AoU CKD, all 13 lambdas below 1e-7, AUC 0.18 under its nested
+        # probit); the study does not (SPEC section 4).
+        lambdas = info.get("lambdas") or []
+        all_rails = bool(lambdas) and all(isinstance(v, (int, float)) and v < ALL_RAILS_LAMBDA for v in lambdas)
+        flags.append(False if ("gaussian-uncertified" in json.dumps(info) or all_rails) else flag)
     if not flags:
         return "no_fit"
     if False in flags:
