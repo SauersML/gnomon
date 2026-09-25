@@ -903,7 +903,8 @@ class Study:
                     threads = self.budget("fit", kind, variant)
                     for fit in self.fits(slug, kind, None if variant == "shared" else variant):
                         step = self.fit_step(slug, kind, variant, fit, component)
-                        if self.checkpoint.done(step):
+                        if self.checkpoint.done(step) and fit_settled(read_json(self.path(step) / "fit.json"),
+                                                                       self.config["compute"]["job_timeout_seconds"]):
                             continue
                         if frame is None:
                             frame = pd.read_parquet(self.path(f"features/{slug}") / f"{kind}.parquet")
@@ -1721,6 +1722,16 @@ def run_evaluate(spec, config, models):
             row.setdefault("model", kind)
     write_json(out / "evaluate.json", {"status": "ok", "rows": rows,
                                        "predictions": prediction_manifest(spec["predictions"])})
+
+
+def fit_settled(record, cap_seconds):
+    """Whether a sealed fit record stands under this run's per-fit cap. A fit sealed as
+    a timeout says only "not within the cap it ran under"; a run whose cap is larger
+    reopens it. Every other sealed outcome (ok, insufficient events, a declared refusal,
+    an error) is a result and stays. On 2026-09-25 nine arms sealed as 7200 s timeouts
+    under one-thread budgets were skipped in three seconds by the refit shards that
+    carried eight threads and a 14400 s cap."""
+    return not (record.get("status") == "timeout" and float(record.get("wall_seconds") or 0) < cap_seconds)
 
 
 def prediction_manifest(predictions):

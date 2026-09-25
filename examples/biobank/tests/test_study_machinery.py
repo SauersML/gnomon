@@ -1047,3 +1047,14 @@ def test_a_sealed_evaluation_is_reused_only_over_the_same_predictions():
     assert not driver.evaluation_covers(sealed, driver.prediction_manifest(both))
     assert not driver.evaluation_covers({"status": "ok", "rows": []}, driver.prediction_manifest(ours_only))
     assert not driver.evaluation_covers({"status": "failed"}, {})
+
+
+def test_a_fit_sealed_as_a_timeout_is_redone_under_a_larger_cap():
+    """A sealed timeout is not a result: a run with a larger per-fit cap fits again. Other
+    sealed outcomes stand, and a timeout that already ran the whole current cap stands too."""
+    driver = driver_module()
+    assert not driver.fit_settled({"status": "timeout", "wall_seconds": 7200.4}, 14400)
+    assert driver.fit_settled({"status": "timeout", "wall_seconds": 14400.2}, 14400)
+    assert driver.fit_settled({"status": "ok", "wall_seconds": 100}, 14400)
+    assert driver.fit_settled({"status": "insufficient_events"}, 14400)
+    assert driver.fit_settled({"status": "failed", "declared_refusal": "x"}, 14400)
