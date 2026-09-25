@@ -1015,11 +1015,17 @@ def test_variant_shard_fits_and_predicts_one_method_and_stops_before_evaluate():
                       180, 128, 180, variants=["ours"])
 
 
+def driver_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("study_driver", HERE / "study.py")
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    return module
+
+
 def test_a_fit_with_every_smoothing_parameter_railed_is_not_certified():
     """gam#4581: the engine certified a marginal-slope fit whose 13 lambdas all sat below 1e-7 and
     whose held-out AUC was 0.18 under its nested probit; the study calls that not certified."""
-    from study import certification  # noqa: F401
-    import study as driver
+    driver = driver_module()
     railed = {"status": "ok", "info": {"converged": True, "lambdas": [8e-12, 1e-15, 4.3e-10, 1.4e-17, 6.5e-8]}}
     sane = {"status": "ok", "info": {"converged": True, "lambdas": [85.6, 3.2e3, 0.26, 2.8e-5, 1.1e-3]}}
     assert driver.certification([railed]) == "not_certified"
